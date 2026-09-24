@@ -12,13 +12,15 @@
 | W6 | 旧epochのblocked workerへsteer/cancel | versioned経路で元委任eventと現在follow-up event、same-thread、旧owner fenceとexact sessionを検証。経路なしならactivation禁止 |
 | W6a | 旧epoch scheduled workerのcancel | schedule/run/revisionと取消mutation ID、旧owner fence、exact sessionを検証 |
 | W7 | Aのlive worker、通知、outbox、sandboxが残るBからCへの更新 | CがA/Bのcompletion/progress、notification、provider、cleanup protocolを扱えなければactivation拒否 |
-| W8 | queued/retryable_failed jobがcutover後にdispatch | claim時に新epoch/release/protocolへ原子的にrebind |
+| W8 | queued/retryable_failed jobがcutover後にdispatch | 保存payload/workspace互換性を検証してからclaim時に新epochへ原子的にrebind |
 | W9 | 未dispatchの旧Event Envelopeが残る | drainまたはsource prompt protocolのtarget reader互換性を検証 |
 | W10 | active scheduleのtzdb/definitionがtarget非互換 | 決定的migrationなしならactivation拒否 |
 | R0a | plan後にworkload/outbox inventoryが変化 | apply拒否し新しいexact planの承認へ戻す |
 | R0b | blocked main turnまたはpreparing jobあり | ingress停止前にapply/activation拒否、preparingはcleanup receiptまでdrain可 |
 | R0 | 初回移行時にlive legacy workerあり | activation拒否。全terminalと通知materialize後に再評価 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
+| R1a | quiesce drain中にmain turnがblocked化 | activation中止、旧sessionとSlack ingressを安全に復旧 |
+| R1b | quiesce後inventoryがapproved planと安全性差分あり | service復旧、新plan承認へ戻す |
 | R2 | quiesce途中でrestart | 同一fenceの両drainとwatermarkを再取得、unknown write再送禁止 |
 | R3 | migration backup後・schema commit前にrestart | backup/receipt/schemaを検査し二重migration禁止 |
 | R4 | pointer rename後・activation commit前にrestart | pointer、receipt、health、sessionを照合し推定で再起動しない |
@@ -47,4 +49,4 @@
 | C1 | terminal Result済み、通知未settle | release/Result/snapshot GC禁止 |
 | C2 | dispatch前cancelでResultなし、通知先none | 両dispositionを`not_required`へ確定後、参照がなければGC可 |
 | C3 | completion receipt commit直後にrestart | terminal状態・event/group transitionも同時に存在し、重複生成なし |
-| C4 | scheduled completion commit直後にrestart | schedule run terminal状態と時刻も同時に存在 |
+| C4 | scheduled completion commit直後にrestart | runと親schedule/revision/audit/outbox状態が同じaggregate transactionで存在 |
