@@ -182,6 +182,7 @@ export interface JobGroupRow {
 
 export interface JobGroupSnapshot {
   source_event_id: string;
+  attention_resolution_state: "not_required" | "unresolved" | "resolved";
   total: number;
   pending: number;
   status_counts: Partial<Record<JobStatus, number>>;

@@ -15,6 +15,186 @@ afterEach(async () => {
 });
 
 describe("通常groupのResult統合", () => {
+  async function oneJobGroup(externalId: string) {
+    const {root,config} = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope(externalId)).row;
+    database.beginDispatch(source.event_id, `${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const job = database.createJob({source_event_id:source.event_id,job_key:"only",objective:"調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id,"workspace","pane");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    return {database,source,job,config};
+  }
+
+  function sealSource(database: DispatcherDatabase, sourceEventId: string, resultPath: string) {
+    database.saveCompleted(sourceEventId, {schema_version:1,event_id:sourceEventId,status:"completed",
+      summary:"delegated",completed_at:"2026-09-05T00:00:00.000Z"}, resultPath);
+  }
+
+  test("blocked only は再起動後も未解決で、明示取消後だけ最終通知へ進む", async () => {
+    const setup = await oneJobGroup("Ev-blocked-fence");
+    let {database} = setup;
+    database.markJobBlocked(setup.job.job_id,"入力待ち");
+    sealSource(database,setup.source.event_id,`${setup.config.resultsDir}/source.json`);
+    const attention = database.enqueueJobNotification(setup.job.job_id);
+    assert.equal((envelopeFromRow(attention.row).payload.group as Record<string,unknown>).transition,"attention");
+    assert.deepEqual(database.listJobsNeedingNotification(),[]);
+    database.close();
+    database = new DispatcherDatabase(setup.config.databasePath);
+    assert.deepEqual(database.listJobsNeedingNotification(),[]);
+    assert.equal(database.enqueueJobNotification(setup.job.job_id).row.event_id,attention.row.event_id);
+    const followUp = database.enqueue(eventEnvelope("Ev-blocked-cancel")).row;
+    database.beginJobCancellation(setup.job.job_id,followUp.event_id);
+    database.markJobCancelled(setup.job.job_id,"明示取消");
+    assert.equal(database.getJobGroup(setup.source.event_id)?.attention_event_id,null);
+    const final = database.enqueueJobNotification(setup.job.job_id);
+    const snapshot = envelopeFromRow(final.row).payload.group as Record<string,unknown>;
+    assert.equal(snapshot.transition,"all_terminal");
+    assert.equal(snapshot.attention_resolution_state,"not_required");
+    assert.equal(database.enqueueJobNotification(setup.job.job_id).row.event_id,final.row.event_id);
+    database.close();
+  });
+
+  test("attentionとrunning siblingは中間通知後も最終化しない", async () => {
+    const {database,source,job,config} = await oneJobGroup("Ev-attention-running");
+    const sibling = database.createJob({source_event_id:source.event_id,job_key:"second",objective:"別調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(sibling.job_id);
+    database.setJobRuntime(sibling.job_id,"workspace-second","pane-second");
+    database.beginJobDispatch(sibling.job_id);
+    database.markJobRunning(sibling.job_id);
+    database.markJobBlocked(job.job_id,"入力待ち");
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    database.enqueueJobNotification(job.job_id);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    database.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"completed",
+      summary:"完了",completed_at:"2026-09-05T00:00:30.000Z"},sibling.result_path);
+    const progress = database.enqueueJobNotification(sibling.job_id);
+    assert.equal((envelopeFromRow(progress.row).payload.group as Record<string,unknown>).transition,"progress");
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    const followUp = database.enqueue(eventEnvelope("Ev-attention-running-cancel")).row;
+    database.beginJobCancellation(job.job_id,followUp.event_id);
+    database.markJobCancelled(job.job_id,"明示取消");
+    const final = database.enqueueJobNotification(job.job_id);
+    assert.equal((envelopeFromRow(final.row).payload.group as Record<string,unknown>).transition,"all_terminal");
+    database.close();
+  });
+
+  test("投稿済みattentionは取消後の最終通知まで同一ownerを保持する", async () => {
+    const {database,source,job,config} = await oneJobGroup("Ev-attention-delivered-cancel");
+    database.markJobBlocked(job.job_id,"入力待ち");
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"attention delivered",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${config.resultsDir}/attention.json`);
+    const followUp=database.enqueue(eventEnvelope("Ev-attention-delivered-cancel-followup")).row;
+    database.beginJobCancellation(job.job_id,followUp.event_id);
+    database.markJobCancelled(job.job_id,"明示取消");
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,attention.row.event_id);
+    const final=database.enqueueJobNotification(job.job_id);
+    assert.equal((envelopeFromRow(final.row).payload.group as Record<string,unknown>).attention_resolution_state,"resolved");
+    assert.equal((envelopeFromRow(final.row).payload.group as Record<string,unknown>).transition,"all_terminal");
+    database.close();
+  });
+
+  test("needs_review only は検証済みlate Resultまでfenceを保持する", async () => {
+    const setup = await oneJobGroup("Ev-review-fence");
+    let {database} = setup;
+    database.markJobNeedsReview(setup.job.job_id,"prompt_interrupted","結果待ち");
+    sealSource(database,setup.source.event_id,`${setup.config.resultsDir}/source.json`);
+    const attention = database.enqueueJobNotification(setup.job.job_id);
+    assert.deepEqual(database.listJobsNeedingNotification(),[]);
+    database.close();
+    database = new DispatcherDatabase(setup.config.databasePath);
+    assert.equal(database.getJobGroup(setup.source.event_id)?.attention_event_id,attention.row.event_id);
+    database.saveJobResult(setup.job.job_id,{schema_version:1,job_id:setup.job.job_id,status:"completed",
+      summary:"検証済み",completed_at:"2026-09-05T00:00:30.000Z"},setup.job.result_path);
+    assert.equal(database.getJobGroup(setup.source.event_id)?.attention_event_id,null);
+    const final = database.enqueueJobNotification(setup.job.job_id);
+    assert.equal((envelopeFromRow(final.row).payload.group as Record<string,unknown>).transition,"all_terminal");
+    database.close();
+  });
+
+  test("曖昧なattention配送は確認receiptまで解消しない", async () => {
+    const {database,source,job,config} = await oneJobGroup("Ev-attention-ambiguous");
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",
+      summary:"失敗",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention = database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"配送結果不明",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",ambiguous:true}]},`${config.resultsDir}/attention.json`);
+    assert.deepEqual(database.listJobsNeedingNotification(),[]);
+    assert.throws(()=>database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,
+      database.getJob(job.job_id)!.updated_at),/notification_requires_reconciliation/);
+    const hash="a".repeat(64),request=database.attentionDeliveryVerificationRequest(source.event_id,attention.row.event_id,"123.456",hash);
+    assert.throws(()=>database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
+      database.get(attention.row.event_id)!.updated_at,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
+        identity_block_verified:false,session_status:"suspended"}),/evidence_mismatch/);
+    database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
+      database.get(attention.row.event_id)!.updated_at,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
+        identity_block_verified:true,session_status:"suspended"});
+    database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,database.getJob(job.job_id)!.updated_at);
+    assert.ok(database.getJobGroup(source.event_id)?.all_terminal_event_id);
+    database.close();
+  });
+
+  test("Session更新timeoutではpost成功記録だけでactiveへ進めない", async () => {
+    const {database,source,job,config} = await oneJobGroup("Ev-attention-session-timeout");
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",
+      summary:"失敗",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention = database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"Session更新結果不明",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",
+          status:"suspended",ambiguous:true}]},`${config.resultsDir}/attention.json`);
+    assert.deepEqual(database.listJobsNeedingNotification(),[]);
+    assert.throws(()=>database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,
+      database.getJob(job.job_id)!.updated_at),/notification_requires_reconciliation/);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    database.close();
+  });
+
+  test("複数publisherの古い候補とclaim途中のrollbackは単一attentionへ収束する", async () => {
+    const setup = await oneJobGroup("Ev-attention-publishers");
+    const {database,source,job,config} = setup;
+    database.markJobNeedsReview(job.job_id,"prompt_interrupted","結果不明");
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const peer = new DispatcherDatabase(config.databasePath);
+    assert.equal(database.listJobsNeedingNotification().length,1);
+    assert.equal(peer.listJobsNeedingNotification().length,1);
+    for(const step of ["event_enqueued","transition_claimed","job_linked"] as const) {
+      assert.throws(()=>database.enqueueJobNotification(job.job_id,new Date(),current=>{
+        if(current===step)throw new Error(`fault:${step}`);
+      }),new RegExp(`fault:${step}`));
+      assert.equal(peer.getJobGroup(source.event_id)?.attention_event_id,null);
+      assert.equal(peer.getJob(job.job_id)?.completion_event_id,null);
+    }
+    const first = peer.enqueueJobNotification(job.job_id);
+    const stale = database.enqueueJobNotification(job.job_id);
+    assert.equal(stale.row.event_id,first.row.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,first.row.event_id);
+    assert.deepEqual(peer.listJobsNeedingNotification(),[]);
+    peer.close();
+    database.close();
+  });
+
   test("provides idempotent group creation, sealing, and transition ownership primitives", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -101,7 +281,7 @@ describe("通常groupのResult統合", () => {
     }
     database.close();
   });
-  test("claims attention and all-terminal transitions for a group containing a failure", async () => {
+  test("keeps a failed group suspended until audited attention resolution", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -139,8 +319,21 @@ describe("通常groupのResult統合", () => {
     assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).pending, 0);
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, attention.row.event_id);
 
-    assert.equal(database.listJobsNeedingNotification()[0]?.job_id, blocked.job_id);
-    const allTerminal = database.enqueueJobNotification(blocked.job_id, new Date("2026-09-05T00:04:00.000Z"));
+    assert.deepEqual(database.listJobsNeedingNotification(), []);
+    assert.equal(database.enqueueJobNotification(blocked.job_id).row.event_id, attention.row.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, null);
+    database.beginDispatch(attention.row.event_id, `${config.resultsDir}/${attention.row.event_id}.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id, {
+      schema_version: 1, event_id: attention.row.event_id, status: "completed",
+      summary: "attention delivered", completed_at: "2026-09-05T00:03:30.000Z",
+      actions: [{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}],
+    }, `${config.resultsDir}/${attention.row.event_id}.json`);
+    assert.deepEqual(database.listJobsNeedingNotification(), []);
+    assert.throws(() => database.resolveFailedJobAttention(source.event_id, blocked.job_id, "wrong-event", blocked.updated_at), /binding_mismatch/);
+    database.resolveFailedJobAttention(source.event_id, blocked.job_id, attention.row.event_id, database.getJob(blocked.job_id)!.updated_at);
+    const allTerminal = {row:database.get(database.getJobGroup(source.event_id)!.all_terminal_event_id!)!};
     const finalSnapshot = envelopeFromRow(allTerminal.row).payload.group as Record<string, unknown>;
     assert.equal(finalSnapshot.transition, "all_terminal");
     assert.equal(finalSnapshot.pending, 0);

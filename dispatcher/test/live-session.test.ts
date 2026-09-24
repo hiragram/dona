@@ -41,6 +41,24 @@ async function addressableJob(status:"dispatching"|"needs_review"="needs_review"
 }
 
 describe("read-only live session reconciliation",()=>{
+  test("needs_reviewのattentionは最新のlive receiptとoperator確認でのみ解消する",async()=>{
+    const state=await addressableJob("needs_review","review-attention");
+    state.database.sealJobGroup(state.source.event_id);
+    const attention=state.database.enqueueJobNotification(state.job.job_id).row;
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    const current=state.database.getJob(state.job.job_id)!;
+    assert.throws(()=>state.database.resolveNeedsReviewAttention(state.source.event_id,current.job_id,"wrong-event",
+      receipt.receipt_id,current.updated_at),/binding_mismatch/);
+    assert.throws(()=>state.database.resolveNeedsReviewAttention(state.source.event_id,current.job_id,attention.event_id,
+      "wrong-receipt",current.updated_at),/receipt_mismatch/);
+    const resolved=state.database.resolveNeedsReviewAttention(state.source.event_id,current.job_id,attention.event_id,
+      receipt.receipt_id,current.updated_at);
+    assert.equal(resolved.status,"failed");
+    assert.equal(state.database.get(attention.event_id)?.last_error_code,"job_result_superseded");
+    assert.ok(state.database.getJobGroup(state.source.event_id)?.all_terminal_event_id);
+    state.database.close();
+  });
   test("invalid Resultのoperator解決は最新receiptと状態の一致を要求する",async()=>{
     const state=await addressableJob("needs_review","invalid-result-first");
     state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
@@ -80,7 +98,13 @@ describe("read-only live session reconciliation",()=>{
     state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
     state.database.sealJobGroup(state.source.event_id);
     const prior=state.database.enqueueJobNotification(state.job.job_id).row;
-    state.database.manualComplete(prior.event_id);
+    state.database.beginDispatch(prior.event_id,`${state.config.resultsDir}/attention.json`);
+    state.database.markWaiting(prior.event_id);
+    state.database.saveCompleted(prior.event_id,{schema_version:1,event_id:prior.event_id,status:"completed",
+      summary:"attention delivered",completed_at:"2026-09-05T00:00:00.000Z",
+      actions:[{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${state.config.resultsDir}/attention.json`);
     const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
     const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
     const current=state.database.getJob(state.job.job_id)!;

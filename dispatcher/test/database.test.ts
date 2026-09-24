@@ -805,7 +805,7 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
-  test("claims attention and all-terminal transitions for a group containing a failure", async () => {
+  test("keeps a failed group suspended until audited attention resolution", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -843,8 +843,20 @@ describe("DispatcherDatabase", () => {
     assert.equal((envelopeFromRow(attention.row).payload.group as Record<string, unknown>).pending, 0);
     assert.equal(database.getJobGroup(source.event_id)?.attention_event_id, attention.row.event_id);
 
-    assert.equal(database.listJobsNeedingNotification()[0]?.job_id, blocked.job_id);
-    const allTerminal = database.enqueueJobNotification(blocked.job_id, new Date("2026-09-05T00:04:00.000Z"));
+    assert.deepEqual(database.listJobsNeedingNotification(), []);
+    assert.equal(database.enqueueJobNotification(blocked.job_id).row.event_id, attention.row.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id, null);
+    database.beginDispatch(attention.row.event_id, `${config.resultsDir}/${attention.row.event_id}.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id, {
+      schema_version: 1, event_id: attention.row.event_id, status: "completed",
+      summary: "attention delivered", completed_at: "2026-09-05T00:03:30.000Z",
+      actions: [{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}],
+    }, `${config.resultsDir}/${attention.row.event_id}.json`);
+    assert.deepEqual(database.listJobsNeedingNotification(), []);
+    database.resolveFailedJobAttention(source.event_id, blocked.job_id, attention.row.event_id, database.getJob(blocked.job_id)!.updated_at);
+    const allTerminal = {row:database.get(database.getJobGroup(source.event_id)!.all_terminal_event_id!)!};
     const finalSnapshot = envelopeFromRow(allTerminal.row).payload.group as Record<string, unknown>;
     assert.equal(finalSnapshot.transition, "all_terminal");
     assert.equal(finalSnapshot.pending, 0);
