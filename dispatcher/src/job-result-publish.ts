@@ -22,7 +22,9 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^:/\s@]*:[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1)|https?:\/\/[^\s]+[?&](?:token|sig|signature|x-amz-signature|x-goog-signature|api[_-]?key|access[_-]?key|auth)=|(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:\\))/i;
+const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^:/\s@]*:[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1)|(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:\\))/i;
+const httpUrlCandidate = /https?:\/\/[^\s"'<>`]+/gi;
+const signedQueryKey = /[?&](?:token|sig|signature|x-amz-signature|x-goog-signature|api[_-]?key|access[_-]?key|auth)=/i;
 const capabilityCandidate = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g;
 const assignmentCandidate = /\b[A-Za-z_][A-Za-z0-9_]*\s*[:=]/g;
 function forbiddenKey(key: string): boolean {
@@ -38,6 +40,9 @@ const hasInvalidUnicode = (value: string): boolean => /[\uD800-\uDBFF](?![\uDC00
 function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: readonly string[]): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
+    for (const match of value.matchAll(httpUrlCandidate)) {
+      if (signedQueryKey.test(match[0])) throw new JobResultPublishError("content_requires_redaction");
+    }
     for (const match of value.matchAll(assignmentCandidate)) {
       if (forbiddenKey(match[0].replace(/\s*[:=]$/, ""))) throw new JobResultPublishError("content_requires_redaction");
     }
@@ -206,8 +211,9 @@ export class JobResultPublishCapabilities {
     const job = getJob(grant.jobId);
     if (!job || job.job_id !== grant.jobId) throw new JobResultPublishError("capability_invalid");
     const terminalReconcile = (job.status === "completed" || job.status === "failed") && typeof job.result_json === "string";
+    if (grant.session !== session) throw new JobResultPublishError("worker_session_stale");
     if (terminalReconcile) return job;
-    if (grant.session !== session || this.currentSession(job.job_id) !== session ||
+    if (this.currentSession(job.job_id) !== session ||
       grant.attemptCount !== job.attempt_count || grant.paneId !== job.herdr_pane_id) {
       throw new JobResultPublishError("worker_session_stale");
     }

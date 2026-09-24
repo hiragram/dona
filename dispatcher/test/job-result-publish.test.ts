@@ -69,6 +69,10 @@ describe("job result publish contract", () => {
       assert.throws(() => validateJobResultPublish({ ...base, output: { format: "text", text: assignment } }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     assert.equal(validateJobResultPublish({ ...base, summary: `x://:${"a:".repeat(5000)}` }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    const repeatedUrls = "http://x?foo=".repeat(20_000);
+    const started = performance.now();
+    assert.equal(validateJobResultPublish({ ...base, summary: repeatedUrls }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    assert.ok(performance.now() - started < 2_000, "署名URL検査は大きな本文でも線形時間で終わる");
   });
 
   test("canonical digestはkey順とDispatcher時刻によらず同一で、内容の差を識別する", () => {
@@ -132,6 +136,7 @@ describe("job result publish contract", () => {
     const candidate = grants.validate(grant.capability, "session-1", base, () => terminal);
     assert.equal(candidate.reconcileOnly, true);
     assert.deepEqual(candidate.fence, { jobId: "job_one", attemptCount: 1, paneId: "pane-1", session: "session-1" });
+    assert.throws(() => grants.validate(grant.capability, "other-session", base, () => terminal), code("worker_session_stale"));
     assert.throws(() => grants.validate(grant.capability, "session-1", base, () => row({ status: "completed", herdr_pane_id: null, result_json: null })), code("worker_session_stale"));
   });
 
@@ -149,7 +154,7 @@ describe("job result publish contract", () => {
         reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } });
     const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish") => new Promise<{ status: number; body: string }>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: route, method: "POST",
-        headers: { "content-type": "application/json", ...(capability ? { "x-dona-job-result-capability": capability } : {}), "x-dona-worker-session": session } }, response => {
+        headers: { "content-type": "application/json", ...(capability ? { "x-dona-job-result-capability": capability } : {}), "x-dona-worker-session": Buffer.from(JSON.stringify(session), "utf8").toString("base64url") } }, response => {
         const chunks: Buffer[] = [];
         response.on("data", chunk => chunks.push(Buffer.from(chunk)));
         response.on("end", () => resolve({ status: response.statusCode!, body: Buffer.concat(chunks).toString("utf8") }));
@@ -192,6 +197,35 @@ describe("job result publish contract", () => {
       assert.equal(retry.status, 200);
       assert.equal(accepted.length, 3);
       assert.deepEqual(reconciled, [accepted[0]]);
+    } finally {
+      await server.stop();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Unicodeと制御文字を含む永続sessionを可逆に認証する", async () => {
+    const session = "セッション\n\ud800";
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-session-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => session);
+    const grant = grants.issue(row(), session);
+    const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
+      { commit: async candidate => {
+        assert.equal(candidate.fence.session, session);
+        return { outcome: "created" };
+      }, reconcile: async () => ({ outcome: "reused" }) });
+    const post = (encodedSession: string) => new Promise<number>((resolve, reject) => {
+      const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
+        headers: { "x-dona-job-result-capability": grant.capability, "x-dona-worker-session": encodedSession } }, response => {
+        response.resume(); response.on("end", () => resolve(response.statusCode!));
+      });
+      request.on("error", reject); request.end(JSON.stringify(base));
+    });
+    try {
+      await server.start();
+      assert.equal(await post(Buffer.from(JSON.stringify(session), "utf8").toString("base64url")), 202);
+      assert.equal(await post(Buffer.from(JSON.stringify("別session"), "utf8").toString("base64url")), 403);
+      assert.equal(await post("%%%"), 403);
     } finally {
       await server.stop();
       await fs.rm(directory, { recursive: true, force: true });

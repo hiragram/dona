@@ -79,11 +79,21 @@ export class JobResultPublishServer {
       reply(response, 404, "not_found"); return;
     }
     const capability = request.headers["x-dona-job-result-capability"];
-    const session = request.headers["x-dona-worker-session"];
-    if (typeof capability !== "string" || typeof session !== "string") {
+    const encodedSession = request.headers["x-dona-worker-session"];
+    if (typeof capability !== "string" || typeof encodedSession !== "string") {
       reply(response, 403, "capability_invalid"); return;
     }
     try {
+      // JSON before base64url preserves every persisted 512-character session,
+      // including Unicode, control characters and lone surrogates.
+      if (!/^[A-Za-z0-9_-]{1,4096}$/.test(encodedSession)) throw new JobResultPublishError("capability_invalid");
+      let session: unknown;
+      try { session = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(encodedSession, "base64url"))); }
+      catch { throw new JobResultPublishError("capability_invalid"); }
+      if (typeof session !== "string" || !session || session.length > 512 ||
+        Buffer.from(JSON.stringify(session), "utf8").toString("base64url") !== encodedSession) {
+        throw new JobResultPublishError("capability_invalid");
+      }
       if (request.url === "/v1/job-result-publish/renew") {
         if ((request.headers["content-length"] ?? "0") !== "0" || request.headers["transfer-encoding"] !== undefined) {
           throw new JobResultPublishError("invalid_request");
