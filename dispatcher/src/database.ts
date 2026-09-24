@@ -2123,6 +2123,16 @@ export class DispatcherDatabase {
       if(event.source==="dona_message"&&event.event_type==="worker_message_report"){
         const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
         if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind))){
+          const decision=this.db.prepare(`SELECT d.action,d.reason FROM worker_message_decisions d
+            JOIN worker_message_deliveries delivery ON delivery.message_id=d.message_id
+            WHERE d.job_id=? AND d.notification_event_id=? AND delivery.event_id=?
+              AND delivery.consumer='dona-main' LIMIT 1`).get(payload.job_id,eventId,eventId) as
+            {action:string;reason:string}|undefined;
+          if(decision?.action==="ack_internal"&&["answered","terminal"].includes(decision.reason)){
+            this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+            return;
+          }
           const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
           const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
             typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&

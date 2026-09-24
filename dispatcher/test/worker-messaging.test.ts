@@ -43,6 +43,47 @@ function bindRuntime(database:DispatcherDatabase,jobId:string,identity:string) {
 }
 
 describe("worker messaging ledger",()=>{
+  test("回答済み質問の再通知を投稿なしで完了する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const created=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        conversation_revision:1,payload:{kind:"question",question:"確認が必要です"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      sqlite.close();
+      database.workerMessages.appendInstruction(job.job_id,{schema_version:1,source_event_id:source.event_id,
+        producer_sequence:1,idempotency_key:"answer-before-decision",occurred_at:"2026-09-21T00:00:03Z",
+        correlation_message_id:created.message.message_id,conversation_revision:2,
+        payload:{operation:"answer",text:"続けてください"}});
+      const decision=database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id);
+      assert.equal(decision.action,"ack_internal");
+      assert.equal(decision.reason,"answered");
+      database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+        summary:"内部受領",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:04Z"},"result.json");
+      assert.equal(database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)?.status,"completed");
+    } finally {database.close();}
+  });
+  test("needs_review後の質問decisionを保存し、内部受領Resultを完了する",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const created=database.workerMessages.appendReport(job.job_id,{...report(source.event_id),
+        conversation_revision:1,payload:{kind:"question",question:"確認が必要です"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      sqlite.close();
+      database.markJobNeedsReview(job.job_id,"review","review");
+      const decision=database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id);
+      assert.equal(decision.action,"ack_internal");
+      assert.equal(decision.reason,"terminal");
+      database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+        summary:"内部受領",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},"result.json");
+      assert.equal(database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)?.status,"completed");
+    } finally {database.close();}
+  });
   test("terminal遷移後の初回decisionを内部受領として保存する",async()=>{
     const {database,source,job,config}=await fixture();
     try {
@@ -1218,8 +1259,10 @@ test("APIはbinding済みmessageだけをboundedにwrite/read/reconcileする",a
     assert.equal(envelopeFromRow(internal).source,"dona_message");
     const prompt=buildEventPrompt(internal.event_id,"/tmp/result.json",envelopeFromRow(internal));
     assert.match(prompt,/通常Slack messageの宛先判定を適用せず必ず処理対象/);
+    assert.match(prompt,/decide_worker_messageを必ず呼び/);
     assert.match(prompt,/get_worker_messageへsource_event_idとして現在のevent_id/);
-    assert.match(prompt,/questionまたはdecision_request.*suspended/);
+    assert.match(prompt,/decide_worker_messageを必ず呼び/);
+    assert.match(prompt,/ask_userはsafe_projectionだけ.*suspended/);
     const sqlite=new Database(config.databasePath);
     assert.deepEqual(readEventJobBinding(sqlite,internal.event_id)?.owner,readEventJobBinding(sqlite,source.event_id)?.owner);
     sqlite.close();

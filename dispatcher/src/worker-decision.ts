@@ -41,7 +41,7 @@ export interface WorkerDecision {
   reason: "terminal" | "group_attention" | "question" | "decision_request" | "risk_escalation" |
     "risk" | "eta_change" | "silence" | "duplicate" | "heartbeat" | "changed" | "group_wait" | "answered";
   content_sha256: string;
-  safe_projection?: { kind: "question" | "decision_request"; prompt: string; options?: string[] };
+  safe_projection?: { kind: "question" | "decision_request" | "progress"; prompt: string; options?: string[] };
 }
 
 const terminal = new Set<WorkerJobStatus>(["completed", "failed", "cancelled", "needs_review"]);
@@ -72,15 +72,19 @@ export function evaluateWorkerDecision(context: WorkerDecisionContext): WorkerDe
     return { action: "aggregate_wait", reason: "group_wait", content_sha256 };
   if (siblings.some(sibling => sibling.status === "failed" || sibling.status === "needs_review"))
     return { action: "aggregate_wait", reason: "group_attention", content_sha256 };
-  if (report.kind === "risk" && report.severity === "high")
-    return { action: "report_to_user", reason: "risk_escalation", content_sha256 };
-  if (report.kind === "risk" && context.last_risk_severity !== report.severity)
-    return { action: "report_to_user", reason: "risk", content_sha256 };
+  const progress=(reason:"risk_escalation"|"risk"|"eta_change"|"silence"):WorkerDecision=>({action:"report_to_user",reason,
+    content_sha256,safe_projection:{kind:"progress",prompt:reason==="risk_escalation"?
+      "作業上の重要な懸念が報告されました。状況を確認しています。":reason==="risk"?
+      "作業上の懸念に変化がありました。状況を確認しています。":reason==="eta_change"?
+      "作業の見込み時刻に変化がありました。状況を確認しています。":
+      "作業は継続中です。新しい結果が得られ次第お知らせします。"}});
+  if (report.kind === "risk" && report.severity === "high") return progress("risk_escalation");
+  if (report.kind === "risk" && context.last_risk_severity !== report.severity) return progress("risk");
   if (report.eta_at && context.last_eta_at && Math.abs(Date.parse(report.eta_at)-Date.parse(context.last_eta_at)) >= 300_000)
-    return { action: "report_to_user", reason: "eta_change", content_sha256 };
+    return progress("eta_change");
   const elapsed = Date.parse(context.now) - Date.parse(context.last_user_decision_at ?? context.first_report_at ?? report.accepted_at);
   if (Number.isFinite(elapsed) && elapsed >= context.silence_interval_ms)
-    return { action: "report_to_user", reason: "silence", content_sha256 };
+    return progress("silence");
   if (previous?.content_sha256 === content_sha256)
     return { action: "ack_internal", reason: "duplicate", content_sha256 };
   if (context.total_jobs > 1) return { action: "aggregate_wait", reason: "group_wait", content_sha256 };

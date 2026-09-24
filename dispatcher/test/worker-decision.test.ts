@@ -44,6 +44,8 @@ describe("worker decision policy", () => {
     const risk = evaluateWorkerDecision({ ...base, report: { ...base.report,
       kind: "risk", text: "品質上の懸念", severity: "high" } });
     assert.equal(risk.reason, "risk_escalation");
+    assert.equal(risk.safe_projection?.kind,"progress");
+    assert.ok(!JSON.stringify(risk.safe_projection).includes("品質上の懸念"));
     const group = evaluateWorkerDecision({ ...base, siblings: [ ...base.siblings,
       { job_id: "job_2", status: "needs_review" } ], total_jobs: 2,
       report: { ...base.report, kind: "risk", text: "品質上の懸念", severity: "high" } });

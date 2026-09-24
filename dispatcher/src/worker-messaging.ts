@@ -558,7 +558,7 @@ export class WorkerMessageRepository {
         content_sha256:row.content_sha256,group_sha256:row.group_sha256,group_total:row.group_total,
         ...(row.safe_projection_json?{safe_projection:JSON.parse(row.safe_projection_json)}:{}),decided_at:row.decided_at});
       if(existing)return project(existing);
-      if(terminal(job.status)===false)this.getMessage(jobId,messageId,notificationEventId);
+      if(terminal(job.status)===false&&job.status!=="needs_review")this.getMessage(jobId,messageId,notificationEventId);
       const event=this.db.prepare("SELECT status FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_report'")
         .get(notificationEventId) as {status:string}|undefined;
       if(!event||!["dispatching","waiting_agent"].includes(event.status))
