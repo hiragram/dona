@@ -100,8 +100,8 @@ const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_-]*|["'][^"'\r\n]+["'])\s*
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
   return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie)(?:_|$)/.test(normalized) ||
-    /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|privatekey|capability|cookie|sessionid)$/.test(normalized.replaceAll("_", "")) ||
-    /(?:^|_)(?:api|access|private)_key(?:_|$)/.test(normalized) ||
+    /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|accountkey|privatekey|capability|cookie|sessionid)$/.test(normalized.replaceAll("_", "")) ||
+    /(?:^|_)(?:api|access|account|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
     normalized.startsWith("herdr_");
 }
