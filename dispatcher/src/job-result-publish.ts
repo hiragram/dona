@@ -105,13 +105,13 @@ function hasPrivateJwkText(value: string): boolean {
 }
 const localPath = /(?:^|[\s"'<>`()[\]{},:=])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/))/i;
 function hasLocalPath(value: string): boolean {
-  if (/(?<![A-Za-z0-9/])\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run)(?:\/|$)/i.test(value)) return true;
+  if (/(?<![A-Za-z0-9/])\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run|proc|dev|sys)(?:\/|$)/i.test(value)) return true;
   const candidate = new RegExp(localPath.source, "gi");
   for (const match of value.matchAll(candidate)) {
     const route = match[0].trimStart();
     const prefix = value.slice(0, match.index);
     if (route.startsWith("/") && /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(prefix.trimEnd()) &&
-      !/^\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run)(?:\/|\b)/i.test(route) &&
+      !/^\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run|proc|dev|sys)(?:\/|\b)/i.test(route) &&
       !/\/(?:\.ssh|\.aws|\.env|secrets|id_(?:rsa|ed25519))(?:\/|\b)/i.test(route)) continue;
     return true;
   }
