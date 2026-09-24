@@ -8,9 +8,10 @@
 | W2 | 旧epoch running worker、Result atomic publish後にactivation | digest/session/fence照合でreceiptを一度確定、通知は別にsettle |
 | W3 | 旧protocol compatible、Result到着後にDispatcher restart | receipt再読で重複回収せずterminal維持 |
 | W4 | 旧protocol unsupportedまたはowner不明 | Result隔離、削除・resume・notify禁止 |
-| W5 | lease expired/revoked、旧workerが後からResult公開 | 死亡や移譲を推定せず`needs_review` |
-| W6 | 旧epochのblocked workerへsteer/cancel | versioned経路で旧owner fenceとexact sessionを検証。経路なしならactivation禁止 |
+| W5 | lease expiredのみ、旧workerが後からResult公開 | 同一owner/session/fenceでrevokeなしならreceipt化。revokedは隔離 |
+| W6 | 旧epochのblocked workerへsteer/cancel | versioned経路で元委任eventと現在follow-up event、same-thread、旧owner fenceとexact sessionを検証。経路なしならactivation禁止 |
 | W7 | Aのlive workerが残るBからCへの更新 | CがA/Bの全live protocolを扱えなければactivation拒否 |
+| R0 | 初回移行時にlive legacy workerあり | activation拒否。全terminalと通知materialize後に再評価 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
 | R2 | quiesce途中でrestart | 同一fenceの両drainとwatermarkを再取得、unknown write再送禁止 |
 | R3 | migration backup後・schema commit前にrestart | backup/receipt/schemaを検査し二重migration禁止 |
@@ -25,10 +26,10 @@
 | M1 | migration前、旧schemaでrollback | 旧SHA/schema healthとreceiptを検証して復帰可 |
 | M2 | migration後、旧releaseは新schema非互換 | 検証済みsnapshot復元と外部receipt照合なしではrollback禁止 |
 | M3 | migration後、新epochでprovider write確定 | snapshot復元でもwriteを未実行扱いせずreconcile |
-| M4 | target epoch worker稼働中に旧snapshotへのrollback要求 | 両epochのowner/Result/receiptの再構成を証明できなければrollback禁止 |
+| M4 | target ingress開始後に旧snapshotへのrollback要求 | 全mutation journalがないためsnapshot rollback禁止 |
 | M5 | Dispatcher active epoch install応答喪失 | receiptをread-backし、exact一致までingress停止 |
 | M6 | target稼働後に旧releaseへrollback | 新しいrollback epochをCAS install/read-backし、target epochを再利用しない |
-| M7 | targetのterminal event/group stateが旧snapshotにない | completion transaction全体を再構成できなければrollback拒否 |
+| M7 | 新ingress前のrollback inventory直後にworker Result到着 | writer fence後ならDB commitなし。Result領域を保護し復帰後に回収 |
 | C1 | terminal Result済み、通知未settle | release/Result/snapshot GC禁止 |
 | C2 | dispatch前cancelでResultなし、通知先none | 両dispositionを`not_required`へ確定後、参照がなければGC可 |
 | C3 | completion receipt commit直後にrestart | terminal状態・event/group transitionも同時に存在し、重複生成なし |
