@@ -218,9 +218,7 @@ function reconcileLegacyAttentionClaims(db: Database.Database): void {
     FROM job_groups g JOIN events e ON e.event_id=g.all_terminal_event_id
     WHERE g.notification_mode='grouped' AND g.attention_event_id IS NOT NULL
       AND g.all_terminal_event_id IS NOT NULL
-      AND json_extract(e.payload_json,'$.group.attention_resolution_state') IS NULL
-      AND EXISTS (SELECT 1 FROM jobs j WHERE j.source_event_id=g.source_event_id
-        AND j.status IN ('blocked','needs_review','failed'))`)
+      AND json_extract(e.payload_json,'$.group.attention_resolution_state') IS NULL`)
     .all() as Array<{source_event_id:string;all_terminal_event_id:string;status:EventStatus}>;
   const at=nowUtc();
   for(const candidate of candidates) {
@@ -237,7 +235,12 @@ function reconcileLegacyAttentionClaims(db: Database.Database): void {
     if(changed!==1) throw new Error("legacy_group_terminal_changed_during_recovery");
     db.prepare("UPDATE jobs SET completion_event_id=NULL,updated_at=? WHERE source_event_id=? AND completion_event_id=?")
       .run(at,candidate.source_event_id,candidate.all_terminal_event_id);
-    db.prepare(`UPDATE job_groups SET all_terminal_event_id=NULL,updated_at=?
+    db.prepare(`UPDATE job_groups SET all_terminal_event_id=NULL,
+      attention_event_id=CASE WHEN NOT EXISTS (
+        SELECT 1 FROM jobs j WHERE j.source_event_id=job_groups.source_event_id
+          AND j.status NOT IN ('completed','cancelled')
+      ) THEN NULL ELSE attention_event_id END,
+      updated_at=?
       WHERE source_event_id=? AND all_terminal_event_id=?`)
       .run(at,candidate.source_event_id,candidate.all_terminal_event_id);
   }
