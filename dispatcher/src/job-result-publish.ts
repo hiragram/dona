@@ -120,7 +120,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)|[A-Za-z][A-Za-z0-9-]*)(?::\d{1,5})?\/[^\s"'<>`]+)/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -482,15 +482,20 @@ export class JobResultPublishCapabilities {
   }
 
   renew(capability: string, session: string, getJob: (jobId: string) => JobRow | undefined): { capability: string; expiresAt: string } {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(capability)) throw new JobResultPublishError("capability_invalid");
+    const next = createHmac("sha256", this.renewalKey).update(`renew:v1\n${capability}`).digest("base64url");
+    const key = createHash("sha256").update(next).digest("hex");
+    const existing = this.grants.get(key);
+    if (existing) {
+      const current = this.authorize(next, session, getJob);
+      if (current.status !== "running") throw new JobResultPublishError("job_not_publishable");
+      return { capability: next, expiresAt: new Date(existing.expiresAt).toISOString() };
+    }
     const job = this.authorize(capability, session, getJob);
     if (job.status !== "running") throw new JobResultPublishError("job_not_publishable");
     this.pruneExpiredGrants();
     // The previous token remains valid until its own expiry. A lost response can
     // safely repeat the same renewal and recover the same successor token.
-    const next = createHmac("sha256", this.renewalKey).update(`renew:v1\n${capability}`).digest("base64url");
-    const key = createHash("sha256").update(next).digest("hex");
-    const existing = this.grants.get(key);
-    if (existing) return { capability: next, expiresAt: new Date(existing.expiresAt).toISOString() };
     const predecessor = this.grants.get(createHash("sha256").update(capability).digest("hex"));
     if (!predecessor || this.now() < predecessor.renewableAt) throw new JobResultPublishError("renewal_not_due");
     const expiresAt = this.now() + jobResultPublishTtlMs;
