@@ -10,6 +10,7 @@
 | W4 | 旧protocol unsupportedまたはowner不明 | Result隔離、削除・resume・notify禁止 |
 | W5 | lease expiredのみ、旧workerが後からResult公開 | 同一owner/session/fenceでrevokeなしならreceipt化。revokedは隔離 |
 | W6 | 旧epochのblocked workerへsteer/cancel | versioned経路で元委任eventと現在follow-up event、same-thread、旧owner fenceとexact sessionを検証。経路なしならactivation禁止 |
+| W6a | 旧epoch scheduled workerのcancel | schedule/run/revisionと取消mutation ID、旧owner fence、exact sessionを検証 |
 | W7 | Aのlive workerまたは通知が残るBからCへの更新 | CがA/Bの全live owner/notification protocolを扱えなければactivation拒否 |
 | R0 | 初回移行時にlive legacy workerあり | activation拒否。全terminalと通知materialize後に再評価 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
@@ -19,9 +20,12 @@
 | N1 | terminal jobだがnotification event欠損 | 自動event生成なし、`needs_review` |
 | N1a | event永続化済み、`send_not_started`、投稿receiptなし | 必要な認可とaccess再検証後、同一eventから一度だけ送信 |
 | N1b | scheduled通知pending、authorization取消/失効 | 二段階認可が成立せず送信抑止 |
+| N1c | 未claimのgeneric provider outbox | intentなしならfenced claimで一度だけ送信 |
 | N2 | 投稿応答不明だがexact markerあり | 既送信としてreceiptを確定、再投稿なし |
 | N3 | 投稿応答不明でmarkerなし/old thread | 通知抑止、operator判断待ち |
-| N3a | blocked状態commit直後にrestart | attention event/IDとgroup transitionが同一transactionで残る |
+| N3a | blocked/cancelled/failed/needs_review commit直後にrestart | 対応event/IDとgroup transitionが同一transactionで残る |
+| N3b | 最後のattention解決直後にrestart | all-terminal event/IDが同一transactionで残る |
+| N3c | scheduled通知のauthorization phaseだけ進行 | fresh送信扱いせずread-only reconcile |
 | N4 | group attention未解決、全sibling terminal | all-terminal抑止、sessionをactiveへ戻さない |
 | N5 | attention解決済み、全sibling terminal | 保存済みall-terminal eventだけ一度処理 |
 | M1 | migration前、旧schemaでrollback | 旧SHA/schema healthとreceiptを検証して復帰可 |
@@ -29,7 +33,7 @@
 | M3 | migration後、新epochでprovider write確定 | snapshot復元でもwriteを未実行扱いせずreconcile |
 | M4 | targetでjob stamp/due scan等のwriter開始後に旧snapshotへのrollback要求 | 全mutation journalがないためsnapshot rollback禁止 |
 | M4a | 初回更新で旧releaseにactive-epoch APIなし | rollback不可なのでapply拒否、互換API先行導入が必要 |
-| M5 | Dispatcher active epoch install応答喪失 | receiptをread-backし、exact一致までingress停止 |
+| M5 | Dispatcher active epoch install応答喪失 | safe modeのままreceiptをread-backし、exact一致まで全writer停止 |
 | M6 | target稼働後に旧releaseへrollback | 新しいrollback epochをCAS install/read-backし、target epochを再利用しない |
 | M7 | 新ingress前のrollback inventory直後にworker Result到着 | writer fence後ならDB commitなし。Result領域を保護し復帰後に回収 |
 | C1 | terminal Result済み、通知未settle | release/Result/snapshot GC禁止 |
