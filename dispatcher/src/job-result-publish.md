@@ -19,3 +19,4 @@
 - terminal job の再送は、永続 `result_json` がある場合だけ受け入れ、`reconcileOnly` によって read-only callback へ分岐する。#291 は保存済み digest と比較して `reused` または `conflict` だけを返し、terminal Result を更新しない。
 - 認可済み candidate の `fence` は job ID、attempt count、pane ID、live session を保持する。#291 の commit callback は Result 作成と同じ durable transaction でこの世代を再照合し、非同期処理中の cancel・再投入後に旧 worker の結果を保存しない。同じ job の期限内 grant の digest を照合し、更新前後の capability が本文に含まれれば拒否する。
 - validation error は固定 code だけを返す。本文、capability、private URL、local path は error や通常の log、metrics、監査へ含めない。公開 transport も raw header/body を記録せず、この型付き code だけを返す。
+- artifact と action のキーは区切り文字と camelCase を正規化して資格情報・内部 runtime identity を拒否する。本文中の session、pane、workspace/result path も永続 job の値と照合して拒否する。

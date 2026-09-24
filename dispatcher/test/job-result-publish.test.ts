@@ -50,7 +50,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "Bearer abcdefghijklmnop", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
@@ -62,6 +62,9 @@ describe("job result publish contract", () => {
     }
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ token: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, actions: [{ nested: { api_key: "CANARY_VALUE" } }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "herdr_pane_id", "agent_session", "workspacePath"]) {
+      assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    }
   });
 
   test("canonical digestはkey順とDispatcher時刻によらず同一で、内容の差を識別する", () => {
@@ -152,6 +155,8 @@ describe("job result publish contract", () => {
       assert.equal(leaked.status, 400);
       assert.equal(leaked.body.includes(grant.capability), false);
       assert.equal((await post(JSON.stringify({ ...base, artifacts: [{ capability: "CANARY_VALUE" }] }), grant.capability)).status, 400);
+      assert.equal((await post(JSON.stringify({ ...base, artifacts: [{ herdr_pane_id: "pane-1", agent_session: "session-1" }] }), grant.capability)).status, 400);
+      assert.equal((await post(JSON.stringify({ ...base, summary: "session-1" }), grant.capability)).status, 400);
       assert.equal((await post("{", grant.capability)).status, 400);
       assert.equal((await post(Buffer.from([0xff]), grant.capability)).status, 400);
       assert.equal((await post(JSON.stringify(base), grant.capability, "old-session")).status, 403);
