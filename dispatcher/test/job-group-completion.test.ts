@@ -85,6 +85,34 @@ describe("通常groupのResult統合", () => {
     database.close();
   });
 
+  test("attention原因のlate Result後も別の未解決failedへownerを引き継ぐ", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-attention-handoff");
+    const failed=database.createJob({source_event_id:source.event_id,job_key:"failed",objective:"別調査",workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(failed.job_id);
+    database.setJobRuntime(failed.job_id,"workspace-failed","pane-failed");
+    database.beginJobDispatch(failed.job_id);
+    database.markJobRunning(failed.job_id);
+    database.markJobNeedsReview(job.job_id,"prompt_interrupted","結果待ち");
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const first=database.enqueueJobNotification(job.job_id);
+    database.saveJobResult(failed.job_id,{schema_version:1,job_id:failed.job_id,status:"failed",
+      summary:"失敗",completed_at:"2026-09-05T00:00:30.000Z"},failed.result_path);
+    const progress=database.enqueueJobNotification(failed.job_id);
+    assert.equal((envelopeFromRow(progress.row).payload.group as Record<string,unknown>).transition,"progress");
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",
+      summary:"late Result",completed_at:"2026-09-05T00:00:40.000Z"},job.result_path);
+    assert.equal(database.get(first.row.event_id)?.last_error_code,"job_result_superseded");
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,null);
+    assert.equal(database.listJobsNeedingNotification()[0]?.job_id,failed.job_id);
+    const replacement=database.enqueueJobNotification(failed.job_id);
+    assert.equal((envelopeFromRow(replacement.row).payload.group as Record<string,unknown>).transition,"attention");
+    assert.notEqual(replacement.row.event_id,first.row.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.attention_event_id,replacement.row.event_id);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    database.close();
+  });
+
   test("投稿済みattentionは取消後の最終通知まで同一ownerを保持する", async () => {
     const {database,source,job,config} = await oneJobGroup("Ev-attention-delivered-cancel");
     database.markJobBlocked(job.job_id,"入力待ち");
@@ -94,8 +122,8 @@ describe("通常groupのResult統合", () => {
     database.markWaiting(attention.row.event_id);
     database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
       status:"completed",summary:"attention delivered",completed_at:"2026-09-05T00:01:00.000Z",
-      actions:[{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
-        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
       `${config.resultsDir}/attention.json`);
     const followUp=database.enqueue(eventEnvelope("Ev-attention-delivered-cancel-followup")).row;
     database.beginJobCancellation(job.job_id,followUp.event_id);
@@ -139,12 +167,18 @@ describe("通常groupのResult統合", () => {
     assert.deepEqual(database.listJobsNeedingNotification(),[]);
     assert.throws(()=>database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,
       database.getJob(job.job_id)!.updated_at),/notification_requires_reconciliation/);
-    const hash="a".repeat(64),request=database.attentionDeliveryVerificationRequest(source.event_id,attention.row.event_id,"123.456",hash);
+    const hash="a".repeat(64),expectedUpdatedAt=database.get(attention.row.event_id)!.updated_at;
+    const {request,claimToken}=database.claimAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash);
+    assert.throws(()=>database.claimAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash));
+    assert.equal(database.resumeAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash,claimToken).claimToken,claimToken);
     assert.throws(()=>database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
-      database.get(attention.row.event_id)!.updated_at,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
+      expectedUpdatedAt,claimToken,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
         identity_block_verified:false,session_status:"suspended"}),/evidence_mismatch/);
     database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,
-      database.get(attention.row.event_id)!.updated_at,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
+      expectedUpdatedAt,claimToken,{...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
         identity_block_verified:true,session_status:"suspended"});
     database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,database.getJob(job.job_id)!.updated_at);
     assert.ok(database.getJobGroup(source.event_id)?.all_terminal_event_id);
@@ -161,13 +195,59 @@ describe("通常groupのResult統合", () => {
     database.markWaiting(attention.row.event_id);
     database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
       status:"completed",summary:"Session更新結果不明",completed_at:"2026-09-05T00:01:00.000Z",
-      actions:[{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
-        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",
           status:"suspended",ambiguous:true}]},`${config.resultsDir}/attention.json`);
     assert.deepEqual(database.listJobsNeedingNotification(),[]);
     assert.throws(()=>database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,
       database.getJob(job.job_id)!.updated_at),/notification_requires_reconciliation/);
     assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    database.close();
+  });
+
+  test("別workspaceへのattention投稿記録はresolutionの証拠にしない", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-attention-wrong-workspace");
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",
+      summary:"失敗",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"別workspace",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_OTHER",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_OTHER",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${config.resultsDir}/attention.json`);
+    assert.throws(()=>database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,
+      database.getJob(job.job_id)!.updated_at),/notification_requires_reconciliation/);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    database.close();
+  });
+
+  test("配送reconcileのclaim中はlate resolutionがactiveへ進まない", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-attention-claim-race");
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",
+      summary:"失敗",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"投稿済み",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${config.resultsDir}/attention.json`);
+    const hash="b".repeat(64),expectedUpdatedAt=database.get(attention.row.event_id)!.updated_at;
+    const {request,claimToken}=database.claimAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash);
+    database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,database.getJob(job.job_id)!.updated_at);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,expectedUpdatedAt,claimToken,
+      {...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,identity_block_verified:true,session_status:"suspended"});
+    const final=database.enqueueJobNotification(job.job_id);
+    assert.equal((envelopeFromRow(final.row).payload.group as Record<string,unknown>).transition,"all_terminal");
+    assert.throws(()=>database.attentionDeliveryVerificationRequest(source.event_id,attention.row.event_id,"123.456",hash),
+      /reconciliation_unavailable/);
     database.close();
   });
 
@@ -278,6 +358,10 @@ describe("通常groupのResult統合", () => {
         (envelopeFromRow(notification.row).payload.group as Record<string, unknown>).transition,
         "all_terminal",
       );
+      const contender=database.enqueue(eventEnvelope(`Ev-manual-${suffix}-contender`)).row;
+      const repeated=database.claimJobGroupTransition(source.event_id,"all_terminal",contender.event_id);
+      assert.equal(repeated.claimed,false);
+      assert.equal(repeated.row.all_terminal_event_id,notification.row.event_id);
     }
     database.close();
   });
@@ -327,8 +411,8 @@ describe("通常groupのResult統合", () => {
     database.saveCompleted(attention.row.event_id, {
       schema_version: 1, event_id: attention.row.event_id, status: "completed",
       summary: "attention delivered", completed_at: "2026-09-05T00:03:30.000Z",
-      actions: [{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
-        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}],
+      actions: [{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}],
     }, `${config.resultsDir}/${attention.row.event_id}.json`);
     assert.deepEqual(database.listJobsNeedingNotification(), []);
     assert.throws(() => database.resolveFailedJobAttention(source.event_id, blocked.job_id, "wrong-event", blocked.updated_at), /binding_mismatch/);

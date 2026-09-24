@@ -37,7 +37,7 @@ function usage(): never {
   dona-dispatcher job resolve-invalid-result <job_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
-  dona-dispatcher job reconcile-attention-delivery <source_event_id> <attention_event_id> <expected_event_updated_at> <message_ts> <body_sha256> --notification-reviewed
+  dona-dispatcher job reconcile-attention-delivery <source_event_id> <attention_event_id> <expected_event_updated_at> <message_ts> <body_sha256> --notification-reviewed [--resume <claim_token>]
   dona-dispatcher scheduler health
   dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
   dona-dispatcher scheduler retention [--apply --force]`);
@@ -140,11 +140,16 @@ async function main(): Promise<void> {
           group:database.getJobGroup(sourceEventId)},null,2));return;
       }
       if(command==="reconcile-attention-delivery") {
-        if(args.length!==8 || args[7]!=="--notification-reviewed") usage();
+        if((args.length!==8 && args.length!==10) || args[7]!=="--notification-reviewed" ||
+          (args.length===10 && args[8]!=="--resume")) usage();
         const sourceEventId=eventIdAt(args,2),attentionEventId=eventIdAt(args,3),expectedUpdatedAt=eventIdAt(args,4);
-        const request=database.attentionDeliveryVerificationRequest(sourceEventId,attentionEventId,eventIdAt(args,5),eventIdAt(args,6));
-        const evidence=await new SlackAdapterJobNotificationVerifier(config).settle(request);
-        database.recordVerifiedAttentionDelivery(sourceEventId,attentionEventId,expectedUpdatedAt,evidence);
+        const messageTs=eventIdAt(args,5),bodySha256=eventIdAt(args,6);
+        const claim=args.length===10
+          ? database.resumeAttentionDeliveryReconciliation(sourceEventId,attentionEventId,expectedUpdatedAt,messageTs,bodySha256,eventIdAt(args,9))
+          : database.claimAttentionDeliveryReconciliation(sourceEventId,attentionEventId,expectedUpdatedAt,messageTs,bodySha256);
+        console.log(JSON.stringify({attention_event_id:attentionEventId,claim_token:claim.claimToken,status:"claimed"}));
+        const evidence=await new SlackAdapterJobNotificationVerifier(config).settle(claim.request);
+        database.recordVerifiedAttentionDelivery(sourceEventId,attentionEventId,expectedUpdatedAt,claim.claimToken,evidence);
         console.log(JSON.stringify({source_event_id:sourceEventId,attention_event_id:attentionEventId,verified:true},null,2));return;
       }
       usage();

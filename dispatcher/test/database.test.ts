@@ -851,8 +851,8 @@ describe("DispatcherDatabase", () => {
     database.saveCompleted(attention.row.event_id, {
       schema_version: 1, event_id: attention.row.event_id, status: "completed",
       summary: "attention delivered", completed_at: "2026-09-05T00:03:30.000Z",
-      actions: [{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
-        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}],
+      actions: [{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}],
     }, `${config.resultsDir}/${attention.row.event_id}.json`);
     assert.deepEqual(database.listJobsNeedingNotification(), []);
     database.resolveFailedJobAttention(source.event_id, blocked.job_id, attention.row.event_id, database.getJob(blocked.job_id)!.updated_at);

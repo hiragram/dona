@@ -102,8 +102,8 @@ describe("read-only live session reconciliation",()=>{
     state.database.markWaiting(prior.event_id);
     state.database.saveCompleted(prior.event_id,{schema_version:1,event_id:prior.event_id,status:"completed",
       summary:"attention delivered",completed_at:"2026-09-05T00:00:00.000Z",
-      actions:[{tool:"dona_slack.post_message",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
-        {tool:"dona_slack.set_agent_session_status",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
       `${state.config.resultsDir}/attention.json`);
     const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
     const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
