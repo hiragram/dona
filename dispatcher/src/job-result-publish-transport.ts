@@ -1,13 +1,16 @@
 import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import net from "node:net";
 import path from "node:path";
 import { TextDecoder } from "node:util";
 
 import type { JobRow } from "./types.js";
 import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, type ValidatedJobResultPublish } from "./job-result-publish.js";
 
-export interface JobResultPublishCommit {
-  (candidate: ValidatedJobResultPublish): Promise<{ outcome: "created" | "reused" | "conflict" }>;
+export interface JobResultPublishSink {
+  commit(candidate: ValidatedJobResultPublish): Promise<{ outcome: "created" | "reused" | "conflict" }>;
+  /** Must compare the durable digest and may never mutate a terminal Result. */
+  reconcile(candidate: ValidatedJobResultPublish): Promise<{ outcome: "reused" | "conflict" }>;
 }
 
 function reply(response: ServerResponse, status: number, code: string): void {
@@ -23,13 +26,35 @@ export class JobResultPublishServer {
     private readonly socketPath: string,
     private readonly grants: JobResultPublishCapabilities,
     private readonly getJob: (jobId: string) => JobRow | undefined,
-    private readonly commit: JobResultPublishCommit,
+    private readonly sink: JobResultPublishSink,
   ) {}
 
   async start(): Promise<void> {
     await fs.mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
     await fs.chmod(path.dirname(this.socketPath), 0o700);
-    // Do not unlink an existing socket: another process may own it.
+    try {
+      const prior = await fs.lstat(this.socketPath);
+      if (!prior.isSocket()) throw new Error("publish_socket_path_occupied");
+      const alive = await new Promise<boolean>(resolve => {
+        const socket = net.createConnection(this.socketPath);
+        let settled = false;
+        const finish = (value: boolean) => {
+          if (settled) return;
+          settled = true;
+          socket.destroy();
+          resolve(value);
+        };
+        socket.once("connect", () => finish(true));
+        socket.once("error", () => finish(false));
+        socket.setTimeout(500, () => finish(false));
+      });
+      if (alive) throw new Error("publish_socket_owned");
+      const current = await fs.lstat(this.socketPath);
+      if (!current.isSocket() || current.ino !== prior.ino || current.dev !== prior.dev) throw new Error("publish_socket_changed");
+      await fs.unlink(this.socketPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     this.server = http.createServer((request, response) => void this.handle(request, response));
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
@@ -82,7 +107,9 @@ export class JobResultPublishServer {
       catch { throw new JobResultPublishError("invalid_request"); }
       // Recheck current grant/row after body receipt to close a revoke or worker-change race.
       const candidate = this.grants.validate(capability, session, input, this.getJob);
-      const result = await this.commit(candidate);
+      const result = candidate.reconcileOnly
+        ? await this.sink.reconcile(candidate)
+        : await this.sink.commit(candidate);
       reply(response, result.outcome === "conflict" ? 409 : result.outcome === "created" ? 202 : 200, result.outcome);
     } catch (error) {
       if (error instanceof JobResultPublishError) {

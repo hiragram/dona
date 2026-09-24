@@ -4,6 +4,8 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 
 import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, validateJobResultPublish } from "../src/job-result-publish.js";
 import { buildJobResultPublishInstructions } from "../src/job-prompt.js";
@@ -29,6 +31,9 @@ describe("job result publish contract", () => {
     assert.throws(() => validateJobResultPublish({ ...base, schema_version: 2 }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: ["text"] }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ bad: undefined }] }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
+    let nested: unknown = "value";
+    for (let index = 0; index < 70; index++) nested = { child: nested };
+    assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ nested }] }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
   });
 
   test("UTF-8と最終envelopeの1 MiB境界を検証する", () => {
@@ -45,7 +50,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "https://files.slack.com/private/abc", "/Users/example/private.txt", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "https://files.slack.com/private/abc", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "ghp_abcdefghijklmnop"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
@@ -55,6 +60,8 @@ describe("job result publish contract", () => {
         assert.equal(String(error).includes(canary), false);
       }
     }
+    assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ token: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    assert.throws(() => validateJobResultPublish({ ...base, actions: [{ nested: { api_key: "CANARY_VALUE" } }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
   });
 
   test("canonical digestはkey順とDispatcher時刻によらず同一で、内容の差を識別する", () => {
@@ -87,7 +94,8 @@ describe("job result publish contract", () => {
     current = row({ status: "running" });
     const renewed = grants.renew(grant.capability, "session-1", getJob);
     assert.notEqual(renewed.capability, grant.capability);
-    assert.throws(() => grants.validate(grant.capability, "session-1", base, getJob), code("capability_revoked"));
+    assert.equal(grants.renew(grant.capability, "session-1", getJob).capability, renewed.capability);
+    assert.equal(grants.validate(grant.capability, "session-1", base, getJob).envelope.job_id, "job_one");
     assert.throws(() => new JobResultPublishCapabilities(() => persistedSession, () => now).validate(grant.capability, "session-1", base, getJob), code("capability_invalid"));
     now = Date.parse(renewed.expiresAt);
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_expired"));
@@ -101,10 +109,12 @@ describe("job result publish contract", () => {
     const socket = path.join(directory, "p.sock");
     const grants = new JobResultPublishCapabilities(() => "session-1");
     const grant = grants.issue(row(), "session-1");
-    const current = row({ status: "running" });
+    let current = row({ status: "running" });
     const accepted: string[] = [];
+    const reconciled: string[] = [];
     const server = new JobResultPublishServer(socket, grants, id => id === current.job_id ? current : undefined,
-      async candidate => { accepted.push(candidate.canonicalDigest); return { outcome: "created" }; });
+      { commit: async candidate => { accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
+        reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } });
     const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish") => new Promise<{ status: number; body: string }>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: route, method: "POST",
         headers: { "content-type": "application/json", ...(capability ? { "x-dona-job-result-capability": capability } : {}), "x-dona-worker-session": session } }, response => {
@@ -131,11 +141,38 @@ describe("job result publish contract", () => {
       assert.equal((await post(" ".repeat(jobResultEnvelopeMaxBytes + 1), grant.capability)).status, 413);
       const renewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew");
       assert.equal(renewal.status, 200);
-      assert.equal((await post(JSON.stringify(base), grant.capability)).status, 403);
+      const retriedRenewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew");
+      assert.equal(retriedRenewal.body, renewal.body);
+      assert.equal((await post(JSON.stringify(base), grant.capability)).status, 202);
       assert.equal((await post(JSON.stringify(base), JSON.parse(renewal.body).capability)).status, 202);
-      assert.equal(accepted.length, 2);
+      assert.equal(accepted.length, 3);
+      current = row({ status: "completed", result_json: "{}" });
+      const retry = await post(JSON.stringify(base), grant.capability);
+      assert.equal(retry.status, 200);
+      assert.equal(accepted.length, 3);
+      assert.deepEqual(reconciled, [accepted[0]]);
     } finally {
       await server.stop();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("停止済みUDSを復旧し、稼働中の別ownerは保持する", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-socket-"));
+    const socket = path.join(directory, "p.sock");
+    const child = spawn(process.execPath, ["-e", `require('net').createServer().listen(${JSON.stringify(socket)},()=>process.stdout.write('ready'))`], { stdio: ["ignore", "pipe", "ignore"] });
+    try {
+      await once(child.stdout!, "data");
+      const server = new JobResultPublishServer(socket, new JobResultPublishCapabilities(() => undefined), () => undefined,
+        { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) });
+      await assert.rejects(server.start(), /publish_socket_owned/);
+      child.kill("SIGKILL");
+      await once(child, "exit");
+      assert.equal((await fs.lstat(socket)).isSocket(), true);
+      await server.start();
+      await server.stop();
+    } finally {
+      if (child.exitCode === null) child.kill("SIGKILL");
       await fs.rm(directory, { recursive: true, force: true });
     }
   });
