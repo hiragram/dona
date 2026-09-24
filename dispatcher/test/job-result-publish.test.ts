@@ -100,7 +100,7 @@ describe("job result publish contract", () => {
       "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
-      "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result",
+      "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "artifact.internal./private/result",
       "GET /run/secrets/db-password returned 200", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
       "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
@@ -350,6 +350,7 @@ describe("job result publish contract", () => {
     });
     let connections = 0;
     const reusableAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+    const recoveryAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
     try {
       await startServer(server, socket, () => { connections++; });
       const unauthorized = await post(JSON.stringify(base));
@@ -359,10 +360,14 @@ describe("job result publish contract", () => {
       assert.equal(acceptedResult.status, 202);
       assert.equal(accepted.length, 1);
       assert.equal(acceptedResult.body.includes(grant.capability), false);
-      const secret = await post(JSON.stringify({ ...base, summary: "secret=CANARY_VALUE" }), grant.capability);
+      const beforeCorrection = connections;
+      const secret = await post(JSON.stringify({ ...base, summary: "secret=CANARY_VALUE" }), grant.capability, "session-1", "/v1/job-result-publish", recoveryAgent);
       assert.equal(secret.status, 400);
-      assert.equal(secret.connection, "close");
+      assert.notEqual(secret.connection, "close");
       assert.equal(secret.body.includes("CANARY_VALUE"), false);
+      assert.equal((await post(JSON.stringify(base), grant.capability, "session-1", "/v1/job-result-publish", recoveryAgent)).status, 202);
+      assert.equal(connections, beforeCorrection + 1, "修正したResultを同じ専用接続で公開する");
+      recoveryAgent.destroy();
       const leaked = await post(JSON.stringify({ ...base, summary: `capability ${grant.capability}` }), grant.capability);
       assert.equal(leaked.status, 400);
       assert.equal(leaked.body.includes(grant.capability), false);
@@ -390,14 +395,15 @@ describe("job result publish contract", () => {
       assert.equal(connections, beforeReuse + 1, "renewalとpublishは同じ接続済みFDを再利用する");
       assert.equal((await post(JSON.stringify(base), grant.capability)).status, 202);
       assert.equal((await post(JSON.stringify({ ...base, summary: grant.capability }), JSON.parse(renewal.body).capability)).status, 400);
-      assert.equal(accepted.length, 3);
+      assert.equal(accepted.length, 4);
       current = row({ status: "completed", result_json: "{}" });
       const retry = await post(JSON.stringify(base), grant.capability);
       assert.equal(retry.status, 200);
-      assert.equal(accepted.length, 3);
+      assert.equal(accepted.length, 4);
       assert.deepEqual(reconciled, [accepted[0]]);
     } finally {
       reusableAgent.destroy();
+      recoveryAgent.destroy();
       await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }

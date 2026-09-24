@@ -34,6 +34,17 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
   reply(response, status, code);
 }
 
+function recoverableReject(request: IncomingMessage, response: ServerResponse, status: number, code: string, timeoutMs: number): void {
+  if (request.complete) { reply(response, status, code); return; }
+  // The authenticated worker may correct its payload on the same FD after
+  // the current body is fully drained. A stalled body still closes the socket.
+  const deadline = setTimeout(() => request.socket.destroy(), timeoutMs);
+  deadline.unref();
+  request.once("end", () => { clearTimeout(deadline); if (!response.destroyed) reply(response, status, code); });
+  request.once("close", () => clearTimeout(deadline));
+  request.resume();
+}
+
 // JSON.parse discards the original number spelling. Reject decimal and exponent
 // lexemes before parsing so precision loss cannot alias two publish digests.
 function assertExactJsonNumbers(source: string): void {
@@ -132,6 +143,7 @@ export class JobResultPublishServer {
     if (typeof capability !== "string" || typeof encodedSession !== "string") {
       reject(request, response, 403, "capability_invalid"); return;
     }
+    let authenticated = false;
     try {
       // JSON before base64url preserves every persisted 512-character session,
       // including Unicode, control characters and lone surrogates.
@@ -155,19 +167,22 @@ export class JobResultPublishServer {
       }
       // Authenticate before consuming the body. A generic UDS connection has no grant.
       this.grants.authorize(capability, session, this.getJob);
+      authenticated = true;
       const chunks: Buffer[] = [];
       let bytes = 0;
+      let tooLarge = false;
       const deadline = setTimeout(() => request.destroy(), this.bodyTimeoutMs);
       deadline.unref();
       try {
         for await (const chunk of request) {
           bytes += chunk.length;
-          if (bytes > jobResultEnvelopeMaxBytes) throw new JobResultPublishError("payload_too_large");
+          if (bytes > jobResultEnvelopeMaxBytes) { tooLarge = true; continue; }
           chunks.push(Buffer.from(chunk));
         }
       } finally {
         clearTimeout(deadline);
       }
+      if (tooLarge) throw new JobResultPublishError("payload_too_large");
       let input: unknown;
       try {
         const source = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
@@ -201,6 +216,9 @@ export class JobResultPublishServer {
       if (error instanceof JobResultPublishError) {
         const status = error.code === "payload_too_large" ? 413 : error.code === "invalid_request" || error.code === "content_requires_redaction" ? 400 : error.code === "renewal_not_due" ? 425 : 403;
         if (error.code === "renewal_not_due") reply(response, status, error.code);
+        else if (authenticated && ["invalid_request", "content_requires_redaction", "payload_too_large"].includes(error.code)) {
+          recoverableReject(request, response, status, error.code, this.bodyTimeoutMs);
+        }
         else reject(request, response, status, error.code);
       } else {
         reject(request, response, 503, "publish_unavailable");
