@@ -62,7 +62,7 @@ describe("job result publish contract", () => {
 
   test("secret、private URL、local pathは本文を返さない型付きerrorで拒否する", () => {
     assert.equal(validateJobResultPublish({ ...base, summary: "公開資料: https://github.com/hiragram/dona/issues/290" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
-    for (const canary of ["secret=CANARY_VALUE", "Bearer abcdefghijklmnop", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "https://blob.example.test/file?sv=1&%73ig=CANARY_VALUE", "https://CANARY_VALUE@private.example/repo", "https://user:@private.example/repo", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "ghp_abcdefghijklmnop"]) {
+    for (const canary of ["secret=CANARY_VALUE", "auth=CANARY_VALUE", "Bearer abcdefghijklmnop", "https://files.slack.com/private/abc", "https://blob.example.test/file?sv=1&sig=CANARY_VALUE", "https://blob.example.test/file?sv=1&%73ig=CANARY_VALUE", "https://CANARY_VALUE@private.example/repo", "https://user:@private.example/repo", "postgresql://admin:CANARY_VALUE@db.internal/app", "redis://:CANARY_VALUE@cache.internal/0", "amqps://user:CANARY_VALUE@mq.internal/vhost", "/Users/example/private.txt", "/root/.dona/workspaces/job", "/workspace/dona/job", "`/workspace/dona/job`", "path=/root/.dona/job", "C:/Users/example/.ssh/id_rsa", "D:/private/result.json", "ghp_abcdefghijklmnop"]) {
       try {
         validateJobResultPublish({ ...base, artifacts: [{ nested: { value: canary } }] }, row(), "2026-09-24T00:00:00Z");
         assert.fail("must reject");
@@ -74,7 +74,7 @@ describe("job result publish contract", () => {
     }
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ token: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, actions: [{ nested: { api_key: "CANARY_VALUE" } }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
-    for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "cookie", "set-cookie", "passwd", "passphrase", "herdr_pane_id", "agent_session", "workspacePath"]) {
+    for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "auth", "cookie", "set-cookie", "passwd", "passphrase", "herdr_pane_id", "agent_session", "workspacePath"]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE", '{"client_secret":"CANARY_VALUE"}', '{"client-secret":"CANARY_VALUE"}', '{"set-cookie":"sessionid=CANARY_VALUE"}', '"password" = "CANARY_VALUE"']) {
@@ -134,6 +134,8 @@ describe("job result publish contract", () => {
     assert.equal(grants.renew(grant.capability, "session-1", getJob).capability, renewed.capability);
     assert.equal(grants.validate(grant.capability, "session-1", base, getJob).envelope.job_id, "job_one");
     assert.throws(() => grants.validate(renewed.capability, "session-1", { ...base, summary: grant.capability }, getJob), code("content_requires_redaction"));
+    const anotherGrant = grants.issue(row({ job_id: "job_two" }), "session-1");
+    assert.throws(() => grants.validate(renewed.capability, "session-1", { ...base, summary: anotherGrant.capability }, getJob), code("content_requires_redaction"));
     assert.throws(() => new JobResultPublishCapabilities(() => persistedSession, () => now).validate(grant.capability, "session-1", base, getJob), code("capability_invalid"));
     now = Date.parse(renewed.expiresAt);
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_expired"));
@@ -148,6 +150,10 @@ describe("job result publish contract", () => {
     const grant = grants.issue(row(), session);
     assert.equal(grants.authorize(grant.capability, session, () => row({ status: "running" })).job_id, "job_one");
     assert.throws(() => grants.issue(row(), `${session}s`), code("job_not_publishable"));
+    const emojiSession = "😀".repeat(300);
+    const emojiGrants = new JobResultPublishCapabilities(() => emojiSession);
+    const emojiGrant = emojiGrants.issue(row(), emojiSession);
+    assert.equal(emojiGrants.authorize(emojiGrant.capability, emojiSession, () => row({ status: "running" })).job_id, "job_one");
     const short = new JobResultPublishCapabilities(() => "s1");
     const shortGrant = short.issue(row(), "s1");
     assert.throws(() => short.validate(shortGrant.capability, "s1", { ...base, summary: "s1" }, () => row({ status: "running" })), code("content_requires_redaction"));
@@ -402,6 +408,43 @@ describe("job result publish contract", () => {
       assert.equal(clients[0]!.destroyed, false);
     } finally {
       for (const client of clients) client.destroy();
+      await stopServer(server);
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("単一接続からpipelined publishを複数実行しない", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-pipeline-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => "session-1");
+    const grant = grants.issue(row(), "session-1");
+    let calls = 0;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
+      { commit: async () => { calls++; entered(); await barrier; return { outcome: "created" }; },
+        reconcile: async () => ({ outcome: "reused" }) });
+    let client: net.Socket | undefined;
+    try {
+      await startServer(server, socket);
+      client = net.createConnection(socket);
+      client.on("error", () => {});
+      client.on("data", () => {});
+      await new Promise<void>(resolve => client!.once("connect", () => resolve()));
+      const body = JSON.stringify(base);
+      const request = `POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nContent-Length: ${Buffer.byteLength(body)}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${body}`;
+      client.write(request.repeat(40));
+      await started;
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal(calls, 1);
+      release();
+      await stopServer(server);
+      assert.equal(calls, 1);
+    } finally {
+      release();
+      client?.destroy();
       await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }

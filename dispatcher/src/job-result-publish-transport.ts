@@ -49,6 +49,9 @@ export class JobResultPublishServer {
     private readonly bodyTimeoutMs = 15_000,
   ) {
     this.server = http.createServer((request, response) => void this.handle(request, response));
+    // One request per pre-connected FD prevents HTTP pipelining from multiplying
+    // concurrent durable commits beyond the 32 accepted connection cap.
+    this.server.maxRequestsPerSocket = 1;
   }
 
   /** The caller must supply a pre-connected socket over an authenticated channel. */
@@ -94,7 +97,7 @@ export class JobResultPublishServer {
       let session: unknown;
       try { session = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(encodedSession, "base64url"))); }
       catch { throw new JobResultPublishError("capability_invalid"); }
-      if (typeof session !== "string" || !session || session.length > 512 ||
+      if (typeof session !== "string" || !session || [...session].length > 512 ||
         Buffer.from(JSON.stringify(session), "utf8").toString("base64url") !== encodedSession) {
         throw new JobResultPublishError("capability_invalid");
       }

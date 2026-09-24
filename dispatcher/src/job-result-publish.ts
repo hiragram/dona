@@ -22,7 +22,8 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1)|(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:\\))/i;
+const sensitive = /(?:xox[baprs]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+[A-Za-z0-9._~-]{8,}|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const localPath = /(?:^|[\s"'(`=:])(?:\/(?!\/)[^\s"'<>`]+|~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
 const httpUrlCandidate = /https?:\/\/[^\s"'<>`]+/gi;
 const signedQueryKeys = new Set(["token", "sig", "signature", "x-amz-signature", "x-goog-signature", "api_key", "api-key", "access_key", "access-key", "auth"]);
 function hasSignedQueryKey(candidate: string): boolean {
@@ -68,8 +69,8 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
 const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_]*|["'][^"'\r\n]+["'])\s*[:=]/g;
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
-  return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|capability|cookie)(?:_|$)/.test(normalized) ||
-    /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|apikey|accesskey|privatekey|capability|cookie)$/.test(normalized.replaceAll("_", "")) ||
+  return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie)(?:_|$)/.test(normalized) ||
+    /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|privatekey|capability|cookie)$/.test(normalized.replaceAll("_", "")) ||
     /(?:^|_)(?:api|access|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
     normalized.startsWith("herdr_");
@@ -89,7 +90,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (forbiddenValues?.some(privateValue => privateValue.length >= 4 ? value.includes(privateValue) : value === privateValue)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
-    if (sensitive.test(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || localPath.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
@@ -204,7 +205,7 @@ export class JobResultPublishCapabilities {
   ) {}
 
   issue(job: JobRow, session: string): { capability: string; expiresAt: string } {
-    if (job.status !== "dispatching" || !session || session.length > 512 || this.currentSession(job.job_id) !== session) {
+    if (job.status !== "dispatching" || !session || [...session].length > 512 || this.currentSession(job.job_id) !== session) {
       throw new JobResultPublishError("job_not_publishable");
     }
     return this.mint(job, session);
@@ -273,10 +274,10 @@ export class JobResultPublishCapabilities {
     const job = this.authorize(capability, session, getJob);
     const grant = this.grants.get(createHash("sha256").update(capability).digest("hex"))!;
     const forbiddenDigests = new Set([...this.grants.entries()]
-      .filter(([, grant]) => grant.jobId === job.job_id && grant.expiresAt > this.now())
+      .filter(([, candidate]) => candidate.expiresAt > this.now())
       .map(([digest]) => digest));
     const forbiddenFingerprints = new Set([...this.grants.values()]
-      .filter(candidate => candidate.jobId === job.job_id && candidate.expiresAt > this.now())
+      .filter(candidate => candidate.expiresAt > this.now())
       .map(candidate => candidate.fingerprint));
     const grantIdentities = [...this.grants.values()]
       .filter(candidate => candidate.jobId === job.job_id && candidate.expiresAt > this.now())
