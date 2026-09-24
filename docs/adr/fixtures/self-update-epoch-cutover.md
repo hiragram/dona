@@ -14,6 +14,9 @@
 | W7 | Aのlive worker、通知、outbox、sandboxが残るBからCへの更新 | CがA/Bのcompletion/progress、notification、provider、cleanup protocolを扱えなければactivation拒否 |
 | W8 | queued/retryable_failed jobがcutover後にdispatch | claim時に新epoch/release/protocolへ原子的にrebind |
 | W9 | 未dispatchの旧Event Envelopeが残る | drainまたはsource prompt protocolのtarget reader互換性を検証 |
+| W10 | active scheduleのtzdb/definitionがtarget非互換 | 決定的migrationなしならactivation拒否 |
+| R0a | plan後にworkload/outbox inventoryが変化 | apply拒否し新しいexact planの承認へ戻す |
+| R0b | blocked main turnまたはpreparing jobあり | ingress停止前にapply/activation拒否、preparingはcleanup receiptまでdrain可 |
 | R0 | 初回移行時にlive legacy workerあり | activation拒否。全terminalと通知materialize後に再評価 |
 | R1 | apply受理後、quiesce前にrestart | 同一epoch/requestを再読しinventoryとacceptanceを照合 |
 | R2 | quiesce途中でrestart | 同一fenceの両drainとwatermarkを再取得、unknown write再送禁止 |
@@ -38,6 +41,7 @@
 | M5 | Dispatcher active epoch install応答喪失 | safe modeのままreceiptをread-backし、exact一致まで全writer停止 |
 | M5a | writer release intent後に応答喪失 | writer stateとreceiptを照合し、snapshot rollback禁止 |
 | M5b | progress/notification DB migration後にtarget health失敗 | 全runtime DBの同一watermark backup/restore receiptを照合 |
+| M5c | safe modeでResult rename後にhealth失敗 | filesystem journalの逆操作receiptなしではsnapshot rollback禁止 |
 | M6 | target稼働後に旧releaseへrollback | 新しいrollback epochをCAS install/read-backし、target epochを再利用しない |
 | M7 | 新ingress前のrollback inventory直後にworker Result到着 | writer fence後ならDB commitなし。Result領域を保護し復帰後に回収 |
 | C1 | terminal Result済み、通知未settle | release/Result/snapshot GC禁止 |
