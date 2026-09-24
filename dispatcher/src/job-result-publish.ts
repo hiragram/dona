@@ -42,7 +42,6 @@ function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
     Object.keys(value).some(key => privateJwkParameter.has(key));
 }
 function hasPrivateJwkText(value: string): boolean {
-  const jwkTypeAt = /"(?:RSA|EC|OKP|oct)"/y;
   const scopes: { keyType: boolean; privateParameter: boolean }[] = [];
   for (let index = 0; index < value.length; index++) {
     const char = value[index];
@@ -69,19 +68,28 @@ function hasPrivateJwkText(value: string): boolean {
     if (key === "kty") {
       next++;
       while (/\s/.test(value[next] ?? "")) next++;
-      jwkTypeAt.lastIndex = next;
-      if (jwkTypeAt.exec(value)) scope.keyType = true;
+      if (value[next] === '"') {
+        const valueStart = next++;
+        for (; next < value.length; next++) {
+          if (value[next] === "\\") { next++; continue; }
+          if (value[next] === '"') break;
+        }
+        try { scope.keyType = ["RSA", "EC", "OKP", "oct"].includes(JSON.parse(value.slice(valueStart, next + 1))); }
+        catch { /* Malformed snippets remain handled by the structural validator. */ }
+      }
     } else if (typeof key === "string" && privateJwkParameter.has(key)) scope.privateParameter = true;
   }
   return false;
 }
-const localPath = /(?:(?<![A-Za-z0-9:/])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
+const localPath = /(?:(?<![A-Za-z0-9/])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/)))/i;
 const windowsUncPath = /(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\/;
 const slashAuthority = /(?<![A-Za-z0-9:/])\/\/([^/\s]+)\/[^\s"'<>`]*/g;
 function hasPrivateSlashAuthority(value: string): boolean {
   for (const match of value.matchAll(slashAuthority)) {
     const host = match[1]!;
-    if (!host.includes(".") || hasPrivateHttpHost(`https://${host}/`)) return true;
+    let url: URL;
+    try { url = new URL(`https:${match[0]}`); } catch { return true; }
+    if (!host.includes(".") || url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(url.href)) return true;
   }
   return false;
 }
@@ -157,6 +165,10 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
   return false;
 }
 const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
+function isPublicCountField(key: string, value: unknown): boolean {
+  return /_count$/i.test(key.replace(/([a-z0-9])([A-Z])/g, "$1_$2")) &&
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
   return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie|session)(?:_|$)/.test(normalized) ||
@@ -235,7 +247,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   } else if (value !== null && typeof value === "object") {
     if (hasPrivateJwkFields(value as Record<string, unknown>)) throw new JobResultPublishError("content_requires_redaction");
     for (const [key, item] of Object.entries(value)) {
-      if (forbiddenKey(key)) throw new JobResultPublishError("content_requires_redaction");
+      if (forbiddenKey(key) && !isPublicCountField(key, item)) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
       assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);
     }

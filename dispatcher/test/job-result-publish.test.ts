@@ -79,7 +79,8 @@ describe("job result publish contract", () => {
     }
     for (const value of ["session=CANARY_VALUE", '{"to\\u006ben":"CANARY_VALUE"}',
       '{"kty":"RSA","n":"public","e":"AQAB","d":"PRIVATE_VALUE"}',
-      '{"d":"PRIVATE_VALUE","kty":"RSA","n":"public"}']) {
+      '{"d":"PRIVATE_VALUE","kty":"RSA","n":"public"}',
+      '{"kty":"R\\u0053A","n":"public","d":"PRIVATE_VALUE"}']) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const value of [{ session: "CANARY_VALUE" }, { kty: "RSA", n: "public", e: "AQAB", d: "PRIVATE_VALUE" },
@@ -88,12 +89,16 @@ describe("job result publish contract", () => {
     }
     for (const value of ["http://artifact-service.internal/download/OPAQUE_VALUE", "http://artifact/download/OPAQUE_VALUE",
       "http://cache.local/private", "ftp://10.0.0.5/private/archive.zip", "sftp://artifact.internal/result",
-      "report,[/root/.dona/result.json]", "report,/home/worker/private.txt"]) {
+      "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
+      "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
+      "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const value of ["//cdn.example.com/assets/report.json", '{"kty":"RSA","n":"public"} {"d":"done"}']) {
       assert.equal(validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     }
+    assert.equal(validateJobResultPublish({ ...base, artifacts: [{ session_count: 3 }], actions: [{ token_count: 100 }] }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ session_count: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE", '{"client_secret":"CANARY_VALUE"}', '{"client-secret":"CANARY_VALUE"}', '{"set-cookie":"sessionid=CANARY_VALUE"}', '"password" = "CANARY_VALUE"']) {
       assert.throws(() => validateJobResultPublish({ ...base, output: { format: "text", text: assignment } }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
