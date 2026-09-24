@@ -52,7 +52,7 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
   }
   return false;
 }
-const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_]*|["'][A-Za-z_][A-Za-z0-9_]*["'])\s*[:=]/g;
+const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_]*|["'][^"'\r\n]+["'])\s*[:=]/g;
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
   return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|capability|cookie)(?:_|$)/.test(normalized) ||
