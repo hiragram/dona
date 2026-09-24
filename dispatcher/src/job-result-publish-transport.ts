@@ -20,10 +20,27 @@ function reply(response: ServerResponse, status: number, code: string): void {
   response.end(encoded);
 }
 
+function reject(request: IncomingMessage, response: ServerResponse, status: number, code: string): void {
+  // Drain an already-sent body so the peer can receive the fixed error. A peer
+  // that withholds the rest gets a short, bounded window before forced close.
+  request.resume();
+  const socket = request.socket ?? response.socket;
+  response.once("finish", () => {
+    if (socket) {
+      const deadline = setTimeout(() => socket.destroy(), 200);
+      deadline.unref();
+    }
+  });
+  reply(response, status, code);
+}
+
 /** Separate UDS. It is never registered on the general Dispatcher API or MCP server. */
 export class JobResultPublishServer {
   private server: http.Server | undefined;
   private readonly sockets = new Set<net.Socket>();
+  private readonly publishingSockets = new Set<net.Socket>();
+  private readonly publishing = new Set<Promise<void>>();
+  private stopping = false;
   constructor(
     private readonly socketPath: string,
     private readonly grants: JobResultPublishCapabilities,
@@ -33,6 +50,7 @@ export class JobResultPublishServer {
   ) {}
 
   async start(): Promise<void> {
+    this.stopping = false;
     await fs.mkdir(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
     await fs.chmod(path.dirname(this.socketPath), 0o700);
     try {
@@ -59,6 +77,7 @@ export class JobResultPublishServer {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     this.server = http.createServer((request, response) => void this.handle(request, response));
+    this.server.headersTimeout = this.bodyTimeoutMs;
     this.server.on("connection", socket => {
       this.sockets.add(socket);
       socket.once("close", () => this.sockets.delete(socket));
@@ -73,7 +92,10 @@ export class JobResultPublishServer {
   async stop(): Promise<void> {
     if (!this.server) return;
     if (!this.server.listening) { this.server = undefined; return; }
+    this.stopping = true;
     const closing = new Promise<void>((resolve, reject) => this.server!.close(error => error ? reject(error) : resolve()));
+    for (const socket of this.sockets) if (!this.publishingSockets.has(socket)) socket.destroy();
+    await Promise.allSettled([...this.publishing]);
     for (const socket of this.sockets) socket.destroy();
     await closing;
     this.server = undefined;
@@ -84,12 +106,12 @@ export class JobResultPublishServer {
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (request.method !== "POST" || !["/v1/job-result-publish", "/v1/job-result-publish/renew"].includes(request.url ?? "")) {
-      reply(response, 404, "not_found"); return;
+      reject(request, response, 404, "not_found"); return;
     }
     const capability = request.headers["x-dona-job-result-capability"];
     const encodedSession = request.headers["x-dona-worker-session"];
     if (typeof capability !== "string" || typeof encodedSession !== "string") {
-      reply(response, 403, "capability_invalid"); return;
+      reject(request, response, 403, "capability_invalid"); return;
     }
     try {
       // JSON before base64url preserves every persisted 512-character session,
@@ -132,16 +154,28 @@ export class JobResultPublishServer {
       catch { throw new JobResultPublishError("invalid_request"); }
       // Recheck current grant/row after body receipt to close a revoke or worker-change race.
       const candidate = this.grants.validate(capability, session, input, this.getJob);
-      const result = candidate.reconcileOnly
-        ? await this.sink.reconcile(candidate)
-        : await this.sink.commit(candidate);
-      reply(response, result.outcome === "conflict" ? 409 : result.outcome === "created" ? 202 : 200, result.outcome);
+      if (this.stopping) throw new JobResultPublishError("job_not_publishable");
+      const publish = (async () => {
+        const result = candidate.reconcileOnly
+          ? await this.sink.reconcile(candidate)
+          : await this.sink.commit(candidate);
+        const finished = new Promise<void>(resolve => response.once("finish", () => resolve()));
+        reply(response, result.outcome === "conflict" ? 409 : result.outcome === "created" ? 202 : 200, result.outcome);
+        await finished;
+      })();
+      this.publishing.add(publish);
+      this.publishingSockets.add(request.socket);
+      try { await publish; }
+      finally {
+        this.publishing.delete(publish);
+        this.publishingSockets.delete(request.socket);
+      }
     } catch (error) {
       if (error instanceof JobResultPublishError) {
         const status = error.code === "payload_too_large" ? 413 : error.code === "invalid_request" || error.code === "content_requires_redaction" ? 400 : error.code === "renewal_not_due" ? 425 : 403;
-        reply(response, status, error.code);
+        reject(request, response, status, error.code);
       } else {
-        reply(response, 503, "publish_unavailable");
+        reject(request, response, 503, "publish_unavailable");
       }
     }
   }

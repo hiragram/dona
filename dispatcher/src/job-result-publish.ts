@@ -55,8 +55,8 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
 const assignmentCandidate = /\b[A-Za-z_][A-Za-z0-9_]*\s*[:=]/g;
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
-  return /(?:^|_)(?:token|secret|password|credential|authorization|capability|cookie)(?:_|$)/.test(normalized) ||
-    /(?:token|secret|password|credential|authorization|apikey|accesskey|privatekey|capability|cookie)$/.test(normalized.replaceAll("_", "")) ||
+  return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|capability|cookie)(?:_|$)/.test(normalized) ||
+    /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|apikey|accesskey|privatekey|capability|cookie)$/.test(normalized.replaceAll("_", "")) ||
     /(?:^|_)(?:api|access|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
     normalized.startsWith("herdr_");
@@ -103,10 +103,22 @@ function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value !== null && typeof value === "object") {
     return `{${Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .sort(([left], [right]) => compareCodePoints(left, right))
       .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function compareCodePoints(left: string, right: string): number {
+  const a = left[Symbol.iterator]();
+  const b = right[Symbol.iterator]();
+  while (true) {
+    const currentA = a.next();
+    const currentB = b.next();
+    if (currentA.done || currentB.done) return currentA.done ? currentB.done ? 0 : -1 : 1;
+    const difference = currentA.value.codePointAt(0)! - currentB.value.codePointAt(0)!;
+    if (difference !== 0) return difference;
+  }
 }
 
 const jsonValue: z.ZodType<unknown> = z.json();

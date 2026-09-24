@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 
 import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, validateJobResultPublish } from "../src/job-result-publish.js";
@@ -62,7 +63,7 @@ describe("job result publish contract", () => {
     }
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ token: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, actions: [{ nested: { api_key: "CANARY_VALUE" } }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
-    for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "cookie", "set-cookie", "herdr_pane_id", "agent_session", "workspacePath"]) {
+    for (const key of ["client_secret", "clientSecret", "refresh_token", "authorization", "cookie", "set-cookie", "passwd", "passphrase", "herdr_pane_id", "agent_session", "workspacePath"]) {
       assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ [key]: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE"]) {
@@ -81,6 +82,9 @@ describe("job result publish contract", () => {
     assert.equal(first.canonicalDigest, reordered.canonicalDigest);
     assert.notEqual(first.canonicalDigest, validateJobResultPublish({ ...base, summary: "別内容" }, row(), "2026-09-24T00:00:00Z").canonicalDigest);
     assert.notEqual(first.canonicalDigest, validateJobResultPublish(base, row({ job_id: "job_two" }), "2026-09-24T00:00:00Z").canonicalDigest);
+    const unicode = validateJobResultPublish({ ...base, artifacts: [{ "😀": 2, "\ue000": 1 }] }, row(), "2026-09-24T00:00:00Z");
+    const codePointJson = '{"actions":[],"artifacts":[{"\ue000":1,"😀":2}],"schema_version":1,"status":"completed","summary":"確認済み"}';
+    assert.equal(unicode.canonicalDigest, createHash("sha256").update(`job-result-publish:v1\njob_one\n${codePointJson}`).digest("hex"));
   });
 
   test("単一job、失効、revocation、stale worker、restart時fail closed", () => {
@@ -275,6 +279,50 @@ describe("job result publish contract", () => {
       assert.ok(performance.now() - started < 1_000);
       active.destroy();
     } finally {
+      await server.stop();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("認証拒否時に未完了本文の接続を閉じ、開始済みcommitは停止前に待つ", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-stop-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => "session-1");
+    const grant = grants.issue(row(), "session-1");
+    let enteredCommit!: () => void;
+    const committed = new Promise<void>(resolve => { enteredCommit = resolve; });
+    let finishCommit!: () => void;
+    const commitBarrier = new Promise<void>(resolve => { finishCommit = resolve; });
+    const server = new JobResultPublishServer(socket, grants, () => row({ status: "running" }),
+      { commit: async () => { enteredCommit(); await commitBarrier; return { outcome: "created" }; },
+        reconcile: async () => ({ outcome: "reused" }) });
+    try {
+      await server.start();
+      const rejected = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
+        headers: { "content-length": "100000" } });
+      rejected.on("error", () => {});
+      const rejectedClosed = new Promise<void>(resolve => rejected.once("close", () => resolve()));
+      rejected.write("{");
+      await Promise.race([rejectedClosed, new Promise((_, fail) => setTimeout(() => fail(new Error("unauthorized socket stayed open")), 1_000))]);
+      const accepted = new Promise<number>((resolve, fail) => {
+        const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
+          headers: { "x-dona-job-result-capability": grant.capability,
+            "x-dona-worker-session": Buffer.from(JSON.stringify("session-1")).toString("base64url") } }, response => {
+          response.resume(); response.once("end", () => resolve(response.statusCode!));
+        });
+        request.once("error", fail); request.end(JSON.stringify(base));
+      });
+      await committed;
+      let stopped = false;
+      const stopping = server.stop().then(() => { stopped = true; });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(stopped, false);
+      finishCommit();
+      assert.equal(await accepted, 202);
+      await stopping;
+      assert.equal(stopped, true);
+    } finally {
+      finishCommit();
       await server.stop();
       await fs.rm(directory, { recursive: true, force: true });
     }
