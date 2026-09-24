@@ -95,7 +95,7 @@ function hasPrivateSlashAuthority(value: string): boolean {
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
+const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
     try {
@@ -250,7 +250,14 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       } else if (rawKey.startsWith("'")) key = rawKey.slice(1, -1);
       if (forbiddenKey(key)) throw new JobResultPublishError("content_requires_redaction");
     }
-    if (forbiddenDigests && forbiddenFingerprints && containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
+    if (forbiddenDigests && forbiddenFingerprints) {
+      if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
+      if (value.includes("%")) {
+        let decoded: string;
+        try { decoded = decodeURIComponent(value); } catch { throw new JobResultPublishError("content_requires_redaction"); }
+        if (decoded !== value && containsForbiddenCapability(decoded, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
+      }
+    }
     if (forbiddenValues?.contains(value)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
@@ -388,6 +395,12 @@ export class JobResultPublishCapabilities {
     private readonly now: () => number = Date.now,
   ) {}
 
+  private pruneExpiredGrants(): void {
+    for (const [key, grant] of this.grants) if (grant.expiresAt <= this.now()) this.grants.delete(key);
+    const retainedJobs = new Set([...this.grants.values()].map(grant => grant.jobId));
+    for (const jobId of this.generations.keys()) if (!retainedJobs.has(jobId)) this.generations.delete(jobId);
+  }
+
   issue(job: JobRow, session: string): { capability: string; expiresAt: string } {
     if (job.status !== "dispatching" || !validJobResultPublishSession(session) || this.currentSession(job.job_id) !== session) {
       throw new JobResultPublishError("job_not_publishable");
@@ -398,7 +411,7 @@ export class JobResultPublishCapabilities {
   renew(capability: string, session: string, getJob: (jobId: string) => JobRow | undefined): { capability: string; expiresAt: string } {
     const job = this.authorize(capability, session, getJob);
     if (job.status !== "running") throw new JobResultPublishError("job_not_publishable");
-    for (const [key, grant] of this.grants) if (grant.expiresAt <= this.now()) this.grants.delete(key);
+    this.pruneExpiredGrants();
     // The previous token remains valid until its own expiry. A lost response can
     // safely repeat the same renewal and recover the same successor token.
     const next = createHmac("sha256", this.renewalKey).update(`renew:v1\n${capability}`).digest("base64url");
@@ -416,7 +429,7 @@ export class JobResultPublishCapabilities {
   }
 
   private mint(job: JobRow, session: string): { capability: string; expiresAt: string } {
-    for (const [key, grant] of this.grants) if (grant.expiresAt <= this.now()) this.grants.delete(key);
+    this.pruneExpiredGrants();
     for (const grant of this.grants.values()) if (grant.jobId === job.job_id) grant.revoked = true;
     const generation = (this.generations.get(job.job_id) ?? 0) + 1;
     this.generations.set(job.job_id, generation);
@@ -432,6 +445,8 @@ export class JobResultPublishCapabilities {
   }
 
   revokeJob(jobId: string): void {
+    this.pruneExpiredGrants();
+    if (![...this.grants.values()].some(grant => grant.jobId === jobId)) return;
     this.generations.set(jobId, (this.generations.get(jobId) ?? 0) + 1);
     for (const grant of this.grants.values()) if (grant.jobId === jobId) grant.revoked = true;
   }

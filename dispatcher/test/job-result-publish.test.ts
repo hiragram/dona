@@ -7,7 +7,7 @@ import path from "node:path";
 import { describe, test } from "node:test";
 import { createHash } from "node:crypto";
 
-import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, validateJobResultPublish } from "../src/job-result-publish.js";
+import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeMaxBytes, jobResultPublishTtlMs, validateJobResultPublish } from "../src/job-result-publish.js";
 import { buildJobResultPublishInstructions } from "../src/job-prompt.js";
 import { JobResultPublishServer } from "../src/job-result-publish-transport.js";
 import type { JobRow } from "../src/types.js";
@@ -94,6 +94,7 @@ describe("job result publish contract", () => {
       "https://example.com/file?access%5Ftoken=CANARY_VALUE", "https://example.com/file?client%5Fsecret=CANARY_VALUE",
       "prefix_https://10.0.0.1/private", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
+      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
@@ -147,6 +148,8 @@ describe("job result publish contract", () => {
     const getJob = (id: string) => id === current.job_id ? current : undefined;
     assert.equal(grants.validate(grant.capability, "session-1", base, getJob).envelope.job_id, "job_one");
     assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: `prefix-${grant.capability}-suffix` }, getJob), code("content_requires_redaction"));
+    const encodedCapability = `%${grant.capability.charCodeAt(0).toString(16).padStart(2, "0")}${grant.capability.slice(1)}`;
+    assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: `https://example.com/?id=${encodedCapability}` }, getJob), code("content_requires_redaction"));
     current = row({ status: "running", agent_name: "internal-worker-42" });
     assert.throws(() => grants.validate(grant.capability, "session-1", { ...base, summary: "internal-worker-42" }, getJob), code("content_requires_redaction"));
     current = row({ status: "running", agent_name: "s1" });
@@ -193,6 +196,16 @@ describe("job result publish contract", () => {
     assert.equal(next.fence.grantGeneration, 2);
     grants.revokeJob("job_one");
     assert.throws(() => next.assertCurrentGrant(), code("capability_revoked"));
+  });
+
+  test("期限切れgrantと終了jobの世代を次の発行前に解放する", () => {
+    let now = Date.parse("2026-09-24T00:00:00Z");
+    const grants = new JobResultPublishCapabilities(() => "session-one", () => now);
+    for (let index = 0; index < 100; index++) grants.issue(row({ job_id: `job_${index}` }), "session-one");
+    assert.equal((grants as unknown as { generations: Map<string, number> }).generations.size, 100);
+    now += jobResultPublishTtlMs;
+    grants.issue(row({ job_id: "new-job" }), "session-one");
+    assert.equal((grants as unknown as { generations: Map<string, number> }).generations.size, 1);
   });
 
   test("永続live sessionの512文字上限を発行でも受理する", () => {
