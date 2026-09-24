@@ -119,6 +119,10 @@ describe("job result publish contract", () => {
     const started = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: repeatedUrls }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.ok(performance.now() - started < 2_000, "署名URL検査は大きな本文でも線形時間で終わる");
+    const plusUrls = "https://example.com/?q=a+b ".repeat(500);
+    const plusStarted = performance.now();
+    assert.equal(validateJobResultPublish({ ...base, summary: plusUrls }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    assert.ok(performance.now() - plusStarted < 2_000, "plusを含む複数URLもboundedに検査する");
     const publicJwks = '{"kty":"RSA","n":"public"}'.repeat(8_000);
     const jwkStarted = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: publicJwks }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");

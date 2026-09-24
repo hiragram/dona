@@ -285,10 +285,6 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
           if (forbiddenValues?.contains(parameterValue)) throw new JobResultPublishError("content_requires_redaction");
         }
       }
-      if ((url.search.includes("+") || url.hash.includes("+")) && match[0].includes("+")) {
-        const decodedForm = value.replace(match[0], match[0].replace(/\+/g, " "));
-        assertSafeJson(decodedForm, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
-      }
     }
     for (const match of value.matchAll(privateHostPathCandidate)) {
       if (hasPrivateHttpHost(`http://${match[1]}`)) throw new JobResultPublishError("content_requires_redaction");
