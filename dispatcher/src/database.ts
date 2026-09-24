@@ -999,6 +999,48 @@ export class DispatcherDatabase {
     return row ? projectLiveSessionReceipt(row) : undefined;
   }
 
+  resolveInvalidJobResult(jobId: string, receiptId: string, expectedUpdatedAt: string, at = new Date()): JobRow {
+    return this.db.transaction(() => {
+      const job = this.getJobRequired(jobId);
+      const binding = readEventJobBinding(this.db, job.source_event_id);
+      if (binding?.owner.kind === "schedule") throw new Error("scheduled_job_reconciliation_required");
+      if (job.status !== "needs_review" || !["invalid_result", "invalid_result_agent_stopped"].includes(job.last_error_code ?? ""))
+        throw new Error("job_invalid_result_reconciliation_unavailable");
+      if (job.updated_at !== expectedUpdatedAt) throw new Error("job_changed_since_review");
+      if (job.result_json !== null) throw new Error("job_result_already_accepted");
+      const receipt = this.getLiveSessionReceipt(jobId, receiptId);
+      if (!receipt || receipt.durable_status_after !== "needs_review" || receipt.result_present_after ||
+          receipt.reconciliation.safe_next_action !== "do_not_retry") throw new Error("live_session_receipt_mismatch");
+      if (Date.parse(receipt.observed_at) < Date.parse(job.updated_at)) throw new Error("live_session_receipt_precedes_job_state");
+      const latest = this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
+        .get(jobId) as {receipt_id:string}|undefined;
+      if (latest?.receipt_id !== receiptId) throw new Error("newer_live_session_receipt_exists");
+      const group = this.getJobGroup(job.source_event_id);
+      for (const eventId of new Set([job.completion_event_id, group?.attention_event_id, group?.all_terminal_event_id])) {
+        if (!eventId) continue;
+        const event = this.getRequired(eventId);
+        const pending = ["queued", "retryable_failed"].includes(event.status);
+        if (pending) {
+          this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+            last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=?`)
+            .run(at.toISOString(),at.toISOString(),eventId);
+        } else if (event.status !== "completed") throw new Error("prior_notification_requires_reconciliation");
+        this.db.prepare(`UPDATE job_groups SET
+          attention_event_id=CASE WHEN attention_event_id=? AND ? THEN NULL ELSE attention_event_id END,
+          all_terminal_event_id=CASE WHEN all_terminal_event_id=? THEN NULL ELSE all_terminal_event_id END
+          WHERE source_event_id=?`).run(eventId,pending?1:0,eventId,job.source_event_id);
+      }
+      const changed = this.db.prepare(`UPDATE jobs SET status='failed',completed_at=?,updated_at=?,
+        completion_event_id=NULL,last_error_code='invalid_result_operator_resolved',last_error_message=?
+        WHERE job_id=? AND status='needs_review' AND updated_at=? AND result_json IS NULL`)
+        .run(at.toISOString(), at.toISOString(), `Operator reviewed worker termination and side effects; receipt ${receiptId}`, jobId, expectedUpdatedAt).changes;
+      if (changed !== 1) throw new Error("job_changed_since_review");
+      this.enqueueJobNotification(jobId, at);
+      this.enqueueJobNotification(jobId, at);
+      return this.getJobRequired(jobId);
+    }).immediate();
+  }
+
   latestLiveSessionStateChangeSeq(jobId: string, identity:LiveSessionIdentityRow): number | undefined {
     const current=this.db.prepare(`SELECT max_state_change_seq FROM job_live_session_identities
       WHERE job_id=? AND recorded_at=? AND herdr_agent_session_id=? AND herdr_workspace_id=? AND herdr_pane_id=? AND agent_name=?`)

@@ -34,6 +34,7 @@ function usage(): never {
   dona-dispatcher job show <job_id> [--live-session | --live-session-receipt <receipt_id>]
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
+  dona-dispatcher job resolve-invalid-result <job_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher scheduler health
   dona-dispatcher scheduler outbox [--status STATUS] [--limit N]
   dona-dispatcher scheduler retention [--apply --force]`);
@@ -114,6 +115,12 @@ async function main(): Promise<void> {
       if(command==="reconcile-run") {
         const runId=eventIdAt(args,2),outcome=args[3];if(outcome!=="failed"&&outcome!=="cancelled")usage();
         console.log(JSON.stringify(database.reconcileScheduledRun(runId,outcome),null,2));return;
+      }
+      if(command==="resolve-invalid-result") {
+        if(args.length!==7 || args[5]!=="--worker-stopped-reviewed" || args[6]!=="--side-effects-reviewed") usage();
+        const jobId=eventIdAt(args,2),receiptId=eventIdAt(args,3),expectedUpdatedAt=eventIdAt(args,4);
+        const row=database.resolveInvalidJobResult(jobId,receiptId,expectedUpdatedAt);
+        console.log(JSON.stringify({job_id:row.job_id,status:row.status,updated_at:row.updated_at,last_error_code:row.last_error_code},null,2));return;
       }
       usage();
     }
