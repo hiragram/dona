@@ -2140,6 +2140,15 @@ export class DispatcherDatabase {
         }
         const posts=(result.actions??[]).filter(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
           typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")) as Array<Record<string,unknown>>;
+        const statusActions=(result.actions??[]).filter(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+          typeof (action as Record<string,unknown>).tool==="string"&&
+          String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")) as Array<Record<string,unknown>>;
+        if(decision.action!=="ask_user"&&statusActions.length){
+          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:"worker_message_unexpected_session_change",
+            last_error_message:"Worker report changed the agent session without a user question"});
+          return;
+        }
         if(decision.action==="ack_internal"||decision.action==="aggregate_wait"){
           if(posts.length){
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
@@ -2192,9 +2201,6 @@ export class DispatcherDatabase {
             typeof posts[0]!.message_ts==="string"&&posts[0]!.body_sha256===expectedBodySha256&&
             posts[0]!.reply_broadcast===false&&posts[0]!.ambiguous!==true&&posts[0]!.success!==false&&
             posts[0]!.ok!==false&&!("error" in posts[0]!);
-          const statusActions=(result.actions??[]).filter(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-            typeof (action as Record<string,unknown>).tool==="string"&&
-            String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")) as Array<Record<string,unknown>>;
           const finalStatus=statusActions.at(-1);
           const suspended=finalStatus?.tool==="dona_slack.set_agent_session_status"&&
             finalStatus.workspace_id===target?.workspace_id&&finalStatus.channel_id===target?.channel_id&&

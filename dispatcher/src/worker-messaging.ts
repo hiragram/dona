@@ -578,10 +578,14 @@ export class WorkerMessageRepository {
         WHERE d.job_id=? AND m.producer_sequence<? AND m.producer='worker'
         ORDER BY m.producer_sequence DESC,d.decided_at DESC,d.notification_event_id DESC LIMIT 1`).get(jobId,message.producer_sequence) as
         {action:WorkerDecisionAction;content_sha256:string;decided_at:string;severity:string|null}|undefined;
-      const lastEta=this.db.prepare(`SELECT json_extract(payload_json,'$.eta_at') AS eta_at FROM worker_messages
-        WHERE job_id=? AND direction='worker_to_dona' AND producer_sequence<?
-          AND json_type(payload_json,'$.eta_at')='text'
-        ORDER BY producer_sequence DESC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
+      const lastEta=this.db.prepare(`SELECT json_extract(m.payload_json,'$.eta_at') AS eta_at FROM worker_messages m
+        JOIN worker_message_decisions d ON d.message_id=m.message_id
+        JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
+        JOIN worker_message_deliveries delivery ON delivery.message_id=m.message_id
+          AND delivery.consumer='dona-main' AND delivery.event_id=d.notification_event_id
+        WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.producer_sequence<?
+          AND json_type(m.payload_json,'$.eta_at')='text'
+        ORDER BY m.producer_sequence DESC,d.decided_at DESC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
       const lastRisk=this.db.prepare(`SELECT json_extract(m.payload_json,'$.severity') AS severity FROM worker_messages m
         JOIN worker_message_decisions d ON d.message_id=m.message_id AND d.action='report_to_user'
         JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
@@ -650,7 +654,7 @@ export class WorkerMessageRepository {
       .get(job.source_event_id) as {count:number}).count;
     if(decision.action!=="ask_user"&&sha256(stableStringify({total,jobs:group}))!==decision.group_sha256)
       return {current:false,reason:"group_changed"};
-    if(group.some(row=>(row.status==="blocked"&&!(decision.action==="ask_user"&&row.job_id===jobId))
+    if(decision.action!=="ask_user"&&group.some(row=>row.status==="blocked"
       ||row.status==="failed"||row.status==="needs_review"))
       return {current:false,reason:"group_attention"};
     return {current:decision.action==="ask_user"||decision.action==="report_to_user",

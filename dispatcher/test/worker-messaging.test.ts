@@ -43,7 +43,7 @@ function bindRuntime(database:DispatcherDatabase,jobId:string,identity:string) {
 }
 
 describe("worker messaging ledger",()=>{
-  test("質問は無害なgroup driftで維持しattention時だけ投稿を抑止する",async()=>{
+  test("質問はgroup attention後も回答可能な通知として維持する",async()=>{
     const {database,source,job,config}=await fixture();
     try {
       bindRuntime(database,job.job_id,"runtime-question-group-drift");
@@ -60,11 +60,11 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.workerMessages.decisionCurrent(job.job_id,created.message.message_id,event.event_id).current,true);
       database.markJobNeedsReview(sibling.job_id,"review","review");
       assert.deepEqual(database.workerMessages.decisionCurrent(job.job_id,created.message.message_id,event.event_id),
-        {current:false,reason:"group_attention"});
+        {current:true,reason:"current"});
       database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
         summary:"group attentionへ集約",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},"result.json");
-      assert.equal(database.get(event.event_id)?.status,"completed");
-      assert.equal(database.getJob(job.job_id)?.status,"blocked");
+      assert.equal(database.get(event.event_id)?.status,"needs_review");
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
     } finally {database.close();}
   });
   test("投稿前に無効になったprogress decisionを投稿なしで完了する",async()=>{
@@ -287,6 +287,26 @@ describe("worker messaging ledger",()=>{
       assert.equal(database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)?.status,"completed");
     } finally {database.close();}
   });
+  test("非質問decisionのsession変更をResultで拒否する",async()=>{
+    for(const status of ["active","suspended","closed"]){
+      const {database,source,job,config}=await fixture();
+      try {
+        const created=database.workerMessages.appendReport(job.job_id,report(source.event_id),new Date("2026-09-21T00:00:01Z"));
+        database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+        const event=database.getByExternalId("dona_message",`worker-message:${created.message.message_id}`)!;
+        const sqlite=new Database(config.databasePath);
+        sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+        sqlite.close();
+        assert.equal(database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id,
+          new Date("2026-09-21T00:00:03Z")).action,"ack_internal");
+        database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+          summary:"内部受領",actions:[{tool:"dona_slack.set_agent_session_status",status,success:true}],
+          memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},"result.json");
+        assert.equal(database.get(event.event_id)?.status,"needs_review");
+        assert.equal(database.get(event.event_id)?.last_error_code,"worker_message_unexpected_session_change");
+      } finally {database.close();}
+    }
+  });
   test("needs_review後の質問decisionを保存し、内部受領Resultを完了する",async()=>{
     const {database,source,job,config}=await fixture();
     try {
@@ -408,8 +428,40 @@ describe("worker messaging ledger",()=>{
         sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
         sqlite.close();
         decisions.push(database.workerMessages.decideReport(job.job_id,created.message.message_id,event.event_id,new Date(times[i]!)));
+        if(i===0)database.saveCompleted(event.event_id,{schema_version:1,event_id:event.event_id,status:"completed",
+          summary:"内部受領",actions:[],memory_candidates:[],completed_at:times[i]!},"result.json",new Date(times[i]!));
       }
       assert.equal(decisions[2]!.reason,"eta_change");
+    } finally {database.close();}
+  });
+
+  test("superseded ETAを変化判定の基準にしない",async()=>{
+    const {database,source,job,config}=await fixture();
+    try {
+      const first=database.workerMessages.appendReport(job.job_id,{...report(source.event_id,1),
+        payload:{kind:"checkpoint",summary:"開始",eta_at:"2026-09-21T02:00:00Z"}},new Date("2026-09-21T00:00:01Z"));
+      database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:00:02Z"));
+      const firstEvent=database.getByExternalId("dona_message",`worker-message:${first.message.message_id}`)!;
+      const sqlite=new Database(config.databasePath);
+      sqlite.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(firstEvent.event_id);
+      sqlite.close();
+      assert.equal(database.workerMessages.decideReport(job.job_id,first.message.message_id,firstEvent.event_id,
+        new Date("2026-09-21T00:00:03Z")).action,"ack_internal");
+      database.saveCompleted(firstEvent.event_id,{schema_version:1,event_id:firstEvent.event_id,status:"completed",
+        summary:"内部受領",actions:[],memory_candidates:[],completed_at:"2026-09-21T00:00:03Z"},"result.json");
+      const skipped=database.workerMessages.appendReport(job.job_id,{...report(source.event_id,2),
+        payload:{kind:"checkpoint",summary:"未配送",eta_at:"2026-09-21T03:00:00Z"}},new Date("2026-09-21T00:01:01Z"));
+      const latest=database.workerMessages.appendReport(job.job_id,{...report(source.event_id,3),
+        payload:{kind:"checkpoint",summary:"最新",eta_at:"2026-09-21T03:02:00Z"}},new Date("2026-09-21T00:01:02Z"));
+      assert.equal((database.workerMessages.reconcile(job.job_id,source.event_id,"worker","report-2") as
+        {delivery:{state:string}}).delivery.state,"superseded");
+      assert.equal(database.workerMessages.publishPendingReports(1,new Date("2026-09-21T00:20:00Z")),1);
+      const event=database.getByExternalId("dona_message",`worker-message:${latest.message.message_id}`)!;
+      const again=new Database(config.databasePath);
+      again.prepare("UPDATE events SET status='waiting_agent' WHERE event_id=?").run(event.event_id);
+      again.close();
+      assert.equal(database.workerMessages.decideReport(job.job_id,latest.message.message_id,event.event_id).reason,"eta_change");
+      assert.equal(database.getByExternalId("dona_message",`worker-message:${skipped.message.message_id}`),undefined);
     } finally {database.close();}
   });
 
