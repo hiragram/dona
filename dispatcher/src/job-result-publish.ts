@@ -94,7 +94,17 @@ function hasPrivateSlashAuthority(value: string): boolean {
   return false;
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
-const networkUrlCandidate = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
+const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
+const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
+function hasJwt(value: string): boolean {
+  for (const match of value.matchAll(jwtCandidate)) {
+    try {
+      const header = JSON.parse(Buffer.from(match[1]!, "base64url").toString("utf8"));
+      if (header && typeof header === "object" && typeof header.alg === "string") return true;
+    } catch { /* Other dotted identifiers are allowed. */ }
+  }
+  return false;
+}
 const signedQueryKeys = new Set(["token", "sig", "signature", "x-amz-signature", "x-goog-signature", "api_key", "api-key", "access_key", "access-key", "auth"]);
 function hasPrivateHttpHost(candidate: string): boolean {
   let hostname: string;
@@ -126,14 +136,18 @@ function hasPrivateHttpHost(candidate: string): boolean {
 }
 function hasSignedQueryKey(candidate: string): boolean {
   const queryStart = candidate.indexOf("?");
-  if (queryStart < 0) return false;
-  for (const parameter of candidate.slice(queryStart + 1).split("&")) {
-    const equal = parameter.indexOf("=");
-    if (equal < 0) continue;
-    try {
-      const key = decodeURIComponent(parameter.slice(0, equal).replaceAll("+", " ")).toLowerCase();
-      if (signedQueryKeys.has(key) || forbiddenKey(key)) return true;
-    } catch { return true; }
+  const fragmentStart = candidate.indexOf("#");
+  const segments = [
+    queryStart >= 0 ? candidate.slice(queryStart + 1, fragmentStart >= 0 ? fragmentStart : undefined) : "",
+    fragmentStart >= 0 ? candidate.slice(fragmentStart + 1) : "",
+  ];
+  for (const segment of segments) for (const parameter of segment.split("&")) {
+      const equal = parameter.indexOf("=");
+      if (equal < 0) continue;
+      try {
+        const key = decodeURIComponent(parameter.slice(0, equal).replaceAll("+", " ")).toLowerCase();
+        if (signedQueryKeys.has(key) || forbiddenKey(key)) return true;
+      } catch { return true; }
   }
   return false;
 }
@@ -240,7 +254,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (forbiddenValues?.contains(value)) {
       throw new JobResultPublishError("content_requires_redaction");
     }
-    if (sensitive.test(value) || localPath.test(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value) || slackMention.test(value) || hasPrivateJwkText(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || localPath.test(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints);

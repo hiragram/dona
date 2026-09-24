@@ -92,6 +92,8 @@ describe("job result publish contract", () => {
     for (const value of ["http://artifact-service.internal/download/OPAQUE_VALUE", "http://artifact/download/OPAQUE_VALUE",
       "http://cache.local/private", "ftp://10.0.0.5/private/archive.zip", "sftp://artifact.internal/result",
       "https://example.com/file?access%5Ftoken=CANARY_VALUE", "https://example.com/file?client%5Fsecret=CANARY_VALUE",
+      "prefix_https://10.0.0.1/private", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
@@ -287,7 +289,7 @@ describe("job result publish contract", () => {
     const server = new JobResultPublishServer(grants, id => id === current.job_id ? current : undefined,
       { commit: async candidate => { assert.deepEqual(candidate.fence, { jobId: "job_one", publishableStatuses: ["dispatching", "running"], grantGeneration: 1,
         attemptCount: 1, paneId: "pane-1", session: "session-1" }); candidate.assertCurrentGrant(); accepted.push(candidate.canonicalDigest); return { outcome: "created" }; },
-        reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } });
+        reconcile: async candidate => { reconciled.push(candidate.canonicalDigest); return { outcome: "reused" }; } }, 32);
     const post = (body: string | Buffer, capability?: string, session = "session-1", route = "/v1/job-result-publish", agent?: http.Agent) => new Promise<{ status: number; body: string; connection: string | undefined }>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: route, method: "POST", agent,
         headers: { "content-type": "application/json", ...(capability ? { "x-dona-job-result-capability": capability } : {}), "x-dona-worker-session": Buffer.from(JSON.stringify(session), "utf8").toString("base64url") } }, response => {
@@ -360,7 +362,7 @@ describe("job result publish contract", () => {
       { commit: async candidate => {
         assert.equal(candidate.fence.session, session);
         return { outcome: "created" };
-      }, reconcile: async () => ({ outcome: "reused" }) });
+      }, reconcile: async () => ({ outcome: "reused" }) }, 32);
     const post = (encodedSession: string) => new Promise<number>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
         headers: { "x-dona-job-result-capability": grant.capability, "x-dona-worker-session": encodedSession } }, response => {
@@ -395,7 +397,7 @@ describe("job result publish contract", () => {
     const grants = new JobResultPublishCapabilities(() => "session-1");
     const grant = grants.issue(row(), "session-1");
     const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
-      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 40);
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 32, 40);
     const partial = () => new Promise<http.ClientRequest>((resolve, reject) => {
       const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
         headers: { "x-dona-job-result-capability": grant.capability,
@@ -426,7 +428,7 @@ describe("job result publish contract", () => {
     const grants = new JobResultPublishCapabilities(() => "session-1");
     const grant = grants.issue(row(), "session-1");
     const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
-      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 40);
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 32, 40);
     let client: net.Socket | undefined;
     let stalled: net.Socket | undefined;
     let waiting: net.Socket | undefined;
@@ -474,7 +476,7 @@ describe("job result publish contract", () => {
     const commitBarrier = new Promise<void>(resolve => { finishCommit = resolve; });
     const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
       { commit: async () => { enteredCommit(); await commitBarrier; return { outcome: "created" }; },
-        reconcile: async () => ({ outcome: "reused" }) });
+        reconcile: async () => ({ outcome: "reused" }) }, 32);
     try {
       await startServer(server, socket);
       const rejected = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
@@ -518,7 +520,7 @@ describe("job result publish contract", () => {
     const barrier = new Promise<void>(resolve => { release = resolve; });
     const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
       { commit: async () => { entered(); await barrier; return { outcome: "created" }; },
-        reconcile: async () => ({ outcome: "reused" }) });
+        reconcile: async () => ({ outcome: "reused" }) }, 32);
     try {
       await startServer(server, socket);
       const request = http.request({ socketPath: socket, path: "/v1/job-result-publish", method: "POST",
@@ -541,7 +543,7 @@ describe("job result publish contract", () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-cap-"));
     const socket = path.join(directory, "p.sock");
     const server = new JobResultPublishServer(new JobResultPublishCapabilities(() => undefined), () => undefined,
-      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) });
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 32);
     const clients: net.Socket[] = [];
     try {
       await startServer(server, socket);
@@ -561,6 +563,30 @@ describe("job result publish contract", () => {
     }
   });
 
+  test("接続容量を設定された並行job数へ拡張できる", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-cap64-"));
+    const socket = path.join(directory, "p.sock");
+    const server = new JobResultPublishServer(new JobResultPublishCapabilities(() => undefined), () => undefined,
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 64);
+    const clients: net.Socket[] = [];
+    try {
+      await startServer(server, socket);
+      for (let index = 0; index < 65; index++) {
+        const client = net.createConnection(socket);
+        client.on("error", () => {});
+        clients.push(client);
+        await new Promise<void>(resolve => client.once("connect", resolve));
+      }
+      assert.equal(clients[63]!.destroyed, false);
+      await Promise.race([new Promise<void>(resolve => clients[64]!.once("close", resolve)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("configured limit not enforced")), 1_000))]);
+    } finally {
+      for (const client of clients) client.destroy();
+      await stopServer(server);
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("切断済みでもcommit中の接続は32件の上限を占有する", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-orphan-cap-"));
     const socket = path.join(directory, "p.sock");
@@ -572,7 +598,7 @@ describe("job result publish contract", () => {
     const barrier = new Promise<void>(resolve => { release = resolve; });
     const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
       { commit: async () => { started++; entrances.shift()?.(); await barrier; return { outcome: "created" }; },
-        reconcile: async () => ({ outcome: "reused" }) });
+        reconcile: async () => ({ outcome: "reused" }) }, 32);
     try {
       await startServer(server, socket);
       for (let index = 0; index < 32; index++) {
@@ -611,7 +637,7 @@ describe("job result publish contract", () => {
     const barrier = new Promise<void>(resolve => { release = resolve; });
     const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
       { commit: async () => { calls++; entered(); await barrier; return { outcome: "created" }; },
-        reconcile: async () => ({ outcome: "reused" }) });
+        reconcile: async () => ({ outcome: "reused" }) }, 32);
     let client: net.Socket | undefined;
     try {
       await startServer(server, socket);

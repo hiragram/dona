@@ -73,8 +73,10 @@ export class JobResultPublishServer {
     private readonly grants: JobResultPublishCapabilities,
     private readonly getJob: (jobId: string) => JobRow | undefined,
     private readonly sink: JobResultPublishSink,
+    private readonly maxConnections: number,
     private readonly bodyTimeoutMs = 15_000,
   ) {
+    if (!Number.isSafeInteger(maxConnections) || maxConnections < 1) throw new Error("invalid_max_connections");
     this.server = http.createServer((request, response) => void this.handle(request, response));
     // A worker may renew and then publish over its sole pre-connected FD.
     // The per-socket active fence below rejects overlapping/pipelined requests.
@@ -83,7 +85,7 @@ export class JobResultPublishServer {
 
   /** The caller must supply a pre-connected socket over an authenticated channel. */
   accept(socket: net.Socket): void {
-    if (this.stopping || new Set([...this.sockets, ...this.publishingSockets]).size >= 32) { socket.destroy(); return; }
+    if (this.stopping || new Set([...this.sockets, ...this.publishingSockets]).size >= this.maxConnections) { socket.destroy(); return; }
     this.sockets.add(socket);
     socket.on("error", () => socket.destroy());
     // Keep the FD outside the HTTP parser until its first byte. The worker may
