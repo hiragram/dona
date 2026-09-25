@@ -56,6 +56,20 @@ function fenceOpenAt(text: string, end: number): boolean {
   return open;
 }
 
+function inlineCodeOpenAt(text: string, end: number): boolean {
+  let inFence = false;
+  let inCode = false;
+  for (let index = 0; index < end; index++) {
+    if (text.startsWith("```", index) && !isEscaped(text, index)) {
+      inFence = !inFence;
+      index += 2;
+      continue;
+    }
+    if (!inFence && text[index] === "`" && !isEscaped(text, index)) inCode = !inCode;
+  }
+  return inCode;
+}
+
 function findMultiQuoteStart(text: string): number {
   let inFence = false;
   let inCode = false;
@@ -167,7 +181,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       else if (mrkdwn) {
         const lastOpenToken = prefix.lastIndexOf("<");
         const lastCloseToken = prefix.lastIndexOf(">");
-        if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken)) {
+        if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken) && !inlineCodeOpenAt(text, offset + lastOpenToken)) {
           const close = text.indexOf(">", offset + lastOpenToken + 1);
           if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
           else if (close !== -1 && close + 1 - offset <= 3_000) end = close + 1;
@@ -246,7 +260,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     let chunk = mrkdwn
       ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? "\n```" : ""}`
       : rawChunk;
-    if (chunk.length > 3_000 && !startsInsideFence && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) chunk = rawChunk;
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) chunk = rawChunk;
     return ({
     type: "section" as const,
     ...(index === 0 ? { block_id: blockId } : {}),

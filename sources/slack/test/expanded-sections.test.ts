@@ -197,3 +197,10 @@ test("Slack entities stay in one section", () => {
     assert.ok(blocks.some((block) => block.text.text.includes(entity)));
   }
 });
+
+test("a long angle string inside inline code stays literal", () => {
+  const blocks = expandedSections(`\`<https://${"a".repeat(2_987)}|P>\``, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.every((block) => block.text.text.startsWith("`") && block.text.text.endsWith("`")));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
