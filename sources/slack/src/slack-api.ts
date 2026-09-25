@@ -289,7 +289,13 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     }
     const graphemeEnd = graphemeBoundaries[low - 1] ?? end;
     const nextBoundary = graphemeBoundaries[low];
-    if (nextBoundary !== undefined && graphemeEnd > offset && nextBoundary - graphemeEnd > maxRawLength / 2 && !isEscaped(text, graphemeEnd)) end = graphemeEnd;
+    if (nextBoundary !== undefined && graphemeEnd > offset && nextBoundary - graphemeEnd > maxRawLength / 2) {
+      let escapeStart = graphemeEnd;
+      while (escapeStart > offset && text[escapeStart - 1] === "\\") escapeStart--;
+      if (escapeStart > offset) end = escapeStart;
+      else if (!isEscaped(text, graphemeEnd)) end = graphemeEnd;
+      else if (nextBoundary - offset <= 3_000) end = nextBoundary;
+    }
     else if (nextBoundary !== undefined && nextBoundary - offset <= 3_000 && end - graphemeEnd > maxRawLength / 4) end = nextBoundary;
     else if (graphemeEnd > offset) end = graphemeEnd;
     else if (nextBoundary !== undefined && nextBoundary - offset <= 3_000) end = nextBoundary;
@@ -415,6 +421,9 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length > 0) {
       const consumedClosing = [...startsInsideInline].reverse().slice(0, startsInsideInline.length - state.inline.length).join("");
       const grapheme = consumedClosing && rawChunk.endsWith(consumedClosing) ? rawChunk.slice(0, -consumedClosing.length) : rawChunk;
+      if ((isSlackAngleToken(grapheme) || /^:[a-z0-9_+-]+:$/i.test(grapheme) || isEscapedSlackAngleToken(grapheme)) && grapheme.length <= 3_000) {
+        chunk = quotePrefix && grapheme.length <= 2_999 ? `>${grapheme}` : grapheme;
+      }
       if (grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
         chunk = grapheme;
         plainFallback = true;

@@ -569,3 +569,19 @@ test("an escaped long grapheme inside emphasis falls back to plain text", () => 
   assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === escaped));
   assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
 });
+
+test("a maximum-length token inside nested markers is delivered", () => {
+  const token = `<https://${"a".repeat(2_987)}|P>`;
+  const blocks = expandedSections(`*_${token}_*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === token));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});
+
+test("ordinary text before an escaped long grapheme is split first", () => {
+  const grapheme = `a${"\u0301".repeat(2_996)}`;
+  const escaped = `\\${grapheme}`;
+  const blocks = expandedSections(`*x${escaped}*`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.some((block) => block.text.text.includes(escaped)));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});
