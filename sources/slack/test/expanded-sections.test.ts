@@ -500,3 +500,14 @@ test("a long grapheme with nested inline closers falls back to plain text", () =
   assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === grapheme));
   assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
 });
+
+test("a long underscore divider leaves room for section formatting", () => {
+  const blocks = expandedSections("_".repeat(7_000), "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});
+
+test("an existing single-line quote marker precedes reopened inline formatting", () => {
+  const blocks = expandedSections(`>*intro\n${"a".repeat(2_885)}\n>second ${"b".repeat(300)}*`, "identity", true);
+  assert.ok(blocks.slice(1).some((block) => block.text.text.startsWith(">*second")));
+});

@@ -293,6 +293,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     while (mrkdwn && end < text.length && end - offset < 3_000 && !isEscaped(text, end)) {
       const marker = text[end] as InlineMarker;
       if (marker === "*" || marker === "_" || marker === "~" || marker === "`") {
+        if (marker === "_" && /[\p{L}\p{N}_]/u.test(text[end - 1] ?? "") && /[\p{L}\p{N}_]/u.test(text[end + 1] ?? "")) break;
         const boundaryState: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
         advanceMrkdwnState(text.slice(0, end), boundaryState, text, 0, candidates);
         if (boundaryState.inline.includes(marker) && !boundaryState.fence) {
@@ -340,9 +341,10 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     let chunk = mrkdwn
       ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? `${rendered.endsWith("\n") ? "" : "\n"}\`\`\`` : ""}`
       : rawChunk;
-    if (mrkdwn && !quotePrefix && rawOffset - rawChunk.length === lineStart && rawChunk.startsWith(">>>") && startsInsideInline.length && !startsInsideFence) {
+    if (mrkdwn && !quotePrefix && rawOffset - rawChunk.length === lineStart && rawChunk.startsWith(">") && startsInsideInline.length && !startsInsideInline.includes("`") && !startsInsideFence) {
       const markers = startsInsideInline.join("");
-      chunk = `>>>${markers}${chunk.slice(markers.length + 3)}`;
+      const quoteMarker = rawChunk.startsWith(">>>") ? ">>>" : ">";
+      chunk = `${quoteMarker}${markers}${chunk.slice(markers.length + quoteMarker.length)}`;
     }
     if (mrkdwn && startsInsideInline.length === 1 && rawChunk.startsWith(startsInsideInline[0]!) && state.inline.length === 0 && !startsInsideFence) {
       chunk = chunk.slice(startsInsideInline[0]!.length + 1);
