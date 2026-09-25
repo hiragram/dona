@@ -185,7 +185,8 @@ function hasPrivateHttpHost(candidate: string): boolean {
   }
   if (isIP(host) === 6) {
     const first = Number.parseInt(host.split(":")[0] || "0", 16);
-    if (host === "::" || host === "::1" || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00) return true;
+    if (host === "::" || host === "::1" || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
+      (first & 0xffc0) === 0xfec0 || (first & 0xff00) === 0xff00) return true;
     const mapped = host.match(/(?:^|:)ffff:(\d+\.\d+\.\d+\.\d+)$/i);
     if (mapped) return hasPrivateHttpHost(`http://${mapped[1]}/`);
     // Also cover compressed hexadecimal IPv4-mapped addresses.
@@ -235,7 +236,8 @@ function fingerprint(value: string): number {
   return hash;
 }
 function displayProjection(value: string): string {
-  return value.replace(/(?<!\\)[*~`]/g, "")
+  return value.replace(/<https?:\/\/[^|>\s]+\|([^>]+)>/gi, "$1")
+    .replace(/(?<!\\)[*~`]/g, "")
     .replace(/&(?:amp|lt|gt);/g, entity => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[entity]!)
     .normalize("NFC");
 }
