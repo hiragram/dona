@@ -10,7 +10,7 @@
 
 ### Closed grammar v1
 
-UTF-8の正規化後、最大256 byte、ASCII space 1個で区切った次の完全一致だけを受理する。前後空白、連続空白、改行、引用、escape、Unicode類似字、追加引数、未知versionは拒否する。Slackへ登録するcommand名は`/dona`のみで、versionはserver側のcontract `runtime-control.v1`へ固定する。将来versionは明示的な別schemaとrolloutを要する。
+受信したraw UTF-8 bytesを厳密にdecodeし、正規化を行う前にASCII byte以外をすべて拒否する。最大256 byte、ASCII space 1個で区切った次の完全一致だけを受理する。NFKC等による互換文字のASCII変換は行わない。前後空白、連続空白、改行、引用、escape、Unicode類似字、追加引数、未知versionは拒否する。Slackへ登録するcommand名は`/dona`のみで、versionはserver側のcontract `runtime-control.v1`へ固定する。将来versionは明示的な別schemaとrolloutを要する。
 
 | 入力 | typed operation | 効果 |
 |---|---|---|
@@ -22,7 +22,7 @@ UTF-8の正規化後、最大256 byte、ASCII space 1個で区切った次の完
 | `operation <opaque-operation-id>` | `runtime.operation.read.v1` | 受付者のoperation状態を参照する |
 | `cancel <opaque-operation-id>` | `runtime.operation.cancel.v1` | 外部mutation前の取消を要求する |
 
-opaque IDはserver生成の固定長URL-safe tokenであり、syntaxは`[A-Za-z0-9_-]{32,64}`に限定する。ID自体は権限を与えない。任意shell、Git ref、path、URL、environment、process引数、MCP tool名、JSON body、自由文は全operationで受け取らない。`confirm`は実行命令ではなくapproval要求である。
+slashに表示するopaque IDはserver生成の`rc_`と32文字のbase64url tokenであり、syntaxは`rc_[A-Za-z0-9_-]{32}`に限定する。stable control planeはこのIDとoperation kind、principal、tenant、既存Updaterの`plan_<26文字ULID>` / `upd_<26文字ULID>`を永続的に一対一対応付ける。内部IDをslash parserへ直接渡さず、`update confirm`、`operation`、`cancel`は保存済み対応から解決する。対応が失われた場合は拒否し、推測で再生成しない。ID自体は権限を与えない。任意shell、Git ref、path、URL、environment、process引数、MCP tool名、JSON body、自由文は全operationで受け取らない。`confirm`は実行命令ではなくapproval要求である。
 
 ## Identity、authorization、表示
 
@@ -39,11 +39,11 @@ opaque IDはserver生成の固定長URL-safe tokenであり、syntaxは`[A-Za-z0
 
 ## Immutable planと状態
 
-serverだけが`{schema_version, operation_kind, instance_id, workspace_id, requester_principal, target_release_sha_or_current_generation, expected_generation, policy_revision, request_identity, reply_target, expires_at}`をmaterializeし、canonical bytesのSHA-256を保存する。restartはcurrent generationとexact process/service identity、updateは既存`plan_self_update`が選ぶfixed main exact SHA、CI、compatibility、rollback可否、plan hashを含む。表示するplan IDと短い要約からtargetを再生成しない。confirmはplan IDから保存済みsnapshotを取得し、hash、version、principal、instance、workspace、期限、revisionを照合する。承認receiptはこのhashとoperation IDへ束縛し、短いTTL、one-shot consume、replay拒否を適用する。取消、失効、rotation、role変更は未消費planを無効化し、消費後の外部効果を巻き戻したことにはしない。
+serverだけが`{schema_version, operation_kind, instance_id, workspace_id, requester_principal, target_release_sha_or_current_generation, expected_generation, policy_revision, request_identity, reply_target, expires_at}`をmaterializeし、canonical bytesのSHA-256を保存する。restartはcurrent generationとexact process/service identity、updateは既存`plan_self_update`が選ぶfixed main exact SHA、CI、compatibility、rollback可否、plan hashを含む。表示するplan IDと短い要約からtargetを再生成しない。confirmはplan IDから保存済みsnapshotを取得し、hash、version、principal、instance、workspace、期限、revisionを照合する。v1のplan TTLは作成から最長10分、approval decision receipt TTLは発行から最長5分とし、server側policy revisionに値を固定する。保護されたcontrol-plane clockで`now >= expires_at`なら失効とし、Adapterの時計で判定しない。承認receiptはこのhashとoperation IDへ束縛し、one-shot consume、replay拒否を適用する。取消、失効、rotation、role変更は未消費planを無効化し、消費後の外部効果を巻き戻したことにはしない。
 
-状態は`planned → awaiting_approval → approved → accepted → quiescing → activating → healthy → notified`。`rejected`、`cancelled`、`expired`、`known_rejected`、`needs_review`、`rolled_back`も永続terminal/attention状態として区別する。`approved`は実行権ではなく、consumeと再検証に成功して初めて`accepted`となる。`accepted`はactivation成功ではない。健康確認と通知receiptを分離し、read statusはdurable stateから得る。operation ID、request identity、delivery IDにunique制約を設け、duplicate delivery/confirmは同じrecordを返す。競合するrestart/updateはinstance単位の単一active leaseとgeneration CASで拒否し、別operationへ暗黙に乗り換えない。
+状態は`planned → awaiting_approval → approved → accepted → quiescing → activating → healthy → notified`。`rejected`、`cancelled`、`expired`、`failed`、`known_rejected`、`needs_review`、`rolled_back`も永続terminal/attention状態として区別する。Updaterのplanning/preparing/staged/quiescingで既知の失敗は`failed`へ写像し、terminal通知へ進めてactive leaseを解放する。外部writeの受理が不明なら`failed`へ落とさず`needs_review`を保持する。`approved`は実行権ではなく、consumeと再検証に成功して初めて`accepted`となる。`accepted`はactivation成功ではない。健康確認と通知receiptを分離し、read statusはdurable stateから得る。operation ID、request identity、delivery IDにunique制約を設け、duplicate delivery/confirmは同じrecordを返す。競合するrestart/updateはinstance単位の単一active leaseとgeneration CASで拒否し、別operationへ暗黙に乗り換えない。
 
-ACK前に受付を永続化できない場合は一時失敗を返し、成功ACKを偽らない。3秒内に結果が未確定なら「受付照合中」とopaque request IDだけを返す。ACK後の実行はdurable queue/outboxから再開する。受付応答喪失時は同じrequest identityの永続recordをread-only照合し、不明なら再実行せず`needs_review`へ送る。通知は保存済み本人destinationへboundedな定型文で行い、post応答喪失時は保存済みnotification IDとSlack上のexact receiptを照合する。照合不能なら再投稿しない。
+ACK前に受付を永続化できない場合は一時失敗を返し、成功ACKを偽らない。3秒内に結果が未確定なら「受付照合中」とopaque request IDだけを返す。ACK後の実行はdurable queue/outboxから再開する。slash confirmには通常messageとは別のstrict `source: slack_runtime_control` eventを永続化し、server由来のverified principal、固定reply target、operation ID、plan hashだけを保持する。既存`source: slack`専用self-update APIを直接呼ばず、専用typed bridgeで同等のevent terminal barrierとUpdaterの`approval_event_id`を結ぶ。承認受付eventのResult Envelopeをatomic公開・再読してterminal化するまでUpdaterはactivationをclaimしない。barrierの照合が不明なら`needs_review`とし、approvalを再消費しない。受付応答喪失時は同じrequest identityの永続recordをread-only照合し、不明なら再実行せず`needs_review`へ送る。通知は保存済み本人destinationへboundedな定型文で行い、post応答喪失時は保存済みnotification IDとSlack上のexact receiptを照合する。照合不能なら再投稿しない。
 
 ## Quiesceとrecovery
 
@@ -70,4 +70,4 @@ stop/start応答喪失、process crash、identity drift、health failureでは�
 
 #26は共通approval primitive、decision proof、consume/auditを所有する。#231はexact SHA self-update、stable updater、activation/rollback、terminal通知を所有する。Epic #259はslash ingress、closed parser、runtime restart plan/controller、typed接続とE2E gateを所有する。feature branchのapproval成果をcurrent mainへ統合済みと仮定しない。
 
-機能は既定off。まずfake transportと全fixture、crash/restart、duplicate、timing、permission driftを決定的に検証する。次にisolated instanceだけで3秒ACK、quiesce、healthy/rollback、通知照合をlive smokeする。Slack App manifestのcommand登録、必要最小scope、workspace再install、運用/incident/retention runbook、auditとredactionを確認する。production enablement、App設定変更、restart/updateはそれぞれ別の明示承認を要し、段階的にtenant allowlistで有効化する。break-glassではfeature flagをoffにし、未解決operationを保存したままoperatorがreconcileする。監査metadataは最小化し、未解決fence/receiptは解決まで保持する。
+機能は既定off。まずfake transportと全fixture、crash/restart、duplicate、timing、permission driftを決定的に検証する。次にisolated instanceだけで3秒ACK、quiesce、healthy/rollback、通知照合をlive smokeする。Slack App manifestのcommand登録、必要最小scope、workspace再install、運用/incident/retention runbook、auditとredactionを確認する。production enablement、App設定変更、restart/updateはそれぞれ別の明示承認を要し、段階的にtenant allowlistで有効化する。break-glassではfeature flagをoffにし、未解決operationを保存したままoperatorがreconcileする。監査metadataは最小化し、未解決fence/receiptは解決まで保持する。terminal後は本文・destinationを30日以内に消去し、request/delivery identityのhash、operation kind、最終decisionだけのtombstoneを90日保持する。Slack retryの最大許容期間を90日以内に制限し、期間外の署名済みdeliveryも時刻で拒否する。未解決fenceは解決まで消去せず、tombstone purge後の古いdeliveryが再実行にならないよう保護されたclockとdelivery時刻を照合する。
