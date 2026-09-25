@@ -101,7 +101,7 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
     const startsInsideInline = [...state.inline];
     if (mrkdwn) advanceMrkdwnState(rawChunk, state);
     const inlinePrefix = startsInsideInline.join("");
-    const inlineSuffix = [...state.inline].reverse().join("");
+    const inlineSuffix = index < chunks.length - 1 ? [...state.inline].reverse().join("") : "";
     const chunk = mrkdwn
       ? `${startsInsideFence ? "```\n" : ""}${inlinePrefix}${rawChunk}${inlineSuffix}${state.fence ? "\n```" : ""}`
       : rawChunk;

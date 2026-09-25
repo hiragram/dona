@@ -31,3 +31,11 @@ test("long inline code and emphasis remain balanced across sections", () => {
     }
   }
 });
+
+test("a final section preserves unmatched inline markers", () => {
+  for (const value of ["job_idを確認", "*確認", "`未完了"]) {
+    const blocks = expandedSections(value, "identity", true);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0]?.text.text, value);
+  }
+});
