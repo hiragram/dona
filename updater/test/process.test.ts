@@ -197,7 +197,7 @@ test("Dispatcher test hang records bounded process observations before and after
   assert.ok(observations.some((record) => record.includes("phase=checkpoint_25") && record.includes("test/api.test.ts:012345abcdef#1")));
   assert.ok(observations.some((record) => record.includes("phase=timeout") && record.includes("process_tree=observed")));
   assert.ok(observations.some((record) => record.includes("phase=cleanup")));
-  assert.ok(observations.every((record) => !record.includes("setInterval") && record.length < 6000));
+  assert.ok(observations.every((record) => !record.includes("setInterval") && record.length <= 501));
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -217,6 +217,27 @@ test("successful Dispatcher test does not persist a diagnostic capture", async (
   assert.equal(failed, false);
   assert.ok(records.some((record) => record.includes("phase=exit")));
   assert.equal(result.diagnostic_log, undefined);
+});
+
+test("process observation includes an orphan in the command process group", async () => {
+  const records: string[] = [];
+  const store = { start: (identity: { step: string }) => ({
+    write: (_stream: string, chunk: Buffer) => {
+      if (identity.step === "dispatcher:npm-test-observation") records.push(chunk.toString("utf8"));
+    },
+    finish: () => undefined,
+  }) } as unknown as DiagnosticLogStore;
+  const result = await new ProcessRunner().run(process.execPath, ["-e", `
+    const { spawn } = require('node:child_process');
+    spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] }).unref();
+  `], {
+    timeoutMs: 1_000,
+    outputLimitBytes: 1024,
+    diagnostic: { store, identity: { request_id: "upd_01m1es03xy5cf8d9pm5cwx4srv", attempt: 1, step: "dispatcher:npm-test" } },
+  });
+  assert.equal(result.timed_out, true);
+  assert.ok(records.some((record) => /phase=timeout.*process_tree=observed total=[1-9]/.test(record)), records.join("\n"));
+  assert.ok(records.some((record) => /phase=timeout.*pgid=/.test(record)));
 });
 
 test("ProcessCheckpointTracker keeps the exact remaining concurrent case identity", () => {

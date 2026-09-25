@@ -68,22 +68,23 @@ export class ProcessRunner {
       const startedAt = Date.now();
       const observations: NodeJS.Timeout[] = [];
       const pendingObservations = new Set<Promise<void>>();
-      const sample = (phase: string): void => {
-        if (!observe) return;
+      const sample = (phase: string): Promise<void> => {
+        if (!observe) return Promise.resolve();
         const elapsed = Date.now() - startedAt;
         const checkpoint = checkpoints.checkpoint() ?? "none";
         const pid = child.pid;
         const task = observeProcessTree(pid).then((tree) => {
-          const record = `[preflight-observation] phase=${phase} elapsed_ms=${elapsed} root_pid=${pid ?? "unknown"} checkpoint=${checkpoint} ${tree}\n`;
+          const record = `[preflight-observation] phase=${phase} elapsed_ms=${elapsed} root_pid=${pid ?? "unknown"} checkpoint=${checkpoint.slice(0, 160)} ${tree}`.slice(0, 500) + "\n";
           try { observationLog?.write("stderr", Buffer.from(record)); } catch { /* diagnostic only */ }
         }).catch(() => {});
         pendingObservations.add(task);
         void task.finally(() => pendingObservations.delete(task));
+        return task;
       };
       if (observe) {
-        sample("start");
+        void sample("start");
         for (const fraction of [0.25, 0.75]) {
-          const observation = setTimeout(() => sample(`checkpoint_${Math.round(fraction * 100)}`), Math.max(1, Math.floor(options.timeoutMs * fraction)));
+          const observation = setTimeout(() => { void sample(`checkpoint_${Math.round(fraction * 100)}`); }, Math.max(1, Math.floor(options.timeoutMs * fraction)));
           observation.unref();
           observations.push(observation);
         }
@@ -132,7 +133,7 @@ export class ProcessRunner {
       const finish = async (): Promise<void> => {
         if (closedCode === undefined || settled) return;
         for (const observation of observations) clearTimeout(observation);
-        sample(timedOut ? "cleanup" : "exit");
+        void sample(timedOut ? "cleanup" : "exit");
         settled = true;
         const outputCheckpoint = checkpoints.checkpoint();
         const cleanupStatus = timedOut || readinessFailed
@@ -186,12 +187,15 @@ export class ProcessRunner {
         poll();
       };
       let timer: NodeJS.Timeout | undefined;
-      const terminate = (reason: "timeout" | "readiness_failed"): void => {
+      let samplingTimeout = false;
+      const terminate = async (reason: "timeout" | "readiness_failed"): Promise<void> => {
         if (settled || timedOut || readinessFailed) return;
         if (reason === "timeout") {
           timedOut = true;
           checkpoints.freezeTimeout();
-          sample("timeout");
+          samplingTimeout = true;
+          await sample("timeout");
+          samplingTimeout = false;
         } else {
           readinessFailed = true;
         }
@@ -202,7 +206,7 @@ export class ProcessRunner {
           finishAfterGroupCleanup();
         }, 1_000);
       };
-      const timeOut = (): void => terminate("timeout");
+      const timeOut = (): void => { void terminate("timeout"); };
       const armCommandTimeout = (timeoutMs: number): void => {
         if (settled || timedOut || readinessFailed) return;
         if (timer) clearTimeout(timer);
@@ -215,7 +219,7 @@ export class ProcessRunner {
         void options.timeoutStartAfter.then(() => {
           const remainingMs = Math.max(0, options.timeoutMs - (Date.now() - timeoutStartedAt));
           armCommandTimeout(Math.min(options.timeoutAfterReadyMs!, remainingMs));
-        }, () => terminate("readiness_failed"));
+        }, () => { void terminate("readiness_failed"); });
       }
       child.once("error", (error) => {
         if (timer) clearTimeout(timer);
@@ -239,7 +243,7 @@ export class ProcessRunner {
         if (timer) clearTimeout(timer);
         closedCode = code;
         exitSignal = signal;
-        if (!hardKillTimer && !cleanupPollTimer) void finish();
+        if (!hardKillTimer && !cleanupPollTimer && !samplingTimeout) void finish();
       });
     });
   }
