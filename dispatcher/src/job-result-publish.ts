@@ -206,7 +206,8 @@ function hasPrivateHttpHost(candidate: string): boolean {
     const mapped = host.match(/(?:^|:)ffff:(\d+\.\d+\.\d+\.\d+)$/i);
     if (mapped) return hasPrivateHttpHost(`http://${mapped[1]}/`);
     // Also cover compressed hexadecimal IPv4-mapped addresses.
-    const hexMapped = host.match(/(?:^|:)ffff:(?:0:)?([a-f0-9]{1,4}):([a-f0-9]{1,4})$/i);
+    const hexMapped = host.match(/(?:^|:)ffff:(?:0:)?([a-f0-9]{1,4}):([a-f0-9]{1,4})$/i) ??
+      host.match(/^::([a-f0-9]{1,4}):([a-f0-9]{1,4})$/i);
     if (hexMapped) {
       const bits = (Number.parseInt(hexMapped[1]!, 16) << 16) | Number.parseInt(hexMapped[2]!, 16);
       return hasPrivateHttpHost(`http://${[(bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255].join(".")}/`);
@@ -340,11 +341,13 @@ class ForbiddenValueMatcher {
 
 function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher): boolean {
   const decoder = new TextDecoder("utf-8", { fatal: true });
+  let candidates = 0;
   for (const match of value.matchAll(/[A-Za-z0-9+/_-]{8,}={0,2}/g)) {
     const encoded = match[0];
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
     if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
+    if (++candidates > 1_024) return true;
     try { if (matcher.contains(decoder.decode(bytes))) return true; }
     catch { /* Non-UTF-8 data is not worker-visible text. */ }
   }
