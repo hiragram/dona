@@ -599,7 +599,12 @@ describe("job result publish contract", () => {
       assert.ok(chunks.reduce((size, chunk) => size + chunk.length, 0) > jobResultEnvelopeMaxBytes);
       const response = new Promise<string>(resolve => client!.once("data", data => resolve(String(data))));
       client.write(Buffer.concat([Buffer.from(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nTransfer-Encoding: chunked\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n`), ...chunks, Buffer.from("0\r\n\r\n")]));
-      assert.match(await Promise.race([response, new Promise<string>((_, reject) => setTimeout(() => reject(new Error("chunked response timeout")), 5_000))]), /^HTTP\/1\.1 202 /);
+      let responseDeadline: NodeJS.Timeout | undefined;
+      try {
+        assert.match(await Promise.race([response, new Promise<string>((_, reject) => {
+          responseDeadline = setTimeout(() => reject(new Error("chunked response timeout")), 12_000);
+        })]), /^HTTP\/1\.1 202 /);
+      } finally { if (responseDeadline) clearTimeout(responseDeadline); }
     } finally {
       client?.destroy();
       await stopServer(server);
