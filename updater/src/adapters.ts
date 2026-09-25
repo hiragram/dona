@@ -521,7 +521,7 @@ export class RealRuntime implements RuntimePort {
           .get() as { count: number }).count;
         if (legacyTable) active += (database.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
           JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
-            AND j.status NOT IN ('completed','failed','cancelled')
+            AND COALESCE(j.steer_state,'') <> 'dispatching'
             AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
             AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
               (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)

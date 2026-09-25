@@ -898,6 +898,8 @@ export class UpdateController {
         }
         const slackHealth = await this.runtime.slackHealth();
         this.assertLease(row);
+        const targetSlackStoppedForRollback =
+          this.database.runtimeOperation(row.request_id, "stop_target_slack")?.phase === "observed";
         // A stopped Dispatcher cannot report a drain snapshot, while its
         // external Herdr workers may still be running. Read durable job state
         // before any rollback quiesce, service stop, or pointer mutation.
@@ -932,7 +934,8 @@ export class UpdateController {
           const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
           this.assertLease(row);
           if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-            await this.restoreTargetAfterDrain(row, "rollback_dispatcher_drain_incomplete", true, slackHealth.live);
+            await this.restoreTargetAfterDrain(row, "rollback_dispatcher_drain_incomplete", true,
+              slackHealth.live || targetSlackStoppedForRollback);
             return;
           }
         }
@@ -1675,7 +1678,8 @@ export class UpdateController {
         return;
       }
       this.assertLease(row);
-      if (!manifest || schema.user_version !== manifest.compatibility.app_schema_write ||
+      if (!manifest || schema.user_version < manifest.compatibility.app_schema_read_min ||
+          schema.user_version > manifest.compatibility.app_schema_read_max ||
           !schema.integrity_ok || schema.foreign_key_violations !== 0) {
         this.needsReview(row, "quiesce_recovery_schema_incompatible");
         return;

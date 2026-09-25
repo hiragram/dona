@@ -175,7 +175,7 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
   dispatcherDatabase.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
   dispatcherDatabase.exec("ALTER TABLE jobs ADD COLUMN job_id TEXT");
   dispatcherDatabase.prepare("INSERT INTO jobs (status,job_id) VALUES ('completed','old-terminal')").run();
-  dispatcherDatabase.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('old-terminal',NULL)").run();
+  dispatcherDatabase.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('old-terminal','2026-09-25T00:00:00Z')").run();
   dispatcherDatabase.close();
   await fs.chmod(dispatcherDatabasePath, 0o600);
   const requests: unknown[] = [];
@@ -235,6 +235,28 @@ test("RealRuntime refuses a legacy drained response while a durable worker remai
     await new Promise<void>((resolve) => dispatcher.close(() => resolve()));
     await removeTree(root);
   }
+});
+
+test("RealRuntime counts terminal legacy agents until durable stop", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  database.prepare("INSERT INTO jobs (job_id,status) VALUES ('legacy-terminal','failed')").run();
+  database.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('legacy-terminal',NULL)").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at='2026-09-25T00:00:00Z'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+  } finally { await removeTree(root); }
 });
 
 test("RealRuntime distinguishes unresolved steer from definite retryable agent absence", async () => {
