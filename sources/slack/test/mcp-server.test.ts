@@ -34,6 +34,7 @@ class MemoryKeychain implements KeychainStore {
 }
 
 class FakeSlackClient implements SlackApiClient {
+  channelLookups = 0;
   readonly posts: Array<{
     channelId: string;
     text: string;
@@ -68,6 +69,7 @@ class FakeSlackClient implements SlackApiClient {
     };
   }
   async getChannel(channelId: string): Promise<SlackChannel> {
+    this.channelLookups += 1;
     return {
       id: channelId,
       name: "general",
@@ -308,6 +310,14 @@ describe("Dona Slack MCP server", () => {
         workspace: "company", channel_id: "D123", text: "dm", thread_ts: "1.2",
       } });
       assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      const lookupsBeforeExplicitFalse = fake.channelLookups;
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GMPIM", text: "quiet", thread_ts: "1.2",
+        reply_broadcast: false,
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+      assert.equal(fake.channelLookups, lookupsBeforeExplicitFalse);
 
       await client.callTool({ name: "post_message", arguments: {
         workspace: "company", channel_id: "GPRIVATE", text: "private", thread_ts: "1.2",

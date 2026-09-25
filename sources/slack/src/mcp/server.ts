@@ -506,7 +506,7 @@ export function createSlackMcpServer(
     async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse, event_id }) => {
       try {
         const connection = registry.get(workspace);
-        const channel = thread_ts && channel_id.startsWith("G") && !event_id
+        const channel = thread_ts && channel_id.startsWith("G") && !event_id && reply_broadcast !== false
           ? await connection.client.getChannel(channel_id) : undefined;
         const isChannel = channel_id.startsWith("C") || (channel?.isPrivate === true && channel.isMpim !== true && channel.isIm !== true);
         const effectiveReplyBroadcast = Boolean(thread_ts) && !event_id && isChannel && (reply_broadcast ?? true);
