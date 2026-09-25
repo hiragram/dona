@@ -1018,6 +1018,40 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
+  test("restores stopped target Slack when resumed rollback finds a worker", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-resumed-rollback-worker" });
+    const requestId = planned.request_id as string;
+    let row = f.database.claim(requestId, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    const staging = await f.store.prepareStaging(requestId, row.fence);
+    await fs.writeFile(path.join(staging, "app.js"), "export {};\n", { mode: 0o600 });
+    const release = await f.store.publish(staging, manifest(targetSha));
+    row = f.database.transition(requestId, row.fence, "staged", "release_staged");
+    row = f.database.transition(requestId, row.fence, "quiescing", "runtime_quiesce_started");
+    row = f.database.transition(requestId, row.fence, "activating", "runtime_quiesced");
+    const activation = await f.store.activate(row, release);
+    f.database.recordActivationGeneration(requestId, row.fence, activation.generation);
+    row = f.database.transition(requestId, row.fence, "restarting", "pointer_activated",
+      { activation_generation: activation.generation });
+    row = f.database.transition(requestId, row.fence, "rolling_back", "rollback_started");
+    f.database.prepareRuntimeOperation(requestId, row.fence, "stop_target_slack", "slack_adapter", null, null);
+    f.database.recordRuntimeOperation(requestId, row.fence, "stop_target_slack", "observed", null, {});
+    f.runtime.mainAgentSha = targetSha;
+    await f.runtime.stopSlack();
+    f.runtime.activeWorkerCount = 1;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(requestId)?.last_error_code, "rollback_active_worker_handoff_unavailable");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
+    assert.equal(f.database.runtimeOperation(requestId, "restart_target_slack_after_drain")?.phase, "observed");
+    assert.equal(f.runtime.calls.at(-1), "startSlack");
+    f.database.close();
+  });
+
   test("restores target supervision when a worker appears after rollback service stop", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

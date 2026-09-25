@@ -1740,6 +1740,23 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("a result after an accepted steer preserves the unresolved worker", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-result-after-steer")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "操舵後Result",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='running',steer_state='accepted' WHERE job_id=?").run(job.job_id);
+    raw.close();
+    database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id,
+      status: "completed", summary: "完了", output: { format: "markdown", text: "完了" },
+      completed_at: new Date().toISOString() }, job.result_path);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "terminal_steer_worker_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    database.close();
+  });
+
   test("a result raced with cancellation stays unsafe until the worker exit is observed", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);

@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
+import Database from "better-sqlite3";
 
 import { DispatcherDatabase } from "../src/database.js";
 import type { DispatcherConfig } from "../src/config.js";
@@ -1765,6 +1766,23 @@ describe("JobSupervisor", () => {
     await (supervisor as unknown as {stopLegacySharedGrantAgents():Promise<void>}).stopLegacySharedGrantAgents();
     assert.deepEqual(calls,["cancel","close","get"]); assert.equal(marked,true);
     database.close();
+  });
+  test("terminal jobのworker停止を読み取りで確認して安全markerを解除する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-stop-proof");
+    const raw=new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',last_error_code='terminal_steer_worker_unverified' WHERE job_id=?")
+      .run(job.job_id);
+    raw.close();
+    let reads=0;
+    const runtime=fakeRuntime({async get(){reads+=1;return ok(reads===1?"working":"idle");}});
+    const supervisor=new JobSupervisor(database,runtime,{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();
+    await waitFor(()=>database.getJob(job.job_id)?.last_error_code===null);
+    assert.ok(reads>=2);
+    assert.equal(database.updateSafetyStatus().active_worker_count,0);
+    await supervisor.stop();database.close();
   });
   test("discovers cleanup candidates from progress directories instead of cancelled history", async () => {
     const { root, config } = await tempConfig();

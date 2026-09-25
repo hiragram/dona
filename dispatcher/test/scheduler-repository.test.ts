@@ -379,6 +379,20 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   repo.update("review_work",1,{...input,action:"work.read_only",content:objective,authorization_id:"renewed",authorization_revision:2},"2026-09-08T00:01:00Z",actor,due);
 });
 
+test("identity未保存のstale schedule jobはreconcile後もworker不明を保持する", () => {
+  const {repo,dispatcher,raw}=setup(),objective="未確認の準備";
+  repo.create("stale_work",{...input,action:"work.read_only",content:objective},due,actor,now);
+  const run=repo.materialize("stale_work",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective,
+    workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));
+  dispatcher.markJobNeedsReview(job.job_id,"stale_preparing_agent_unverified","agent identity is unknown");
+  dispatcher.enqueueJobNotification(job.job_id,new Date(due));
+  dispatcher.reconcileScheduledRun(run.run_id,"failed",new Date(due));
+  assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,"schedule_reconcile_worker_unverified");
+  assert.equal(dispatcher.updateSafetyStatus().active_worker_count,1);
+});
+
 test("workspace cleanup失敗のscheduled jobを再cleanup対象に保持する", () => {
   const {repo,dispatcher,raw}=setup(),objective="cleanup再試行";
   repo.create("cleanup_retry",{...input,action:"work.read_only",target:{kind:"none"},content:objective},due,actor,now);

@@ -907,7 +907,13 @@ export class UpdateController {
         const workerSafety = await this.runtime.workerSafety();
         this.assertLease(row);
         if (!workerSafety.safe) {
-          this.needsReview(row, workerSafety.error_code ?? "rollback_active_worker_handoff_unavailable");
+          const [dispatcherRecoveryHealth, slackRecoveryHealth] = await Promise.all([
+            this.runtime.dispatcherHealth(), this.runtime.slackHealth(),
+          ]);
+          this.assertLease(row);
+          await this.restoreTargetAfterDrain(row,
+            workerSafety.error_code ?? "rollback_active_worker_handoff_unavailable",
+            !dispatcherRecoveryHealth.live, !slackRecoveryHealth.live);
           return;
         }
         // KeepAlive may have restarted Dispatcher after the first observation.
