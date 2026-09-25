@@ -36,6 +36,7 @@ export class JobResultPublishError extends Error {
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
 const sensitive = /(?:(?:^|\s)(?:-u\s*|--user(?:=|\s+))[^:\s]+:[^\s]+|\bmachine\s+[^\s]+\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const pgpassCredential = /(?:^|\s)[^\s:]{1,255}:(?:\d{1,5}|\*):[^\s:]{1,255}:[^\s:]{1,255}:[^\s:]{1,255}(?=$|\s)/;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
@@ -196,6 +197,7 @@ function hasPrivateHttpHost(candidate: string): boolean {
     const first = Number.parseInt(host.split(":")[0] || "0", 16);
     if (host === "::" || host === "::1" || first === 0x100 || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
       (first & 0xffc0) === 0xfec0 || (first & 0xff00) === 0xff00) return true;
+    if (first === 0x2001 && (Number.parseInt(host.split(":")[1] || "0", 16) & 0xfff0) === 0x20) return true;
     if (first === 0x2001 && Number.parseInt(host.split(":")[1] || "0", 16) === 2 &&
       Number.parseInt(host.split(":")[2] || "0", 16) === 0) return true;
     if (first === 0x2001 && Number.parseInt(host.split(":")[1] || "0", 16) === 0x0db8) return true;
@@ -350,7 +352,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     for (const match of value.matchAll(rootRelativeUrlCandidate)) {
       const route = match[0].trimStart();
       if (route.includes("?") || route.includes("#")) {
-        if (hasForbiddenUrlParameters(new URL(route, "https://example.com"), forbiddenValues)) throw new JobResultPublishError("content_requires_redaction");
+        if (hasSignedQueryKey(route) || hasForbiddenUrlParameters(new URL(route, "https://example.com"), forbiddenValues)) throw new JobResultPublishError("content_requires_redaction");
       }
     }
     for (const match of value.matchAll(privateHostPathCandidate)) {
@@ -404,7 +406,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
     }
-    if (sensitive.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
