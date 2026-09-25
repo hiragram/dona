@@ -60,7 +60,7 @@ function angleTokenClose(text: string, open: number): number {
   if (close === -1 || (newline !== -1 && newline < close)) return -1;
   const content = text.slice(open + 1, close);
   const target = content.split("|", 1)[0] ?? "";
-  return /^(?:(?:https?:\/\/|mailto:)[^\s<>]+|[@#!][^\s<>]+)$/i.test(target) ? close : -1;
+  return /^(?:(?:https?:\/\/|mailto:)[^\s<>]+|@[UW][A-Z0-9]+|#[CGD][A-Z0-9]+|!(?:channel|here|everyone|subteam\^S[A-Z0-9]+))$/i.test(target) ? close : -1;
 }
 
 function isSlackAngleToken(value: string): boolean {
@@ -400,6 +400,14 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     }
     if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
       const grapheme = rawChunk.slice(0, -closingMarkers.length);
+      if (grapheme.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(grapheme)].length === 1) {
+        chunk = grapheme;
+        plainFallback = true;
+      }
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length > 0) {
+      const consumedClosing = [...startsInsideInline].reverse().slice(0, startsInsideInline.length - state.inline.length).join("");
+      const grapheme = consumedClosing && rawChunk.endsWith(consumedClosing) ? rawChunk.slice(0, -consumedClosing.length) : rawChunk;
       if (grapheme.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(grapheme)].length === 1) {
         chunk = grapheme;
         plainFallback = true;

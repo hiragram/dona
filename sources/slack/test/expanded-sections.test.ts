@@ -528,3 +528,15 @@ test("removing a final inline closer preserves the quote prefix", () => {
     assert.ok(blocks.every((block) => block.text.text !== quote));
   }
 });
+
+test("a maximum-length grapheme inside nested markers falls back to plain text", () => {
+  const grapheme = `a${"\u0301".repeat(2_998)}`;
+  const blocks = expandedSections(`*_${grapheme}_*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === grapheme));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});
+
+test("an invalid user mention is not protected as a Slack token", () => {
+  const blocks = expandedSections(`*bold ${"x".repeat(7_000)}<@not-a-user*>`, "identity", true);
+  assert.ok(blocks.slice(1).some((block) => block.text.text.startsWith("*")));
+});
