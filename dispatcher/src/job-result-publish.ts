@@ -181,7 +181,7 @@ function hasPrivateHttpHost(candidate: string): boolean {
       (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
       (a === 100 && b >= 64 && b <= 127) || (a === 192 && b === 0 && (c === 0 || c === 2)) ||
       (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
-      (a === 203 && b === 0 && c === 113);
+      (a === 192 && b === 88 && c === 99) || (a === 203 && b === 0 && c === 113);
   }
   if (isIP(host) === 6) {
     const first = Number.parseInt(host.split(":")[0] || "0", 16);
@@ -218,7 +218,9 @@ function hasSignedQueryKey(candidate: string): boolean {
 }
 function hasForbiddenUrlParameters(url: URL, forbiddenValues?: ForbiddenValueMatcher): boolean {
   for (const parameters of [url.searchParams, new URLSearchParams(url.hash.slice(1))]) {
-    for (const [, parameterValue] of parameters) if (forbiddenValues?.contains(parameterValue)) return true;
+    for (const [parameterKey, parameterValue] of parameters) {
+      if (forbiddenValues?.contains(parameterKey) || forbiddenValues?.contains(parameterValue)) return true;
+    }
   }
   return false;
 }
@@ -240,6 +242,7 @@ function displayProjection(value: string): string {
   return value.replace(/<[A-Za-z][A-Za-z0-9+.-]*:[^|>\s]+\|([^>]+)>/g, "$1")
     .replace(/(?<![A-Za-z0-9])_([^_\r\n]+)_(?![A-Za-z0-9])/g, "$1")
     .replace(/(?<!\\)[*~`]/g, "")
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
     .replace(/&(?:amp|lt|gt);/g, entity => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[entity]!)
     .normalize("NFC");
 }
@@ -272,7 +275,7 @@ function forbiddenKey(key: string): boolean {
     normalized.startsWith("herdr_");
 }
 function normalizedStructuredKey(key: string): string {
-  let normalized = key.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
+  let normalized = key.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
   for (let depth = 0; depth < 8; depth++) {
     const decoded = normalized.replace(/\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g, escaped => {
       if (escaped[1] === "u") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
@@ -282,7 +285,7 @@ function normalizedStructuredKey(key: string): string {
     if (/%[0-9A-Fa-f]{2}/.test(next)) {
       try { next = decodeURIComponent(next); } catch { /* Invalid encodings remain literal. */ }
     }
-    next = next.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
+    next = next.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
     if (next === normalized) break;
     normalized = next;
   }
@@ -356,9 +359,9 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints) ||
         containsForbiddenCapability(displayProjection(value), forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
     }
-    if (/[\p{Cc}\p{Cf}]/u.test(value)) {
+    if (/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/u.test(value)) {
       if (value.includes("\u001b]")) throw new JobResultPublishError("content_requires_redaction");
-      const stripped = value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
+      const stripped = value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
       if (stripped !== value) assertSafeJson(stripped, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
     }
     const jsonEscape = /\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g;
@@ -443,7 +446,7 @@ const jsonValue: z.ZodType<unknown> = z.json();
 const requestSchema = z.object({
   schema_version: z.literal(1),
   status: z.enum(["completed", "failed"]),
-  summary: z.string().min(1).refine(value => value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "").trim().length > 0),
+  summary: z.string().min(1).refine(value => displayProjection(value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "")).trim().length > 0),
   output: z.object({ format: z.enum(["markdown", "text"]), text: z.string() }).strict().optional(),
   artifacts: z.array(z.record(z.string(), jsonValue)).optional(),
   actions: z.array(jsonValue).optional(),
