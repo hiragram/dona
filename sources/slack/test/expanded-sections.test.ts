@@ -437,3 +437,23 @@ test("an underscore inside an emoji alias does not create emphasis", () => {
   const blocks = expandedSections(`:foo-_bar:${"x".repeat(7_000)}_`, "identity", true);
   assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("_")));
 });
+
+test("three escapes and one long grapheme fit in a plain section", () => {
+  const grapheme = `a${"\u0301".repeat(2_996)}`;
+  const escaped = `\\\\\\${grapheme}`;
+  const blocks = expandedSections(`*prefix\n${escaped}tail*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === escaped));
+});
+
+test("a long comparison expression keeps its emphasis", () => {
+  const blocks = expandedSections(`*prefix\n< threshold ${"x".repeat(2_985)} >tail*`, "identity", true);
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+  assert.ok(blocks.slice(1).some((block) => block.text.text.startsWith("*")));
+});
+
+test("a Slack link label with spaces and a marker remains a token", () => {
+  const token = "<https://example.com|PR *draft version>";
+  const blocks = expandedSections(`${token}${"x".repeat(7_000)}*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(token)));
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("*")));
+});

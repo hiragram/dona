@@ -59,7 +59,17 @@ function angleTokenClose(text: string, open: number): number {
   const newline = text.indexOf("\n", open + 1);
   if (close === -1 || (newline !== -1 && newline < close)) return -1;
   const content = text.slice(open + 1, close);
-  return /^(?:https?:\/\/|mailto:|[@#!])\S+$/i.test(content) ? close : -1;
+  const target = content.split("|", 1)[0] ?? "";
+  return /^(?:(?:https?:\/\/|mailto:)[^\s<>]+|[@#!][^\s<>]+)$/i.test(target) ? close : -1;
+}
+
+function isSlackAngleToken(value: string): boolean {
+  return value.startsWith("<") && angleTokenClose(value, 0) === value.length - 1;
+}
+
+function isEscapedSlackAngleToken(value: string): boolean {
+  const slashRun = /^(\\+)/.exec(value)?.[1] ?? "";
+  return slashRun.length % 2 === 1 && isSlackAngleToken(value.slice(slashRun.length));
 }
 
 function fenceOpenAt(text: string, end: number): boolean {
@@ -228,7 +238,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
         const lastOpenToken = prefix.lastIndexOf("<");
         const lastCloseToken = prefix.lastIndexOf(">");
         if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken) && !inlineCodeOpenAt(text, offset + lastOpenToken, candidates)) {
-          const close = text.indexOf(">", offset + lastOpenToken + 1);
+          const close = angleTokenClose(text, offset + lastOpenToken);
           if (close !== -1 && isEscaped(text, offset + lastOpenToken) && close + 1 - offset <= 3_000) end = close + 1;
           else if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
           else if (close !== -1 && close + 1 - offset <= 3_000) end = close + 1;
@@ -334,14 +344,13 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       chunk = chunk.slice(startsInsideInline[0]!.length + 1);
     }
     let plainFallback = false;
-    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && isSlackAngleToken(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
     const closingMarkers = [...startsInsideInline].reverse().join("");
     if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
       const token = rawChunk.slice(0, -closingMarkers.length);
-      const escapedToken = /^(\\+)<[^>]+>$/.exec(token);
-      if ((/^<[^>]+>$/.test(token) || /^:[a-z0-9_+-]+:$/i.test(token) || (escapedToken && escapedToken[1]!.length % 2 === 1)) && token.length <= 3_000) {
+      if ((isSlackAngleToken(token) || /^:[a-z0-9_+-]+:$/i.test(token) || isEscapedSlackAngleToken(token)) && token.length <= 3_000) {
         chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
       }
     }
@@ -350,8 +359,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       const closing = [...opening].reverse().join("");
       if (opening && rawChunk.endsWith(closing)) {
         const token = rawChunk.slice(opening.length, -closing.length);
-        const escapedToken = /^(\\+)<[^>]+>$/.exec(token);
-        if ((/^<[^>]+>$/.test(token) || /^:[a-z0-9_+-]+:$/i.test(token) || (escapedToken && escapedToken[1]!.length % 2 === 1)) && token.length <= 3_000) {
+        if ((isSlackAngleToken(token) || /^:[a-z0-9_+-]+:$/i.test(token) || isEscapedSlackAngleToken(token)) && token.length <= 3_000) {
           chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
         }
       }
@@ -362,8 +370,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       const consumedClosing = closing.slice(0, -state.inline.length);
       if (opening && consumedClosing && rawChunk.endsWith(consumedClosing)) {
         const token = rawChunk.slice(opening.length, -consumedClosing.length);
-        const escapedToken = /^(\\+)<[^>]+>$/.exec(token);
-        if ((/^<[^>]+>$/.test(token) || /^:[a-z0-9_+-]+:$/i.test(token) || (escapedToken && escapedToken[1]!.length % 2 === 1)) && token.length <= 3_000) {
+        if ((isSlackAngleToken(token) || /^:[a-z0-9_+-]+:$/i.test(token) || isEscapedSlackAngleToken(token)) && token.length <= 3_000) {
           chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
         }
       }
@@ -379,7 +386,8 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       chunk = rawChunk;
       plainFallback = true;
     }
-    if (chunk.length > 3_000 && rawChunk.startsWith("\\") && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk.slice(1))].length === 1) {
+    const graphemeSlashRun = /^(\\+)/.exec(rawChunk)?.[1] ?? "";
+    if (chunk.length > 3_000 && graphemeSlashRun.length % 2 === 1 && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk.slice(graphemeSlashRun.length))].length === 1) {
       chunk = rawChunk;
       plainFallback = true;
     }
