@@ -183,13 +183,15 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     offset = end;
   }
   const state: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
+  const multiQuoteStart = text.startsWith(">>>") ? 0 : text.indexOf("\n>>>") >= 0 ? text.indexOf("\n>>>") + 1 : -1;
   let rawOffset = 0;
   const blocks = chunks.map((rawChunk, index) => {
     const startsInsideFence = state.fence;
     const startsInsideInline = [...state.inline];
     const lineStart = text.lastIndexOf("\n", rawOffset - 1) + 1;
     const continuesQuote = rawOffset > lineStart && text[lineStart] === ">";
-    let rendered = startsInsideFence ? "```\n" : `${continuesQuote ? ">" : ""}${startsInsideInline.join("")}`;
+    const quotePrefix = multiQuoteStart >= 0 && rawOffset > multiQuoteStart ? ">>>" : continuesQuote ? ">" : "";
+    let rendered = startsInsideFence ? "```\n" : `${quotePrefix}${startsInsideInline.join("")}`;
     let cursor = 0;
     if (mrkdwn) {
       for (const match of rawChunk.matchAll(/```/g)) {
@@ -209,9 +211,10 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       rendered += rest;
     }
     rawOffset += rawChunk.length;
-    const chunk = mrkdwn
+    let chunk = mrkdwn
       ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? "\n```" : ""}`
       : rawChunk;
+    if (chunk.length > 3_000 && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) chunk = rawChunk;
     return ({
     type: "section" as const,
     ...(index === 0 ? { block_id: blockId } : {}),

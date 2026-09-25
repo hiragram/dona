@@ -158,3 +158,16 @@ test("blockquote continues across sections of one long line", () => {
   assert.ok(blocks.every((block) => block.text.text.startsWith(">")));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("a near-limit Slack token is delivered despite surrounding inline markers", () => {
+  const token = `<https://${"a".repeat(2_987)}|P>`;
+  const blocks = expandedSections(`*prefix\n${token}tail*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === token));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
+
+test("multi-line blockquote continues in later sections", () => {
+  const blocks = expandedSections(`>>>見出し\n${"x".repeat(3_000)}\n${"y".repeat(3_000)}`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith(">>>")));
+});
