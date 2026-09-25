@@ -226,7 +226,7 @@ type LegacyNotificationState = "notified" | "not_sent" | "acceptance_unknown";
 function legacyNotificationState(row: {
   job_id: string; source_event_id: string; workspace_id: string | null; channel_id: string | null;
   thread_ts: string | null; result_json: string | null; status: JobStatus;
-  completed_at: string | null; updated_at: string; source_status: string;
+  completed_at: string | null; updated_at: string; last_error_code: string | null; source_status: string;
   source_result_json: string | null; source_reply_target_json: string | null;
 }): { state: LegacyNotificationState; messageTs: string | null } {
   if (row.source_status !== "completed" || !row.source_result_json || !row.source_reply_target_json) {
@@ -309,6 +309,7 @@ function ensureLegacyNotificationMigration(db: Database.Database): void {
     source_event_id TEXT NOT NULL REFERENCES events(event_id),
     state TEXT NOT NULL CHECK (state IN ('notified','not_sent','acceptance_unknown')),
     job_status TEXT NOT NULL CHECK (job_status IN ('blocked','completed','failed','cancelled','needs_review')),
+    last_error_code TEXT,
     workspace_id TEXT,
     channel_id TEXT,
     thread_ts TEXT,
@@ -320,20 +321,23 @@ function ensureLegacyNotificationMigration(db: Database.Database): void {
 function classifyMigratedLegacyNotifications(db: Database.Database): void {
   ensureLegacyNotificationMigration(db);
   const rows = db.prepare(`SELECT j.job_id,j.job_key,j.workspace_json,j.source_event_id,j.workspace_id,j.channel_id,j.thread_ts,
-      j.result_json,j.status,j.completed_at,j.updated_at,
+      j.result_json,j.status,j.completed_at,j.updated_at,j.last_error_code,
       e.status AS source_status,e.result_json AS source_result_json,e.reply_target_json AS source_reply_target_json
     FROM jobs j JOIN events e ON e.event_id=j.source_event_id
     WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
-      AND j.completion_event_id IS NULL AND j.source='slack' AND j.job_key=?`).all(legacyJobKey) as Array<Parameters<typeof legacyNotificationState>[0] & {workspace_json:string}>;
+      AND j.completion_event_id IS NULL AND j.source='slack' AND j.job_key=?
+      AND NOT EXISTS (SELECT 1 FROM job_legacy_notification_migration m WHERE m.job_id=j.job_id)`)
+    .all(legacyJobKey) as Array<Parameters<typeof legacyNotificationState>[0] & {workspace_json:string}>;
   const insert = db.prepare(`INSERT OR IGNORE INTO job_legacy_notification_migration
-    (job_id,source_event_id,state,job_status,workspace_id,channel_id,thread_ts,message_ts,classified_at)
-    VALUES (?,?,?,?,?,?,?,?,?)`);
+    (job_id,source_event_id,state,job_status,last_error_code,workspace_id,channel_id,thread_ts,message_ts,classified_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`);
   for (const row of rows) {
     try {
       if (jobCreationPayloadSha256FromWorkspace(JSON.parse(row.workspace_json) as unknown) !== undefined) continue;
     } catch { /* Legacy workspace shape is unverified and therefore classified conservatively. */ }
     const classification = legacyNotificationState(row);
-    insert.run(row.job_id,row.source_event_id,classification.state,row.status,row.workspace_id,row.channel_id,
+    insert.run(row.job_id,row.source_event_id,classification.state,row.status,row.last_error_code,
+      row.workspace_id,row.channel_id,
       row.thread_ts,classification.messageTs,nowUtc());
   }
 }
@@ -1124,7 +1128,8 @@ export class DispatcherDatabase {
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
         OR (json_extract(b.owner_json,'$.kind')='slack_thread'
           AND NOT EXISTS (SELECT 1 FROM job_legacy_notification_migration m
-            WHERE m.job_id=j.job_id AND m.job_status=j.status AND m.state IN ('notified','acceptance_unknown'))
+            WHERE m.job_id=j.job_id AND m.job_status=j.status AND m.last_error_code IS j.last_error_code
+              AND m.state IN ('notified','acceptance_unknown'))
           AND (g.notification_mode='legacy' OR (g.sealed_at IS NOT NULL AND g.all_terminal_event_id IS NULL))
           AND (j.completion_event_id IS NULL
             OR (g.notification_mode='grouped' AND g.attention_event_id IS NOT NULL
@@ -1781,8 +1786,9 @@ export class DispatcherDatabase {
     return this.db.transaction(() => {
       const job = this.getJobRequired(jobId);
       this.assertJobSourceMatchesThread(jobId, job.source_event_id);
-      const legacyState = this.db.prepare("SELECT state FROM job_legacy_notification_migration WHERE job_id=? AND job_status=?")
-        .get(jobId,job.status) as {state:LegacyNotificationState}|undefined;
+      const legacyState = this.db.prepare(`SELECT state FROM job_legacy_notification_migration
+        WHERE job_id=? AND job_status=? AND last_error_code IS ?`)
+        .get(jobId,job.status,job.last_error_code) as {state:LegacyNotificationState}|undefined;
       if (legacyState?.state === "notified" || legacyState?.state === "acceptance_unknown") {
         throw new Error(`legacy_notification_${legacyState.state}`);
       }

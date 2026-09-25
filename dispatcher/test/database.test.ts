@@ -537,6 +537,31 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("a new legacy sandbox reason is not hidden by an old needs_review marker", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const raw = new Database(config.databasePath);
+    raw.pragma("foreign_keys = ON");
+    raw.prepare("UPDATE jobs SET result_path=? WHERE job_id='job-needs_review'")
+      .run("/private/job-needs_review.json");
+    migrateDispatcherDatabase(raw, () => {}, false, 3);
+    const marker = raw.prepare("SELECT job_status,last_error_code,state,classified_at FROM job_legacy_notification_migration WHERE job_id='job-needs_review'")
+      .get() as {job_status:string;last_error_code:string;state:string;classified_at:string};
+    assert.equal(marker.job_status, "needs_review");
+    assert.equal(marker.last_error_code, "error-needs_review");
+    assert.equal(marker.state, "acceptance_unknown");
+    raw.close();
+    const database = new DispatcherDatabase(config.databasePath);
+    assert.equal(database.getJob("job-needs_review")?.last_error_code, "legacy_agent_sandbox_unknown");
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-needs_review"), true);
+    assert.equal(database.enqueueJobNotification("job-needs_review").duplicate, false);
+    database.close();
+    const checked = new Database(config.databasePath);
+    assert.deepEqual(checked.prepare("SELECT job_status,last_error_code,state,classified_at FROM job_legacy_notification_migration WHERE job_id='job-needs_review'").get(), marker);
+    checked.close();
+  });
+
   test("a busy migration leaves v2 jobs and notification markers untouched", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
