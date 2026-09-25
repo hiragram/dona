@@ -290,6 +290,8 @@ class FakeRuntime implements RuntimePort {
   async migrateAppSchema() { this.calls.push("migrateAppSchema"); return this.migrationResult; }
   async appSchemaState() { this.calls.push("appSchemaState"); return this.appSchemaStateResult; }
   wrongTargetOnce = false;
+  dispatcherWrongShaPersistent = false;
+  dispatcherWrongShaAfterSlackStart = false;
   wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
   mainWaitStatus: MainAgentObservation["status"] = "idle";
@@ -424,6 +426,9 @@ class FakeRuntime implements RuntimePort {
   async dispatcherHealth(): Promise<HealthSnapshot> {
     if (!this.dispatcherLive) return this.health("dispatcher", null, false, false);
     const current = (await this.store.observe()).current_sha;
+    if ((this.dispatcherWrongShaPersistent || (this.dispatcherWrongShaAfterSlackStart && this.slackLive)) && current === targetSha) {
+      return this.health("dispatcher", "f".repeat(40), true);
+    }
     if (this.wrongTargetOnce && current === targetSha) {
       this.wrongTargetOnce = false;
       return this.health("dispatcher", "f".repeat(40), true);
@@ -724,6 +729,49 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, targetSha);
     assert.deepEqual(f.runtime.calls.slice(-2), ["quiesceSlack", "startSlack"]);
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_dispatcher_after_drain"), undefined);
+    f.database.close();
+  });
+
+  test("restores quiesced Slack before reporting an unquiesced Dispatcher SHA mismatch", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-wrong-dispatcher" });
+    f.dispatcher.terminal = true;
+    f.runtime.dispatcherWrongShaAfterSlackStart = true;
+    f.runtime.rollbackSlackDrainIncomplete = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "rollback_drain_dispatcher_health_unverified");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
+    assert.deepEqual(f.runtime.calls.slice(-2), ["quiesceSlack", "startSlack"]);
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_slack_after_drain")?.phase, "observed");
+    f.database.close();
+  });
+
+  test("refuses rollback when Dispatcher is down but its worker remains durable", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-stopped-worker" });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    f.runtime.afterSlackStart = async () => {
+      if ((await f.store.observe()).current_sha === targetSha) {
+        f.runtime.activeWorkerCount = 1;
+        f.runtime.simulateDispatcherStopped();
+      }
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "rollback_active_worker_handoff_unavailable");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
+    assert.equal(f.runtime.calls.filter(call => call === "quiesceSlack").length, 1);
+    assert.equal(f.database.runtimeOperation(row.request_id, "stop_target_dispatcher"), undefined);
     f.database.close();
   });
 

@@ -843,6 +843,15 @@ export class UpdateController {
           this.runtime.slackHealth(), this.runtime.dispatcherHealth(),
         ]);
         this.assertLease(row);
+        // A stopped Dispatcher cannot report a drain snapshot, while its
+        // external Herdr workers may still be running. Read durable job state
+        // before any rollback quiesce, service stop, or pointer mutation.
+        const workerSafety = await this.runtime.workerSafety();
+        this.assertLease(row);
+        if (!workerSafety.safe) {
+          this.needsReview(row, workerSafety.error_code ?? "rollback_active_worker_handoff_unavailable");
+          return;
+        }
         if (slackHealth.live) {
           const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
           this.assertLease(row);
@@ -952,6 +961,10 @@ export class UpdateController {
     // only services that entered quiesce. A live Dispatcher may own a worker.
     if (dispatcherQuiesced && !(await this.restartQuiescedService(row, "restart_target_dispatcher_after_drain",
       "dispatcher", causeCode, () => this.runtime.startDispatcher(), row.target_sha))) return;
+    if (slackQuiesced && !(await this.restartQuiescedService(row, "restart_target_slack_after_drain",
+      "slack_adapter", causeCode, () => this.runtime.startSlack(), row.target_sha))) return;
+    // Complete recovery of every service we actually quiesced before judging
+    // the health of a different, still-live service.
     if (!dispatcherQuiesced) {
       const manifest = await this.releases.releaseManifest(row.target_sha);
       const health = await this.runtime.dispatcherHealth();
@@ -961,8 +974,6 @@ export class UpdateController {
         return;
       }
     }
-    if (slackQuiesced && !(await this.restartQuiescedService(row, "restart_target_slack_after_drain",
-      "slack_adapter", causeCode, () => this.runtime.startSlack(), row.target_sha))) return;
     if (!slackQuiesced) {
       const manifest = await this.releases.releaseManifest(row.target_sha);
       const health = await this.runtime.slackHealth();
