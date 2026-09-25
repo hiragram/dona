@@ -1532,6 +1532,26 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("queued steer receipt survives preparation and deduplicates a running retry", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-queued-steer-receipt-source")).row;
+    const followUp = database.enqueue(eventEnvelope("Ev-queued-steer-receipt-follow-up")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "調査",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    database.appendQueuedJobInstruction(job.job_id, followUp.event_id, "追加条件");
+    database.close();
+    const reopened = new DispatcherDatabase(config.databasePath);
+    reopened.beginJobPreparation(job.job_id);
+    reopened.setJobRuntime(job.job_id, "workspace", "pane");
+    reopened.beginJobDispatch(job.job_id);
+    reopened.markJobRunning(job.job_id);
+    assert.equal(reopened.beginJobSteer(job.job_id, followUp.event_id).duplicate, true);
+    assert.equal(reopened.getJob(job.job_id)?.steer_state, null);
+    assert.equal(reopened.getJob(job.job_id)?.objective.split("追加条件").length, 2);
+    reopened.close();
+  });
+
   test("queued steer rejects oversized effective objectives without changing receipt",async()=>{
     const {root,config}=await tempConfig(); roots.push(root);
     const database=new DispatcherDatabase(config.databasePath);

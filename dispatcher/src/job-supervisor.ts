@@ -280,6 +280,7 @@ export class JobSupervisor {
         if (current && ["completed", "failed", "cancelled"].includes(current.status) &&
           current.last_error_code === "terminal_steer_worker_unverified") {
           this.database.markTerminalJobWorkerStopped(jobId, "terminal_steer_worker_unverified");
+          this.database.markTerminalWorkerStopProof(jobId);
         } else {
           this.database.markJobNeedsReview(jobId, prompted.errorCode!, commandMessage(prompted));
         }
@@ -342,7 +343,10 @@ export class JobSupervisor {
       if (!cancelled.ok && !cancelled.timedOut &&
           ["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
         this.database.markJobCancellationWorkerStopped(jobId);
-        if (await this.tryComplete(cancelling,false)) return { row: this.database.getJob(jobId)!, duplicate:false };
+        if (await this.tryComplete(cancelling,false)) {
+          this.database.markTerminalWorkerStopProof(jobId);
+          return { row: this.database.getJob(jobId)!, duplicate:false };
+        }
         this.database.markJobCancelled(jobId,reason); this.wake();
         return { row:this.database.getJob(jobId)!, duplicate:false };
       }
@@ -369,7 +373,10 @@ export class JobSupervisor {
         this.wake(); throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
       }
       this.database.markJobCancellationWorkerStopped(jobId);
-      if(await this.tryComplete(cancelling,false)) return {row:this.database.getJob(jobId)!,duplicate:false};
+      if(await this.tryComplete(cancelling,false)) {
+        this.database.markTerminalWorkerStopProof(jobId);
+        return {row:this.database.getJob(jobId)!,duplicate:false};
+      }
       this.database.markJobCancelled(jobId, reason);
       this.trackCancelledWorkerCleanup(cancelling);
       this.wake();
@@ -487,6 +494,7 @@ export class JobSupervisor {
               this.database.markTerminalJobWorkerStopped(job.job_id, job.last_error_code);
             }
             if (job.steer_state === "accepted") this.database.markTerminalAcceptedSteerStopped(job.job_id);
+            this.database.markTerminalWorkerStopProof(job.job_id);
           }
         } catch (error) {
           this.logger.warn("Terminal job worker stop proof is still unavailable", {

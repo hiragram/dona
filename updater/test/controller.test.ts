@@ -810,6 +810,31 @@ describe("UpdateController isolated end-to-end", () => {
       f.database.close();
     });
   }
+  test("activating resume preserves a persisted Slack-only recovery scope", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-slack-only-recovery" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    row = f.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "restart_current_slack", "slack_adapter",
+      currentSha, null, { cause_code: "dispatcher_registration_restored_before_activation",
+        dispatcher_quiesced: false, slack_quiesced: true });
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "restart_current_slack", "observed", null,
+      { cause_code: "dispatcher_registration_restored_before_activation",
+        dispatcher_quiesced: false, slack_quiesced: true });
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.last_error_code,
+      "dispatcher_registration_restored_before_activation");
+    assert.equal(f.runtime.calls.includes("startDispatcher"), false);
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
+    f.database.close();
+  });
   test("restores stopped current runtime when activation recovery has no restart intent", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

@@ -739,8 +739,13 @@ export class UpdateController {
         let evidence: Record<string, unknown> = {};
         try { evidence = JSON.parse(persistedRecovery.evidence_json) as Record<string, unknown>; }
         catch { /* Invalid evidence cannot authorize a new activation. */ }
+        if (typeof evidence.cause_code !== "string" || typeof evidence.dispatcher_quiesced !== "boolean" ||
+          typeof evidence.slack_quiesced !== "boolean") {
+          this.needsReview(row, "pre_activation_recovery_intent_unverified");
+          return;
+        }
         await this.restoreQuiescedServices(row,
-          typeof evidence.cause_code === "string" ? evidence.cause_code : "pre_activation_recovery_unverified");
+          evidence.cause_code, evidence.dispatcher_quiesced, evidence.slack_quiesced);
         return;
       }
       let dispatcherRegistered: boolean;
