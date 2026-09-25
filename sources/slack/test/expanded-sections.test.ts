@@ -402,3 +402,8 @@ test("a near-limit link followed by nested closing markers is delivered", () => 
   assert.ok(blocks.some((block) => block.text.text === token));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("comparison signs on separate lines do not hide an emphasis close", () => {
+  const blocks = expandedSections(`*bold < threshold\n${"x".repeat(7_000)}*\nvalue > threshold`, "identity", true);
+  assert.ok(blocks.slice(1, -1).every((block) => block.text.text.startsWith("*")));
+});

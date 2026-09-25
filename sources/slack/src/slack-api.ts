@@ -57,6 +57,12 @@ function insideAngleToken(text: string, index: number): boolean {
   return newline === -1 || newline > close;
 }
 
+function angleTokenClose(text: string, open: number): number {
+  const close = text.indexOf(">", open + 1);
+  const newline = text.indexOf("\n", open + 1);
+  return close !== -1 && (newline === -1 || close < newline) ? close : -1;
+}
+
 function fenceOpenAt(text: string, end: number): boolean {
   let open = false;
   for (const match of text.slice(0, end).matchAll(/```/g)) {
@@ -121,7 +127,7 @@ function hasMatchingClose(text: string, start: number, marker: InlineMarker, can
       continue;
     }
     if (text[index] === "<") {
-      const close = text.indexOf(">", index + 1);
+      const close = angleTokenClose(text, index);
       if (close !== -1) {
         index = close;
         continue;
@@ -158,7 +164,7 @@ function advanceMrkdwnState(
       continue;
     }
     if (text[index] === "<") {
-      const close = text.indexOf(">", index + 1);
+      const close = angleTokenClose(text, index);
       if (close !== -1) {
         index = close;
         continue;
