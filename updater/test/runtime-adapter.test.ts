@@ -318,7 +318,7 @@ test("RealRuntime distinguishes unresolved steer from definite retryable agent a
     const settled = new Database(databasePath);
     settled.prepare("UPDATE jobs SET steer_state='accepted'").run();
     settled.close();
-    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
     const retryable = new Database(databasePath);
     retryable.prepare("UPDATE jobs SET status='retryable_failed',herdr_workspace_id='recorded',last_error_code='agent_not_found'").run();
     retryable.close();

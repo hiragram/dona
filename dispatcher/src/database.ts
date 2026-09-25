@@ -771,13 +771,14 @@ export class DispatcherDatabase {
         AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
           AND attempt_count=0 AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
         AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
-          ('invalid_result_agent_stopped','agent_not_found','agent_not_running'))
+          ('invalid_result_agent_stopped','agent_not_found','agent_not_running','workspace_cleanup_agent_stopped'))
         AND NOT (status='needs_review'
           AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l
             WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)))
         OR (status = 'retryable_failed' AND (last_error_code = 'stale_preparing' OR
           (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
         OR steer_state = 'dispatching'
+        OR (status IN ('completed','failed','cancelled') AND steer_state='accepted')
         OR (status IN ('completed','failed','cancelled') AND last_error_code='schedule_reconcile_worker_unverified')
         OR (status IN ('completed','failed','cancelled') AND last_error_code IN
           ('terminal_steer_worker_unverified','cancel_worker_unverified'))
@@ -790,7 +791,7 @@ export class DispatcherDatabase {
     // while any such worker may exist, including legacy agents marked for stop.
     const legacy = this.db.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
       JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
-        AND COALESCE(j.steer_state,'') <> 'dispatching'
+        AND COALESCE(j.steer_state,'') NOT IN ('dispatching','accepted')
         AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
         AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
         AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
@@ -1084,7 +1085,8 @@ export class DispatcherDatabase {
   markJobRuntimeCleaned(jobId: string): void {
     this.db.transaction(()=>{
       const changed=this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,
-        last_error_code=CASE WHEN last_error_code IN
+        last_error_code=CASE WHEN last_error_code='workspace_cleanup_failed'
+          THEN 'workspace_cleanup_agent_stopped' WHEN last_error_code IN
           ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified')
           THEN NULL ELSE last_error_code END,
         updated_at=? WHERE job_id=? AND herdr_workspace_id IS NOT NULL
@@ -1099,7 +1101,7 @@ export class DispatcherDatabase {
 
   listTerminalJobsNeedingWorkerStopProof(afterJobId = "", limit = 100): JobRow[] {
     return this.db.prepare(`SELECT * FROM jobs WHERE job_id>? AND status IN ('completed','failed','cancelled')
-      AND (last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+      AND (steer_state='accepted' OR last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
         OR (last_error_code='schedule_reconcile_worker_unverified' AND herdr_workspace_id IS NULL))
       AND COALESCE(steer_state,'') <> 'dispatching'
       ORDER BY job_id LIMIT ?`).all(afterJobId,limit) as JobRow[];
@@ -1114,6 +1116,12 @@ export class DispatcherDatabase {
         OR (last_error_code='schedule_reconcile_worker_unverified' AND herdr_workspace_id IS NULL))
       AND COALESCE(steer_state,'') <> 'dispatching'`)
       .run(nowUtc(),jobId,expectedCode);
+  }
+
+  markTerminalAcceptedSteerStopped(jobId: string): void {
+    this.db.prepare(`UPDATE jobs SET steer_state=NULL,updated_at=? WHERE job_id=?
+      AND status IN ('completed','failed','cancelled') AND steer_state='accepted'`)
+      .run(nowUtc(),jobId);
   }
 
   getJobGroup(sourceEventId: string): JobGroupRow | undefined {

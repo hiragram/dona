@@ -513,17 +513,18 @@ export class RealRuntime implements RuntimePort {
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
               AND attempt_count=0 AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
-              ('invalid_result_agent_stopped','agent_not_found','agent_not_running'))
+              ('invalid_result_agent_stopped','agent_not_found','agent_not_running','workspace_cleanup_agent_stopped'))
             ${stoppedLegacyClause})
             OR (status='retryable_failed' AND (last_error_code='stale_preparing' OR
               (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
             OR steer_state='dispatching'
+            OR (status IN ('completed','failed','cancelled') AND steer_state='accepted')
             OR (status IN ('completed','failed','cancelled') AND last_error_code IN
               ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified'))`)
           .get() as { count: number }).count;
         if (legacyTable) active += (database.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
           JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
-            AND COALESCE(j.steer_state,'') <> 'dispatching'
+            AND COALESCE(j.steer_state,'') NOT IN ('dispatching','accepted')
             AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
             AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
             AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')

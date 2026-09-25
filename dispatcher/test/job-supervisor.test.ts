@@ -1805,6 +1805,21 @@ describe("JobSupervisor", () => {
     assert.equal(database.updateSafetyStatus().active_worker_count,0);
     await supervisor.stop();database.close();
   });
+  test("legacy terminal accepted steer is counted until a bounded stop proof", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-legacy-terminal-accepted-steer");
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',steer_state='accepted' WHERE job_id=?").run(job.job_id);
+    raw.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    const supervisor = new JobSupervisor(database, fakeRuntime({ async get() { return failed("agent_not_found"); } }),
+      { ...config, queuePollMs: 5 }, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.steer_state === null);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    await supervisor.stop(); database.close();
+  });
   test("discovers cleanup candidates from progress directories instead of cancelled history", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

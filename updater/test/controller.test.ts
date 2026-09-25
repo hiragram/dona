@@ -340,6 +340,8 @@ class FakeRuntime implements RuntimePort {
   private slackLive = true;
   slackQuiescing = false;
   dispatcherQuiescing = false;
+  slackDrainStatusThrows = false;
+  slackHealthUnreadyWhenQuiescing = false;
   mainAgentSha = currentSha;
   constructor(
     private readonly store: ReleaseStore,
@@ -352,6 +354,7 @@ class FakeRuntime implements RuntimePort {
     this.slackLive = false;
   }
   simulateDispatcherStopped(): void { this.dispatcherLive = false; }
+  simulateSlackRestarted(): void { this.slackLive = true; }
   setHealthCompatibility(sha: string, compatibility: Compatibility): void {
     this.healthCompatibility.set(sha, compatibility);
   }
@@ -385,6 +388,7 @@ class FakeRuntime implements RuntimePort {
     return { service: "dispatcher", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] };
   }
   async slackDrainStatus(): Promise<DrainSnapshot> {
+    if (this.slackDrainStatusThrows) throw new Error("drain_status_unavailable");
     return { service: "slack_adapter", quiescing: this.slackQuiescing,
       drained: this.slackQuiescing, in_flight: 0, unsafe_states: [] };
   }
@@ -526,7 +530,8 @@ class FakeRuntime implements RuntimePort {
       this.wrongSlackOnce = false;
       return { ...this.health("slack_adapter", "f".repeat(40), true), workspaces_ready: true };
     }
-    return { ...this.health("slack_adapter", current, true), workspaces_ready: true };
+    const ready = !this.slackHealthUnreadyWhenQuiescing || !this.slackQuiescing;
+    return { ...this.health("slack_adapter", current, ready), workspaces_ready: ready };
   }
   private health(service: HealthSnapshot["service"], sha: string | null, ready: boolean, live = true): HealthSnapshot {
     const compatibility = sha ? this.healthCompatibility.get(sha) : undefined;
@@ -1248,6 +1253,31 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, targetSha);
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_main_agent_after_drain")?.phase, "observed");
     assert.equal(f.runtime.calls.at(-1), `startMainAgent:${targetSha}`);
+    f.database.close();
+  });
+  test("restores stopped target components when live Slack drain status is unreadable", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-drain-read-failure" });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.runtime.slackDrainStatusThrows = true;
+    f.runtime.slackHealthUnreadyWhenQuiescing = true;
+    f.runtime.afterMainWait = async call => {
+      if (call === 2) {
+        f.runtime.activeWorkerCount = 1;
+        f.runtime.simulateSlackRestarted();
+      }
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_dispatcher_after_drain")?.phase, "observed");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_main_agent_after_drain")?.phase, "observed");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
     f.database.close();
   });
   for (const stopFailure of ["blocked", "rejected", "acceptance_unknown"] as const) {

@@ -481,7 +481,13 @@ export class JobSupervisor {
             ["agent_not_found","agent_not_running"].includes(observed.errorCode??"");
           const stopped = observed.ok && ["idle","done"].includes(observed.agentStatus??"") &&
             (!expectedIdentity || observed.agentIdentity === expectedIdentity);
-          if (absent || stopped) this.database.markTerminalJobWorkerStopped(job.job_id,job.last_error_code!);
+          if (absent || stopped) {
+            if (job.last_error_code && ["terminal_steer_worker_unverified", "cancel_worker_unverified",
+              "schedule_reconcile_worker_unverified"].includes(job.last_error_code)) {
+              this.database.markTerminalJobWorkerStopped(job.job_id, job.last_error_code);
+            }
+            if (job.steer_state === "accepted") this.database.markTerminalAcceptedSteerStopped(job.job_id);
+          }
         } catch (error) {
           this.logger.warn("Terminal job worker stop proof is still unavailable", {
             job_id: job.job_id, error_message: error instanceof Error ? error.message : String(error),

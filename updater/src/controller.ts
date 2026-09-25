@@ -1093,13 +1093,13 @@ export class UpdateController {
   private async rollbackQuiescedScope(dispatcher: HealthSnapshot, slack: HealthSnapshot): Promise<{
     dispatcherQuiesced: boolean; slackQuiesced: boolean;
   }> {
-    const [dispatcherDrain, slackDrain] = await Promise.all([
+    const [dispatcherDrain, slackDrain] = await Promise.allSettled([
       dispatcher.live ? this.runtime.dispatcherDrainStatus() : Promise.resolve(null),
       slack.live ? this.runtime.slackDrainStatus() : Promise.resolve(null),
     ]);
     return {
-      dispatcherQuiesced: !dispatcher.live || dispatcherDrain!.quiescing,
-      slackQuiesced: !slack.live || slackDrain!.quiescing,
+      dispatcherQuiesced: !dispatcher.live || (dispatcherDrain.status === "fulfilled" && dispatcherDrain.value!.quiescing),
+      slackQuiesced: !slack.live || (slackDrain.status === "fulfilled" && slackDrain.value!.quiescing),
     };
   }
 
