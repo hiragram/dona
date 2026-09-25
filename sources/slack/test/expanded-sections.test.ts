@@ -389,3 +389,16 @@ test("dense unmatched markers do not stall section splitting", () => {
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
   assert.ok(performance.now() - start < 2_000);
 });
+
+test("comparison signs on separate lines do not hide a code fence", () => {
+  const blocks = expandedSections("value < threshold\n```\n" + "x".repeat(7_000) + "\n```\nvalue > threshold", "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.filter((block) => block.text.text.includes("x")).every((block) => block.text.text.includes("```")));
+});
+
+test("a near-limit link followed by nested closing markers is delivered", () => {
+  const token = `<https://${"a".repeat(2_985)}|P>`;
+  const blocks = expandedSections(`*_${token}_*tail${"x".repeat(100)}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === token));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});

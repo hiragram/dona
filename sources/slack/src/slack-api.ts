@@ -50,7 +50,11 @@ function isEscaped(text: string, index: number): boolean {
 
 function insideAngleToken(text: string, index: number): boolean {
   const open = text.lastIndexOf("<", index);
-  return open >= 0 && open > text.lastIndexOf(">", index) && text.indexOf(">", index + 1) !== -1;
+  if (open < 0 || open < text.lastIndexOf("\n", index) || open < text.lastIndexOf(">", index)) return false;
+  const close = text.indexOf(">", index + 1);
+  if (close === -1) return false;
+  const newline = text.indexOf("\n", index + 1);
+  return newline === -1 || newline > close;
 }
 
 function fenceOpenAt(text: string, end: number): boolean {
@@ -312,6 +316,11 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     let plainFallback = false;
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
+    }
+    const closingMarkers = [...startsInsideInline].reverse().join("");
+    if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
+      const token = rawChunk.slice(0, -closingMarkers.length);
+      if (/^<[^>]+>$/.test(token) && token.length <= 3_000) chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
     }
     const escapedAngle = /^(\\+)<[^>]+>$/.exec(rawChunk);
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && escapedAngle && escapedAngle[1]!.length % 2 === 1 && rawChunk.length <= 3_000) {
