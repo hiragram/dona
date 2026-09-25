@@ -1459,6 +1459,12 @@ describe("DispatcherDatabase", () => {
       assert.equal(database.updateSafetyStatus().active_worker_count,
         code === "steer_acceptance_unknown" ? 1 : 0);
     }
+    const legacy = new Database(config.databasePath);
+    legacy.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown' WHERE job_id=?").run(job.job_id);
+    legacy.prepare("INSERT INTO legacy_job_agents_to_stop(job_id,stopped_at) VALUES(?,?)")
+      .run(job.job_id, new Date().toISOString());
+    legacy.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
     database.close();
   });
 

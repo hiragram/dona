@@ -243,8 +243,9 @@ test("RealRuntime excludes only a proven pre-prepare result collision", async ()
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
   const databasePath = path.join(root, "Dona", "dona.sqlite3");
   const database = new Database(databasePath);
-  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
-  database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('needs_review','result_path_exists')").run();
+  database.exec("CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  database.prepare("INSERT INTO jobs (job_id,status,last_error_code) VALUES ('collision-job','needs_review','result_path_exists')").run();
   database.close();
   await fs.chmod(databasePath, 0o600);
   const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
@@ -265,6 +266,12 @@ test("RealRuntime excludes only a proven pre-prepare result collision", async ()
       assert.equal((await runtime.workerSafety()).active_worker_count,
         code === "steer_acceptance_unknown" ? 1 : 0);
     }
+    const legacy = new Database(databasePath);
+    legacy.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown'").run();
+    legacy.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('collision-job',?)")
+      .run(new Date().toISOString());
+    legacy.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
   } finally {
     await removeTree(root);
   }

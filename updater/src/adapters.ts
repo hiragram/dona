@@ -504,15 +504,20 @@ export class RealRuntime implements RuntimePort {
     try {
       const database = new Database(this.dispatcherDatabasePath(), { readonly: true, fileMustExist: true });
       try {
+        const legacyTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get();
+        const stoppedLegacyClause = legacyTable ? `AND NOT (status='needs_review'
+          AND COALESCE(last_error_code,'')='legacy_agent_sandbox_unknown'
+          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l
+            WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL))` : "";
         let active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs
           WHERE (status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
               AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
-              ('invalid_result_agent_stopped','agent_not_found','agent_not_running')))
+              ('invalid_result_agent_stopped','agent_not_found','agent_not_running'))
+            ${stoppedLegacyClause})
             OR (status='retryable_failed' AND (herdr_workspace_id IS NOT NULL OR last_error_code='stale_preparing'))`)
           .get() as { count: number }).count;
-        const legacyTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get();
         if (legacyTable) active += (database.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
           JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
             AND j.status NOT IN ('completed','failed','cancelled')
