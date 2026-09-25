@@ -934,7 +934,7 @@ export class UpdateController {
           const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
           this.assertLease(row);
           if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-            await this.restoreTargetAfterDrain(row, "rollback_dispatcher_drain_incomplete", true,
+            await this.restoreTargetAfterDrain(row, "rollback_dispatcher_drain_incomplete", dispatcherDrain.quiescing,
               slackHealth.live || targetSlackStoppedForRollback);
             return;
           }
