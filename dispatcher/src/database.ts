@@ -244,6 +244,9 @@ function legacyNotificationState(row: {
     let delegated = false;
     let postBoundToJob = false;
     let settledSessionStatus: string | null = null;
+    const jobResult = row.result_json ? JSON.parse(row.result_json) as Record<string, unknown> : null;
+    const expectedBodyHash = jobResult && jobResult.job_id === row.job_id
+      ? createHash("sha256").update(renderJobResult(jobResult)).digest("hex") : null;
     for (const raw of result.actions) {
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { state: "acceptance_unknown", messageTs: null };
       const action = raw as Record<string, unknown>;
@@ -258,9 +261,6 @@ function legacyNotificationState(row: {
             typeof action.message_ts !== "string" || !/^\d{1,20}\.\d{6}$/.test(action.message_ts)) {
           return { state: "acceptance_unknown", messageTs: null };
         }
-        const jobResult = row.result_json ? JSON.parse(row.result_json) as Record<string, unknown> : null;
-        const expectedBodyHash = jobResult && jobResult.job_id === row.job_id
-          ? createHash("sha256").update(renderJobResult(jobResult)).digest("hex") : null;
         if (action.job_id !== row.job_id || !expectedBodyHash || action.body_sha256 !== expectedBodyHash) {
           return { state: "acceptance_unknown", messageTs: null };
         }
@@ -315,26 +315,37 @@ function ensureLegacyNotificationMigration(db: Database.Database): void {
     thread_ts TEXT,
     message_ts TEXT,
     classified_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS job_legacy_notification_reconciliations (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+    source_event_id TEXT NOT NULL REFERENCES events(event_id),
+    job_status TEXT NOT NULL,
+    last_error_code TEXT,
+    evidence_sha256 TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision='not_sent'),
+    reconciled_at TEXT NOT NULL
   )`);
 }
 
 function classifyMigratedLegacyNotifications(db: Database.Database): void {
   ensureLegacyNotificationMigration(db);
-  const rows = db.prepare(`SELECT j.job_id,j.job_key,j.workspace_json,j.source_event_id,j.workspace_id,j.channel_id,j.thread_ts,
+  const rows = db.prepare(`SELECT j.job_id,j.source_event_id,j.workspace_id,j.channel_id,j.thread_ts,
       j.result_json,j.status,j.completed_at,j.updated_at,j.last_error_code,
       e.status AS source_status,e.result_json AS source_result_json,e.reply_target_json AS source_reply_target_json
     FROM jobs j JOIN events e ON e.event_id=j.source_event_id
+    JOIN job_groups g ON g.source_event_id=j.source_event_id
     WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
       AND j.completion_event_id IS NULL AND j.source='slack' AND j.job_key=?
+      AND (g.notification_mode='legacy' OR (g.notification_mode='grouped'
+        AND g.attention_event_id IS NULL AND g.all_terminal_event_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM jobs sibling WHERE sibling.source_event_id=j.source_event_id
+          AND sibling.job_id<>j.job_id)))
       AND NOT EXISTS (SELECT 1 FROM job_legacy_notification_migration m WHERE m.job_id=j.job_id)`)
-    .all(legacyJobKey) as Array<Parameters<typeof legacyNotificationState>[0] & {workspace_json:string}>;
+    .all(legacyJobKey) as Parameters<typeof legacyNotificationState>[0][];
   const insert = db.prepare(`INSERT OR IGNORE INTO job_legacy_notification_migration
     (job_id,source_event_id,state,job_status,last_error_code,workspace_id,channel_id,thread_ts,message_ts,classified_at)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
   for (const row of rows) {
-    try {
-      if (jobCreationPayloadSha256FromWorkspace(JSON.parse(row.workspace_json) as unknown) !== undefined) continue;
-    } catch { /* Legacy workspace shape is unverified and therefore classified conservatively. */ }
     const classification = legacyNotificationState(row);
     insert.run(row.job_id,row.source_event_id,classification.state,row.status,row.last_error_code,
       row.workspace_id,row.channel_id,
@@ -1148,6 +1159,51 @@ export class DispatcherDatabase {
       )
       ORDER BY CASE WHEN j.status IN ('blocked','failed','needs_review') THEN 0 ELSE 1 END,j.updated_at,j.job_id LIMIT ?
     `).all(limit) as JobRow[];
+  }
+
+  legacyNotificationMigration(jobId: string): Record<string, unknown> | undefined {
+    return this.db.prepare(`SELECT m.job_id,m.source_event_id,m.state,m.job_status,m.last_error_code,
+      m.workspace_id,m.channel_id,m.thread_ts,m.message_ts,m.classified_at,
+      j.status AS current_status,j.last_error_code AS current_error_code,j.updated_at AS job_updated_at,
+      j.completion_event_id,r.decision AS reconciliation_decision,r.evidence_sha256,r.reconciled_at
+      FROM job_legacy_notification_migration m JOIN jobs j ON j.job_id=m.job_id
+      LEFT JOIN job_legacy_notification_reconciliations r ON r.job_id=m.job_id WHERE m.job_id=?`)
+      .get(jobId) as Record<string, unknown> | undefined;
+  }
+
+  reconcileLegacyNotificationNotSent(
+    jobId: string, expectedJobUpdatedAt: string, expectedClassifiedAt: string,
+    evidenceSha256: string, at = new Date(),
+  ): {job_id:string;state:"not_sent";reconciled_at:string} {
+    if (!/^[0-9a-f]{64}$/.test(evidenceSha256)) throw new Error("legacy_notification_evidence_digest_invalid");
+    return this.db.transaction(() => {
+      const job = this.getJobRequired(jobId);
+      const marker = this.db.prepare(`SELECT source_event_id,state,job_status,last_error_code,classified_at
+        FROM job_legacy_notification_migration WHERE job_id=?`).get(jobId) as
+        {source_event_id:string;state:LegacyNotificationState;job_status:JobStatus;last_error_code:string|null;classified_at:string}|undefined;
+      if (!marker || marker.source_event_id !== job.source_event_id ||
+          marker.state !== "acceptance_unknown" || marker.job_status !== job.status ||
+          marker.last_error_code !== job.last_error_code || marker.classified_at !== expectedClassifiedAt ||
+          job.updated_at !== expectedJobUpdatedAt || job.completion_event_id !== null) {
+        throw new Error("legacy_notification_reconciliation_state_changed");
+      }
+      const prefix = `${jobId}:`;
+      if (this.db.prepare(`SELECT 1 FROM events WHERE source='dona_job'
+        AND substr(external_event_id,1,?)=? LIMIT 1`).get(prefix.length,prefix)) {
+        throw new Error("legacy_notification_existing_event_requires_review");
+      }
+      const changed = this.db.prepare(`UPDATE job_legacy_notification_migration SET state='not_sent'
+        WHERE job_id=? AND state='acceptance_unknown' AND classified_at=?
+          AND job_status=? AND last_error_code IS ?`)
+        .run(jobId,expectedClassifiedAt,job.status,job.last_error_code).changes;
+      if (changed !== 1) throw new Error("legacy_notification_reconciliation_conflict");
+      const reconciledAt = at.toISOString();
+      this.db.prepare(`INSERT INTO job_legacy_notification_reconciliations
+        (job_id,source_event_id,job_status,last_error_code,evidence_sha256,decision,reconciled_at)
+        VALUES (?,?,?,?,?,'not_sent',?)`)
+        .run(jobId,job.source_event_id,job.status,job.last_error_code,evidenceSha256,reconciledAt);
+      return {job_id:jobId,state:"not_sent" as const,reconciled_at:reconciledAt};
+    }).immediate();
   }
 
   recoverStaleJobs(at = new Date()): { retryable: number; needsReview: number } {

@@ -34,6 +34,8 @@ function usage(): never {
   dona-dispatcher job show <job_id> [--live-session | --live-session-receipt <receipt_id>]
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
+  dona-dispatcher job legacy-notification <job_id>
+  dona-dispatcher job reconcile-legacy-notification <job_id> <expected_job_updated_at> <expected_classified_at> <evidence_sha256> --notification-reviewed --no-post-confirmed
   dona-dispatcher job resolve-invalid-result <job_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
@@ -120,6 +122,18 @@ async function main(): Promise<void> {
       if(command==="reconcile-run") {
         const runId=eventIdAt(args,2),outcome=args[3];if(outcome!=="failed"&&outcome!=="cancelled")usage();
         console.log(JSON.stringify(database.reconcileScheduledRun(runId,outcome),null,2));return;
+      }
+      if(command==="legacy-notification") {
+        if(args.length!==3)usage();
+        const marker=database.legacyNotificationMigration(eventIdAt(args,2));
+        if(!marker)throw new Error("legacy_notification_marker_not_found");
+        console.log(JSON.stringify(marker,null,2));return;
+      }
+      if(command==="reconcile-legacy-notification") {
+        if(args.length!==8 || args[6]!=="--notification-reviewed" || args[7]!=="--no-post-confirmed")usage();
+        const result=database.reconcileLegacyNotificationNotSent(
+          eventIdAt(args,2),eventIdAt(args,3),eventIdAt(args,4),eventIdAt(args,5));
+        console.log(JSON.stringify(result,null,2));return;
       }
       if(command==="resolve-invalid-result") {
         if(args.length!==7 || args[5]!=="--worker-stopped-reviewed" || args[6]!=="--side-effects-reviewed") usage();

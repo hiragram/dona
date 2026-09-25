@@ -390,6 +390,10 @@ describe("DispatcherDatabase", () => {
     await createSchemaV2Fixture(config.databasePath);
     const raw = new Database(config.databasePath);
     raw.pragma("foreign_keys = ON");
+    migrateDispatcherDatabase(raw, () => {}, false, 2);
+    raw.prepare("UPDATE jobs SET workspace_json=? WHERE job_id='job-blocked'").run(JSON.stringify({
+      kind:"scratch",fixture:"blocked",__dona_job_creation:{canonical_payload_sha256:"0".repeat(64)},
+    }));
     raw.prepare("UPDATE jobs SET completed_at=NULL,updated_at=? WHERE job_id='job-blocked'")
       .run("2026-09-03T00:02:05.000Z");
     raw.prepare("UPDATE events SET result_json=? WHERE event_id='evt-source-blocked'").run(JSON.stringify({
@@ -560,6 +564,36 @@ describe("DispatcherDatabase", () => {
     const checked = new Database(config.databasePath);
     assert.deepEqual(checked.prepare("SELECT job_status,last_error_code,state,classified_at FROM job_legacy_notification_migration WHERE job_id='job-needs_review'").get(), marker);
     checked.close();
+  });
+
+  test("operator-confirmed no-post resolution is audited and allows one normal enqueue", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const raw = new Database(config.databasePath);
+    raw.pragma("foreign_keys = ON");
+    migrateDispatcherDatabase(raw, () => {}, false, 3);
+    raw.close();
+    const database = new DispatcherDatabase(config.databasePath);
+    const marker = database.legacyNotificationMigration("job-blocked")!;
+    assert.equal(marker.state, "acceptance_unknown");
+    assert.throws(() => database.reconcileLegacyNotificationNotSent("job-blocked",
+      String(marker.job_updated_at),String(marker.classified_at),"invalid"),/digest_invalid/);
+    assert.throws(() => database.reconcileLegacyNotificationNotSent("job-blocked",
+      "stale",String(marker.classified_at),"a".repeat(64)),/state_changed/);
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    const resolved = database.reconcileLegacyNotificationNotSent("job-blocked",
+      String(marker.job_updated_at),String(marker.classified_at),"a".repeat(64));
+    assert.equal(resolved.state, "not_sent");
+    assert.equal(database.legacyNotificationMigration("job-blocked")?.evidence_sha256, "a".repeat(64));
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
+    const first = database.enqueueJobNotification("job-blocked");
+    assert.equal(first.duplicate, false);
+    database.close();
+    const restarted = new DispatcherDatabase(config.databasePath);
+    assert.equal(restarted.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    assert.equal(restarted.enqueueJobNotification("job-blocked").row.event_id, first.row.event_id);
+    restarted.close();
   });
 
   test("a busy migration leaves v2 jobs and notification markers untouched", async () => {
