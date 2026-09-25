@@ -170,18 +170,26 @@ test("ProcessRunner prioritizes the unfinished case and cleanup result on timeou
 
 test("Dispatcher test hang records bounded process observations before and after cleanup", async () => {
   const records: string[] = [];
-  const store = { start: () => ({
-    write: (_stream: string, chunk: Buffer) => { records.push(chunk.toString("utf8")); },
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-observation-ready-"));
+  const readyPath = path.join(root, "ready");
+  const store = { start: (identity: { step: string }) => ({
+    write: (_stream: string, chunk: Buffer) => {
+      if (identity.step === "dispatcher:npm-test-observation") records.push(chunk.toString("utf8"));
+    },
     finish: () => undefined,
   }) } as unknown as DiagnosticLogStore;
   const result = await new ProcessRunner().run(process.execPath, ["-e", `
     process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] file-start test/api.test.ts\\n');
     process.stderr.write('[dispatcher-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] case-start test/api.test.ts:012345abcdef#1\\n');
+    process.stdout.write('x'.repeat(200000));
+    require('node:fs').writeFileSync(${JSON.stringify(readyPath)}, 'ready');
     process.on('SIGTERM', () => {});
     setInterval(() => {}, 1000);
   `], {
-    timeoutMs: 1_000,
+    timeoutMs: 5_000,
     outputLimitBytes: 1024,
+    timeoutStartAfter: waitForFile(readyPath),
+    timeoutAfterReadyMs: 1_500,
     diagnostic: { store, identity: { request_id: "upd_01m1es03xy5cf8d9pm5cwx4srv", attempt: 1, step: "dispatcher:npm-test" } },
   });
   assert.equal(result.timed_out, true);
@@ -190,6 +198,7 @@ test("Dispatcher test hang records bounded process observations before and after
   assert.ok(observations.some((record) => record.includes("phase=timeout") && record.includes("process_tree=observed")));
   assert.ok(observations.some((record) => record.includes("phase=cleanup")));
   assert.ok(observations.every((record) => !record.includes("setInterval") && record.length < 6000));
+  await fs.rm(root, { recursive: true, force: true });
 });
 
 test("successful Dispatcher test does not persist a diagnostic capture", async () => {

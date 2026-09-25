@@ -41,12 +41,17 @@ export class ProcessRunner {
     }
     return new Promise((resolve) => {
       let diagnostic: DiagnosticCaptureSession | undefined;
+      let observationLog: DiagnosticCaptureSession | undefined;
       try {
         diagnostic = options.diagnostic?.store.start(options.diagnostic.identity);
       } catch {
         // Diagnostic persistence is subordinate to the command. An unavailable
         // index must not prevent the command from running or alter its result.
         diagnostic = undefined;
+      }
+      if (options.diagnostic?.identity.step === "dispatcher:npm-test") {
+        try { observationLog = options.diagnostic.store.start({ ...options.diagnostic.identity, step: "dispatcher:npm-test-observation" }); }
+        catch { /* diagnostic only */ }
       }
       const child = spawn(executable, [...args], {
         cwd: options.cwd,
@@ -62,10 +67,18 @@ export class ProcessRunner {
       const observe = options.diagnostic?.identity.step === "dispatcher:npm-test";
       const startedAt = Date.now();
       const observations: NodeJS.Timeout[] = [];
+      const pendingObservations = new Set<Promise<void>>();
       const sample = (phase: string): void => {
         if (!observe) return;
-        const record = `[preflight-observation] phase=${phase} elapsed_ms=${Date.now() - startedAt} root_pid=${child.pid ?? "unknown"} checkpoint=${checkpoints.checkpoint() ?? "none"} ${observeProcessTree(child.pid)}\n`;
-        try { diagnostic?.write("stderr", Buffer.from(record)); } catch { /* diagnostic only */ }
+        const elapsed = Date.now() - startedAt;
+        const checkpoint = checkpoints.checkpoint() ?? "none";
+        const pid = child.pid;
+        const task = observeProcessTree(pid).then((tree) => {
+          const record = `[preflight-observation] phase=${phase} elapsed_ms=${elapsed} root_pid=${pid ?? "unknown"} checkpoint=${checkpoint} ${tree}\n`;
+          try { observationLog?.write("stderr", Buffer.from(record)); } catch { /* diagnostic only */ }
+        }).catch(() => {});
+        pendingObservations.add(task);
+        void task.finally(() => pendingObservations.delete(task));
       };
       if (observe) {
         sample("start");
@@ -105,7 +118,9 @@ export class ProcessRunner {
       const writeDiagnostic = (stream: "stdout" | "stderr", chunk: Buffer): void => {
         try { diagnostic?.write(stream, chunk); } catch { /* command capture remains authoritative */ }
       };
-      const finishDiagnostic = (failed: boolean) => {
+      const finishDiagnostic = async (failed: boolean) => {
+        await Promise.allSettled([...pendingObservations]);
+        try { observationLog?.finish(failed); } catch { /* diagnostic only */ }
         try { return diagnostic?.finish(failed); } catch { return undefined; }
       };
       child.stdout.on("data", (chunk: Buffer) => { writeDiagnostic("stdout", chunk); stdout = append(stdout, chunk, false); rebalance(); });
@@ -114,7 +129,7 @@ export class ProcessRunner {
       let cleanupPollTimer: NodeJS.Timeout | undefined;
       let closedCode: number | null | undefined;
       let exitSignal: NodeJS.Signals | null = null;
-      const finish = (): void => {
+      const finish = async (): Promise<void> => {
         if (closedCode === undefined || settled) return;
         for (const observation of observations) clearTimeout(observation);
         sample(timedOut ? "cleanup" : "exit");
@@ -123,7 +138,7 @@ export class ProcessRunner {
         const cleanupStatus = timedOut || readinessFailed
           ? `term=${termOutcome},kill=${killOutcome},closed=yes`
           : "term=not-sent,kill=not-sent,closed=yes";
-        const diagnosticLog = finishDiagnostic(timedOut || readinessFailed || closedCode !== 0);
+        const diagnosticLog = await finishDiagnostic(timedOut || readinessFailed || closedCode !== 0);
         resolve({
           exit_code: closedCode,
           stdout: stdout.toString("utf8"),
@@ -149,7 +164,7 @@ export class ProcessRunner {
         return child.kill(signal) ? "child-sent" : "unavailable";
       };
       const finishAfterGroupCleanup = (): void => {
-        if (!child.pid) { finish(); return; }
+        if (!child.pid) { void finish(); return; }
         const deadline = Date.now() + 1_000;
         const poll = (): void => {
           try {
@@ -157,13 +172,13 @@ export class ProcessRunner {
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === "ESRCH") {
               cleanupPollTimer = undefined;
-              finish();
+              void finish();
               return;
             }
           }
           if (Date.now() >= deadline) {
             cleanupPollTimer = undefined;
-            finish();
+            void finish();
             return;
           }
           cleanupPollTimer = setTimeout(poll, 20);
@@ -209,8 +224,7 @@ export class ProcessRunner {
         if (settled) return;
         settled = true;
         for (const observation of observations) clearTimeout(observation);
-        const diagnosticLog = finishDiagnostic(true);
-        resolve({
+        void finishDiagnostic(true).then((diagnosticLog) => resolve({
           exit_code: null,
           stdout: stdout.toString("utf8"),
           stderr: stderr.toString("utf8"),
@@ -219,13 +233,13 @@ export class ProcessRunner {
           spawn_error: (error as NodeJS.ErrnoException).code ?? "spawn_error",
           cleanup_status: "spawn-failed",
           ...(diagnosticLog ? { diagnostic_log: diagnosticLog } : {}),
-        });
+        }));
       });
       child.once("close", (code, signal) => {
         if (timer) clearTimeout(timer);
         closedCode = code;
         exitSignal = signal;
-        if (!hardKillTimer && !cleanupPollTimer) finish();
+        if (!hardKillTimer && !cleanupPollTimer) void finish();
       });
     });
   }
