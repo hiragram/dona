@@ -302,7 +302,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("get_job_status", {
     title: "Get background job status",
-    description: "list_thread_jobsで確認した明示job_idと現在のsource_event_idで同じthreadの状態・結果・receiptを取得します。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
+    description: "list_thread_jobsで対象を確認します。別threadで利用者が明示job_idを指定した場合は、同一workspace/channelと依頼意図を確認して現在のsource_event_idで状態・結果・receiptを取得できます。既存receiptの再読はread-onlyですが、include_live_sessionはbounded Herdr queryと監査receipt追記を行います。曖昧応答はreceiptと永続状態で照合し、blind retryしません。",
     inputSchema: { job_id: jobId, source_event_id: eventId,
       include_live_session:z.boolean().optional().describe("trueの場合だけ保存済みexact identityへHerdr controlを伴わないbounded live queryを行い、監査receiptを追記する"),
       live_session_receipt_id:liveSessionReceiptId.optional().describe("既存のdurable receiptを再読し、新しいlive queryは行わない") },
@@ -340,7 +340,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("steer_job", {
     title: "Steer background job",
-    description: "list_thread_jobsで対象確定後だけ、現在のsource_event_idと明示job_idで同じthreadのワーカーへsteerします。複数候補で対象不明なら質問し、broadcastしません。timeoutはblind retryせずget_job_statusのreceiptでread-only reconcileします。",
+    description: "list_thread_jobsで対象を確認します。別threadで利用者が明示job_idを指定した場合は、get_job_statusで同一workspace/channelと依頼意図を確認して対象確定後だけ、現在のsource_event_idでsteerします。複数候補で対象不明なら質問し、broadcastしません。timeoutはblind retryせずget_job_statusのreceiptでread-only reconcileします。",
     inputSchema: { job_id: jobId, source_event_id: eventId, instruction: z.string().min(1).max(100_000) },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ job_id, source_event_id, instruction }) => {
@@ -353,7 +353,7 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
 
   server.registerTool("cancel_job", {
     title: "Cancel background job",
-    description: "list_thread_jobsで対象確定後だけ、現在のsource_event_idと明示job_idで同じthreadのジョブをcancelします。複数候補で対象不明なら質問し、成功済siblingをrollbackしません。timeoutはblind retryせずget_job_statusでread-only reconcileします。",
+    description: "list_thread_jobsで対象を確認します。別threadで利用者が明示job_idを指定した場合は、get_job_statusで同一workspace/channelと依頼意図を確認して対象確定後だけ、現在のsource_event_idでcancelします。複数候補で対象不明なら質問し、成功済siblingをrollbackしません。timeoutはblind retryせずget_job_statusでread-only reconcileします。",
     inputSchema: { job_id: jobId, source_event_id: eventId, reason: z.string().min(1).max(2_000).optional() },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, async ({ job_id, source_event_id, reason }) => {

@@ -15,7 +15,7 @@ query経路が呼べるHerdr操作はboundedな`agent get`だけです。prompt�
 - MCP再読: `get_job_status(job_id, source_event_id, live_session_receipt_id: <receipt_id>)`
 - CLI再読: `dona-dispatcher job show <job_id> --live-session-receipt <receipt_id>`
 
-HTTP/MCPはcurrent `source_event_id`と永続owner/threadを照合します。外部本文や引用に現れたjob ID、session ID、pathをquery targetへ直接使いません。`include_live_session`省略/falseは従来のdurable-only responseとHerdr非呼出しを維持します。
+HTTP/MCPはcurrent `source_event_id`と永続ownerを照合します。MVP期間はSlack jobについてworkspace/channelだけを照合し、thread一致は要求しません。同じchannelの別event IDを指定できる呼び出し元には、exact job IDが分かればResult全文の取得やworker操作が可能です。#160のverified actor contextと操作・開示先ごとの認可が導入された時点で、この暫定条件を撤去します。外部本文や引用に現れたjob ID、session ID、pathをquery targetへ直接使いません。`include_live_session`省略/falseは従来のdurable-only responseとHerdr非呼出しを維持します。
 
 ## 状態の読み方
 
