@@ -17,6 +17,11 @@
 - read-onlyの調査・説明、Issue作成だけの作業、localで完結するone-off reviewでは、この必須routingを適用しない。
 - Skillの選択は追加権限を与えない。commit、通常push、Pull Request作成の依頼から、Pull Request自体のmerge、force push、無関係な変更、ユーザー変更の破棄を許可されたと解釈しない。
 
+## 設計・実装前のreview知見
+
+- 認可境界、永続状態、非同期処理、外部連携を設計・実装する際は、project Skillの`$review-informed-design`を使い、該当する過去のreview知見を現在の要件とコードに照らして確認する。
+- 過去の指摘を現在の欠陥や一律の実装要件とみなさない。PR提出後のCodex Cloud reviewには引き続き`$code-submission-review-cycle`を使う。
+
 ## GitHub ProjectsのIssue着手と提出完了
 
 - Dona Projectの対象Issueを実装・対応する場合は、[Issue lifecycle手順](docs/operations/github-project-issue-lifecycle.md)を読み、Dona親はdelegate前に担当を確認し、workerは着手前に再確認する。
