@@ -479,6 +479,13 @@ test("a maximum-length token followed by the final inline closer has no empty se
   assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
 });
 
+test("a leading inline marker does not become a standalone section before a maximum-length link", () => {
+  const token = `<https://${"a".repeat(2_987)}|P>`;
+  const blocks = expandedSections(`*${token}*`, "identity", true);
+  assert.deepEqual(blocks.map((block) => block.text.text), [token]);
+  assert.equal(blocks[0]?.block_id, "identity");
+});
+
 test("a prefixed escaped near-limit link starts its own section", () => {
   const token = `<https://${"a".repeat(2_985)}|P>`;
   const escaped = `\\${token}`;

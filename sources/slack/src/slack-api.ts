@@ -441,7 +441,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     expand: true,
     });
   });
-  const nonEmptyBlocks = blocks.filter((block, index) => block.text.text.length > 0 && !(index > 0 && /^>+$/.test(block.text.text) && /^[*_~`]+$/.test(chunks[index] ?? "")));
+  const nonEmptyBlocks = blocks.filter((block, index) => block.text.text.length > 0 && !(blocks.length > 1 && (chunks[index]?.length ?? 0) <= 3 && /^[>*_~`]+$/.test(block.text.text) && /^[*_~`]+$/.test(chunks[index] ?? "")));
   if (nonEmptyBlocks[0] && nonEmptyBlocks[0].block_id !== blockId) nonEmptyBlocks[0] = { ...nonEmptyBlocks[0], block_id: blockId };
   if (nonEmptyBlocks.some((block) => block.text.text.length > 3_000)) {
     if (maxRawLength <= 32) throw new Error("Section text cannot fit within Slack's 3,000 character limit");
