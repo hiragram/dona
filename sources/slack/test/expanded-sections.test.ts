@@ -265,3 +265,10 @@ test("a near-limit grapheme falls back to a plain section when formatting exceed
   assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === grapheme));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("an escaped near-limit link fits within a decorated inline section", () => {
+  const token = `<https://${"a".repeat(2_986)}|P>`;
+  const blocks = expandedSections(`*prefix\n\\${token}tail*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.type === "mrkdwn" && block.text.text === `\\${token}`));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});

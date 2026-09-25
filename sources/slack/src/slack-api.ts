@@ -276,6 +276,9 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^\\<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
+      chunk = rawChunk;
+    }
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^:[a-z0-9_+-]+:$/i.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
