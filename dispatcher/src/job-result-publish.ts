@@ -195,7 +195,7 @@ function hasPrivateHttpHost(candidate: string): boolean {
   }
   if (isIP(host) === 6) {
     const first = Number.parseInt(host.split(":")[0] || "0", 16);
-    if (host === "::" || host === "::1" || first === 0x100 || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
+    if (host === "::" || host === "::1" || first === 0 || first === 0x100 || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
       (first & 0xffc0) === 0xfec0 || (first & 0xff00) === 0xff00) return true;
     if (first === 0x2001 && (Number.parseInt(host.split(":")[1] || "0", 16) & 0xfff0) === 0x20) return true;
     if (first === 0x2001 && Number.parseInt(host.split(":")[1] || "0", 16) === 2 &&
@@ -339,7 +339,7 @@ class ForbiddenValueMatcher {
   }
 }
 
-function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher): boolean {
+function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, decodeDepth: number): boolean {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let candidates = 0;
   for (const match of value.matchAll(/[A-Za-z0-9+/_-]{8,}={0,2}/g)) {
@@ -348,8 +348,14 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher): 
     const bytes = Buffer.from(encoded, format);
     if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
     if (++candidates > 1_024) return true;
-    try { if (matcher.contains(decoder.decode(bytes))) return true; }
-    catch { /* Non-UTF-8 data is not worker-visible text. */ }
+    try {
+      const decoded = decoder.decode(bytes);
+      if (matcher.contains(decoded)) return true;
+      assertSafeJson(decoded, 0, undefined, matcher, undefined, decodeDepth + 1);
+    } catch (error) {
+      if (error instanceof JobResultPublishError) return true;
+      // Non-UTF-8 data is not worker-visible text.
+    }
   }
   return false;
 }
@@ -433,7 +439,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
     }
-    if (sensitive.test(value) || (forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
