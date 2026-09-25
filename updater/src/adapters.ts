@@ -511,7 +511,7 @@ export class RealRuntime implements RuntimePort {
         let active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs
           WHERE (status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
-              AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
+              AND attempt_count=0 AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
               ('invalid_result_agent_stopped','agent_not_found','agent_not_running'))
             ${stoppedLegacyClause})

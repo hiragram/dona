@@ -166,6 +166,41 @@ describe("JobSupervisor", () => {
     await supervisor.stop();
     database.close();
   });
+  test("keeps an identity-recorded stale agent in review after a later prepare failure", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.maxAttempts = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-known-orphan");
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "workspace", "pane");
+    database.recoverStaleJobs();
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async prepare() { throw new Error("worktree verification failed"); },
+    }), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "stale_preparing_agent_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("accepts definitive agent absence when cancelling a stale preparation review", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-reviewed-cancel");
+    database.beginJobPreparation(job.job_id);
+    database.recoverStaleJobs();
+    database.markJobNeedsReview(job.job_id, "stale_preparing_agent_unverified", "agent state unknown");
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async cancel() { return failed("agent_not_found"); },
+    }), config, logger, () => undefined);
+    await supervisor.cancel(job.job_id, job.source_event_id);
+    assert.equal(database.getJob(job.job_id)?.status, "cancelled");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    database.close();
+  });
 
   test("fills global slots round-robin without exceeding the per-event limit", async () => {
     const { root, config } = await tempConfig();

@@ -1732,6 +1732,13 @@ describe("DispatcherDatabase", () => {
       .run(job.job_id);
     raw.close();
     assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    const retried = new Database(config.databasePath);
+    retried.prepare("UPDATE jobs SET attempt_count=1 WHERE job_id=?").run(job.job_id);
+    retried.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    const firstAttempt = new Database(config.databasePath);
+    firstAttempt.prepare("UPDATE jobs SET attempt_count=0 WHERE job_id=?").run(job.job_id);
+    firstAttempt.close();
     const guarded = new Database(config.databasePath);
     guarded.prepare("UPDATE jobs SET herdr_workspace_id='possible-worker' WHERE job_id=?").run(job.job_id);
     guarded.close();

@@ -322,7 +322,8 @@ export class JobSupervisor {
         return {row:this.database.getJob(jobId)!,duplicate:false};
       }
       const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
-      if(before.status==="preparing"&&!cancelled.timedOut&&["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
+      if((before.status==="preparing" || ["stale_preparing", "stale_preparing_agent_unverified"].includes(before.last_error_code ?? "")) &&
+          !cancelled.timedOut && ["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
         this.database.markJobCancelled(jobId,reason); this.wake();
         return {row:this.database.getJob(jobId)!,duplicate:false};
       }
@@ -693,11 +694,11 @@ export class JobSupervisor {
       }
       if (this.stopping) return;
       if (this.database.getJob(row.job_id)?.status !== "preparing") return;
-      if (row.last_error_code === "stale_preparing" && row.herdr_workspace_id === null) {
-        // The previous attempt may have created an agent before its identity
-        // was recorded. A later preparation failure cannot prove its absence.
+      if (row.last_error_code === "stale_preparing") {
+        // The previous attempt may have left an agent, even when its workspace
+        // identity was recorded. A later preparation failure does not stop it.
         this.database.markJobNeedsReview(row.job_id, "stale_preparing_agent_unverified",
-          "A previous preparation may have left an agent without a durable identity");
+          "A previous preparation may have left an agent without verified termination");
         return;
       }
       const updated = this.database.recordJobPreparationFailure(

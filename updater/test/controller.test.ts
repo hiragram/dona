@@ -662,6 +662,36 @@ describe("UpdateController isolated end-to-end", () => {
       f.database.close();
     });
   }
+  test("restores stopped current runtime when activation recovery has no restart intent", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-no-restart-intent" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    row = f.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced");
+    for (const [kind, targetRef, expectedSha, previousSessionId] of [
+      ["stop_main_agent", "w1:p1", currentSha, `session-${currentSha}`],
+      ["stop_slack", "slack_adapter", null, null],
+      ["stop_dispatcher", "dispatcher", null, null],
+    ] as const) {
+      f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, targetRef, expectedSha, previousSessionId);
+      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, {});
+    }
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.activeWorkerCount = 1;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    assert.equal(await f.controller.processNext(), true);
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "pre_activation_stop_recovery");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.deepEqual(f.runtime.calls.slice(-3), ["startDispatcher", "startSlack", `startMainAgent:${currentSha}`]);
+    f.database.close();
+  });
   test("does not restart a live Dispatcher when forward Slack drain fails", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

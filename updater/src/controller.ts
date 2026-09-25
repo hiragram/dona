@@ -331,16 +331,23 @@ export class UpdateController {
     }
     const claimed = this.database.claim(requestId, this.owner, this.policy.timeouts.lease_ms, this.clock.now());
     if (!claimed) throw new Error("Update request is leased by another controller");
-    const activatingRecovery = claimed.state === "activating" && (
+    const observation = await this.releases.observe();
+    const activatingRecovery = claimed.state === "activating" && observation.current_sha === claimed.current_sha && (
       this.database.runtimeOperation(requestId, "restart_current_dispatcher") ||
       this.database.runtimeOperation(requestId, "restart_current_slack") ||
       this.database.runtimeOperation(requestId, "start_previous_main_agent")
     );
+    const stoppedBeforeActivation = claimed.state === "activating" && observation.current_sha === claimed.current_sha &&
+      (["stop_main_agent", "stop_slack", "stop_dispatcher"] as const).every((kind) =>
+        this.database.runtimeOperation(requestId, kind)?.phase === "observed");
     if (["quiescing", "restarting", "verifying", "rolling_back"].includes(claimed.state) || activatingRecovery) {
       await this.withLeaseHeartbeat(claimed, () => this.runClaimed(claimed));
       return this.status(requestId);
     }
-    const observation = await this.releases.observe();
+    if (stoppedBeforeActivation) {
+      await this.withLeaseHeartbeat(claimed, () => this.restoreQuiescedServices(claimed, "pre_activation_stop_recovery"));
+      return this.status(requestId);
+    }
     const expectedRelease = observation.current_sha ? path.join(this.policy.release_root, observation.current_sha) : this.policy.current_pointer;
     const [dispatcherHealth, slackHealth, mainAgent, activeManifest] = await Promise.all([
       this.runtime.dispatcherHealth(), this.runtime.slackHealth(), this.runtime.mainAgentStatus(expectedRelease),
