@@ -102,4 +102,14 @@ test("inline delimiters are not synthesized inside a continued fence", () => {
   const logBlocks = blocks.flatMap((block) => [...block.text.text.matchAll(/```([\s\S]*?)```/g)].map((match) => match[1] ?? ""));
   assert.ok(logBlocks.length > 1);
   assert.ok(logBlocks.every((content) => !content.includes("*")));
+  const finalBlock = blocks.at(-1)?.text.text ?? "";
+  assert.ok(finalBlock.includes("```*\n続き*"));
+});
+
+test("grapheme clusters stay in one section", () => {
+  for (const cluster of ["👨‍👩‍👧‍👦", "は\u3099"]) {
+    const blocks = expandedSections(`${"a".repeat(2_899)}${cluster}`, "identity", true);
+    assert.ok(blocks.some((block) => block.text.text.includes(cluster)));
+    assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+  }
 });

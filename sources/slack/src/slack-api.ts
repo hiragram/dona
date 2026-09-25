@@ -120,8 +120,10 @@ function advanceMrkdwnState(
 
 export function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
   const chunks: string[] = [];
+  const graphemeBoundaries = [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(text)].map((part) => part.index);
+  graphemeBoundaries.push(text.length);
   for (let offset = 0; offset < text.length;) {
-    let end = Math.min(offset + 2_980, text.length);
+    let end = Math.min(offset + 2_900, text.length);
     if (end < text.length) {
       const prefix = text.slice(offset, end);
       const newline = prefix.lastIndexOf("\n");
@@ -147,6 +149,15 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
       if ((end - slashStart) % 2 === 1) end = slashStart > offset ? end - 1 : end + 1;
     }
     if (end < text.length && end > offset + 1 && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;
+    let low = 0;
+    let high = graphemeBoundaries.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if ((graphemeBoundaries[middle] ?? 0) <= end) low = middle + 1;
+      else high = middle;
+    }
+    const graphemeEnd = graphemeBoundaries[low - 1] ?? end;
+    if (graphemeEnd > offset) end = graphemeEnd;
     if (end <= offset) end = offset + 1;
     chunks.push(text.slice(offset, end));
     offset = end;
@@ -156,12 +167,28 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
   return chunks.map((rawChunk, index) => {
     const startsInsideFence = state.fence;
     const startsInsideInline = [...state.inline];
-    if (mrkdwn) advanceMrkdwnState(rawChunk, state, text, rawOffset);
+    let rendered = startsInsideFence ? "```\n" : startsInsideInline.join("");
+    let cursor = 0;
+    if (mrkdwn) {
+      for (const match of rawChunk.matchAll(/```/g)) {
+        const fenceAt = match.index;
+        if (isEscaped(text, rawOffset + fenceAt)) continue;
+        const beforeFence = rawChunk.slice(cursor, fenceAt);
+        advanceMrkdwnState(beforeFence, state, text, rawOffset + cursor);
+        rendered += beforeFence;
+        if (!state.fence) rendered += [...state.inline].reverse().join("");
+        rendered += "```";
+        state.fence = !state.fence;
+        if (!state.fence) rendered += state.inline.join("");
+        cursor = fenceAt + 3;
+      }
+      const rest = rawChunk.slice(cursor);
+      advanceMrkdwnState(rest, state, text, rawOffset + cursor);
+      rendered += rest;
+    }
     rawOffset += rawChunk.length;
-    const inlinePrefix = startsInsideFence ? "" : startsInsideInline.join("");
-    const inlineSuffix = !state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : "";
     const chunk = mrkdwn
-      ? `${startsInsideFence ? "```\n" : ""}${inlinePrefix}${rawChunk}${inlineSuffix}${state.fence ? "\n```" : ""}`
+      ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? "\n```" : ""}`
       : rawChunk;
     return ({
     type: "section" as const,
