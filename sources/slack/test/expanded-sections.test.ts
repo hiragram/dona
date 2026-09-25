@@ -457,3 +457,17 @@ test("a Slack link label with spaces and a marker remains a token", () => {
   assert.ok(blocks.some((block) => block.text.text.includes(token)));
   assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("*")));
 });
+
+test("a long grapheme followed by an inline closer falls back to plain text", () => {
+  const grapheme = `a${"\u0301".repeat(2_998)}`;
+  const blocks = expandedSections(`*prefix\n${grapheme}*tail`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === grapheme));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});
+
+test("a maximum-length token followed by the final inline closer has no empty section", () => {
+  const token = `<https://${"a".repeat(2_988)}|P>`;
+  const blocks = expandedSections(`*prefix\n${token}*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === token));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});

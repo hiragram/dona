@@ -386,6 +386,13 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       chunk = rawChunk;
       plainFallback = true;
     }
+    if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
+      const grapheme = rawChunk.slice(0, -closingMarkers.length);
+      if (grapheme.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(grapheme)].length === 1) {
+        chunk = grapheme;
+        plainFallback = true;
+      }
+    }
     const graphemeSlashRun = /^(\\+)/.exec(rawChunk)?.[1] ?? "";
     if (chunk.length > 3_000 && graphemeSlashRun.length % 2 === 1 && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk.slice(graphemeSlashRun.length))].length === 1) {
       chunk = rawChunk;
@@ -398,11 +405,13 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     expand: true,
     });
   });
-  if (blocks.some((block) => block.text.text.length > 3_000)) {
+  const nonEmptyBlocks = blocks.filter((block) => block.text.text.length > 0);
+  if (nonEmptyBlocks[0] && nonEmptyBlocks[0].block_id !== blockId) nonEmptyBlocks[0] = { ...nonEmptyBlocks[0], block_id: blockId };
+  if (nonEmptyBlocks.some((block) => block.text.text.length > 3_000)) {
     if (maxRawLength <= 32) throw new Error("Section text cannot fit within Slack's 3,000 character limit");
     return splitExpandedSections(text, blockId, mrkdwn, Math.floor(maxRawLength / 2));
   }
-  return blocks;
+  return nonEmptyBlocks;
 }
 
 function sectionBlocks(text: string, blockId: string, mrkdwn: boolean): ExpandedSection[] {
