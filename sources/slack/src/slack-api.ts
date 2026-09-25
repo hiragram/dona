@@ -45,6 +45,8 @@ type InlineMarker = "`" | "*" | "_" | "~";
 function advanceMrkdwnState(
   text: string,
   state: { fence: boolean; inline: InlineMarker[] },
+  fullText: string,
+  offset: number,
 ): void {
   for (let index = 0; index < text.length; index++) {
     if (text.startsWith("```", index)) {
@@ -68,15 +70,24 @@ function advanceMrkdwnState(
     if (marker !== "`" && marker !== "*" && marker !== "_" && marker !== "~") continue;
     if (state.inline.includes("`") && marker !== "`") continue;
     const existing = state.inline.lastIndexOf(marker);
-    if (existing === -1) state.inline.push(marker);
-    else state.inline.splice(existing, 1);
+    if (existing !== -1) {
+      state.inline.splice(existing, 1);
+      continue;
+    }
+    const absoluteIndex = offset + index;
+    if (marker === "_" && /[\w]/.test(fullText[absoluteIndex - 1] ?? "")) continue;
+    let close = fullText.indexOf(marker, absoluteIndex + 1);
+    while (close !== -1 && (fullText[close - 1] === "\\" || (marker === "_" && /[\w]/.test(fullText[close + 1] ?? "")))) {
+      close = fullText.indexOf(marker, close + 1);
+    }
+    if (close !== -1) state.inline.push(marker);
   }
 }
 
 export function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
   const chunks: string[] = [];
   for (let offset = 0; offset < text.length;) {
-    let end = Math.min(offset + 2_990, text.length);
+    let end = Math.min(offset + 2_980, text.length);
     if (end < text.length) {
       const prefix = text.slice(offset, end);
       const newline = prefix.lastIndexOf("\n");
@@ -96,10 +107,12 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
     offset = end;
   }
   const state: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
+  let rawOffset = 0;
   return chunks.map((rawChunk, index) => {
     const startsInsideFence = state.fence;
     const startsInsideInline = [...state.inline];
-    if (mrkdwn) advanceMrkdwnState(rawChunk, state);
+    if (mrkdwn) advanceMrkdwnState(rawChunk, state, text, rawOffset);
+    rawOffset += rawChunk.length;
     const inlinePrefix = startsInsideInline.join("");
     const inlineSuffix = index < chunks.length - 1 ? [...state.inline].reverse().join("") : "";
     const chunk = mrkdwn

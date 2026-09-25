@@ -39,3 +39,19 @@ test("a final section preserves unmatched inline markers", () => {
     assert.equal(blocks[0]?.text.text, value);
   }
 });
+
+test("ordinary identifiers do not gain formatting across sections", () => {
+  const text = `job_id ${"x".repeat(7_000)}`;
+  const blocks = expandedSections(text, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.equal(blocks.map((block) => block.text.text).join(""), text);
+});
+
+test("combined inline and fence continuation stays within the section limit", () => {
+  const blocks = expandedSections(`*強調 _斜体 ~取消 \`code\`~_*\n\`\`\`\n${"x".repeat(9_000)}\n\`\`\``, "identity", true);
+  assert.ok(blocks.length > 2);
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+
+  const unmatched = expandedSections(`job_id ~x\n\`\`\`\n${"x".repeat(9_000)}\n\`\`\``, "identity", true);
+  assert.ok(unmatched.every((block) => block.text.text.length <= 3_000));
+});
