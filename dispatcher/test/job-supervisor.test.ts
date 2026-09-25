@@ -105,6 +105,27 @@ afterEach(async () => {
 });
 
 describe("JobSupervisor", () => {
+  test("keeps a stale preparation with unknown agent identity in review after a later prepare failure", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.maxAttempts = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-orphan");
+    database.beginJobPreparation(job.job_id);
+    database.recoverStaleJobs();
+    let prepares = 0;
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async prepare() { prepares += 1; throw new Error("worktree verification failed"); },
+    }), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    assert.equal(prepares, 1);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "stale_preparing_agent_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
   test("fills global slots round-robin without exceeding the per-event limit", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

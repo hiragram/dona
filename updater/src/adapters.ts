@@ -506,7 +506,6 @@ export class RealRuntime implements RuntimePort {
       try {
         const legacyTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get();
         const stoppedLegacyClause = legacyTable ? `AND NOT (status='needs_review'
-          AND COALESCE(last_error_code,'')='legacy_agent_sandbox_unknown'
           AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l
             WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL))` : "";
         let active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs

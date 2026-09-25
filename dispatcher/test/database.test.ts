@@ -1465,6 +1465,10 @@ describe("DispatcherDatabase", () => {
       .run(job.job_id, new Date().toISOString());
     legacy.close();
     assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    const invalid = new Database(config.databasePath);
+    invalid.prepare("UPDATE jobs SET last_error_code='invalid_result' WHERE job_id=?").run(job.job_id);
+    invalid.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
     database.close();
   });
 

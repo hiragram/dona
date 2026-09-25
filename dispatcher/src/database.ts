@@ -636,7 +636,7 @@ export class DispatcherDatabase {
           AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
         AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
           ('invalid_result_agent_stopped','agent_not_found','agent_not_running'))
-        AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='legacy_agent_sandbox_unknown'
+        AND NOT (status='needs_review'
           AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l
             WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)))
         OR (status = 'retryable_failed' AND (herdr_workspace_id IS NOT NULL OR last_error_code = 'stale_preparing'))

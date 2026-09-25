@@ -272,6 +272,10 @@ test("RealRuntime excludes only a proven pre-prepare result collision", async ()
       .run(new Date().toISOString());
     legacy.close();
     assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    const invalid = new Database(databasePath);
+    invalid.prepare("UPDATE jobs SET last_error_code='invalid_result'").run();
+    invalid.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
   } finally {
     await removeTree(root);
   }

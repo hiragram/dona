@@ -311,6 +311,7 @@ class FakeRuntime implements RuntimePort {
   private mainWaitCallCount = 0;
   mainStopOutcome: "stopped" | "rejected" | "accepted_unknown" = "stopped";
   mainStartUnknownOnce = false;
+  targetMainStartRejectedOnce = false;
   previousMainStartUnknownOnce = false;
   mainAgentSessionGeneration = 0;
   rotateMainAgentSessionOnStart = false;
@@ -406,6 +407,11 @@ class FakeRuntime implements RuntimePort {
   async startMainAgent(paneId: string, releasePath: string) {
     this.calls.push(`startMainAgent:${path.basename(releasePath)}`);
     assert.equal(paneId, "w1:p1");
+    if (this.targetMainStartRejectedOnce && path.basename(releasePath) === targetSha) {
+      this.targetMainStartRejectedOnce = false;
+      return { outcome: "rejected" as const, observation: this.mainAgent(this.mainAgentSha, "unknown", releasePath),
+        error_code: "main_agent_start_rejected" };
+    }
     if (this.previousMainStartUnknownOnce && path.basename(releasePath) === currentSha) {
       this.previousMainStartUnknownOnce = false;
       this.mainAgentExists = true;
@@ -841,6 +847,26 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, targetSha);
     assert.equal(f.runtime.calls.filter(call => call === "quiesceSlack").length, 1);
     assert.equal(f.database.runtimeOperation(row.request_id, "stop_target_dispatcher"), undefined);
+    f.database.close();
+  });
+
+  test("rolls back when target services were never started after a rejected main launch", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-target-launch-reject" });
+    f.dispatcher.terminal = true;
+    f.runtime.targetMainStartRejectedOnce = true;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "rolled_back", JSON.stringify({ error: row.last_error_code,
+      calls: f.runtime.calls, operations: f.database.runtimeOperations(row.request_id) }));
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.equal(f.database.runtimeOperation(row.request_id, "stop_dispatcher")?.phase, "observed");
+    assert.equal(f.database.runtimeOperation(row.request_id, "start_target_dispatcher"), undefined);
+    assert.equal(f.runtime.calls.filter(call => call === "quiesceDispatcher").length, 1);
     f.database.close();
   });
 

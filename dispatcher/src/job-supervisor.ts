@@ -669,6 +669,13 @@ export class JobSupervisor {
       }
       if (this.stopping) return;
       if (this.database.getJob(row.job_id)?.status !== "preparing") return;
+      if (row.last_error_code === "stale_preparing" && row.herdr_workspace_id === null) {
+        // The previous attempt may have created an agent before its identity
+        // was recorded. A later preparation failure cannot prove its absence.
+        this.database.markJobNeedsReview(row.job_id, "stale_preparing_agent_unverified",
+          "A previous preparation may have left an agent without a durable identity");
+        return;
+      }
       const updated = this.database.recordJobPreparationFailure(
         row.job_id,
         errorCode(error),

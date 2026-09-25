@@ -868,7 +868,10 @@ export class UpdateController {
         // A stopped Dispatcher cannot be fenced by this rollback protocol.
         const dispatcherBeforeDrain = await this.runtime.dispatcherHealth();
         this.assertLease(row);
-        if (!dispatcherBeforeDrain.live) {
+        const targetDispatcherNeverStarted =
+          this.database.runtimeOperation(row.request_id, "stop_dispatcher")?.phase === "observed" &&
+          this.database.runtimeOperation(row.request_id, "start_target_dispatcher") === undefined;
+        if (!dispatcherBeforeDrain.live && !targetDispatcherNeverStarted) {
           this.needsReview(row, "rollback_dispatcher_unavailable");
           return;
         }
@@ -897,6 +900,14 @@ export class UpdateController {
         if (!(await this.ensureServiceStopped(
           row, "stop_target_dispatcher", "dispatcher", null, () => this.runtime.stopDispatcher(),
         ))) return;
+        // A KeepAlive restart between the earlier observation and stop must
+        // not carry a newly created external worker across the pointer switch.
+        const workerAfterStop = await this.runtime.workerSafety();
+        this.assertLease(row);
+        if (!workerAfterStop.safe) {
+          this.needsReview(row, workerAfterStop.error_code ?? "rollback_active_worker_handoff_unavailable");
+          return;
+        }
       } else {
         const stoppedKinds = ["stop_target_main_agent", "stop_target_slack", "stop_target_dispatcher"] as const;
         if (stoppedKinds.some((kind) => this.database.runtimeOperation(row.request_id, kind)?.phase !== "observed")) {
