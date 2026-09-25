@@ -562,6 +562,7 @@ describe("job result publish contract", () => {
     let client: net.Socket | undefined;
     let combined: net.Socket | undefined;
     let chunked: net.Socket | undefined;
+    let split: net.Socket | undefined;
     let overlapping: net.Socket | undefined;
     let stalled: net.Socket | undefined;
     let waiting: net.Socket | undefined;
@@ -601,6 +602,16 @@ describe("job result publish contract", () => {
       assert.match(await chunkedResponse, /^HTTP\/1\.1 202 /);
       await new Promise(resolve => setTimeout(resolve, 60));
       assert.equal(chunked.destroyed, false, "chunked本文を後続headerと誤認しない");
+      split = net.createConnection(socket);
+      split.on("error", () => {});
+      await new Promise<void>(resolve => split!.once("connect", resolve));
+      const splitResponse = new Promise<string>(resolve => split!.once("data", data => resolve(String(data))));
+      split.write("POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\n");
+      await new Promise(resolve => setTimeout(resolve, 10));
+      split.write(`Content-Length: ${Buffer.byteLength(body)}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${body}POST /v1/job-result-publish HTTP/1.1\r\n`);
+      assert.match(await splitResponse, /^HTTP\/1\.1 202 /);
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(split.destroyed, true, "分割request直後のpartial headerも期限で閉じる");
       blockCommit = true;
       overlapping = net.createConnection(socket);
       overlapping.on("error", () => {});
@@ -631,6 +642,7 @@ describe("job result publish contract", () => {
       client?.destroy();
       combined?.destroy();
       chunked?.destroy();
+      split?.destroy();
       releaseCommit?.();
       overlapping?.destroy();
       stalled?.destroy();

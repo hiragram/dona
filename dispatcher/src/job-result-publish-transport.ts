@@ -34,34 +34,34 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
   reply(response, status, code);
 }
 
-function hasBytesAfterRequest(chunk: Buffer): boolean {
+function requestEndOffset(chunk: Buffer): number | null {
   const headerEnd = chunk.indexOf("\r\n\r\n");
-  if (headerEnd < 0) return false;
+  if (headerEnd < 0) return null;
   const header = chunk.subarray(0, headerEnd).toString("latin1");
-  if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(header)) return false;
+  if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(header)) return null;
   if (/\r\ntransfer-encoding:\s*chunked\s*(?:\r\n|$)/i.test(header)) {
     let cursor = headerEnd + 4;
     while (cursor < chunk.length) {
       const sizeEnd = chunk.indexOf("\r\n", cursor);
-      if (sizeEnd < 0) return false;
+      if (sizeEnd < 0) return null;
       const sizeText = chunk.subarray(cursor, sizeEnd).toString("latin1").split(";", 1)[0]!.trim();
-      if (!/^[0-9a-f]+$/i.test(sizeText)) return false;
+      if (!/^[0-9a-f]+$/i.test(sizeText)) return null;
       const size = Number.parseInt(sizeText, 16);
-      if (!Number.isSafeInteger(size)) return false;
+      if (!Number.isSafeInteger(size)) return null;
       cursor = sizeEnd + 2;
       if (size === 0) {
         const trailerEnd = chunk.indexOf("\r\n\r\n", cursor);
         const end = trailerEnd >= 0 ? trailerEnd + 4 : chunk.subarray(cursor, cursor + 2).toString("latin1") === "\r\n" ? cursor + 2 : -1;
-        return end >= 0 && chunk.length > end;
+        return end >= 0 ? end : null;
       }
-      if (chunk.length < cursor + size + 2 || chunk.subarray(cursor + size, cursor + size + 2).toString("latin1") !== "\r\n") return false;
+      if (chunk.length < cursor + size + 2 || chunk.subarray(cursor + size, cursor + size + 2).toString("latin1") !== "\r\n") return null;
       cursor += size + 2;
     }
-    return false;
+    return null;
   }
   const match = header.match(/\r\ncontent-length:\s*(\d+)/i);
   const length = Number(match?.[1] ?? "0");
-  return Number.isSafeInteger(length) && chunk.length > headerEnd + 4 + length;
+  return Number.isSafeInteger(length) && chunk.length >= headerEnd + 4 + length ? headerEnd + 4 + length : null;
 }
 
 function recoverableReject(request: IncomingMessage, response: ServerResponse, status: number, code: string, timeoutMs: number): void {
@@ -109,8 +109,6 @@ export class JobResultPublishServer {
   private readonly publishingSockets = new Set<net.Socket>();
   private readonly activeRequests = new Set<net.Socket>();
   private readonly activeMessages = new Map<net.Socket, IncomingMessage>();
-  private readonly completedData = new WeakSet<IncomingMessage>();
-  private readonly initialPipelinedHeader = new WeakSet<net.Socket>();
   private readonly publishing = new Set<Promise<void>>();
   private stopping = false;
   constructor(
@@ -132,31 +130,58 @@ export class JobResultPublishServer {
     if (this.stopping || new Set([...this.sockets, ...this.publishingSockets]).size >= this.maxConnections) { socket.destroy(); return; }
     this.sockets.add(socket);
     socket.on("error", () => socket.destroy());
-    // Keep the FD outside the HTTP parser until its first byte. The worker may
-    // run for hours before publishing; a partial first header gets a deadline.
-    socket.once("data", chunk => {
-      if (hasBytesAfterRequest(chunk)) this.initialPipelinedHeader.add(socket);
+    let rawChunks: Buffer[] = [];
+    let rawBytes = 0;
+    let completedOnce = false;
+    const armHeaderDeadline = () => {
+      if (socket.destroyed || this.headerDeadlines.has(socket)) return;
       const deadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
       deadline.unref();
       this.headerDeadlines.set(socket, deadline);
+    };
+    const inspectRaw = () => {
+      if (socket.destroyed) return;
+      if (rawBytes === 0) return;
+      const active = this.activeMessages.get(socket);
+      if (active && !active.complete) return;
+      const raw = Buffer.concat(rawChunks, rawBytes);
+      const end = requestEndOffset(raw);
+      if (end !== null) {
+        completedOnce = true;
+        const remainder = Buffer.from(raw.subarray(end));
+        rawChunks = remainder.length ? [remainder] : [];
+        rawBytes = remainder.length;
+        if (remainder.length) armHeaderDeadline();
+      } else if (completedOnce) {
+        armHeaderDeadline();
+      }
+    };
+    // Keep the FD outside the HTTP parser until its first byte. The worker may
+    // run for hours before publishing; a partial first header gets a deadline.
+    socket.once("data", chunk => {
+      const initial = Buffer.from(chunk);
+      rawChunks = [initial];
+      rawBytes = initial.length;
+      let firstReplay = true;
+      armHeaderDeadline();
       socket.pause();
       socket.unshift(chunk);
       this.server.emit("connection", socket);
       socket.on("data", chunk => {
-        if (this.headerDeadlines.has(socket)) return;
-        const active = this.activeMessages.get(socket);
-        if (active && !active.complete) return;
-        // The HTTP parser sees the data event before this listener. The chunk
-        // that completed the current request is not a new header.
-        if (active?.complete && !this.completedData.has(active)) {
-          this.completedData.add(active);
-          if (!hasBytesAfterRequest(chunk)) return;
+        if (firstReplay && chunk.equals(initial)) {
+          firstReplay = false;
+          queueMicrotask(inspectRaw);
+          return;
         }
-        const nextDeadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
-        nextDeadline.unref();
-        this.headerDeadlines.set(socket, nextDeadline);
+        firstReplay = false;
+        rawBytes += chunk.length;
+        if (rawBytes > jobResultEnvelopeMaxBytes + 16_384) { socket.destroy(); return; }
+        rawChunks.push(Buffer.from(chunk));
+        // Observe the HTTP parser's state after it has handled this data event.
+        queueMicrotask(inspectRaw);
       });
       socket.resume();
+      queueMicrotask(inspectRaw);
     });
     socket.once("close", () => {
       this.sockets.delete(socket);
@@ -187,15 +212,6 @@ export class JobResultPublishServer {
     const headerDeadline = this.headerDeadlines.get(request.socket);
     if (headerDeadline) clearTimeout(headerDeadline);
     this.headerDeadlines.delete(request.socket);
-    if (this.initialPipelinedHeader.has(request.socket)) {
-      this.initialPipelinedHeader.delete(request.socket);
-      request.once("end", () => {
-        if (request.socket.destroyed || this.headerDeadlines.has(request.socket)) return;
-        const deadline = setTimeout(() => request.socket.destroy(), this.bodyTimeoutMs);
-        deadline.unref();
-        this.headerDeadlines.set(request.socket, deadline);
-      });
-    }
     if (request.method !== "POST" || !["/v1/job-result-publish", "/v1/job-result-publish/renew"].includes(request.url ?? "")) {
       reject(request, response, 404, "not_found"); return;
     }
