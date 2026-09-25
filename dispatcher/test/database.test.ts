@@ -399,7 +399,9 @@ describe("DispatcherDatabase", () => {
         { tool: "dona_slack.post_message", job_id:"job-blocked",
         workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.000003",
         body_sha256:createHash("sha256").update("完了").digest("hex"),
-        message_ts: `${Math.floor(Date.parse("2026-09-03T00:02:30.000Z") / 1000)}.000001` }],
+        message_ts: `${Math.floor(Date.parse("2026-09-03T00:02:30.000Z") / 1000)}.000001` },
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",
+          thread_ts:"1756722030.000003",status:"suspended"}],
     }));
     migrateDispatcherDatabase(raw, () => {}, false, 3);
     raw.prepare("DELETE FROM job_legacy_notification_migration WHERE job_id='job-blocked'").run();
@@ -457,6 +459,13 @@ describe("DispatcherDatabase", () => {
       ["premature receipt", [{ ...valid, message_ts: `${Math.floor(Date.parse("2026-09-03T00:01:00.000Z") / 1000)}.000001` }]],
       ["unrelated post", [{ ...valid, job_id:"job-other" }]],
       ["wrong body", [{ ...valid, body_sha256:"0".repeat(64) }]],
+      ["missing final session status", [valid]],
+      ["processing only", [valid,{tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",
+        channel_id:"C_TEST",thread_ts:"1756722030.000003",status:"processing"}]],
+      ["wrong final session status", [valid,{tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",
+        channel_id:"C_TEST",thread_ts:"1756722030.000003",status:"active"}]],
+      ["failed final session status", [valid,{tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",
+        channel_id:"C_TEST",thread_ts:"1756722030.000003",status:"suspended",success:false}]],
     ];
     for (const [label, actions] of cases) {
       const { root, config } = await tempConfig();
@@ -468,6 +477,11 @@ describe("DispatcherDatabase", () => {
         status: "completed", completed_at: "2026-09-03T00:03:00.000Z", actions: [
           {tool:"delegate_job",job_id:"job-blocked",source_event_id:"evt-source-blocked",outcome:"created"},
           ...(actions as unknown[]),
+          ...(["missing final session status", "processing only", "wrong final session status",
+            "failed final session status"].includes(label) ? [] : [
+            {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",
+              thread_ts:"1756722030.000003",status:"suspended"},
+          ]),
         ] });
       raw.prepare("UPDATE events SET result_json=? WHERE event_id='evt-source-blocked'").run(result);
       migrateDispatcherDatabase(raw, () => {}, false, 3);

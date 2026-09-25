@@ -243,6 +243,7 @@ function legacyNotificationState(row: {
     let messageTs: string | null = null;
     let delegated = false;
     let postBoundToJob = false;
+    let settledSessionStatus: string | null = null;
     for (const raw of result.actions) {
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { state: "acceptance_unknown", messageTs: null };
       const action = raw as Record<string, unknown>;
@@ -266,22 +267,30 @@ function legacyNotificationState(row: {
         if (messageTs !== null && messageTs !== action.message_ts) return { state: "acceptance_unknown", messageTs: null };
         messageTs = action.message_ts;
         postBoundToJob = true;
+        settledSessionStatus = null;
       } else if (action.tool === "dona_slack.set_agent_session_status") {
         if (action.workspace_id !== row.workspace_id || action.channel_id !== row.channel_id ||
             action.thread_ts !== row.thread_ts ||
-            !["processing", "active", "suspended"].includes(String(action.status))) {
+            !["processing", "active", "suspended"].includes(String(action.status)) ||
+            action.success === false || action.ok === false || action.ambiguous === true || "error" in action) {
           return { state: "acceptance_unknown", messageTs: null };
         }
+        if (messageTs !== null) settledSessionStatus = String(action.status);
       } else {
         return { state: "acceptance_unknown", messageTs: null };
       }
     }
     if (messageTs !== null) {
+      const validSessionStatus = row.status === "blocked" || row.status === "needs_review"
+        ? settledSessionStatus === "suspended"
+        : row.status === "failed"
+          ? settledSessionStatus === "active" || settledSessionStatus === "suspended"
+          : settledSessionStatus === "active";
       const terminalAt = Date.parse(row.status === "blocked" || row.status === "needs_review"
         ? row.updated_at : row.completed_at ?? "");
       const sourceCompletedAt = Date.parse(String(result.completed_at ?? ""));
       const postedAt = Number(messageTs);
-      if (!delegated || !postBoundToJob || !Number.isFinite(terminalAt) || !Number.isFinite(sourceCompletedAt) ||
+      if (!delegated || !postBoundToJob || !validSessionStatus || !Number.isFinite(terminalAt) || !Number.isFinite(sourceCompletedAt) ||
           !Number.isFinite(postedAt) || postedAt * 1000 < terminalAt ||
           sourceCompletedAt < terminalAt || postedAt * 1000 > sourceCompletedAt + 60_000) {
         return { state: "acceptance_unknown", messageTs: null };
