@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -343,7 +344,7 @@ describe("DispatcherDatabase", () => {
     }
   });
 
-  test("legacy direct-post receipts suppress five migrated terminal notifications across restart", async () => {
+  test("five historical posts without job-bound content proof cannot trigger duplicate notifications", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -355,6 +356,10 @@ describe("DispatcherDatabase", () => {
       const threadTs = (raw.prepare("SELECT thread_ts FROM jobs WHERE job_id=?").get(jobId) as {thread_ts:string}).thread_ts;
       raw.prepare("UPDATE jobs SET status=?,completion_event_id=NULL,completed_at=COALESCE(completed_at,?) WHERE job_id=?")
         .run(status === "queued" ? "failed" : status, "2026-09-03T00:02:00.000Z", jobId);
+      if (status === "blocked" || status === "needs_review") raw.prepare("UPDATE jobs SET completed_at=NULL,updated_at=? WHERE job_id=?")
+        .run("2026-09-03T00:02:05.000Z",jobId);
+      if (status === "queued") raw.prepare("UPDATE jobs SET result_json=? WHERE job_id=?")
+        .run(JSON.stringify({schema_version:1,job_id:jobId,status:"failed"}),jobId);
       raw.prepare("UPDATE events SET status='completed',result_json=? WHERE event_id=?").run(JSON.stringify({
         schema_version: 1, event_id: sourceId, status: "completed", completed_at: "2026-09-03T00:03:00.000Z",
         actions: [{ tool: "dona_slack.post_message", workspace_id: "T_TEST", channel_id: "C_TEST",
@@ -364,14 +369,14 @@ describe("DispatcherDatabase", () => {
     migrateDispatcherDatabase(raw, () => {}, false, 3);
     const markers = raw.prepare("SELECT job_id,state,workspace_id,channel_id,thread_ts,message_ts FROM job_legacy_notification_migration ORDER BY job_id")
       .all() as Array<{job_id:string;state:string;workspace_id:string;channel_id:string;thread_ts:string;message_ts:string|null}>;
-    assert.equal(markers.filter(row => row.state === "notified").length, 5);
+    assert.equal(markers.filter(row => row.state === "acceptance_unknown").length, 5);
     assert.equal(markers.filter(row => row.workspace_id === "T_TEST" && row.channel_id === "C_TEST" && row.thread_ts.startsWith("1756722030.")).length, 5);
     assert.equal(markers.find(row => row.job_id === "job-running"), undefined);
     raw.close();
     for (let pass = 0; pass < 2; pass++) {
       const database = new DispatcherDatabase(config.databasePath);
       assert.deepEqual(database.listJobsNeedingNotification(), []);
-      assert.throws(() => database.enqueueJobNotification("job-blocked"), /legacy_notification_notified/);
+      assert.throws(() => database.enqueueJobNotification("job-blocked"), /legacy_notification_acceptance_unknown/);
       database.close();
     }
     const checked = new Database(config.databasePath);
@@ -385,10 +390,15 @@ describe("DispatcherDatabase", () => {
     await createSchemaV2Fixture(config.databasePath);
     const raw = new Database(config.databasePath);
     raw.pragma("foreign_keys = ON");
+    raw.prepare("UPDATE jobs SET completed_at=NULL,updated_at=? WHERE job_id='job-blocked'")
+      .run("2026-09-03T00:02:05.000Z");
     raw.prepare("UPDATE events SET result_json=? WHERE event_id='evt-source-blocked'").run(JSON.stringify({
       schema_version: 1, event_id: "evt-source-blocked", status: "completed",
-      completed_at: "2026-09-03T00:03:00.000Z", actions: [{ tool: "dona_slack.post_message",
+      completed_at: "2026-09-03T00:03:00.000Z", actions: [
+        {tool:"delegate_job",job_id:"job-blocked",source_event_id:"evt-source-blocked",outcome:"created"},
+        { tool: "dona_slack.post_message", job_id:"job-blocked",
         workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.000003",
+        body_sha256:createHash("sha256").update("完了").digest("hex"),
         message_ts: `${Math.floor(Date.parse("2026-09-03T00:02:30.000Z") / 1000)}.000001` }],
     }));
     migrateDispatcherDatabase(raw, () => {}, false, 3);
@@ -435,7 +445,8 @@ describe("DispatcherDatabase", () => {
   test("legacy receipt decoder fails closed for malformed, conflicting, stale, and unknown actions", async () => {
     const messageTs = `${Math.floor(Date.parse("2026-09-03T00:02:30.000Z") / 1000)}.000001`;
     const valid = { tool: "dona_slack.post_message", workspace_id: "T_TEST", channel_id: "C_TEST",
-      thread_ts: "1756722030.000003", message_ts: messageTs };
+      thread_ts: "1756722030.000003", message_ts: messageTs, job_id:"job-blocked",
+      body_sha256:createHash("sha256").update("完了").digest("hex") };
     const cases: Array<[string, unknown]> = [
       ["malformed", "{"],
       ["unknown action", [{ ...valid, tool: "unknown.post_message" }]],
@@ -444,6 +455,8 @@ describe("DispatcherDatabase", () => {
       ["ambiguous write", [{ ...valid, ambiguous: true }]],
       ["wrong channel", [{ ...valid, channel_id: "C_OTHER" }]],
       ["premature receipt", [{ ...valid, message_ts: `${Math.floor(Date.parse("2026-09-03T00:01:00.000Z") / 1000)}.000001` }]],
+      ["unrelated post", [{ ...valid, job_id:"job-other" }]],
+      ["wrong body", [{ ...valid, body_sha256:"0".repeat(64) }]],
     ];
     for (const [label, actions] of cases) {
       const { root, config } = await tempConfig();
@@ -452,7 +465,10 @@ describe("DispatcherDatabase", () => {
       const raw = new Database(config.databasePath);
       raw.pragma("foreign_keys = ON");
       const result = actions === "{" ? "{" : JSON.stringify({ schema_version: 1, event_id: "evt-source-blocked",
-        status: "completed", completed_at: "2026-09-03T00:03:00.000Z", actions });
+        status: "completed", completed_at: "2026-09-03T00:03:00.000Z", actions: [
+          {tool:"delegate_job",job_id:"job-blocked",source_event_id:"evt-source-blocked",outcome:"created"},
+          ...(actions as unknown[]),
+        ] });
       raw.prepare("UPDATE events SET result_json=? WHERE event_id='evt-source-blocked'").run(result);
       migrateDispatcherDatabase(raw, () => {}, false, 3);
       assert.equal((raw.prepare("SELECT state FROM job_legacy_notification_migration WHERE job_id='job-blocked'")
@@ -487,6 +503,24 @@ describe("DispatcherDatabase", () => {
     assert.equal(b.duplicate, true);
     first.close();
     second.close();
+  });
+
+  test("a later cancellation is not suppressed by an earlier blocked migration marker", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const raw = new Database(config.databasePath);
+    raw.pragma("foreign_keys = ON");
+    migrateDispatcherDatabase(raw, () => {}, false, 3);
+    assert.equal((raw.prepare("SELECT state FROM job_legacy_notification_migration WHERE job_id='job-blocked'")
+      .get() as {state:string}).state, "acceptance_unknown");
+    raw.prepare("UPDATE jobs SET status='cancelled',completed_at=?,updated_at=? WHERE job_id='job-blocked'")
+      .run("2026-09-03T00:10:00.000Z","2026-09-03T00:10:00.000Z");
+    raw.close();
+    const database = new DispatcherDatabase(config.databasePath);
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
+    assert.equal(database.enqueueJobNotification("job-blocked").duplicate, false);
+    database.close();
   });
 
   test("a busy migration leaves v2 jobs and notification markers untouched", async () => {
