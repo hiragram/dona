@@ -1099,15 +1099,19 @@ export class DispatcherDatabase {
 
   listTerminalJobsNeedingWorkerStopProof(afterJobId = "", limit = 100): JobRow[] {
     return this.db.prepare(`SELECT * FROM jobs WHERE job_id>? AND status IN ('completed','failed','cancelled')
-      AND last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+      AND (last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+        OR (last_error_code='schedule_reconcile_worker_unverified' AND herdr_workspace_id IS NULL))
       AND COALESCE(steer_state,'') <> 'dispatching'
       ORDER BY job_id LIMIT ?`).all(afterJobId,limit) as JobRow[];
   }
 
   markTerminalJobWorkerStopped(jobId: string, expectedCode: string): void {
-    this.db.prepare(`UPDATE jobs SET last_error_code=CASE WHEN status='failed' THEN 'agent_reported_failure' ELSE NULL END,
+    this.db.prepare(`UPDATE jobs SET last_error_code=CASE
+      WHEN last_error_code='schedule_reconcile_worker_unverified' AND status='failed' THEN 'schedule_reconciled_failed'
+      WHEN status='failed' THEN 'agent_reported_failure' ELSE NULL END,
       last_error_message=NULL,steer_state=NULL,updated_at=? WHERE job_id=? AND status IN ('completed','failed','cancelled')
-      AND last_error_code=? AND last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+      AND last_error_code=? AND (last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+        OR (last_error_code='schedule_reconcile_worker_unverified' AND herdr_workspace_id IS NULL))
       AND COALESCE(steer_state,'') <> 'dispatching'`)
       .run(nowUtc(),jobId,expectedCode);
   }

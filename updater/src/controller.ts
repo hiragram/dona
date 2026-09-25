@@ -737,7 +737,14 @@ export class UpdateController {
           typeof evidence.cause_code === "string" ? evidence.cause_code : "pre_activation_recovery_unverified");
         return;
       }
-      if (await this.runtime.dispatcherRegistered()) {
+      let dispatcherRegistered: boolean;
+      try { dispatcherRegistered = await this.runtime.dispatcherRegistered(); }
+      catch {
+        this.assertLease(row);
+        await this.restoreQuiescedServices(row, "dispatcher_registration_unverified");
+        return;
+      }
+      if (dispatcherRegistered) {
         this.assertLease(row);
         this.needsReview(row, "dispatcher_registration_restored_before_activation");
         return;
@@ -1917,7 +1924,18 @@ export class UpdateController {
         { cause_code: causeCode, ...scopeEvidence },
         this.clock.now(),
       );
-      const result = await execute();
+      let result: CommandResult;
+      try { result = await execute(); }
+      catch {
+        this.assertLease(row);
+        this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "acceptance_unknown", null, {
+          cause_code: causeCode, ...scopeEvidence, error_code: "runtime_command_exception",
+        }, this.clock.now());
+        if (await reconcileUnknownStart()) return true;
+        fail(`${codePrefix}_restart_unknown`,
+          `Update stopped before main-agent mutation (${causeCode}), but ${label} restart acceptance is unknown; no blind retry was attempted`);
+        return false;
+      }
       this.assertLease(row);
       if (!resultSucceeded(result)) {
         const phase = result.timed_out || result.output_truncated || result.exit_code === null

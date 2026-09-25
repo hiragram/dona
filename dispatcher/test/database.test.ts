@@ -1776,6 +1776,23 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("terminal schedule reconciliation without a workspace can clear after stop proof", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-schedule-reconcile-stop-proof")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "停止照合",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='failed',last_error_code='schedule_reconcile_worker_unverified' WHERE job_id=?")
+      .run(job.job_id);
+    raw.close();
+    assert.deepEqual(database.listTerminalJobsNeedingWorkerStopProof().map(row => row.job_id), [job.job_id]);
+    database.markTerminalJobWorkerStopped(job.job_id, "schedule_reconcile_worker_unverified");
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "schedule_reconciled_failed");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    database.close();
+  });
+
   test("a result after an accepted steer preserves the unresolved worker", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);

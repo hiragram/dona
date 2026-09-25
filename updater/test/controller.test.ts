@@ -268,6 +268,7 @@ class FakeDispatcher implements DispatcherPort {
 class FakeRuntime implements RuntimePort {
   dispatcherRegistrationOverride: boolean | undefined;
   dispatcherRegistrationAppearsOnCall: number | undefined;
+  dispatcherRegistrationThrowsOnCall: number | undefined;
   private dispatcherRegistrationCalls = 0;
   activeWorkerCount = 0;
   workerAppearsAfterForwardStop = false;
@@ -281,6 +282,7 @@ class FakeRuntime implements RuntimePort {
   targetRecoveryDispatcherStartUnknownOnce = false;
   targetRecoveryDispatcherStartRejectedOnce = false;
   currentRecoveryDispatcherStartRejectedOnce = false;
+  dispatcherStartThrows = false;
   reviveDispatcherOnWorkerSafety = false;
   rollbackSlackDrainIncomplete = false;
   forwardSlackDrainIncomplete = false;
@@ -386,6 +388,9 @@ class FakeRuntime implements RuntimePort {
   }
   async dispatcherRegistered() {
     this.dispatcherRegistrationCalls += 1;
+    if (this.dispatcherRegistrationThrowsOnCall === this.dispatcherRegistrationCalls) {
+      throw new Error("dispatcher_registration_unverified");
+    }
     if (this.dispatcherRegistrationAppearsOnCall === this.dispatcherRegistrationCalls) {
       this.dispatcherRegistrationOverride = true;
     }
@@ -393,6 +398,7 @@ class FakeRuntime implements RuntimePort {
   }
   async startDispatcher() {
     this.calls.push("startDispatcher");
+    if (this.dispatcherStartThrows) throw new Error("dispatcher_registration_unverified");
     if (this.currentRecoveryDispatcherStartRejectedOnce && this.mainAgentSha === currentSha) {
       this.currentRecoveryDispatcherStartRejectedOnce = false;
       return { ...ok, exit_code: 1 };
@@ -604,7 +610,8 @@ describe("UpdateController isolated end-to-end", () => {
     f.runtime.dispatcherRestartedDuringDrain = true;
     await f.controller.processNext();
     const row = f.database.get(planned.request_id as string)!;
-    assert.equal(row.state, "failed");
+    assert.equal(row.state, "failed", JSON.stringify({ error: row.last_error_code, calls: f.runtime.calls,
+      operations: f.database.runtimeOperations(row.request_id) }));
     assert.equal(row.last_error_code, "dispatcher_drain_incomplete");
     assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "startSlack"]);
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher"), undefined);
@@ -681,6 +688,44 @@ describe("UpdateController isolated end-to-end", () => {
     await f.controller.processNext();
     assert.equal(f.database.get(planned.request_id as string)?.last_error_code,
       "dispatcher_registration_restored_before_activation");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
+  test("restores old runtime when Dispatcher registration read fails before activation", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-registration-read" });
+    f.dispatcher.terminal = true;
+    f.runtime.dispatcherRegistrationThrowsOnCall = 2;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed", JSON.stringify({ error: row.last_error_code, calls: f.runtime.calls,
+      operations: f.database.runtimeOperations(row.request_id) }));
+    assert.equal(row.last_error_code, "dispatcher_registration_unverified");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher")?.phase, "observed");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
+  test("keeps recovery intents and restores other services when registration stays unreadable", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-registration-failure" });
+    f.dispatcher.terminal = true;
+    f.runtime.dispatcherRegistrationThrowsOnCall = 2;
+    f.runtime.dispatcherStartThrows = true;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher")?.phase, "acceptance_unknown");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
+    assert.equal(f.database.runtimeOperation(row.request_id, "start_previous_main_agent")?.phase, "observed");
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
