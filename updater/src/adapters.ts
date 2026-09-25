@@ -518,12 +518,14 @@ export class RealRuntime implements RuntimePort {
             OR (status='retryable_failed' AND (last_error_code='stale_preparing' OR
               (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
             OR steer_state='dispatching'
-            OR (status IN ('completed','failed','cancelled') AND last_error_code='schedule_reconcile_worker_unverified')`)
+            OR (status IN ('completed','failed','cancelled') AND last_error_code IN
+              ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified'))`)
           .get() as { count: number }).count;
         if (legacyTable) active += (database.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
           JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
             AND COALESCE(j.steer_state,'') <> 'dispatching'
             AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
+            AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
             AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
             AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
               (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)

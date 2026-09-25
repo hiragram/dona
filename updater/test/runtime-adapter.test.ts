@@ -266,12 +266,15 @@ test("RealRuntime counts a reconciled terminal schedule worker without stop proo
   const databasePath = path.join(root, "Dona", "dona.sqlite3");
   const database = new Database(databasePath);
   database.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
-  database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('failed','schedule_reconcile_worker_unverified')").run();
+  for (const code of ["schedule_reconcile_worker_unverified", "terminal_steer_worker_unverified",
+    "cancel_worker_unverified"]) {
+    database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('failed',?)").run(code);
+  }
   database.close();
   await fs.chmod(databasePath, 0o600);
   const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
   try {
-    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 3);
   } finally { await removeTree(root); }
 });
 

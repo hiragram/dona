@@ -777,6 +777,8 @@ export class DispatcherDatabase {
           (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
         OR steer_state = 'dispatching'
         OR (status IN ('completed','failed','cancelled') AND last_error_code='schedule_reconcile_worker_unverified')
+        OR (status IN ('completed','failed','cancelled') AND last_error_code IN
+          ('terminal_steer_worker_unverified','cancel_worker_unverified'))
       GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
     for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
@@ -788,6 +790,7 @@ export class DispatcherDatabase {
       JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
         AND COALESCE(j.steer_state,'') <> 'dispatching'
         AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
+        AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
         AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
         AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
           (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)
@@ -987,7 +990,7 @@ export class DispatcherDatabase {
 
   listLegacySharedGrantJobs():JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN legacy_job_agents_to_stop l USING(job_id) WHERE l.stopped_at IS NULL
-      AND j.status IN ('retryable_failed','preparing','dispatching','running','blocked','needs_review','cancelling') ORDER BY j.created_at,j.job_id`).all() as JobRow[];
+      ORDER BY j.created_at,j.job_id`).all() as JobRow[];
   }
 
   markLegacySharedGrantAgentStopped(jobId:string):void {this.db.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=? WHERE job_id=?").run(nowUtc(),jobId);}
@@ -1737,7 +1740,8 @@ export class DispatcherDatabase {
         if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running","cancelling"], status, {
           result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
-          last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
+          last_error_code: job.status === "cancelling" && job.last_error_code !== "cancel_worker_stopped"
+            ? "cancel_worker_unverified" : result.status === "failed" ? "agent_reported_failure" : null,
           last_error_message: result.status === "failed" ? result.summary : null,
         });
         if (recoverAmbiguous && attentionEventId && binding?.owner.kind === "slack_thread") {
@@ -1786,7 +1790,9 @@ export class DispatcherDatabase {
 
   markJobSteerAccepted(jobId: string, sourceEventId: string): void {
     const changed = this.db.prepare(`
-      UPDATE jobs SET steer_state = 'accepted', updated_at = ?
+      UPDATE jobs SET steer_state = 'accepted',
+        last_error_code=CASE WHEN status IN ('completed','failed','cancelled') THEN 'terminal_steer_worker_unverified' ELSE last_error_code END,
+        updated_at = ?
       WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
     `).run(nowUtc(), jobId, sourceEventId).changes;
     if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
@@ -1842,6 +1848,8 @@ export class DispatcherDatabase {
       this.db.prepare("UPDATE job_groups SET all_terminal_event_id=NULL WHERE source_event_id=?")
         .run(row.source_event_id);
       this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
+      this.db.prepare("UPDATE jobs SET last_error_code='cancel_worker_unverified' WHERE job_id=? AND status='cancelling'")
+        .run(jobId);
     }).immediate();
     return this.getJobRequired(jobId);
   }
@@ -1860,6 +1868,16 @@ export class DispatcherDatabase {
         if(payload.job_id===jobId) this.recordAttentionResolution(jobId,attentionEventId,"cancelled","operator_reconcile",null,at);
       }
     }).immediate();
+  }
+
+  markJobCancellationWorkerStopped(jobId: string): void {
+    this.db.prepare(`UPDATE jobs SET last_error_code=CASE
+      WHEN status='cancelling' THEN 'cancel_worker_stopped'
+      WHEN status='failed' THEN 'agent_reported_failure'
+      ELSE NULL END, last_error_message=NULL, updated_at=?
+      WHERE job_id=? AND (status='cancelling' OR
+        (status IN ('completed','failed','cancelled') AND last_error_code='cancel_worker_unverified'))`)
+      .run(nowUtc(),jobId);
   }
 
   enqueueJobNotification(jobId: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): EnqueueResult {

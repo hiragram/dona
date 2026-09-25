@@ -206,7 +206,9 @@ export class JobSupervisor {
       const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
       if(!stopped.ok&&["agent_not_found","agent_not_running"].includes(stopped.errorCode??"")) {
         this.database.markLegacySharedGrantAgentStopped(job.job_id);
-        await this.tryComplete(this.database.getJob(job.job_id)!,false);
+        const current = this.database.getJob(job.job_id)!;
+        if (!["completed","failed","cancelled"].includes(current.status))
+          await this.tryComplete(current,false);
         continue;
       }
       if(!stopped.ok) throw new Error(`Legacy agent ${job.agent_name} could not be stopped before isolated jobs start`);
@@ -223,7 +225,9 @@ export class JobSupervisor {
       }
       if(!exited) throw new Error(`Legacy agent ${job.agent_name} exit was not observed`);
       this.database.markLegacySharedGrantAgentStopped(job.job_id);
-      await this.tryComplete(this.database.getJob(job.job_id)!,false);
+      const current = this.database.getJob(job.job_id)!;
+      if (!["completed","failed","cancelled"].includes(current.status))
+        await this.tryComplete(current,false);
     }
   }
 
@@ -327,6 +331,13 @@ export class JobSupervisor {
         this.database.markJobCancelled(jobId,reason); this.wake();
         return {row:this.database.getJob(jobId)!,duplicate:false};
       }
+      if (!cancelled.ok && !cancelled.timedOut &&
+          ["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
+        this.database.markJobCancellationWorkerStopped(jobId);
+        if (await this.tryComplete(cancelling,false)) return { row: this.database.getJob(jobId)!, duplicate:false };
+        this.database.markJobCancelled(jobId,reason); this.wake();
+        return { row:this.database.getJob(jobId)!, duplicate:false };
+      }
       if (!cancelled.ok) {
         this.database.markJobNeedsReview(
           jobId,
@@ -349,6 +360,7 @@ export class JobSupervisor {
         this.database.markJobNeedsReview(jobId,"cancel_exit_unknown","Agent exit was not observed after cancellation acceptance");
         this.wake(); throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
       }
+      this.database.markJobCancellationWorkerStopped(jobId);
       if(await this.tryComplete(cancelling,false)) return {row:this.database.getJob(jobId)!,duplicate:false};
       this.database.markJobCancelled(jobId, reason);
       this.trackCancelledWorkerCleanup(cancelling);

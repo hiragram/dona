@@ -1672,7 +1672,8 @@ describe("DispatcherDatabase", () => {
     }
     raw.close();
     const reopened = new DispatcherDatabase(config.databasePath);
-    assert.deepEqual(reopened.listLegacySharedGrantJobs(),[]);
+    assert.deepEqual(reopened.listLegacySharedGrantJobs().map(row=>row.job_id).sort(),
+      jobs.map(({job})=>job.job_id).sort());
     for(const {status,job} of jobs) assert.equal(reopened.getJob(job.job_id)?.status,status);
     assert.equal(reopened.updateSafetyStatus().safe,false);
     assert.equal(reopened.updateSafetyStatus().active_worker_count,3);
@@ -1720,6 +1721,43 @@ describe("DispatcherDatabase", () => {
     assert.equal(safety.active_worker_count, 1);
     assert.equal(safety.worker_recovery_state, "handoff_unavailable");
     assert.ok(safety.unsafe_states.includes("jobs.steer_acceptance_unknown:1"));
+    database.close();
+  });
+
+  test("a steer accepted after terminalization remains unsafe", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-terminal-accepted-steer")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "進行中steer",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',steer_state='dispatching',steer_event_id='evt-followup' WHERE job_id=?")
+      .run(job.job_id);
+    raw.close();
+    database.markJobSteerAccepted(job.job_id, "evt-followup");
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "terminal_steer_worker_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    database.close();
+  });
+
+  test("a result raced with cancellation stays unsafe until the worker exit is observed", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-terminal-cancel-race")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "取消競合",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='cancelling',last_error_code='cancel_worker_unverified' WHERE job_id=?")
+      .run(job.job_id);
+    raw.close();
+    database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id,
+      status: "completed", summary: "完了", output: { format: "markdown", text: "完了" },
+      completed_at: new Date().toISOString() }, job.result_path);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "cancel_worker_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    database.markJobCancellationWorkerStopped(job.job_id);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, null);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
     database.close();
   });
 
