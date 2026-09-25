@@ -104,7 +104,7 @@ describe("job result publish contract", () => {
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "0x7f000001/private/result", "017700000001/download/file", "0x7f.1/private/result", "0177.0.0.1/download/file", "artifact.internal./private/result",
       "GET /run/secrets/db-password returned 200", "GET /proc/self/environ returned 200", "POST /dev/null", "GET /sys/kernel", "保存先は/home/worker/private.txt", "結果を/workspace/dona/privateへ保存", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
-      "path:/root/.dona/result.json", "保存先:/home/worker/private.txt", "保存先は/mnt/private/result.json", "結果は/srv/dona/secretへ保存", "結果🔒/mnt/private/result.json", "сохранено/srv/dona/secret", "http://198.18.0.1/download/result", "http://192.88.99.1/download/result", "http://[fec0::1]/download/result", "http://[2001:db8::1]/download/result", "repo/.ssh/id_rsa", "config/.aws/credentials", "build/secrets/token.json", `npm_${"A".repeat(36)}`]) {
+      "path:/root/.dona/result.json", "保存先:/home/worker/private.txt", "保存先は/mnt/private/result.json", "結果は/srv/dona/secretへ保存", "結果🔒/mnt/private/result.json", "сохранено/srv/dona/secret", "http://198.18.0.1/download/result", "http://192.88.99.1/download/result", "http://[fec0::1]/download/result", "http://[2001:db8::1]/download/result", "http://[64:ff9b:1::a00:1]/download/result", "repo/.ssh/id_rsa", "config/.aws/credentials", "build/secrets/token.json", `npm_${"A".repeat(36)}`]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "to\u200bken": "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
@@ -339,11 +339,14 @@ describe("job result publish contract", () => {
     const linkedCapability = `${grant.capability.slice(0, 20)}<https://example.com/|${grant.capability.slice(20, 30)}>${grant.capability.slice(30)}`;
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: linkedCapability } },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: `${grant.capability.slice(0, 20)}<!date^0^${grant.capability.slice(20)}|x>` } },
+      () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com/status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "参照example.com?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.xn--p1ai?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "GET /status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: 'payload={"detail":"private\\u0020objective\\u0020two"}' }, () => current), code("content_requires_redaction"));

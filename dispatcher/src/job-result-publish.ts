@@ -140,9 +140,9 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
   }
   return false;
 }
-const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
+const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<!date\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/g;
+const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9-]+\.)+(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]{2,})(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/g;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
 const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
@@ -188,6 +188,8 @@ function hasPrivateHttpHost(candidate: string): boolean {
     if (host === "::" || host === "::1" || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
       (first & 0xffc0) === 0xfec0 || (first & 0xff00) === 0xff00) return true;
     if (first === 0x2001 && Number.parseInt(host.split(":")[1] || "0", 16) === 0x0db8) return true;
+    if (first === 0x64 && Number.parseInt(host.split(":")[1] || "0", 16) === 0xff9b &&
+      Number.parseInt(host.split(":")[2] || "0", 16) === 1) return true;
     const mapped = host.match(/(?:^|:)ffff:(\d+\.\d+\.\d+\.\d+)$/i);
     if (mapped) return hasPrivateHttpHost(`http://${mapped[1]}/`);
     // Also cover compressed hexadecimal IPv4-mapped addresses.
