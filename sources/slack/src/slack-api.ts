@@ -40,10 +40,10 @@ export interface SlackPostResult {
   threadTs?: string;
 }
 
-function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
+export function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
   const chunks: string[] = [];
   for (let offset = 0; offset < text.length;) {
-    let end = Math.min(offset + 3_000, text.length);
+    let end = Math.min(offset + 2_990, text.length);
     if (end < text.length) {
       const prefix = text.slice(offset, end);
       const newline = prefix.lastIndexOf("\n");
@@ -57,16 +57,25 @@ function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
         if (protectedStart > 0) end = offset + protectedStart;
       }
     }
-    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;
+    if (end < text.length && end > offset + 1 && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;
+    if (end <= offset) end = offset + 1;
     chunks.push(text.slice(offset, end));
     offset = end;
   }
-  return chunks.map((chunk, index) => ({
+  let insideFence = false;
+  return chunks.map((rawChunk, index) => {
+    const startsInsideFence = insideFence;
+    if (mrkdwn && (rawChunk.match(/```/g) ?? []).length % 2 === 1) insideFence = !insideFence;
+    const chunk = mrkdwn
+      ? `${startsInsideFence ? "```\n" : ""}${rawChunk}${insideFence ? "\n```" : ""}`
+      : rawChunk;
+    return ({
     type: "section" as const,
     ...(index === 0 ? { block_id: blockId } : {}),
     text: mrkdwn ? { type: "mrkdwn" as const, text: chunk, verbatim: true } : { type: "plain_text" as const, text: chunk },
     expand: true,
-  }));
+    });
+  });
 }
 
 export type SlackAgentSessionStatus = "active" | "processing" | "suspended" | "closed";
