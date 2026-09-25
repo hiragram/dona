@@ -545,14 +545,13 @@ export class UpdateController {
         } catch {
           // Invalid persisted evidence is not used to broaden the recovery action.
         }
-        await this.restoreQuiescedServices(
-          row,
-          typeof evidence.cause_code === "string"
+        const causeCode = typeof evidence.cause_code === "string"
             ? evidence.cause_code
             : typeof evidence.error_code === "string"
               ? evidence.error_code
-              : "main_agent_stop_rejected",
-        );
+              : "main_agent_stop_rejected";
+        await this.restoreQuiescedServices(row, causeCode,
+          causeCode !== "slack_adapter_drain_incomplete");
         return;
       }
       // Reboot can restart a previously stopped launchd service. Re-observe each
@@ -1664,7 +1663,27 @@ export class UpdateController {
       );
       return false;
     }
+    const reconcileUnknownStart = async (): Promise<boolean> => {
+      let health: HealthSnapshot | undefined;
+      try {
+        const manifest = await this.releases.releaseManifest(releaseSha);
+        if (manifest) {
+          const observed = await this.waitForHealth(service, releaseSha, manifest.compatibility);
+          if (this.healthMatches(observed, releaseSha, service === "slack_adapter", manifest.compatibility)) {
+            health = observed;
+          }
+        }
+      } catch {
+        // An unavailable read is not evidence that launchctl was rejected.
+      }
+      this.assertLease(row);
+      if (!health) return false;
+      this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null,
+        { cause_code: causeCode, health }, this.clock.now());
+      return true;
+    };
     if (existing?.phase === "prepared" || existing?.phase === "acceptance_unknown") {
+      if (await reconcileUnknownStart()) return true;
       this.needsReview(
         row,
         `${codePrefix}_restart_unknown`,
@@ -1703,6 +1722,7 @@ export class UpdateController {
           timed_out: result.timed_out,
           output_truncated: result.output_truncated,
         }, this.clock.now());
+        if (phase === "acceptance_unknown" && await reconcileUnknownStart()) return true;
         this.needsReview(
           row,
           phase === "rejected" ? `${codePrefix}_restart_rejected` : `${codePrefix}_restart_unknown`,

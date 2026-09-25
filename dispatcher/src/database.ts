@@ -632,7 +632,7 @@ export class DispatcherDatabase {
     const jobRows = this.db.prepare(`
       SELECT status, COUNT(*) AS count FROM jobs
       WHERE status IN ('preparing', 'dispatching', 'running', 'blocked', 'needs_review', 'cancelling')
-        OR (status = 'retryable_failed' AND herdr_workspace_id IS NOT NULL)
+        OR (status = 'retryable_failed' AND (herdr_workspace_id IS NOT NULL OR last_error_code = 'stale_preparing'))
       GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
     for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
@@ -644,7 +644,7 @@ export class DispatcherDatabase {
       JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
         AND j.status NOT IN ('completed','failed','cancelled')
         AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
-        AND NOT (j.status='retryable_failed' AND j.herdr_workspace_id IS NOT NULL)`)
+        AND NOT (j.status='retryable_failed' AND (j.herdr_workspace_id IS NOT NULL OR j.last_error_code='stale_preparing'))`)
       .get() as { count: number };
     if (legacy.count > 0) unsafe.push(`jobs.legacy_shared_grant:${legacy.count}`);
     const activeWorkerCount = jobRows.reduce((count, row) => count + row.count, 0) + legacy.count;

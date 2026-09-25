@@ -171,7 +171,7 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
   const dispatcherDatabasePath = path.join(root, "Dona", "dona.sqlite3");
   const dispatcherDatabase = new Database(dispatcherDatabasePath);
-  dispatcherDatabase.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT)");
+  dispatcherDatabase.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT)");
   dispatcherDatabase.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
   dispatcherDatabase.exec("ALTER TABLE jobs ADD COLUMN job_id TEXT");
   dispatcherDatabase.prepare("INSERT INTO jobs (status,job_id) VALUES ('completed','old-terminal')").run();
@@ -218,8 +218,9 @@ test("RealRuntime refuses a legacy drained response while a durable worker remai
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
   const databasePath = path.join(root, "Dona", "dona.sqlite3");
   const database = new Database(databasePath);
-  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT)");
-  database.prepare("INSERT INTO jobs VALUES ('running','private-agent')").run();
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT)");
+  database.prepare("INSERT INTO jobs (status,herdr_workspace_id) VALUES ('running','private-agent')").run();
+  database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('retryable_failed','stale_preparing')").run();
   database.close();
   await fs.chmod(databasePath, 0o600);
   const requests: unknown[] = [];
@@ -228,7 +229,7 @@ test("RealRuntime refuses a legacy drained response while a durable worker remai
   try {
     const snapshot = await runtime.quiesceDispatcher("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha);
     assert.equal(snapshot.drained, false);
-    assert.deepEqual(snapshot.unsafe_states, ["jobs.handoff_unavailable:1"]);
+    assert.deepEqual(snapshot.unsafe_states, ["jobs.handoff_unavailable:2"]);
     assert.equal(JSON.stringify(snapshot).includes("private-agent"), false);
   } finally {
     await new Promise<void>((resolve) => dispatcher.close(() => resolve()));

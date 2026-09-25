@@ -269,6 +269,7 @@ class FakeRuntime implements RuntimePort {
   activeWorkerCount = 0;
   dispatcherDrainIncomplete = false;
   rollbackDispatcherDrainIncomplete = false;
+  targetRecoveryDispatcherStartUnknownOnce = false;
   rollbackSlackDrainIncomplete = false;
   forwardSlackDrainIncomplete = false;
   workerSafety(): Promise<{ safe: boolean; active_worker_count: number }> {
@@ -347,8 +348,14 @@ class FakeRuntime implements RuntimePort {
   async stopDispatcher() { this.calls.push("stopDispatcher"); this.dispatcherLive = false; return ok; }
   async startDispatcher() {
     this.calls.push("startDispatcher");
+    if (this.targetRecoveryDispatcherStartUnknownOnce && this.calls.filter(call => call === "quiesceDispatcher").length > 1) {
+      this.targetRecoveryDispatcherStartUnknownOnce = false;
+      this.dispatcherLive = true;
+      return { ...ok, exit_code: null, timed_out: true };
+    }
     if (this.dispatcherStartUnknownOnce) {
       this.dispatcherStartUnknownOnce = false;
+      this.dispatcherLive = false;
       return { ...ok, exit_code: null, timed_out: true };
     }
     this.dispatcherLive = true;
@@ -680,6 +687,24 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, targetSha);
     assert.deepEqual(f.runtime.calls.slice(-4), ["quiesceSlack", "quiesceDispatcher", "startDispatcher", "startSlack"]);
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_dispatcher_after_drain")?.phase, "observed");
+    f.database.close();
+  });
+  test("reconciles ambiguous target restart before restoring the other service", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-reconcile" });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    f.runtime.rollbackDispatcherDrainIncomplete = true;
+    f.runtime.targetRecoveryDispatcherStartUnknownOnce = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "rollback_dispatcher_drain_incomplete");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_dispatcher_after_drain")?.phase, "observed");
+    assert.deepEqual(f.runtime.calls.slice(-4), ["quiesceSlack", "quiesceDispatcher", "startDispatcher", "startSlack"]);
     f.database.close();
   });
 
@@ -1406,6 +1431,27 @@ describe("UpdateController isolated end-to-end", () => {
     await f.controller.processNext();
     assert.equal(f.database.get(requestId)?.state, "failed");
     assert.equal(f.database.get(requestId)?.last_error_code, "main_agent_blocked");
+    assert.deepEqual(f.runtime.calls, []);
+    f.database.close();
+  });
+
+  test("resumes Slack-only drain recovery without restarting a live Dispatcher", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-slack-recovery-crash" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms)!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "restart_current_slack",
+      "slack_adapter", currentSha, null, { cause_code: "slack_adapter_drain_incomplete" });
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "restart_current_slack", "observed", null,
+      { cause_code: "slack_adapter_drain_incomplete" });
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "slack_adapter_drain_incomplete");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher"), undefined);
     assert.deepEqual(f.runtime.calls, []);
     f.database.close();
   });
