@@ -58,6 +58,14 @@ describe("Dona Dispatcher MCP server", () => {
         calls.push({ method: "getWorkerMessage", args: [jobId, messageId, sourceEventId] });
         return { schema_version: 1, message: { message_id: messageId } };
       },
+      async decideWorkerMessage(jobId, messageId, notificationEventId) {
+        calls.push({ method: "decideWorkerMessage", args: [jobId, messageId, notificationEventId] });
+        return { schema_version: 1, decision: { message_id: messageId, action: "ack_internal" } };
+      },
+      async workerDecisionCurrent(jobId, messageId, notificationEventId) {
+        calls.push({ method: "workerDecisionCurrent", args: [jobId, messageId, notificationEventId] });
+        return { schema_version: 1, current: true };
+      },
       async reconcileWorkerMessage(jobId, sourceEventId, idempotencyKey) {
         calls.push({ method: "reconcileWorkerMessage", args: [jobId, sourceEventId, idempotencyKey] });
         return { schema_version: 1, reconciliation: "matched" };
@@ -107,6 +115,8 @@ describe("Dona Dispatcher MCP server", () => {
         "cancel_job",
         "send_worker_instruction",
         "get_worker_message",
+        "decide_worker_message",
+        "check_worker_decision_current",
         "reconcile_worker_message",
         "plan_self_update",
         "apply_self_update",
@@ -127,6 +137,7 @@ describe("Dona Dispatcher MCP server", () => {
       assert.equal(listed.tools.find(({ name }) => name === "cancel_job")?.annotations?.destructiveHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "send_worker_instruction")?.annotations?.idempotentHint, false);
       assert.equal(listed.tools.find(({ name }) => name === "get_worker_message")?.annotations?.readOnlyHint, true);
+      assert.equal(listed.tools.find(({ name }) => name === "decide_worker_message")?.annotations?.idempotentHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "reconcile_worker_message")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "plan_self_update")?.annotations?.readOnlyHint, true);
       assert.equal(listed.tools.find(({ name }) => name === "apply_self_update")?.annotations?.destructiveHint, true);
@@ -202,6 +213,14 @@ describe("Dona Dispatcher MCP server", () => {
         source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",message_id:messageId}});
       assert.equal(message.isError,undefined);
       assert.deepEqual(calls.at(-1),{method:"getWorkerMessage",args:["job_01m1es03xy5cf8d9pm5cwx4srv",messageId,"evt_01M1ES03XY5CF8D9PM5CWX4SRV"]});
+      const decision=await client.callTool({name:"decide_worker_message",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",
+        message_id:messageId,notification_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV"}});
+      assert.equal(decision.isError,undefined);
+      assert.deepEqual(calls.at(-1),{method:"decideWorkerMessage",args:["job_01m1es03xy5cf8d9pm5cwx4srv",messageId,"evt_01M1ES03XY5CF8D9PM5CWX4SRV"]});
+      const current=await client.callTool({name:"check_worker_decision_current",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",
+        message_id:messageId,notification_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV"}});
+      assert.equal(current.isError,undefined);
+      assert.deepEqual(calls.at(-1),{method:"workerDecisionCurrent",args:["job_01m1es03xy5cf8d9pm5cwx4srv",messageId,"evt_01M1ES03XY5CF8D9PM5CWX4SRV"]});
       const reconciled=await client.callTool({name:"reconcile_worker_message",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",
         source_event_id:"evt_01M1ES03XY5CF8D9PM5CWX4SRV",idempotency_key:"instruction-1"}});
       assert.equal(reconciled.isError,undefined);

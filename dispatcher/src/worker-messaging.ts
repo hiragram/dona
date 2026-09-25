@@ -7,6 +7,7 @@ import { z } from "zod";
 import { insertEventJobBinding, readEventJobBinding } from "./job-routing.js";
 import type { JobRow } from "./types.js";
 import { jobObjectiveCharacterMax, stableStringify } from "./validation.js";
+import { evaluateWorkerDecision, renderWorkerDecisionPost, type WorkerDecisionAction, type WorkerDecisionSibling } from "./worker-decision.js";
 
 export const workerMessageProtocolVersion = 1 as const;
 export const workerMessagePayloadUtf8ByteMax = 16_384;
@@ -28,9 +29,9 @@ const utcRfc3339 = z.string().regex(utcRfc3339Pattern)
 const identifier = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 const safeText = z.string().trim().min(1).max(4_000);
 const reportPayload = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("checkpoint"), summary: safeText }).strict(),
+  z.object({ kind: z.literal("checkpoint"), summary: safeText, eta_at: utcRfc3339.optional() }).strict(),
   z.object({ kind: z.literal("question"), question: safeText }).strict(),
-  z.object({ kind: z.literal("risk"), summary: safeText, severity: z.enum(["low", "medium", "high"]) }).strict(),
+  z.object({ kind: z.literal("risk"), summary: safeText, severity: z.enum(["low", "medium", "high"]), eta_at: utcRfc3339.optional() }).strict(),
   z.object({ kind: z.literal("decision_request"), question: safeText, options: z.array(safeText.max(1_000)).min(1).max(8) }).strict(),
 ]);
 const instructionPayload = z.discriminatedUnion("operation", [
@@ -237,6 +238,21 @@ export function migrateWorkerMessaging(db: Database.Database): void {
       last_delivery_at       TEXT,
       updated_at             TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS worker_message_decisions (
+      message_id             TEXT NOT NULL REFERENCES worker_messages(message_id) ON DELETE CASCADE,
+      notification_event_id  TEXT NOT NULL REFERENCES events(event_id),
+      job_id                 TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+      action                 TEXT NOT NULL CHECK (action IN ('ack_internal','aggregate_wait','report_to_user','ask_user')),
+      reason                 TEXT NOT NULL,
+      content_sha256         TEXT NOT NULL CHECK (length(content_sha256) = 64),
+      group_sha256           TEXT NOT NULL CHECK (length(group_sha256) = 64),
+      group_total            INTEGER NOT NULL,
+      safe_projection_json   TEXT,
+      decided_at             TEXT NOT NULL,
+      PRIMARY KEY(message_id,notification_event_id)
+    );
+    CREATE INDEX IF NOT EXISTS worker_message_decisions_job_idx ON worker_message_decisions(job_id,decided_at,message_id);
   `);
   const runtimeIdentityColumns=new Set((db.pragma("table_info(worker_message_runtime_identities)") as Array<{name:string}>).map(row=>row.name));
   if(runtimeIdentityColumns.has("job_id"))db.exec(`
@@ -519,6 +535,143 @@ export class WorkerMessageRepository {
         throw new WorkerMessageError("worker_message_report_unavailable","question can no longer receive an answer");
     }
     return message;
+  }
+
+  decideReport(jobId:string,messageId:string,notificationEventId:string,at=new Date()) {
+    return this.db.transaction(()=>{
+      const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
+      if(!job)throw new WorkerMessageError("job_not_found","job does not exist");
+      this.assertAuthorized(job,notificationEventId);
+      const message=this.db.prepare("SELECT * FROM worker_messages WHERE job_id=? AND message_id=?")
+        .get(jobId,messageId) as WorkerMessageRow|undefined;
+      if(!message||message.direction!=="worker_to_dona")
+        throw new WorkerMessageError("job_binding_mismatch","notification does not own this worker report");
+      const delivery=this.db.prepare("SELECT event_id FROM worker_message_deliveries WHERE message_id=? AND consumer='dona-main'")
+        .get(messageId) as {event_id:string|null}|undefined;
+      if(delivery?.event_id!==notificationEventId)
+        throw new WorkerMessageError("job_binding_mismatch","notification does not own this delivery");
+      const existing=this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=? AND notification_event_id=?")
+        .get(messageId,notificationEventId) as {message_id:string;notification_event_id:string;action:WorkerDecisionAction;reason:string;
+          content_sha256:string;group_sha256:string;group_total:number;safe_projection_json:string|null;decided_at:string}|undefined;
+      const project=(row:NonNullable<typeof existing>)=>({message_id:row.message_id,job_id:jobId,
+        notification_event_id:row.notification_event_id,action:row.action,reason:row.reason,
+        content_sha256:row.content_sha256,group_sha256:row.group_sha256,group_total:row.group_total,
+        ...(row.safe_projection_json?(()=>{const safe_projection=JSON.parse(row.safe_projection_json) as NonNullable<ReturnType<typeof evaluateWorkerDecision>["safe_projection"]>;
+          const post_text=renderWorkerDecisionPost(safe_projection);
+          return {safe_projection,post_text,post_body_sha256:sha256(post_text)};})():{}),decided_at:row.decided_at});
+      if(existing)return project(existing);
+      if(terminal(job.status)===false&&job.status!=="needs_review"&&job.status!=="cancelling")
+        this.getMessage(jobId,messageId,notificationEventId);
+      const event=this.db.prepare("SELECT status FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_report'")
+        .get(notificationEventId) as {status:string}|undefined;
+      if(!event||!["dispatching","waiting_agent"].includes(event.status))
+        throw new WorkerMessageError("worker_message_report_unavailable","notification is no longer active");
+      const group=this.db.prepare("SELECT job_id,status FROM jobs WHERE source_event_id=? ORDER BY job_id LIMIT 33")
+        .all(job.source_event_id) as WorkerDecisionSibling[];
+      const total=(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE source_event_id=?")
+        .get(job.source_event_id) as {count:number}).count;
+      if(!group.some(row=>row.job_id===jobId))
+        throw new WorkerMessageError("job_binding_mismatch","report job is absent from its group");
+      const previous=this.db.prepare(`SELECT d.action,d.content_sha256,d.decided_at,
+          json_extract(m.payload_json,'$.severity') AS severity
+        FROM worker_message_decisions d JOIN worker_messages m USING(message_id)
+        WHERE d.job_id=? AND m.producer_sequence<? AND m.producer='worker'
+        ORDER BY m.producer_sequence DESC,d.decided_at DESC,d.notification_event_id DESC LIMIT 1`).get(jobId,message.producer_sequence) as
+        {action:WorkerDecisionAction;content_sha256:string;decided_at:string;severity:string|null}|undefined;
+      const etaQuery=`SELECT json_extract(m.payload_json,'$.eta_at') AS eta_at FROM worker_messages m
+        JOIN worker_message_decisions d ON d.message_id=m.message_id
+        JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
+        JOIN worker_message_deliveries delivery ON delivery.message_id=m.message_id
+          AND delivery.consumer='dona-main' AND delivery.event_id=d.notification_event_id
+        WHERE m.job_id=? AND m.direction='worker_to_dona' AND m.producer_sequence<?
+          AND json_type(m.payload_json,'$.eta_at')='text'`;
+      const postedEta=this.db.prepare(`${etaQuery} AND EXISTS (SELECT 1 FROM json_each(e.result_json,'$.actions') posted
+          WHERE json_extract(posted.value,'$.tool')='dona_slack.post_message'
+            AND json_type(posted.value,'$.message_ts')='text')
+        ORDER BY m.producer_sequence DESC,d.decided_at DESC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
+      const firstEvaluatedEta=postedEta?undefined:this.db.prepare(`${etaQuery}
+        ORDER BY m.producer_sequence ASC,d.decided_at ASC LIMIT 1`).get(jobId,message.producer_sequence) as {eta_at:string}|undefined;
+      const lastEta=postedEta??firstEvaluatedEta;
+      const lastRisk=this.db.prepare(`SELECT json_extract(m.payload_json,'$.severity') AS severity FROM worker_messages m
+        JOIN worker_message_decisions d ON d.message_id=m.message_id AND d.action='report_to_user'
+        JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
+        WHERE EXISTS (SELECT 1 FROM json_each(e.result_json,'$.actions') posted
+          WHERE json_extract(posted.value,'$.tool')='dona_slack.post_message'
+            AND json_type(posted.value,'$.message_ts')='text')
+          AND m.job_id=? AND m.direction='worker_to_dona' AND m.kind='risk' AND m.producer_sequence<?
+        ORDER BY m.producer_sequence DESC,d.decided_at DESC LIMIT 1`).get(jobId,message.producer_sequence) as {severity:string}|undefined;
+      const answered=this.db.prepare(`SELECT 1 FROM worker_messages answer JOIN worker_message_deliveries delivery
+        ON delivery.message_id=answer.message_id WHERE answer.job_id=? AND answer.direction='dona_to_worker'
+        AND answer.kind='answer' AND answer.correlation_message_id=? AND delivery.consumer='worker'
+        AND delivery.state!='superseded' LIMIT 1`).get(jobId,messageId)!==undefined;
+      const firstReport=this.db.prepare("SELECT MIN(accepted_at) AS at FROM worker_messages WHERE job_id=? AND direction='worker_to_dona'")
+        .get(jobId) as {at:string|null};
+      const lastUserDecision=this.db.prepare(`SELECT MAX(e.completed_at) AS at FROM worker_message_decisions d
+        JOIN worker_messages m USING(message_id)
+        JOIN events e ON e.event_id=d.notification_event_id AND e.status='completed'
+        WHERE d.job_id=? AND m.producer_sequence<?
+        AND d.action IN ('report_to_user','ask_user')
+        AND EXISTS (SELECT 1 FROM json_each(e.result_json,'$.actions') posted
+          WHERE json_extract(posted.value,'$.tool')='dona_slack.post_message'
+            AND json_type(posted.value,'$.message_ts')='text')`).get(jobId,message.producer_sequence) as {at:string|null};
+      const payload=JSON.parse(message.payload_json) as {kind:"checkpoint"|"question"|"risk"|"decision_request";
+        summary?:string;question?:string;severity?:"low"|"medium"|"high";options?:string[];eta_at?:string};
+      const cadence=this.db.prepare("SELECT silence_interval_ms FROM worker_message_cadence WHERE job_id=?")
+        .get(jobId) as {silence_interval_ms:number}|undefined;
+      const decision=evaluateWorkerDecision({report:{message_id:messageId,job_id:jobId,kind:payload.kind,
+        sequence:message.producer_sequence,accepted_at:message.accepted_at,text:payload.question??payload.summary??"",
+        ...(payload.severity?{severity:payload.severity}:{}),...(payload.options?{options:payload.options}:{}),
+        ...(payload.eta_at?{eta_at:payload.eta_at}:{})},siblings:group,total_jobs:total,
+        ...(previous?{previous:{action:previous.action,content_sha256:previous.content_sha256,decided_at:previous.decided_at,
+          ...(previous.severity?{severity:previous.severity}:{})}}:{}),
+        ...(lastEta?.eta_at?{last_eta_at:lastEta.eta_at}:{}),
+        ...(lastRisk?.severity?{last_risk_severity:lastRisk.severity}:{}),answered,
+        ...(firstReport.at?{first_report_at:firstReport.at}:{}),
+        ...(lastUserDecision.at?{last_user_decision_at:lastUserDecision.at}:{}),
+        now:at.toISOString(),silence_interval_ms:cadence?.silence_interval_ms??900_000});
+      const groupHash=sha256(stableStringify({total,jobs:group}));
+      this.db.prepare(`INSERT INTO worker_message_decisions(message_id,notification_event_id,job_id,action,reason,
+        content_sha256,group_sha256,group_total,safe_projection_json,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        .run(messageId,notificationEventId,jobId,decision.action,decision.reason,decision.content_sha256,
+          groupHash,total,decision.safe_projection?stableStringify(decision.safe_projection):null,at.toISOString());
+      return project(this.db.prepare("SELECT * FROM worker_message_decisions WHERE message_id=? AND notification_event_id=?")
+        .get(messageId,notificationEventId) as NonNullable<typeof existing>);
+    }).immediate();
+  }
+
+  decisionCurrent(jobId:string,messageId:string,notificationEventId:string) {
+    return this.db.transaction(()=>{
+    const job=this.db.prepare("SELECT * FROM jobs WHERE job_id=?").get(jobId) as JobRow|undefined;
+    if(!job)throw new WorkerMessageError("job_not_found","job does not exist");
+    this.assertAuthorized(job,notificationEventId);
+    const decision=this.db.prepare(`SELECT d.action,d.group_sha256 FROM worker_message_decisions d
+      JOIN worker_message_deliveries delivery ON delivery.message_id=d.message_id
+      WHERE d.job_id=? AND d.message_id=? AND d.notification_event_id=?
+        AND delivery.event_id=? AND delivery.consumer='dona-main'`)
+      .get(jobId,messageId,notificationEventId,notificationEventId) as
+      {action:WorkerDecisionAction;group_sha256:string}|undefined;
+    if(!decision)throw new WorkerMessageError("job_binding_mismatch","notification has no bound decision");
+    const event=this.db.prepare("SELECT status FROM events WHERE event_id=? AND source='dona_message' AND event_type='worker_message_report'")
+      .get(notificationEventId) as {status:string}|undefined;
+    if(!event||!["dispatching","waiting_agent"].includes(event.status))return {current:false,reason:"notification_inactive"};
+    if(terminal(job.status)||job.status==="needs_review"||job.status==="cancelling")return {current:false,reason:"job_inactive"};
+    if(decision.action==="ask_user"&&this.db.prepare(`SELECT 1 FROM worker_messages answer
+      JOIN worker_message_deliveries delivery ON delivery.message_id=answer.message_id
+      WHERE answer.job_id=? AND answer.direction='dona_to_worker' AND answer.kind='answer'
+        AND answer.correlation_message_id=? AND delivery.consumer='worker' AND delivery.state!='superseded' LIMIT 1`)
+      .get(jobId,messageId)!==undefined)return {current:false,reason:"answered"};
+    const group=this.db.prepare("SELECT job_id,status FROM jobs WHERE source_event_id=? ORDER BY job_id LIMIT 33")
+      .all(job.source_event_id) as WorkerDecisionSibling[];
+    const total=(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE source_event_id=?")
+      .get(job.source_event_id) as {count:number}).count;
+    if(decision.action!=="ask_user"&&sha256(stableStringify({total,jobs:group}))!==decision.group_sha256)
+      return {current:false,reason:"group_changed"};
+    if(decision.action!=="ask_user"&&group.some(row=>row.status==="blocked"
+      ||row.status==="failed"||row.status==="needs_review"))
+      return {current:false,reason:"group_attention"};
+    return {current:decision.action==="ask_user"||decision.action==="report_to_user",
+      reason:decision.action==="ask_user"||decision.action==="report_to_user"?"current":"internal_decision"};
+    }).deferred();
   }
 
   pendingQuestion(jobId: string) {

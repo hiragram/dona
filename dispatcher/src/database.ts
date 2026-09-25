@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { renderWorkerDecisionPost, type WorkerDecision } from "./worker-decision.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -283,6 +284,8 @@ export function migrateDispatcherDatabase(
         CREATE TEMP TABLE preserved_worker_message_receipts_v3 AS SELECT * FROM worker_message_receipts;
         CREATE TEMP TABLE preserved_worker_message_cadence_v3 AS SELECT * FROM worker_message_cadence;
         CREATE TEMP TABLE preserved_worker_message_workspace_cadence_v3 AS SELECT * FROM worker_message_workspace_cadence;
+        CREATE TEMP TABLE preserved_worker_message_decisions_v3 AS SELECT * FROM worker_message_decisions;
+        DROP TABLE worker_message_decisions;
         DROP TABLE worker_message_receipts;
         DROP TABLE worker_message_deliveries;
         DROP TABLE worker_message_cadence;
@@ -398,12 +401,18 @@ export function migrateDispatcherDatabase(
           workspace_id, minimum_interval_ms, last_delivery_at, updated_at
         ) SELECT workspace_id, minimum_interval_ms, last_delivery_at, updated_at
         FROM preserved_worker_message_workspace_cadence_v3;
+        INSERT INTO worker_message_decisions (
+          message_id,notification_event_id,job_id,action,reason,content_sha256,group_sha256,
+          group_total,safe_projection_json,decided_at
+        ) SELECT message_id,notification_event_id,job_id,action,reason,content_sha256,group_sha256,
+          group_total,safe_projection_json,decided_at FROM preserved_worker_message_decisions_v3;
         DROP TABLE preserved_worker_messages_v3;
         DROP TABLE preserved_worker_message_runtime_identities_v3;
         DROP TABLE preserved_worker_message_deliveries_v3;
         DROP TABLE preserved_worker_message_receipts_v3;
         DROP TABLE preserved_worker_message_cadence_v3;
         DROP TABLE preserved_worker_message_workspace_cadence_v3;
+        DROP TABLE preserved_worker_message_decisions_v3;
       `);
     }
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
@@ -2113,23 +2122,107 @@ export class DispatcherDatabase {
         }
       }
       if(event.source==="dona_message"&&event.event_type==="worker_message_report"){
-        const payload=JSON.parse(event.payload_json) as {job_id?:unknown;kind?:unknown};
-        if(typeof payload.job_id==="string"&&["question","decision_request"].includes(String(payload.kind))){
+        const payload=JSON.parse(event.payload_json) as {job_id?:unknown;message_id?:unknown;kind?:unknown};
+        const decision=typeof payload.job_id==="string"&&typeof payload.message_id==="string"
+          ?this.db.prepare(`SELECT d.action,d.reason,d.safe_projection_json FROM worker_message_decisions d
+            JOIN worker_message_deliveries delivery ON delivery.message_id=d.message_id
+            WHERE d.job_id=? AND d.message_id=? AND d.notification_event_id=? AND delivery.event_id=?
+              AND delivery.consumer='dona-main' LIMIT 1`).get(payload.job_id,payload.message_id,eventId,eventId) as
+          {action:string;reason:string;safe_projection_json:string|null}|undefined:undefined;
+        const expectedBodySha256=decision?.safe_projection_json?createHash("sha256")
+          .update(renderWorkerDecisionPost(JSON.parse(decision.safe_projection_json) as NonNullable<WorkerDecision["safe_projection"]>)).digest("hex"):undefined;
+        if(!decision){
+          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:"worker_message_decision_missing",
+            last_error_message:"Worker report completed without a bound decision"});
+          this.revealBlockedQuestionOwner(event,"worker_message_decision_missing","Worker report decision is unavailable");
+          return;
+        }
+        const posts=(result.actions??[]).filter(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+          typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")) as Array<Record<string,unknown>>;
+        const statusActions=(result.actions??[]).filter(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+          typeof (action as Record<string,unknown>).tool==="string"&&
+          String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")) as Array<Record<string,unknown>>;
+        if(decision.action!=="ask_user"&&statusActions.length){
+          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:"worker_message_unexpected_session_change",
+            last_error_message:"Worker report changed the agent session without a user question"});
+          return;
+        }
+        if(decision.action==="ack_internal"||decision.action==="aggregate_wait"){
+          if(posts.length){
+            this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:"worker_message_unexpected_post",
+              last_error_message:"Worker report was posted despite an internal-only decision"});
+            return;
+          }
+        }
+        const hasPostOrSuspension=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
+          (typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")||
+            ((action as Record<string,unknown>).status==="suspended"&&typeof (action as Record<string,unknown>).tool==="string"&&
+              String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status"))));
+        const currentState=()=>this.workerMessages.decisionCurrent(String(payload.job_id),String(payload.message_id),eventId);
+        if(decision.action==="ask_user"&&!posts.length&&statusActions.length){
+          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:"worker_message_unexpected_session_change",
+            last_error_message:"Unposted worker question changed the agent session"});
+          this.revealBlockedQuestionOwner(event,"worker_message_unexpected_session_change",
+            "Unposted question changed the agent session");
+          return;
+        }
+        if(posts.length&&!currentState().current){
+          this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+            completed_at:result.completed_at,last_error_code:"worker_message_post_after_decision_invalidated",
+            last_error_message:"Worker report was posted after its decision became invalid"});
+          this.revealBlockedQuestionOwner(event,"worker_message_post_after_decision_invalidated",
+            "Question was posted after its decision became invalid");
+          return;
+        }
+        if(["question","decision_request"].includes(String(payload.kind))){
+          if(decision?.action==="ack_internal"&&["answered","terminal"].includes(decision.reason)){
+            this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+            return;
+          }
+          const answered=typeof payload.job_id==="string"&&typeof payload.message_id==="string"&&
+            this.db.prepare(`SELECT 1 FROM worker_messages answer
+              JOIN worker_message_deliveries delivery ON delivery.message_id=answer.message_id
+              WHERE answer.job_id=? AND answer.direction='dona_to_worker' AND answer.kind='answer'
+                AND answer.correlation_message_id=? AND delivery.consumer='worker'
+                AND delivery.state!='superseded' LIMIT 1`).get(payload.job_id,payload.message_id)!==undefined;
+          if(decision.action==="ask_user"&&answered&&!hasPostOrSuspension){
+            this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+            return;
+          }
+          if(decision.action==="ask_user"&&!hasPostOrSuspension){
+            const state=currentState();
+            if(!state.current&&["job_inactive","group_changed","group_attention"].includes(state.reason)){
+              this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
+                completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+              return;
+            }
+          }
+          if(decision.action!=="ask_user"||!decision.safe_projection_json){
+            this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:"worker_message_question_decision_mismatch",
+              last_error_message:"Question notification has no safe user decision"});
+            this.revealBlockedQuestionOwner(event,"worker_message_question_decision_mismatch","Question decision is unavailable");
+            return;
+          }
           const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
-          const posted=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".post_message")&&
-            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
-            (action as Record<string,unknown>).channel_id===target?.channel_id&&
-            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
-            typeof (action as Record<string,unknown>).message_ts==="string"&&
-            (action as Record<string,unknown>).reply_broadcast===false&&
-            (action as Record<string,unknown>).ambiguous!==true&&(action as Record<string,unknown>).success!==false);
-          const suspended=(result.actions??[]).some(action=>action!==null&&typeof action==="object"&&!Array.isArray(action)&&
-            typeof (action as Record<string,unknown>).tool==="string"&&String((action as Record<string,unknown>).tool).endsWith(".set_agent_session_status")&&
-            (action as Record<string,unknown>).workspace_id===target?.workspace_id&&
-            (action as Record<string,unknown>).channel_id===target?.channel_id&&
-            (action as Record<string,unknown>).thread_ts===target?.thread_ts&&
-            (action as Record<string,unknown>).status==="suspended"&&(action as Record<string,unknown>).success!==false);
+          const posted=posts.length===1&&posts[0]!.tool==="dona_slack.post_message"&&
+            posts[0]!.workspace_id===target?.workspace_id&&
+            posts[0]!.channel_id===target?.channel_id&&posts[0]!.thread_ts===target?.thread_ts&&
+            typeof posts[0]!.message_ts==="string"&&posts[0]!.body_sha256===expectedBodySha256&&
+            posts[0]!.reply_broadcast===false&&posts[0]!.ambiguous!==true&&posts[0]!.success!==false&&
+            posts[0]!.ok!==false&&!("error" in posts[0]!);
+          const finalStatus=statusActions.at(-1);
+          const suspended=finalStatus?.tool==="dona_slack.set_agent_session_status"&&
+            finalStatus.workspace_id===target?.workspace_id&&finalStatus.channel_id===target?.channel_id&&
+            finalStatus.thread_ts===target?.thread_ts&&finalStatus.status==="suspended"&&
+            finalStatus.ambiguous!==true&&finalStatus.success!==false&&finalStatus.ok!==false&&
+            !("error" in finalStatus);
           if(!posted||!suspended){
             const reason=!posted?"worker_message_question_not_posted":"worker_message_session_not_suspended";
             const description=!posted?"Question notification completed without a confirmed post":
@@ -2137,6 +2230,29 @@ export class DispatcherDatabase {
             this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
               completed_at:result.completed_at,last_error_code:reason,last_error_message:description});
             this.revealBlockedQuestionOwner(event,reason,description);
+            return;
+          }
+        }
+        if(decision.action==="report_to_user"){
+          if(!hasPostOrSuspension){
+            const state=currentState();
+            if(!state.current&&["job_inactive","group_changed","group_attention"].includes(state.reason)){
+              this.transition(eventId,["waiting_agent"],"completed",{result_json:stableStringify(result),result_path:resultPath,
+                completed_at:result.completed_at,last_error_code:null,last_error_message:null});
+              return;
+            }
+          }
+          const target=event.reply_target_json?JSON.parse(event.reply_target_json) as {workspace_id?:unknown;channel_id?:unknown;thread_ts?:unknown}:undefined;
+          const posted=posts.length===1&&posts[0]!.tool==="dona_slack.post_message"&&
+            posts[0]!.workspace_id===target?.workspace_id&&
+            posts[0]!.channel_id===target?.channel_id&&posts[0]!.thread_ts===target?.thread_ts&&
+            typeof posts[0]!.message_ts==="string"&&posts[0]!.body_sha256===expectedBodySha256&&
+            posts[0]!.reply_broadcast===false&&posts[0]!.ambiguous!==true&&posts[0]!.success!==false&&
+            posts[0]!.ok!==false&&!("error" in posts[0]!);
+          if(!posted||!decision.safe_projection_json){
+            this.transition(eventId,["waiting_agent"],"needs_review",{result_json:stableStringify(result),result_path:resultPath,
+              completed_at:result.completed_at,last_error_code:"worker_message_progress_not_posted",
+              last_error_message:"Progress decision completed without a safe confirmed post"});
             return;
           }
         }

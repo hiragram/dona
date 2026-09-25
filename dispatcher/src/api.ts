@@ -817,6 +817,27 @@ export class DispatcherApi {
       sendJson(response, 200, { schema_version: 1, message: { ...this.database.workerMessages.project(row), payload: JSON.parse(row.payload_json) } });
       return;
     }
+    const messageDecision = /^\/v1\/jobs\/([^/]+)\/messages\/(msg_[0-9a-hjkmnp-tv-z]{26})\/decision$/.exec(url.pathname);
+    if(request.method==="GET"&&messageDecision){
+      if(!await this.authorizedDonaInternalRequest(request))
+        throw new ApiRequestError(403,"dona_internal_credential_required","Dona internal credential is required");
+      const notificationEventId=url.searchParams.get("notification_event_id")??"";
+      const state=this.database.workerMessages.decisionCurrent(decodeURIComponent(messageDecision[1]!),
+        messageDecision[2]!,notificationEventId);
+      sendJson(response,200,{schema_version:1,...state});
+      return;
+    }
+    if (request.method === "POST" && messageDecision) {
+      if(!await this.authorizedDonaInternalRequest(request))
+        throw new ApiRequestError(403,"dona_internal_credential_required","Dona internal credential is required");
+      const input=await this.readJson(request) as Record<string,unknown>;
+      if(typeof input.notification_event_id!=="string" || Object.keys(input).length!==1)
+        throw new ApiRequestError(400,"invalid_request","notification event identity is required");
+      const decision=this.database.workerMessages.decideReport(decodeURIComponent(messageDecision[1]!),
+        messageDecision[2]!,input.notification_event_id);
+      sendJson(response,200,{schema_version:1,decision});
+      return;
+    }
     const deliveryClaim = /^\/v1\/jobs\/([^/]+)\/messages\/deliveries\/claim$/.exec(url.pathname);
     if (request.method === "POST" && deliveryClaim) {
       const input = await this.readJson(request) as Record<string, unknown>;

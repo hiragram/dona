@@ -78,6 +78,19 @@ export class DispatcherApiClient {
     const query=new URLSearchParams({source_event_id:sourceEventId});
     return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/${encodeURIComponent(messageId)}?${query}`);
   }
+  async decideWorkerMessage(jobId:string,messageId:string,notificationEventId:string):Promise<Record<string,unknown>> {
+    const token=this.internalTokenPath?await readPrivateToken(this.internalTokenPath):undefined;
+    if(!token)throw new DispatcherClientError(undefined,"Dona internal credential is unavailable");
+    return this.request("POST",`/v1/jobs/${encodeURIComponent(jobId)}/messages/${encodeURIComponent(messageId)}/decision`,
+      {notification_event_id:notificationEventId},{"x-dona-internal-token":token});
+  }
+  async workerDecisionCurrent(jobId:string,messageId:string,notificationEventId:string):Promise<Record<string,unknown>> {
+    const token=this.internalTokenPath?await readPrivateToken(this.internalTokenPath):undefined;
+    if(!token)throw new DispatcherClientError(undefined,"Dona internal credential is unavailable");
+    const query=new URLSearchParams({notification_event_id:notificationEventId});
+    return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/${encodeURIComponent(messageId)}/decision?${query}`,
+      undefined,{"x-dona-internal-token":token});
+  }
   reconcileWorkerMessage(jobId:string,sourceEventId:string,idempotencyKey:string):Promise<Record<string,unknown>> {
     const query=new URLSearchParams({source_event_id:sourceEventId,producer:"dona-main",idempotency_key:idempotencyKey});
     return this.request("GET",`/v1/jobs/${encodeURIComponent(jobId)}/messages/reconcile?${query}`);
