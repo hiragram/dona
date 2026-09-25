@@ -61,7 +61,7 @@ function angleTokenClose(text: string, open: number): number {
   const content = text.slice(open + 1, close);
   if (/^!date\^\d+\^[^|]+\|[^>]+$/.test(content)) return close;
   const target = content.split("|", 1)[0] ?? "";
-  return /^(?:(?:https?:\/\/|mailto:)[^\s<>]+|@[UW][A-Z0-9]+|#[CGD][A-Z0-9]+|!(?:channel|here|everyone|subteam\^S[A-Z0-9]+))$/i.test(target) ? close : -1;
+  return /^(?:(?:https?:\/\/|mailto:|tel:)[^\s<>]+|@[UW][A-Z0-9]+|#[CGD][A-Z0-9]+|!(?:channel|here|everyone|subteam\^S[A-Z0-9]+))$/i.test(target) ? close : -1;
 }
 
 function isSlackAngleToken(value: string): boolean {

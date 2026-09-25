@@ -547,3 +547,10 @@ test("a Slack date token stays together at a section boundary", () => {
   assert.ok(blocks.some((block) => block.text.text.includes(token)));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("a Slack phone link stays together at a section boundary", () => {
+  const token = "<tel:+1234567890|Call me>";
+  const blocks = expandedSections("x".repeat(2_890) + token + "y".repeat(500), "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(token)));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
