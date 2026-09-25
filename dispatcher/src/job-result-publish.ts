@@ -44,9 +44,11 @@ function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
 }
 function hasPrivateJwkText(value: string): boolean {
   let lineKeyType = false;
+  let linePrivateParameter = false;
   for (const line of value.split(/\r?\n/)) {
     if (/^\s*['"]?kty['"]?\s*:\s*['"]?(?:RSA|EC|OKP|oct)['"]?[ \t]*(?:#.*)?$/.test(line)) lineKeyType = true;
-    else if (lineKeyType && /^\s*['"]?(?:d|p|q|dp|dq|qi|oth|k)['"]?\s*:/.test(line)) return true;
+    if (/^\s*['"]?(?:d|p|q|dp|dq|qi|oth|k)['"]?\s*:/.test(line)) linePrivateParameter = true;
+    if (lineKeyType && linePrivateParameter) return true;
   }
   for (const match of value.matchAll(/\{[^{}]{0,8192}\}/g)) {
     const scope = match[0];
@@ -151,7 +153,7 @@ const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
 const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9._~%-]+(?::[^@\s/"'<>`]*)?@)?(?:(?:[A-Za-z0-9-]+\.)+(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]{2,})|(?:[A-Za-z0-9-]+\.)*localhost)(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/g;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
-const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa|test|invalid|example)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -180,7 +182,7 @@ function hasPrivateHttpHost(candidate: string): boolean {
   if (hostname === "localhost" || hostname.endsWith(".localhost") ||
     hostname === "files.slack.com" || hostname === "hooks.slack.com") return true;
   const host = hostname.replace(/^\[|\]$/g, "");
-  if (isIP(host) === 0 && (!host.includes(".") || /\.(?:internal|local|lan|home\.arpa)$/.test(host))) return true;
+  if (isIP(host) === 0 && (!host.includes(".") || /\.(?:internal|local|lan|home\.arpa|test|invalid|example)$/.test(host))) return true;
   if (isIP(host) === 4) {
     const [a, b] = host.split(".").map(Number) as [number, number];
     const c = Number(host.split(".")[2]);

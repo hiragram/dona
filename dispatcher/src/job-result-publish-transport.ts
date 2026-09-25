@@ -263,16 +263,16 @@ export class JobResultPublishServer {
       // Authenticate before consuming the body. A generic UDS connection has no grant.
       this.grants.authorize(capability, session, this.getJob);
       authenticated = true;
-      const chunks: Buffer[] = [];
+      const body = Buffer.allocUnsafe(jobResultEnvelopeMaxBytes);
       let bytes = 0;
       let tooLarge = false;
       const deadline = setTimeout(() => request.destroy(), this.bodyTimeoutMs);
       deadline.unref();
       try {
         for await (const chunk of request) {
+          if (bytes + chunk.length > jobResultEnvelopeMaxBytes) { tooLarge = true; continue; }
+          chunk.copy(body, bytes);
           bytes += chunk.length;
-          if (bytes > jobResultEnvelopeMaxBytes) { tooLarge = true; continue; }
-          chunks.push(Buffer.from(chunk));
         }
       } finally {
         clearTimeout(deadline);
@@ -280,7 +280,7 @@ export class JobResultPublishServer {
       if (tooLarge) throw new JobResultPublishError("payload_too_large");
       let input: unknown;
       try {
-        const source = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+        const source = new TextDecoder("utf-8", { fatal: true }).decode(body.subarray(0, bytes));
         assertExactJsonNumbers(source);
         input = JSON.parse(source);
       }
