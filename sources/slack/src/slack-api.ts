@@ -364,6 +364,11 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       chunk = `${chunk.slice(0, quotePrefix.length)}${chunk.slice(quotePrefix.length + startsInsideInline[0]!.length + 1)}`;
     }
     let plainFallback = false;
+    const setGraphemeFallback = (value: string) => {
+      const keepQuote = Boolean(quotePrefix) && value.length <= 2_999;
+      chunk = keepQuote ? `>${value}` : value;
+      plainFallback = !keepQuote;
+    };
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && isSlackAngleToken(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
@@ -396,8 +401,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       }
       const grapheme = rawChunk.slice(opening.length, consumedClosing ? -consumedClosing.length : undefined);
       if (opening && grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
-        chunk = grapheme;
-        plainFallback = true;
+        setGraphemeFallback(grapheme);
       }
     }
     const escapedAngle = /^(\\+)<[^>]+>$/.exec(rawChunk);
@@ -408,14 +412,12 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
     if (chunk.length > 3_000 && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk)].length === 1) {
-      chunk = rawChunk;
-      plainFallback = true;
+      setGraphemeFallback(rawChunk);
     }
     if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
       const grapheme = rawChunk.slice(0, -closingMarkers.length);
       if (grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
-        chunk = grapheme;
-        plainFallback = true;
+        setGraphemeFallback(grapheme);
       }
     }
     if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length > 0) {
@@ -425,14 +427,12 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
         chunk = quotePrefix && grapheme.length <= 2_999 ? `>${grapheme}` : grapheme;
       }
       if (grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
-        chunk = grapheme;
-        plainFallback = true;
+        setGraphemeFallback(grapheme);
       }
     }
     const graphemeSlashRun = /^(\\+)/.exec(rawChunk)?.[1] ?? "";
     if (chunk.length > 3_000 && graphemeSlashRun.length % 2 === 1 && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk.slice(graphemeSlashRun.length))].length === 1) {
-      chunk = rawChunk;
-      plainFallback = true;
+      setGraphemeFallback(rawChunk);
     }
     return ({
     type: "section" as const,
