@@ -506,7 +506,7 @@ export function createSlackMcpServer(
     async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse, event_id }) => {
       try {
         const connection = registry.get(workspace);
-        const effectiveMrkdwn=event_id?false:mrkdwn;
+        const effectiveMrkdwn=event_id?true:mrkdwn;
         const effectiveParse=event_id?"none" as const:parse;
         const result = await connection.client.postMessage({
           channelId: channel_id,

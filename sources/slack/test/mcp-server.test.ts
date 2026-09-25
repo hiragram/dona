@@ -288,7 +288,7 @@ describe("Dona Slack MCP server", () => {
         channelId: "C123",
         text: "scheduled",
         replyBroadcast: false,
-        mrkdwn: false,
+        mrkdwn: true,
         parse: "none",
         identityBlockId: `dona-job-${createHash("sha256").update("evt_01m1zfewbjx8v0844yrrkqwzc7").digest("hex").slice(0,32)}`,
       });
@@ -298,7 +298,7 @@ describe("Dona Slack MCP server", () => {
         message_ts: "2.3",
         body_sha256: createHash("sha256").update("scheduled").digest("hex"),
         reply_broadcast: false,
-        mrkdwn: false,
+        mrkdwn: true,
         parse: "none",
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       });

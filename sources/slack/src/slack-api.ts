@@ -40,6 +40,22 @@ export interface SlackPostResult {
   threadTs?: string;
 }
 
+function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
+  const chunks: string[] = [];
+  for (let offset = 0; offset < text.length;) {
+    let end = Math.min(offset + 3_000, text.length);
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;
+    chunks.push(text.slice(offset, end));
+    offset = end;
+  }
+  return chunks.map((chunk, index) => ({
+    type: "section" as const,
+    ...(index === 0 ? { block_id: blockId } : {}),
+    text: mrkdwn ? { type: "mrkdwn" as const, text: chunk, verbatim: true } : { type: "plain_text" as const, text: chunk },
+    expand: true,
+  }));
+}
+
 export type SlackAgentSessionStatus = "active" | "processing" | "suspended" | "closed";
 
 export interface SlackAgentSessionStatusResult {
@@ -618,11 +634,7 @@ export class SlackWebApiClient implements SlackApiClient {
       unfurl_links: false,
       unfurl_media: false,
       ...(input.identityBlockId ? {
-        blocks: [{
-          type: "section" as const,
-          block_id: input.identityBlockId,
-          text: input.mrkdwn === false ? { type: "plain_text" as const, text: input.text } : { type: "mrkdwn" as const, text: input.text },
-        }],
+        blocks: expandedSections(input.text, input.identityBlockId, input.mrkdwn !== false),
       } : {}),
     };
     const response = await callSlack(() => {
