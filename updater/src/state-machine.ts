@@ -8,7 +8,7 @@ const transitions: Readonly<Record<UpdateState, readonly UpdateState[]>> = {
   preparing: ["staged", "failed", "needs_review", "cancelled"],
   staged: ["quiescing", "cancelled", "failed", "needs_review"],
   quiescing: ["activating", "failed", "needs_review"],
-  activating: ["restarting", "rolling_back", "needs_review"],
+  activating: ["restarting", "rolling_back", "failed", "needs_review"],
   restarting: ["verifying", "rolling_back", "needs_review"],
   verifying: ["succeeded", "rolling_back", "needs_review"],
   succeeded: [],

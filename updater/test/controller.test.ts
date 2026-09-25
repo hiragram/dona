@@ -267,6 +267,10 @@ class FakeDispatcher implements DispatcherPort {
 
 class FakeRuntime implements RuntimePort {
   activeWorkerCount = 0;
+  workerAppearsAfterForwardStop = false;
+  workerAppearsAfterRollbackStop = false;
+  workerAppearsOnSafetyCall: number | undefined;
+  private workerSafetyCalls = 0;
   dispatcherDrainIncomplete = false;
   rollbackDispatcherDrainIncomplete = false;
   targetRecoveryDispatcherStartUnknownOnce = false;
@@ -276,6 +280,8 @@ class FakeRuntime implements RuntimePort {
   rollbackSlackDrainIncomplete = false;
   forwardSlackDrainIncomplete = false;
   workerSafety(): Promise<{ safe: boolean; active_worker_count: number }> {
+    this.workerSafetyCalls += 1;
+    if (this.workerAppearsOnSafetyCall === this.workerSafetyCalls) this.activeWorkerCount = 1;
     if (this.reviveDispatcherOnWorkerSafety && this.mainAgentSha === targetSha && !this.dispatcherLive) {
       this.dispatcherLive = true;
       this.reviveDispatcherOnWorkerSafety = false;
@@ -355,7 +361,13 @@ class FakeRuntime implements RuntimePort {
     return { service: "dispatcher", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] };
   }
   async stopSlack() { this.calls.push("stopSlack"); this.slackLive = false; return ok; }
-  async stopDispatcher() { this.calls.push("stopDispatcher"); this.dispatcherLive = false; return ok; }
+  async stopDispatcher() {
+    this.calls.push("stopDispatcher");
+    this.dispatcherLive = false;
+    if ((this.workerAppearsAfterForwardStop && this.mainAgentSha === currentSha) ||
+      (this.workerAppearsAfterRollbackStop && this.mainAgentSha === targetSha)) this.activeWorkerCount = 1;
+    return ok;
+  }
   async startDispatcher() {
     this.calls.push("startDispatcher");
     if (this.currentRecoveryDispatcherStartRejectedOnce && this.mainAgentSha === currentSha) {
@@ -554,6 +566,43 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
+  test("restores current supervision when a worker appears after forward service stop", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-forward-stop-race" });
+    f.dispatcher.terminal = true;
+    f.runtime.workerAppearsAfterForwardStop = true;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed", JSON.stringify({ error: row.last_error_code,
+      calls: f.runtime.calls, operations: f.database.runtimeOperations(row.request_id) }));
+    assert.equal(row.last_error_code, "active_worker_handoff_unavailable");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.equal(f.runtime.calls.includes(`startMainAgent:${targetSha}`), false);
+    assert.deepEqual(f.runtime.calls.slice(-3), [`startMainAgent:${currentSha}`, "startDispatcher", "startSlack"]);
+    f.database.close();
+  });
+  test("checks worker safety again immediately before forward pointer activation", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-activation-race" });
+    f.dispatcher.terminal = true;
+    f.runtime.workerAppearsOnSafetyCall = 3;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed", JSON.stringify({ error: row.last_error_code,
+      calls: f.runtime.calls, operations: f.database.runtimeOperations(row.request_id) }));
+    assert.equal(row.last_error_code, "active_worker_handoff_unavailable");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.equal(f.runtime.calls.includes(`startMainAgent:${targetSha}`), false);
+    f.database.close();
+  });
   test("does not restart a live Dispatcher when forward Slack drain fails", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -662,8 +711,8 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls, [
       "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
-      `startMainAgent:${targetSha}`, "startDispatcher", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent",
-      "stopDispatcher", `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
+      `startMainAgent:${targetSha}`, "startDispatcher", "quiesceDispatcher", "stopDispatcher",
+      "waitForMainAgentIdle", "stopMainAgent", `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
     ]);
     f.database.close();
   });
@@ -691,7 +740,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.deepEqual(f.runtime.calls, [
       "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
       `startMainAgent:${targetSha}`, "startDispatcher", "startSlack",
-      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
+      "quiesceSlack", "quiesceDispatcher", "stopSlack", "stopDispatcher", "waitForMainAgentIdle", "stopMainAgent",
       `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
     ]);
     f.database.close();
@@ -713,6 +762,25 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, targetSha);
     assert.deepEqual(f.runtime.calls.slice(-4), ["quiesceSlack", "quiesceDispatcher", "startDispatcher", "startSlack"]);
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_dispatcher_after_drain")?.phase, "observed");
+    f.database.close();
+  });
+
+  test("restores target supervision when a worker appears after rollback service stop", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-stop-race" });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    f.runtime.workerAppearsAfterRollbackStop = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "rollback_active_worker_handoff_unavailable");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
+    assert.deepEqual(f.runtime.calls.slice(-4), ["stopSlack", "stopDispatcher", "startDispatcher", "startSlack"]);
+    assert.equal(f.database.runtimeOperation(row.request_id, "stop_target_main_agent"), undefined);
     f.database.close();
   });
   test("reconciles ambiguous target restart before restoring the other service", async () => {

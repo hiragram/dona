@@ -643,6 +643,13 @@ export class UpdateController {
       if (!(await this.ensureServiceStopped(
         row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
       ))) return;
+      const workerAfterStop = await this.runtime.workerSafety();
+      this.assertLease(row);
+      if (!workerAfterStop.safe) {
+        await this.restoreQuiescedServices(row,
+          workerAfterStop.error_code ?? "active_worker_handoff_unavailable");
+        return;
+      }
       const previousManifest = await this.releases.readCurrentManifest();
       const previousCompatibility = previousManifest.compatibility;
       if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
@@ -701,6 +708,13 @@ export class UpdateController {
       row = this.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced", {}, this.clock.now());
     }
     if (row.state === "activating") {
+      const workerBeforeActivation = await this.runtime.workerSafety();
+      this.assertLease(row);
+      if (!workerBeforeActivation.safe) {
+        await this.restoreQuiescedServices(row,
+          workerBeforeActivation.error_code ?? "active_worker_handoff_unavailable");
+        return;
+      }
       const releasePath = `${this.policy.release_root}/${row.target_sha}`;
       const receipt = await this.releases.activate(row, releasePath);
       this.assertLease(row);
@@ -891,9 +905,6 @@ export class UpdateController {
             return;
           }
         }
-        const stoppedMain = await this.ensureRollbackMainAgentStopped(row, knownPaneId);
-        if (!stoppedMain) return;
-        knownPaneId = stoppedMain;
         if (!(await this.ensureServiceStopped(
           row, "stop_target_slack", "slack_adapter", null, () => this.runtime.stopSlack(),
         ))) return;
@@ -905,9 +916,13 @@ export class UpdateController {
         const workerAfterStop = await this.runtime.workerSafety();
         this.assertLease(row);
         if (!workerAfterStop.safe) {
-          this.needsReview(row, workerAfterStop.error_code ?? "rollback_active_worker_handoff_unavailable");
+          await this.restoreTargetAfterDrain(row,
+            workerAfterStop.error_code ?? "rollback_active_worker_handoff_unavailable", true, true);
           return;
         }
+        const stoppedMain = await this.ensureRollbackMainAgentStopped(row, knownPaneId);
+        if (!stoppedMain) return;
+        knownPaneId = stoppedMain;
       } else {
         const stoppedKinds = ["stop_target_main_agent", "stop_target_slack", "stop_target_dispatcher"] as const;
         if (stoppedKinds.some((kind) => this.database.runtimeOperation(row.request_id, kind)?.phase !== "observed")) {
