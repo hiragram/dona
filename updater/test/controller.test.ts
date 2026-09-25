@@ -266,6 +266,10 @@ class FakeDispatcher implements DispatcherPort {
 }
 
 class FakeRuntime implements RuntimePort {
+  activeWorkerCount = 0;
+  workerSafety(): Promise<{ safe: boolean; active_worker_count: number }> {
+    return Promise.resolve({ safe: this.activeWorkerCount === 0, active_worker_count: this.activeWorkerCount });
+  }
   readonly calls: string[] = [];
   schemaMigrationReady = true;
   schemaMigrationBuildSha = targetSha;
@@ -468,6 +472,21 @@ async function fixture(policyVersion = "2026-09-03.2") {
 }
 
 describe("UpdateController isolated end-to-end", () => {
+  test("rejects active worker handoff before quiesce, stop, migration, or activation", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-active-worker" });
+    f.dispatcher.terminal = true;
+    f.runtime.activeWorkerCount = 1;
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.state, "failed");
+    assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "active_worker_handoff_unavailable");
+    assert.deepEqual(f.runtime.calls, []);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
   test("waits for the source Result terminal barrier, then stages, activates, verifies, and routes completion", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

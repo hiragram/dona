@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseDotenv } from "dotenv";
+import Database from "better-sqlite3";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "./ports.js";
@@ -499,6 +500,27 @@ function shellSingleQuote(value: string): string {
 export class RealRuntime implements RuntimePort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
 
+  async workerSafety(): Promise<{ safe: boolean; active_worker_count: number; error_code?: string }> {
+    try {
+      const database = new Database(this.dispatcherDatabasePath(), { readonly: true, fileMustExist: true });
+      try {
+        let active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs
+          WHERE status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
+            OR (status='retryable_failed' AND herdr_workspace_id IS NOT NULL)`)
+          .get() as { count: number }).count;
+        const legacyTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get();
+        if (legacyTable) active += (database.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
+          JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
+            AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
+            AND NOT (j.status='retryable_failed' AND j.herdr_workspace_id IS NOT NULL)`)
+          .get() as { count: number }).count;
+        return { safe: active === 0, active_worker_count: active };
+      } finally { database.close(); }
+    } catch {
+      return { safe: false, active_worker_count: 0, error_code: "worker_state_unverified" };
+    }
+  }
+
   async quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot> {
     let snapshot = drainSnapshot(await udsRequest(this.policy.slack_socket, "POST", "/v1/admin/quiesce", {
       schema_version: 1, protocol: 1, operation_id: requestId, target_sha: targetSha,
@@ -523,6 +545,15 @@ export class RealRuntime implements RuntimePort {
       snapshot = drainSnapshot(await udsRequest(
         this.policy.dispatcher_socket, "GET", "/v1/admin/drain-status", undefined, this.policy.timeouts.health_ms,
       ), "dispatcher");
+    }
+    if (snapshot.drained) {
+      // A pre-handoff Dispatcher can report a drained supervisor while Herdr
+      // workers still run. Independently inspect durable job state before any
+      // service stop, schema migration or pointer switch. No worker is stopped.
+      const worker = await this.workerSafety();
+      if (!worker.safe) snapshot = { ...snapshot, drained: false, in_flight: Math.max(snapshot.in_flight, 1),
+        unsafe_states: [...snapshot.unsafe_states, worker.error_code
+          ? "jobs.handoff_observation_unknown" : `jobs.handoff_unavailable:${worker.active_worker_count}`] };
     }
     return snapshot;
   }

@@ -167,6 +167,13 @@ async function listen(
 
 test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without live process access", async () => {
   const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const dispatcherDatabasePath = path.join(root, "Dona", "dona.sqlite3");
+  const dispatcherDatabase = new Database(dispatcherDatabasePath);
+  dispatcherDatabase.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT)");
+  dispatcherDatabase.close();
+  await fs.chmod(dispatcherDatabasePath, 0o600);
   const requests: unknown[] = [];
   const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests, 1);
   const slack = await listen(policy.slack_socket, "slack_adapter", requests);
@@ -197,6 +204,30 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
     assert.equal(Object.values(recording.calls[0]!.options.env ?? {}).some((value) => /token|secret/i.test(value)), false);
   } finally {
     await Promise.all([new Promise<void>((resolve) => dispatcher.close(() => resolve())), new Promise<void>((resolve) => slack.close(() => resolve()))]);
+    await removeTree(root);
+  }
+});
+
+test("RealRuntime refuses a legacy drained response while a durable worker remains active", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT)");
+  database.prepare("INSERT INTO jobs VALUES ('running','private-agent')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const requests: unknown[] = [];
+  const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    const snapshot = await runtime.quiesceDispatcher("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha);
+    assert.equal(snapshot.drained, false);
+    assert.deepEqual(snapshot.unsafe_states, ["jobs.handoff_unavailable:1"]);
+    assert.equal(JSON.stringify(snapshot).includes("private-agent"), false);
+  } finally {
+    await new Promise<void>((resolve) => dispatcher.close(() => resolve()));
     await removeTree(root);
   }
 });

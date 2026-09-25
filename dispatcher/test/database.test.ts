@@ -1405,6 +1405,28 @@ describe("DispatcherDatabase", () => {
     reopened.close();
   });
 
+  test("update safety refuses active and unresolved workers without exposing identities", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const statuses = ["running", "blocked", "needs_review", "completed"];
+    const jobs = statuses.map((status, index) => {
+      const source = database.enqueue(eventEnvelope(`Ev-update-worker-${index}`)).row;
+      return { status, row: database.createJob({source_event_id: source.event_id, objective: `秘密-${index}`,
+        workspace: {kind: "scratch"}}, config.jobsWorkspaceRoot, config.jobResultsDir).row };
+    });
+    const raw = new Database(config.databasePath);
+    for (const { status, row } of jobs) raw.prepare("UPDATE jobs SET status=? WHERE job_id=?").run(status, row.job_id);
+    raw.close();
+    const safety = database.updateSafetyStatus();
+    assert.equal(safety.safe, false);
+    assert.equal(safety.active_worker_count, 3);
+    assert.equal(safety.worker_recovery_state, "handoff_unavailable");
+    assert.deepEqual(safety.unsafe_states.sort(), ["jobs.blocked:1", "jobs.needs_review:1", "jobs.running:1"]);
+    assert.equal(JSON.stringify(safety).includes("秘密"), false);
+    assert.equal(JSON.stringify(safety).includes(config.jobResultsDir), false);
+    database.close();
+  });
+
   test("schema v3はmulti-jobとschedule runのcardinalityを同時に保持する", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const dispatcher = new DispatcherDatabase(config.databasePath);

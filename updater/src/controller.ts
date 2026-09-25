@@ -518,6 +518,17 @@ export class UpdateController {
       if (!row.approval_event_id || !(await this.dispatcher.eventTerminal(row.approval_event_id))) {
         throw new Error("approval_event_terminal_barrier_not_met");
       }
+      const workerSafety = await this.runtime.workerSafety();
+      this.assertLease(row);
+      if (!workerSafety.safe) {
+        this.database.terminal(row.request_id, row.fence, "failed",
+          workerSafety.error_code ?? "active_worker_handoff_unavailable", {
+            last_error_code: workerSafety.error_code ?? "active_worker_handoff_unavailable",
+            last_error_message: "Active worker handoff was not proven before quiesce; runtime was not stopped",
+            observed_active_sha: row.current_sha,
+          }, this.clock.now());
+        return;
+      }
       row = this.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started", {}, this.clock.now());
     }
     if (row.state === "quiescing") {

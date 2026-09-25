@@ -622,7 +622,7 @@ export class DispatcherDatabase {
       .get(eventId) !== undefined;
   }
 
-  updateSafetyStatus(): { safe: boolean; unsafe_states: string[] } {
+  updateSafetyStatus(): { safe: boolean; unsafe_states: string[]; active_worker_count: number; worker_recovery_state: "clear" | "handoff_unavailable" } {
     const unsafe: string[] = [];
     const eventRows = this.db.prepare(`
       SELECT status, COUNT(*) AS count FROM events
@@ -631,13 +631,28 @@ export class DispatcherDatabase {
     for (const row of eventRows) unsafe.push(`events.${row.status}:${row.count}`);
     const jobRows = this.db.prepare(`
       SELECT status, COUNT(*) AS count FROM jobs
-      WHERE status IN ('dispatching', 'cancelling') GROUP BY status
+      WHERE status IN ('preparing', 'dispatching', 'running', 'blocked', 'needs_review', 'cancelling')
+        OR (status = 'retryable_failed' AND herdr_workspace_id IS NOT NULL)
+      GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
     for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
+    // The current release protocol has no durable handoff receipt binding an
+    // isolated result grant and Herdr session to the next Dispatcher. A stopped
+    // supervisor is not proof that the external agent stopped. Refuse activation
+    // while any such worker may exist, including legacy agents marked for stop.
+    const legacy = this.db.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
+      JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
+        AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
+        AND NOT (j.status='retryable_failed' AND j.herdr_workspace_id IS NOT NULL)`)
+      .get() as { count: number };
+    if (legacy.count > 0) unsafe.push(`jobs.legacy_shared_grant:${legacy.count}`);
+    const activeWorkerCount = jobRows.reduce((count, row) => count + row.count, 0) + legacy.count;
     const steer = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE steer_state = 'dispatching'")
       .get() as { count: number };
     if (steer.count > 0) unsafe.push(`jobs.steer_acceptance_unknown:${steer.count}`);
-    return { safe: unsafe.length === 0, unsafe_states: unsafe };
+    return { safe: unsafe.length === 0, unsafe_states: unsafe,
+      active_worker_count: activeWorkerCount,
+      worker_recovery_state: activeWorkerCount === 0 ? "clear" : "handoff_unavailable" };
   }
 
   getBySequence(sequence: number): EventRow | undefined {

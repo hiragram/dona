@@ -58,6 +58,7 @@ export interface ReleaseStorePort {
 }
 
 export interface RuntimePort {
+  workerSafety(): Promise<{ safe: boolean; active_worker_count: number; error_code?: string }>;
   quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot>;
   quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot>;
   stopSlack(): Promise<CommandResult>;
