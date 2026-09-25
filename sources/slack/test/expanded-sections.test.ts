@@ -302,3 +302,8 @@ test("a backtick in a Slack token does not hide a following multi-line quote", (
   const blocks = expandedSections(`<https://example.com/\`tick|P>\n>>>intro\n${"x".repeat(7_000)}`, "identity", true);
   assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith(">>>")));
 });
+
+test("a backtick in a Slack token does not hide a following single-line quote", () => {
+  const blocks = expandedSections(`<https://example.com/\`tick|P>\n>${"x".repeat(7_000)}`, "identity", true);
+  assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith(">")));
+});

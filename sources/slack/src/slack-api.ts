@@ -70,7 +70,7 @@ function inlineCodeOpenAt(text: string, end: number): boolean {
       index += 2;
       continue;
     }
-    if (!inFence && text[index] === "`" && !isEscaped(text, index)) inCode = !inCode;
+    if (!inFence && text[index] === "`" && !isEscaped(text, index) && !insideAngleToken(text, index)) inCode = !inCode;
   }
   return inCode;
 }
