@@ -69,3 +69,17 @@ test("a marker inside a code fence does not close an earlier unmatched marker", 
   assert.ok(blocks.length > 1);
   assert.equal(blocks[0]?.text.text, text.slice(0, blocks[0]?.text.text.length));
 });
+
+test("a fence opener straddling the split stays intact", () => {
+  const blocks = expandedSections(`${"a".repeat(2_978)}\`\`\`\n${"x".repeat(6_000)}\n\`\`\``, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.some((block) => block.text.text.includes("```\n")));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+  assert.ok(blocks.every((block) => (block.text.text.match(/```/g) ?? []).length % 2 === 0));
+});
+
+test("an escape and its marker stay in the same section", () => {
+  const blocks = expandedSections(`${"a".repeat(2_979)}\\*literal*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes("\\*literal*")));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});

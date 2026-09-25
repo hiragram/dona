@@ -126,12 +126,21 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
         if (partialLink !== undefined && partialLink > 0 && text.startsWith("<http", offset + partialLink)) {
           end = offset + partialLink;
         }
+        const partialFence = /`{1,2}$/.exec(prefix)?.index;
+        if (partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence)) {
+          end = Math.min(end, offset + partialFence);
+        }
         const lastOpenLink = prefix.lastIndexOf("<http");
         const lastCloseLink = prefix.lastIndexOf(">");
         const lastFence = prefix.lastIndexOf("```");
         const protectedStart = lastOpenLink > lastCloseLink ? lastOpenLink : fenceCount % 2 ? lastFence : -1;
         if (protectedStart > 0) end = Math.min(end, offset + protectedStart);
       }
+    }
+    if (mrkdwn && end < text.length) {
+      let slashStart = end;
+      while (slashStart > offset && text[slashStart - 1] === "\\") slashStart--;
+      if ((end - slashStart) % 2 === 1) end = slashStart > offset ? end - 1 : end + 1;
     }
     if (end < text.length && end > offset + 1 && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;
     if (end <= offset) end = offset + 1;
