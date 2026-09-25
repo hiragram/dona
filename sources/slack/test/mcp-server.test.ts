@@ -284,6 +284,7 @@ describe("Dona Slack MCP server", () => {
           workspace: "company",
           channel_id: "C123",
           text: "scheduled",
+          mrkdwn: true,
           event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
         },
       });
@@ -312,6 +313,7 @@ describe("Dona Slack MCP server", () => {
           workspace: "company",
           channel_id: "C123",
           text: "<https://example.com|link> <!channel> <!here> <@U123> <@U123|name> <!subteam^S123>",
+          mrkdwn: true,
           event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
         },
       });
@@ -357,9 +359,18 @@ describe("Dona Slack MCP server", () => {
 
       await client.callTool({ name: "post_message", arguments: {
         workspace: "company", channel_id: "C123", text: "job", thread_ts: "1.2",
+        mrkdwn: true,
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       } });
       assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      const postsBeforeMissingFormat = fake.posts.length;
+      const missingFormatResult = await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "C123", text: "job", thread_ts: "1.2",
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+      } });
+      assert.equal(missingFormatResult.isError, true);
+      assert.equal(fake.posts.length, postsBeforeMissingFormat);
 
       const fileResult = await client.callTool({
         name: "get_file",

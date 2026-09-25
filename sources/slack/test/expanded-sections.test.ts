@@ -561,3 +561,11 @@ test("a Slack deep link stays together at a section boundary", () => {
   assert.ok(blocks.some((block) => block.text.text.includes(token)));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("an escaped long grapheme inside emphasis falls back to plain text", () => {
+  const grapheme = `a${"\u0301".repeat(2_997)}`;
+  const escaped = `\\${grapheme}`;
+  const blocks = expandedSections(`*${escaped}*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === escaped));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});

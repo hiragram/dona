@@ -511,7 +511,8 @@ export function createSlackMcpServer(
         const isChannel = channel_id.startsWith("C") || (channel?.isPrivate === true && channel.isMpim !== true && channel.isIm !== true);
         const effectiveReplyBroadcast = Boolean(thread_ts) && !event_id && isChannel && (reply_broadcast ?? true);
         if (event_id && reply_broadcast === true) throw new Error("job_notification_broadcast_forbidden");
-        const effectiveMrkdwn=event_id?(mrkdwn??true):mrkdwn;
+        if (event_id && mrkdwn === undefined) throw new Error("job_notification_mrkdwn_required");
+        const effectiveMrkdwn=mrkdwn;
         const effectiveParse=event_id?"none" as const:parse;
         const safeText=event_id&&effectiveMrkdwn
           ? text.replace(/<!(?:channel|here|everyone)(?:\|[^>]+)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+(?:\|[^>]+)?>/gi, (mention) => `&lt;${mention.slice(1)}`)

@@ -73,6 +73,12 @@ function isEscapedSlackAngleToken(value: string): boolean {
   return slashRun.length % 2 === 1 && isSlackAngleToken(value.slice(slashRun.length));
 }
 
+function isSingleGraphemeWithOptionalEscape(value: string): boolean {
+  const slashRun = /^(\\+)/.exec(value)?.[1] ?? "";
+  if (slashRun && slashRun.length % 2 === 0) return false;
+  return [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(value.slice(slashRun.length))].length === 1;
+}
+
 function fenceOpenAt(text: string, end: number): boolean {
   let open = false;
   for (const match of text.slice(0, end).matchAll(/```/g)) {
@@ -383,7 +389,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
         }
       }
       const grapheme = rawChunk.slice(opening.length, consumedClosing ? -consumedClosing.length : undefined);
-      if (opening && grapheme.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(grapheme)].length === 1) {
+      if (opening && grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
         chunk = grapheme;
         plainFallback = true;
       }
@@ -401,7 +407,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     }
     if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
       const grapheme = rawChunk.slice(0, -closingMarkers.length);
-      if (grapheme.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(grapheme)].length === 1) {
+      if (grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
         chunk = grapheme;
         plainFallback = true;
       }
@@ -409,7 +415,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length > 0) {
       const consumedClosing = [...startsInsideInline].reverse().slice(0, startsInsideInline.length - state.inline.length).join("");
       const grapheme = consumedClosing && rawChunk.endsWith(consumedClosing) ? rawChunk.slice(0, -consumedClosing.length) : rawChunk;
-      if (grapheme.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(grapheme)].length === 1) {
+      if (grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
         chunk = grapheme;
         plainFallback = true;
       }
