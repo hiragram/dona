@@ -496,7 +496,7 @@ export function createSlackMcpServer(
         channel_id: channelSchema,
         text: z.string().min(1).max(12_000).describe("Slack message body"),
         thread_ts: timestampSchema.optional(),
-        reply_broadcast: z.boolean().default(false),
+        reply_broadcast: z.boolean().optional().describe("Defaults to true for ordinary channel thread replies; false for DMs and job notifications"),
         mrkdwn: z.boolean().optional(),
         parse: z.literal("none").optional(),
         event_id: z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i).optional().describe("Dona job通知時のcurrent event ID"),
@@ -506,13 +506,15 @@ export function createSlackMcpServer(
     async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse, event_id }) => {
       try {
         const connection = registry.get(workspace);
+        const effectiveReplyBroadcast = event_id ? false : (reply_broadcast ?? (Boolean(thread_ts) && channel_id.startsWith("C")));
+        if (event_id && reply_broadcast === true) throw new Error("job_notification_broadcast_forbidden");
         const effectiveMrkdwn=event_id?false:mrkdwn;
         const effectiveParse=event_id?"none" as const:parse;
         const result = await connection.client.postMessage({
           channelId: channel_id,
           text,
           ...(thread_ts ? { threadTs: thread_ts } : {}),
-          replyBroadcast: reply_broadcast,
+          replyBroadcast: effectiveReplyBroadcast,
           ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
           ...(effectiveParse?{parse:effectiveParse}:{}),
           ...(event_id?{identityBlockId:`dona-job-${createHash("sha256").update(event_id).digest("hex").slice(0,32)}`}:{}),
@@ -531,7 +533,7 @@ export function createSlackMcpServer(
           channel_id: result.channelId,
           message_ts: result.messageTs,
           body_sha256,
-          reply_broadcast,
+          reply_broadcast: effectiveReplyBroadcast,
           ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
           ...(effectiveParse?{parse:effectiveParse}:{}),
           ...(event_id?{event_id}:{}),

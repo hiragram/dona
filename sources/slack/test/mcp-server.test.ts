@@ -259,7 +259,7 @@ describe("Dona Slack MCP server", () => {
           channelId: "C123",
           text: "hello",
           threadTs: "1.2",
-          replyBroadcast: false,
+          replyBroadcast: true,
           mrkdwn: false,
           parse: "none",
         },
@@ -270,7 +270,7 @@ describe("Dona Slack MCP server", () => {
         message_ts: "2.3",
         body_sha256: createHash("sha256").update("hello").digest("hex"),
         thread_ts: "1.2",
-        reply_broadcast: false,
+        reply_broadcast: true,
         mrkdwn: false,
         parse: "none",
       });
@@ -302,6 +302,17 @@ describe("Dona Slack MCP server", () => {
         parse: "none",
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       });
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "D123", text: "dm", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "C123", text: "job", thread_ts: "1.2",
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
 
       const fileResult = await client.callTool({
         name: "get_file",
