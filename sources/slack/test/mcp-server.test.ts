@@ -284,6 +284,7 @@ describe("Dona Slack MCP server", () => {
           workspace: "company",
           channel_id: "C123",
           text: "scheduled",
+          mrkdwn: true,
           event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
         },
       });
@@ -291,7 +292,7 @@ describe("Dona Slack MCP server", () => {
         channelId: "C123",
         text: "scheduled",
         replyBroadcast: false,
-        mrkdwn: false,
+        mrkdwn: true,
         parse: "none",
         identityBlockId: `dona-job-${createHash("sha256").update("evt_01m1zfewbjx8v0844yrrkqwzc7").digest("hex").slice(0,32)}`,
       });
@@ -301,10 +302,37 @@ describe("Dona Slack MCP server", () => {
         message_ts: "2.3",
         body_sha256: createHash("sha256").update("scheduled").digest("hex"),
         reply_broadcast: false,
-        mrkdwn: false,
+        mrkdwn: true,
         parse: "none",
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       });
+
+      const mentionResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "<https://example.com|link> <!channel> <!here> <@U123> <@U123|name> <!subteam^S123>",
+          mrkdwn: true,
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      const safeText = "<https://example.com|link> &lt;!channel> &lt;!here> &lt;@U123> &lt;@U123|name> &lt;!subteam^S123>";
+      assert.equal(fake.posts.at(-1)?.text, safeText);
+      assert.equal((mentionResult.structuredContent as { body_sha256?: string })?.body_sha256, createHash("sha256").update(safeText).digest("hex"));
+
+      const plainScheduledResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "schedule notice",
+          mrkdwn: false,
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      assert.equal(fake.posts.at(-1)?.mrkdwn, false);
+      assert.equal((plainScheduledResult.structuredContent as { mrkdwn?: boolean })?.mrkdwn, false);
 
       await client.callTool({ name: "post_message", arguments: {
         workspace: "company", channel_id: "D123", text: "dm", thread_ts: "1.2",
@@ -331,9 +359,18 @@ describe("Dona Slack MCP server", () => {
 
       await client.callTool({ name: "post_message", arguments: {
         workspace: "company", channel_id: "C123", text: "job", thread_ts: "1.2",
+        mrkdwn: true,
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       } });
       assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      const postsBeforeMissingFormat = fake.posts.length;
+      const missingFormatResult = await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "C123", text: "job", thread_ts: "1.2",
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+      } });
+      assert.equal(missingFormatResult.isError, true);
+      assert.equal(fake.posts.length, postsBeforeMissingFormat);
 
       const fileResult = await client.callTool({
         name: "get_file",

@@ -511,11 +511,15 @@ export function createSlackMcpServer(
         const isChannel = channel_id.startsWith("C") || (channel?.isPrivate === true && channel.isMpim !== true && channel.isIm !== true);
         const effectiveReplyBroadcast = Boolean(thread_ts) && !event_id && isChannel && (reply_broadcast ?? true);
         if (event_id && reply_broadcast === true) throw new Error("job_notification_broadcast_forbidden");
-        const effectiveMrkdwn=event_id?false:mrkdwn;
+        if (event_id && mrkdwn === undefined) throw new Error("job_notification_mrkdwn_required");
+        const effectiveMrkdwn=mrkdwn;
         const effectiveParse=event_id?"none" as const:parse;
+        const safeText=event_id&&effectiveMrkdwn
+          ? text.replace(/<!(?:channel|here|everyone)(?:\|[^>]+)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+(?:\|[^>]+)?>/gi, (mention) => `&lt;${mention.slice(1)}`)
+          : text;
         const result = await connection.client.postMessage({
           channelId: channel_id,
-          text,
+          text: safeText,
           ...(thread_ts ? { threadTs: thread_ts } : {}),
           replyBroadcast: effectiveReplyBroadcast,
           ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
@@ -530,7 +534,7 @@ export function createSlackMcpServer(
           message_ts: result.messageTs,
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
-        const body_sha256=createHash("sha256").update(text).digest("hex");
+        const body_sha256=createHash("sha256").update(safeText).digest("hex");
         return success({
           workspace,
           channel_id: result.channelId,

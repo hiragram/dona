@@ -40,6 +40,422 @@ export interface SlackPostResult {
   threadTs?: string;
 }
 
+type InlineMarker = "`" | "*" | "_" | "~";
+
+function isEscaped(text: string, index: number): boolean {
+  let start = index;
+  while (start > 0 && text[start - 1] === "\\") start--;
+  return (index - start) % 2 === 1;
+}
+
+function insideAngleToken(text: string, index: number): boolean {
+  const open = text.lastIndexOf("<", index);
+  if (open < 0 || open < text.lastIndexOf("\n", index) || open < text.lastIndexOf(">", index)) return false;
+  return angleTokenClose(text, open) !== -1;
+}
+
+function angleTokenClose(text: string, open: number): number {
+  const close = text.indexOf(">", open + 1);
+  const newline = text.indexOf("\n", open + 1);
+  if (close === -1 || (newline !== -1 && newline < close)) return -1;
+  const content = text.slice(open + 1, close);
+  if (/^!date\^\d+\^[^|]+\|[^>]+$/.test(content)) return close;
+  const target = content.split("|", 1)[0] ?? "";
+  return /^(?:(?:https?:\/\/|slack:\/\/|mailto:|tel:)[^\s<>]+|@[UW][A-Z0-9]+|#[CGD][A-Z0-9]+|!(?:channel|here|everyone|subteam\^S[A-Z0-9]+))$/i.test(target) ? close : -1;
+}
+
+function isSlackAngleToken(value: string): boolean {
+  return value.startsWith("<") && angleTokenClose(value, 0) === value.length - 1;
+}
+
+function isEscapedSlackAngleToken(value: string): boolean {
+  const slashRun = /^(\\+)/.exec(value)?.[1] ?? "";
+  return slashRun.length % 2 === 1 && isSlackAngleToken(value.slice(slashRun.length));
+}
+
+function isSingleGraphemeWithOptionalEscape(value: string): boolean {
+  const slashRun = /^(\\+)/.exec(value)?.[1] ?? "";
+  if (slashRun && slashRun.length % 2 === 0) return false;
+  return [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(value.slice(slashRun.length))].length === 1;
+}
+
+function fenceOpenAt(text: string, end: number): boolean {
+  let open = false;
+  for (const match of text.slice(0, end).matchAll(/```/g)) {
+    if (!isEscaped(text, match.index) && !insideAngleToken(text, match.index)) open = !open;
+  }
+  return open;
+}
+
+type CloseCandidates = Map<InlineMarker, number[]>;
+
+function inlineCodeOpenAt(text: string, end: number, candidates: CloseCandidates): boolean {
+  let inFence = false;
+  let inCode = false;
+  for (let index = 0; index < end; index++) {
+    if (text.startsWith("```", index) && !isEscaped(text, index) && !insideAngleToken(text, index)) {
+      inFence = !inFence;
+      index += 2;
+      continue;
+    }
+    if (!inFence && text[index] === "`" && !isEscaped(text, index) && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`", candidates))) inCode = !inCode;
+  }
+  return inCode;
+}
+
+function findMultiQuoteStart(text: string, candidates: CloseCandidates): number {
+  let inFence = false;
+  let inCode = false;
+  for (let index = 0; index < text.length; index++) {
+    if (text.startsWith("```", index) && !isEscaped(text, index) && !insideAngleToken(text, index)) {
+      inFence = !inFence;
+      index += 2;
+      continue;
+    }
+    if (inFence || isEscaped(text, index)) continue;
+    if (text[index] === "`" && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`", candidates))) inCode = !inCode;
+    if (!inCode && (index === 0 || text[index - 1] === "\n") && text.startsWith(">>>", index)) return index;
+  }
+  return -1;
+}
+
+function hasMatchingClose(text: string, start: number, marker: InlineMarker, candidates: CloseCandidates): boolean {
+  const positions = candidates.get(marker) ?? [];
+  let low = 0;
+  let high = positions.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((positions[middle] ?? 0) <= start) low = middle + 1;
+    else high = middle;
+  }
+  if (low === positions.length) return false;
+  let inFence = false;
+  let inCode = false;
+  for (let index = start + 1; index < text.length; index++) {
+    if (text.startsWith("```", index) && !isEscaped(text, index) && !insideAngleToken(text, index)) {
+      inFence = !inFence;
+      index += 2;
+      continue;
+    }
+    if (inFence) continue;
+    if (text[index] === "\\") {
+      index++;
+      continue;
+    }
+    if (text[index] === "<") {
+      const close = angleTokenClose(text, index);
+      if (close !== -1) {
+        index = close;
+        continue;
+      }
+    }
+    if (text[index] === ":") {
+      const alias = /^:[a-z0-9_+-]+:/i.exec(text.slice(index));
+      if (alias) { index += alias[0].length - 1; continue; }
+    }
+    if (text[index] === "`" && marker !== "`" && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`", candidates))) {
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode || text[index] !== marker) continue;
+    if (marker === "_" && /[\p{L}\p{N}_]/u.test(text[index - 1] ?? "") && /[\p{L}\p{N}_]/u.test(text[index + 1] ?? "")) continue;
+    if (marker !== "`" && /\s/.test(text[index - 1] ?? "")) continue;
+    return true;
+  }
+  return false;
+}
+
+function advanceMrkdwnState(
+  text: string,
+  state: { fence: boolean; inline: InlineMarker[] },
+  fullText: string,
+  offset: number,
+  candidates: CloseCandidates,
+): void {
+  for (let index = 0; index < text.length; index++) {
+    if (text.startsWith("```", index) && !isEscaped(fullText, offset + index) && !insideAngleToken(fullText, offset + index)) {
+      state.fence = !state.fence;
+      index += 2;
+      continue;
+    }
+    if (state.fence) continue;
+    if (text[index] === "\\") {
+      index++;
+      continue;
+    }
+    if (text[index] === "<") {
+      const close = angleTokenClose(text, index);
+      if (close !== -1) {
+        index = close;
+        continue;
+      }
+    }
+    if (text[index] === ":") {
+      const alias = /^:[a-z0-9_+-]+:/i.exec(text.slice(index));
+      if (alias) { index += alias[0].length - 1; continue; }
+    }
+    const marker = text[index];
+    if (marker !== "`" && marker !== "*" && marker !== "_" && marker !== "~") continue;
+    if (state.inline.includes("`") && marker !== "`") continue;
+    const absoluteIndex = offset + index;
+    if (marker === "_" && /[\p{L}\p{N}_]/u.test(fullText[absoluteIndex - 1] ?? "") && /[\p{L}\p{N}_]/u.test(fullText[absoluteIndex + 1] ?? "")) continue;
+    const existing = state.inline.lastIndexOf(marker);
+    if (existing !== -1) {
+      if (marker !== "`" && /\s/.test(fullText[absoluteIndex - 1] ?? "")) continue;
+      state.inline.splice(existing, 1);
+      continue;
+    }
+    if (marker !== "`" && /\s/.test(fullText[absoluteIndex + 1] ?? "")) continue;
+    if (hasMatchingClose(fullText, absoluteIndex, marker, candidates)) state.inline.push(marker);
+  }
+}
+
+type ExpandedSection = {
+  type: "section";
+  block_id?: string;
+  text: { type: "mrkdwn"; text: string; verbatim: boolean } | { type: "plain_text"; text: string };
+  expand: boolean;
+};
+
+function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, maxRawLength: number): ExpandedSection[] {
+  const chunks: string[] = [];
+  const candidates: CloseCandidates = new Map<InlineMarker, number[]>([["`", []], ["*", []], ["_", []], ["~", []]]);
+  for (let index = 0; index < text.length; index++) {
+    const marker = text[index] as InlineMarker;
+    if (!candidates.has(marker) || isEscaped(text, index)) continue;
+    if (marker !== "`" && /\s/.test(text[index - 1] ?? "")) continue;
+    if (marker === "_" && /[\p{L}\p{N}_]/u.test(text[index - 1] ?? "") && /[\p{L}\p{N}_]/u.test(text[index + 1] ?? "")) continue;
+    candidates.get(marker)!.push(index);
+  }
+  const graphemeBoundaries = [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(text)].map((part) => part.index);
+  graphemeBoundaries.push(text.length);
+  for (let offset = 0; offset < text.length;) {
+    let end = Math.min(offset + maxRawLength, text.length);
+    if (offset === 0 && maxRawLength === 2_900 && text.length <= 3_000) end = text.length;
+    if (end < text.length) {
+      const prefix = text.slice(offset, end);
+      const newline = prefix.lastIndexOf("\n");
+      const fences = [...prefix.matchAll(/```/g)].map((match) => match.index).filter((index) => !isEscaped(text, offset + index) && !insideAngleToken(text, offset + index));
+      const fenceCount = fences.length;
+      const lastFence = fences.at(-1) ?? -1;
+      const startsInsideFence = mrkdwn && fenceOpenAt(text, offset);
+      const endsInsideFence = startsInsideFence !== (fenceCount % 2 === 1);
+      if (newline > 0 && (!mrkdwn || !endsInsideFence) && !(mrkdwn && !endsInsideFence && lastFence > newline)) end = offset + newline + 1;
+      else if (mrkdwn) {
+        const lastOpenToken = prefix.lastIndexOf("<");
+        const lastCloseToken = prefix.lastIndexOf(">");
+        if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken) && !inlineCodeOpenAt(text, offset + lastOpenToken, candidates)) {
+          const close = angleTokenClose(text, offset + lastOpenToken);
+          if (close !== -1 && isEscaped(text, offset + lastOpenToken) && close + 1 - offset <= 3_000) {
+            let escapeStart = lastOpenToken;
+            while (escapeStart > 0 && prefix[escapeStart - 1] === "\\") escapeStart--;
+            end = escapeStart > 0 && close + 1 - offset > maxRawLength ? offset + escapeStart : close + 1;
+          }
+          else if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
+          else if (close !== -1 && close + 1 - offset <= 3_000) end = close + 1;
+        }
+        const lastEntity = prefix.lastIndexOf("&");
+        if (end <= offset + maxRawLength && lastEntity > prefix.lastIndexOf(";") && lastEntity >= 0) {
+          const entity = /^(?:&amp;|&lt;|&gt;)/.exec(text.slice(offset + lastEntity));
+          if (entity && lastEntity > 0) end = Math.min(end, offset + lastEntity);
+          else if (entity && offset + lastEntity + entity[0].length - offset <= 3_000) end = offset + lastEntity + entity[0].length;
+        }
+        const lastColon = prefix.lastIndexOf(":");
+        if (end <= offset + maxRawLength && lastColon >= 0 && !fenceOpenAt(text, offset + lastColon) && !inlineCodeOpenAt(text, offset + lastColon, candidates)) {
+          const alias = /^:[a-z0-9_+-]+:/i.exec(text.slice(offset + lastColon));
+          if (alias && lastColon > 0) end = Math.min(end, offset + lastColon);
+          else if (alias && alias[0].length <= 3_000) end = offset + lastColon + alias[0].length;
+        }
+        const partialFence = /`{1,2}$/.exec(prefix)?.index;
+        if (end <= offset + maxRawLength && partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence) && !isEscaped(text, offset + partialFence) && !insideAngleToken(text, offset + partialFence)) {
+          end = Math.min(end, offset + partialFence);
+        }
+        const protectedStart = endsInsideFence && !startsInsideFence ? lastFence : -1;
+        if (protectedStart > 0) end = Math.min(end, offset + protectedStart);
+      }
+    }
+    if (mrkdwn && end < text.length) {
+      let slashStart = end;
+      while (slashStart > offset && text[slashStart - 1] === "\\") slashStart--;
+      if ((end - slashStart) % 2 === 1) end = slashStart > offset ? end - 1 : end + 1;
+    }
+    if (end < text.length && end > offset + 1 && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;
+    let low = 0;
+    let high = graphemeBoundaries.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if ((graphemeBoundaries[middle] ?? 0) <= end) low = middle + 1;
+      else high = middle;
+    }
+    const graphemeEnd = graphemeBoundaries[low - 1] ?? end;
+    const nextBoundary = graphemeBoundaries[low];
+    if (nextBoundary !== undefined && graphemeEnd > offset && nextBoundary - graphemeEnd > maxRawLength / 2) {
+      let escapeStart = graphemeEnd;
+      while (escapeStart > offset && text[escapeStart - 1] === "\\") escapeStart--;
+      if (escapeStart > offset) end = escapeStart;
+      else if (!isEscaped(text, graphemeEnd)) end = graphemeEnd;
+      else if (nextBoundary - offset <= 3_000) end = nextBoundary;
+    }
+    else if (nextBoundary !== undefined && nextBoundary - offset <= 3_000 && end - graphemeEnd > maxRawLength / 4) end = nextBoundary;
+    else if (graphemeEnd > offset) end = graphemeEnd;
+    else if (nextBoundary !== undefined && nextBoundary - offset <= 3_000) end = nextBoundary;
+    if (mrkdwn && end < text.length) {
+      let slashStart = end;
+      while (slashStart > offset && text[slashStart - 1] === "\\") slashStart--;
+      if ((end - slashStart) % 2 === 1) end = slashStart > offset ? slashStart : end + 1;
+    }
+    while (mrkdwn && end < text.length && end - offset < 3_000 && !isEscaped(text, end)) {
+      const marker = text[end] as InlineMarker;
+      if (marker === "*" || marker === "_" || marker === "~" || marker === "`") {
+        if (marker === "_" && /[\p{L}\p{N}_]/u.test(text[end - 1] ?? "") && /[\p{L}\p{N}_]/u.test(text[end + 1] ?? "")) break;
+        const boundaryState: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
+        advanceMrkdwnState(text.slice(0, end), boundaryState, text, 0, candidates);
+        if (boundaryState.inline.includes(marker) && !boundaryState.fence) {
+          end++;
+          continue;
+        }
+      }
+      break;
+    }
+    if (end <= offset) end = offset + 1;
+    chunks.push(text.slice(offset, end));
+    offset = end;
+  }
+  const state: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
+  const multiQuoteStart = findMultiQuoteStart(text, candidates);
+  let rawOffset = 0;
+  const blocks = chunks.map((rawChunk, index) => {
+    const startsInsideFence = state.fence;
+    const startsInsideInline = [...state.inline];
+    const lineStart = text.lastIndexOf("\n", rawOffset - 1) + 1;
+    const continuesQuote = rawOffset > lineStart && text[lineStart] === ">" && !fenceOpenAt(text, lineStart) && !inlineCodeOpenAt(text, lineStart, candidates);
+    const quotePrefix = multiQuoteStart >= 0 && rawOffset > multiQuoteStart
+      ? rawOffset === lineStart && rawChunk.startsWith(">>>") && !startsInsideFence && !startsInsideInline.includes("`") ? "" : ">>>"
+      : continuesQuote ? ">" : "";
+    let rendered = `${quotePrefix}${startsInsideFence ? "```\n" : startsInsideInline.join("")}`;
+    let cursor = 0;
+    if (mrkdwn) {
+      for (const match of rawChunk.matchAll(/```/g)) {
+        const fenceAt = match.index;
+        if (isEscaped(text, rawOffset + fenceAt) || insideAngleToken(text, rawOffset + fenceAt)) continue;
+        const beforeFence = rawChunk.slice(cursor, fenceAt);
+        advanceMrkdwnState(beforeFence, state, text, rawOffset + cursor, candidates);
+        rendered += beforeFence;
+        if (!state.fence) rendered += [...state.inline].reverse().join("");
+        rendered += "```";
+        state.fence = !state.fence;
+        if (!state.fence) rendered += state.inline.join("");
+        cursor = fenceAt + 3;
+      }
+      const rest = rawChunk.slice(cursor);
+      advanceMrkdwnState(rest, state, text, rawOffset + cursor, candidates);
+      rendered += rest;
+    }
+    rawOffset += rawChunk.length;
+    let chunk = mrkdwn
+      ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? `${rendered.endsWith("\n") ? "" : "\n"}\`\`\`` : ""}`
+      : rawChunk;
+    if (mrkdwn && !quotePrefix && rawOffset - rawChunk.length === lineStart && rawChunk.startsWith(">") && startsInsideInline.length && !startsInsideInline.includes("`") && !startsInsideFence) {
+      const markers = startsInsideInline.join("");
+      const quoteMarker = rawChunk.startsWith(">>>") ? ">>>" : ">";
+      chunk = `${quoteMarker}${markers}${chunk.slice(markers.length + quoteMarker.length)}`;
+    }
+    if (mrkdwn && startsInsideInline.length === 1 && rawChunk.startsWith(startsInsideInline[0]!) && state.inline.length === 0 && !startsInsideFence) {
+      chunk = `${chunk.slice(0, quotePrefix.length)}${chunk.slice(quotePrefix.length + startsInsideInline[0]!.length + 1)}`;
+    }
+    let plainFallback = false;
+    const setGraphemeFallback = (value: string) => {
+      const keepQuote = Boolean(quotePrefix) && value.length <= 2_999;
+      chunk = keepQuote ? `>${value}` : value;
+      plainFallback = !keepQuote;
+    };
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && isSlackAngleToken(rawChunk) && rawChunk.length <= 3_000) {
+      chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
+    }
+    const closingMarkers = [...startsInsideInline].reverse().join("");
+    if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
+      const token = rawChunk.slice(0, -closingMarkers.length);
+      if ((isSlackAngleToken(token) || /^:[a-z0-9_+-]+:$/i.test(token) || isEscapedSlackAngleToken(token)) && token.length <= 3_000) {
+        chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
+      }
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length === 0 && state.inline.length === 0) {
+      const opening = /^([*_~`]+)/.exec(rawChunk)?.[1] ?? "";
+      const closing = [...opening].reverse().join("");
+      if (opening && rawChunk.endsWith(closing)) {
+        const token = rawChunk.slice(opening.length, -closing.length);
+        if ((isSlackAngleToken(token) || /^:[a-z0-9_+-]+:$/i.test(token) || isEscapedSlackAngleToken(token)) && token.length <= 3_000) {
+          chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
+        }
+      }
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length === 0 && state.inline.length === 1) {
+      const opening = /^([*_~`]+)/.exec(rawChunk)?.[1] ?? "";
+      const closing = [...opening].reverse().join("");
+      const consumedClosing = closing.slice(0, -state.inline.length);
+      if (opening && consumedClosing && rawChunk.endsWith(consumedClosing)) {
+        const token = rawChunk.slice(opening.length, -consumedClosing.length);
+        if ((isSlackAngleToken(token) || /^:[a-z0-9_+-]+:$/i.test(token) || isEscapedSlackAngleToken(token)) && token.length <= 3_000) {
+          chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
+        }
+      }
+      const grapheme = rawChunk.slice(opening.length, consumedClosing ? -consumedClosing.length : undefined);
+      if (opening && grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
+        setGraphemeFallback(grapheme);
+      }
+    }
+    const escapedAngle = /^(\\+)<[^>]+>$/.exec(rawChunk);
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && escapedAngle && escapedAngle[1]!.length % 2 === 1 && rawChunk.length <= 3_000) {
+      chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^:[a-z0-9_+-]+:$/i.test(rawChunk) && rawChunk.length <= 3_000) {
+      chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
+    }
+    if (chunk.length > 3_000 && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk)].length === 1) {
+      setGraphemeFallback(rawChunk);
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
+      const grapheme = rawChunk.slice(0, -closingMarkers.length);
+      if (grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
+        setGraphemeFallback(grapheme);
+      }
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length > 0) {
+      const consumedClosing = [...startsInsideInline].reverse().slice(0, startsInsideInline.length - state.inline.length).join("");
+      const grapheme = consumedClosing && rawChunk.endsWith(consumedClosing) ? rawChunk.slice(0, -consumedClosing.length) : rawChunk;
+      if ((isSlackAngleToken(grapheme) || /^:[a-z0-9_+-]+:$/i.test(grapheme) || isEscapedSlackAngleToken(grapheme)) && grapheme.length <= 3_000) {
+        chunk = quotePrefix && grapheme.length <= 2_999 ? `>${grapheme}` : grapheme;
+      }
+      if (grapheme.length <= 3_000 && isSingleGraphemeWithOptionalEscape(grapheme)) {
+        setGraphemeFallback(grapheme);
+      }
+    }
+    const graphemeSlashRun = /^(\\+)/.exec(rawChunk)?.[1] ?? "";
+    if (chunk.length > 3_000 && graphemeSlashRun.length % 2 === 1 && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk.slice(graphemeSlashRun.length))].length === 1) {
+      setGraphemeFallback(rawChunk);
+    }
+    return ({
+    type: "section" as const,
+    ...(index === 0 ? { block_id: blockId } : {}),
+    text: mrkdwn && !plainFallback ? { type: "mrkdwn" as const, text: chunk, verbatim: true } : { type: "plain_text" as const, text: chunk },
+    expand: true,
+    });
+  });
+  const nonEmptyBlocks = blocks.filter((block, index) => block.text.text.length > 0 && !(blocks.length > 1 && (chunks[index]?.length ?? 0) <= 3 && /^[>*_~`]+$/.test(block.text.text) && /^[*_~`]+$/.test(chunks[index] ?? "")));
+  if (nonEmptyBlocks[0] && nonEmptyBlocks[0].block_id !== blockId) nonEmptyBlocks[0] = { ...nonEmptyBlocks[0], block_id: blockId };
+  if (nonEmptyBlocks.some((block) => block.text.text.length > 3_000)) {
+    if (maxRawLength <= 32) throw new Error("Section text cannot fit within Slack's 3,000 character limit");
+    return splitExpandedSections(text, blockId, mrkdwn, Math.floor(maxRawLength / 2));
+  }
+  return nonEmptyBlocks;
+}
+
+function sectionBlocks(text: string, blockId: string, mrkdwn: boolean): ExpandedSection[] {
+  return splitExpandedSections(text, blockId, mrkdwn, 2_900);
+}
+
+export const expandedSections = sectionBlocks;
+
 export type SlackAgentSessionStatus = "active" | "processing" | "suspended" | "closed";
 
 export interface SlackAgentSessionStatusResult {
@@ -618,11 +1034,7 @@ export class SlackWebApiClient implements SlackApiClient {
       unfurl_links: false,
       unfurl_media: false,
       ...(input.identityBlockId ? {
-        blocks: [{
-          type: "section" as const,
-          block_id: input.identityBlockId,
-          text: input.mrkdwn === false ? { type: "plain_text" as const, text: input.text } : { type: "mrkdwn" as const, text: input.text },
-        }],
+        blocks: expandedSections(input.text, input.identityBlockId, input.mrkdwn !== false),
       } : {}),
     };
     const response = await callSlack(() => {
