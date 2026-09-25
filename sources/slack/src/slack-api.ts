@@ -70,7 +70,7 @@ function inlineCodeOpenAt(text: string, end: number): boolean {
       index += 2;
       continue;
     }
-    if (!inFence && text[index] === "`" && !isEscaped(text, index) && !insideAngleToken(text, index)) inCode = !inCode;
+    if (!inFence && text[index] === "`" && !isEscaped(text, index) && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`"))) inCode = !inCode;
   }
   return inCode;
 }
@@ -95,7 +95,7 @@ function hasMatchingClose(text: string, start: number, marker: InlineMarker): bo
   let inFence = false;
   let inCode = false;
   for (let index = start + 1; index < text.length; index++) {
-    if (text.startsWith("```", index) && !isEscaped(text, index)) {
+    if (text.startsWith("```", index) && !isEscaped(text, index) && !insideAngleToken(text, index)) {
       inFence = !inFence;
       index += 2;
       continue;
@@ -112,7 +112,7 @@ function hasMatchingClose(text: string, start: number, marker: InlineMarker): bo
         continue;
       }
     }
-    if (text[index] === "`" && marker !== "`") {
+    if (text[index] === "`" && marker !== "`" && !insideAngleToken(text, index)) {
       inCode = !inCode;
       continue;
     }
@@ -283,13 +283,14 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     }
     rawOffset += rawChunk.length;
     let chunk = mrkdwn
-      ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? "\n```" : ""}`
+      ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? `${rendered.endsWith("\n") ? "" : "\n"}\`\`\`` : ""}`
       : rawChunk;
     let plainFallback = false;
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
-    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^\\<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
+    const escapedAngle = /^(\\+)<[^>]+>$/.exec(rawChunk);
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && escapedAngle && escapedAngle[1]!.length % 2 === 1 && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^:[a-z0-9_+-]+:$/i.test(rawChunk) && rawChunk.length <= 3_000) {

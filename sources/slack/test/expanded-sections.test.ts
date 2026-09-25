@@ -335,3 +335,28 @@ test("an escape and near-limit grapheme fall back together", () => {
   assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === `\\${grapheme}`));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("an odd escape run and a near-limit link stay together", () => {
+  const token = `<https://${"a".repeat(2_984)}|P>`;
+  const escaped = `\\\\\\${token}`;
+  const blocks = expandedSections(`*prefix\n${escaped}tail*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === escaped));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
+
+test("a fence-like sequence in an escaped Slack token does not change emphasis", () => {
+  const blocks = expandedSections(`*\\<https://example.com/\`\`\`tail|PR>${"x".repeat(7_000)}*`, "identity", true);
+  assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith("*")));
+});
+
+test("an unmatched backtick does not allow a Slack link to split", () => {
+  const token = "<https://example.com|PR>";
+  const blocks = expandedSections(`\`typo${"x".repeat(2_880)}${token}${"y".repeat(2_000)}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(token)));
+});
+
+test("a split code fence does not insert an extra blank line", () => {
+  const blocks = expandedSections("```\n" + "x\n".repeat(4_000) + "```", "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.slice(0, -1).every((block) => !block.text.text.endsWith("\n\n```")));
+});
