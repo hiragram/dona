@@ -343,36 +343,35 @@ class ForbiddenValueMatcher {
   }
 }
 
-function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, decodeDepth: number): boolean {
+function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, decodeDepth: number, budget: { count: number }): boolean {
   const decoder = new TextDecoder("utf-8", { fatal: true });
-  let candidates = 0;
   const inspect = (bytes: Buffer): boolean => {
     try {
       const decoded = decoder.decode(bytes);
       if (matcher.contains(decoded)) return true;
-      assertSafeJson(decoded, 0, undefined, matcher, undefined, decodeDepth + 1);
+      assertSafeJson(decoded, 0, undefined, matcher, undefined, decodeDepth + 1, budget);
     } catch (error) {
       if (error instanceof JobResultPublishError) return true;
       // Non-UTF-8 data is not worker-visible text.
     }
     return false;
   };
-  for (const match of value.matchAll(/[A-Za-z0-9+/_-]{8,}={0,2}/g)) {
+  for (const match of value.matchAll(/(?:[A-Za-z0-9+/_-]{2,7}={1,2}|[A-Za-z0-9+/_-]{8,}={0,2})/g)) {
     const encoded = match[0];
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
     if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
-    if (++candidates > 1_024 || inspect(bytes)) return true;
+    if (++budget.count > 1_024 || inspect(bytes)) return true;
   }
   for (const match of value.matchAll(/[0-9a-f]{8,}/gi)) {
     const encoded = match[0];
     if (encoded.length % 2 !== 0) continue;
-    if (++candidates > 1_024 || inspect(Buffer.from(encoded, "hex"))) return true;
+    if (++budget.count > 1_024 || inspect(Buffer.from(encoded, "hex"))) return true;
   }
   return false;
 }
 
-function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0): void {
+function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0, budget: { count: number } = { count: 0 }): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
     for (const match of value.matchAll(networkUrlCandidate)) {
@@ -423,7 +422,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/u.test(value)) {
       if (value.includes("\u001b]")) throw new JobResultPublishError("content_requires_redaction");
       const stripped = value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
-      if (stripped !== value) assertSafeJson(stripped, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
+      if (stripped !== value) assertSafeJson(stripped, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     }
     const jsonEscape = /\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g;
     if (decodeDepth < 2 && jsonEscape.test(value)) {
@@ -432,7 +431,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
         if (escaped[1] === "u") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
         return ({ b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" } as Record<string, string>)[escaped[1]!] ?? escaped[1]!;
       });
-      assertSafeJson(decodedJson, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
+      assertSafeJson(decodedJson, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
     if (decodeDepth >= 2 && /\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (decodeDepth < 2 && value.includes("%")) {
@@ -440,7 +439,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
         try { return decodeURIComponent(encoded); }
         catch { return encoded; }
       });
-      if (decoded !== value) assertSafeJson(decoded, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
+      if (decoded !== value) assertSafeJson(decoded, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
     if (decodeDepth >= 2 && /%[0-9A-Fa-f]{2}/.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (forbiddenValues?.contains(value)) {
@@ -449,12 +448,12 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     const displayed = displayProjection(value);
     if (displayed !== value) {
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
-      assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
+      assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/i.test(value) || sensitive.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/i.test(value) || sensitive.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
-    for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
+    for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
   } else if (value !== null && typeof value === "object") {
     const normalizedEntries = Object.entries(value).map(([key, item]) =>
       [normalizedStructuredKey(key), typeof item === "string" ? normalizedStructuredKey(item) : item] as const);
@@ -463,8 +462,8 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (hasPrivateJwkFields(normalizedObject)) throw new JobResultPublishError("content_requires_redaction");
     for (const [key, item] of Object.entries(value)) {
       if (forbiddenKey(normalizedStructuredKey(key)) && !isPublicCountField(key, item)) throw new JobResultPublishError("content_requires_redaction");
-      assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
-      assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
+      assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
+      assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     }
   } else if (typeof value === "number" && !Number.isSafeInteger(value)) {
     throw new JobResultPublishError("invalid_request");
@@ -540,17 +539,18 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     throw new JobResultPublishError("invalid_request");
   }
   const matcher = forbiddenValues ? new ForbiddenValueMatcher(forbiddenValues, shortRuntimeValues) : undefined;
+  const encodedBudget = { count: 0 };
   // Fixed schema keys are Dispatcher-owned; inspect only worker-provided fields.
-  assertSafeJson(parsed.data.summary, 0, forbiddenDigests, matcher, forbiddenFingerprints);
-  if (parsed.data.output !== undefined) assertSafeJson(parsed.data.output.text, 0, forbiddenDigests, matcher, forbiddenFingerprints);
+  assertSafeJson(parsed.data.summary, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
+  if (parsed.data.output !== undefined) assertSafeJson(parsed.data.output.text, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
   if (parsed.data.output?.text.trim()) {
     assertSafeJson(`${parsed.data.summary}\n\n${parsed.data.output.text}`, 0,
-      forbiddenDigests, matcher, forbiddenFingerprints);
+      forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
     assertSafeJson(`${parsed.data.summary}${parsed.data.output.text}`, 0,
-      forbiddenDigests, matcher, forbiddenFingerprints);
+      forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
   }
-  if (parsed.data.artifacts !== undefined) assertSafeJson(parsed.data.artifacts, 0, forbiddenDigests, matcher, forbiddenFingerprints);
-  if (parsed.data.actions !== undefined) assertSafeJson(parsed.data.actions, 0, forbiddenDigests, matcher, forbiddenFingerprints);
+  if (parsed.data.artifacts !== undefined) assertSafeJson(parsed.data.artifacts, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
+  if (parsed.data.actions !== undefined) assertSafeJson(parsed.data.actions, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
   const envelope: JobResultEnvelope = {
     schema_version: 1,
     job_id: job.job_id,
