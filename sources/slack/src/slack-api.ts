@@ -44,6 +44,19 @@ function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
   const chunks: string[] = [];
   for (let offset = 0; offset < text.length;) {
     let end = Math.min(offset + 3_000, text.length);
+    if (end < text.length) {
+      const prefix = text.slice(offset, end);
+      const newline = prefix.lastIndexOf("\n");
+      const fenceCount = (prefix.match(/```/g) ?? []).length;
+      if (newline > 0 && (!mrkdwn || fenceCount % 2 === 0)) end = offset + newline + 1;
+      else if (mrkdwn) {
+        const lastOpenLink = prefix.lastIndexOf("<http");
+        const lastCloseLink = prefix.lastIndexOf(">");
+        const lastFence = prefix.lastIndexOf("```");
+        const protectedStart = lastOpenLink > lastCloseLink ? lastOpenLink : fenceCount % 2 ? lastFence : -1;
+        if (protectedStart > 0) end = offset + protectedStart;
+      }
+    }
     if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;
     chunks.push(text.slice(offset, end));
     offset = end;

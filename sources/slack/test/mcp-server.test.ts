@@ -303,6 +303,19 @@ describe("Dona Slack MCP server", () => {
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       });
 
+      const plainScheduledResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "schedule notice",
+          mrkdwn: false,
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      assert.equal(fake.posts.at(-1)?.mrkdwn, false);
+      assert.equal((plainScheduledResult.structuredContent as { mrkdwn?: boolean })?.mrkdwn, false);
+
       const fileResult = await client.callTool({
         name: "get_file",
         arguments: { workspace: "company", file_id: "F123" },
