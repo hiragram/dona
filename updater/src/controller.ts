@@ -547,9 +547,9 @@ export class UpdateController {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
       const persistedSlackStop = this.database.runtimeOperation(row.request_id, "stop_slack");
       const persistedDispatcherStop = this.database.runtimeOperation(row.request_id, "stop_dispatcher");
-      const persistedRecovery = this.database.runtimeOperation(row.request_id, "start_previous_main_agent") ??
-        this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
-        this.database.runtimeOperation(row.request_id, "restart_current_slack");
+      const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
+        this.database.runtimeOperation(row.request_id, "restart_current_slack") ??
+        this.database.runtimeOperation(row.request_id, "start_previous_main_agent");
       if (persistedRecovery || persistedStop?.phase === "rejected") {
         let evidence: Record<string, unknown> = {};
         try {
@@ -562,8 +562,12 @@ export class UpdateController {
             : typeof evidence.error_code === "string"
               ? evidence.error_code
               : "main_agent_stop_rejected";
+        if (persistedRecovery && typeof evidence.dispatcher_quiesced !== "boolean") {
+          this.needsReview(row, "quiesce_recovery_scope_unverified");
+          return;
+        }
         await this.restoreQuiescedServices(row, causeCode,
-          causeCode !== "slack_adapter_drain_incomplete");
+          persistedRecovery ? evidence.dispatcher_quiesced as boolean : true);
         return;
       }
       // Reboot can restart a previously stopped launchd service. Re-observe each
@@ -587,7 +591,7 @@ export class UpdateController {
         const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
         this.assertLease(row);
         if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-          await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete");
+          await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete", dispatcherDrain.quiescing);
           return;
         }
       } else if (persistedDispatcherStop?.phase !== "observed") {
@@ -1657,14 +1661,33 @@ export class UpdateController {
       this.needsReview(row, "quiesce_recovery_pointer_mismatch");
       return;
     }
+    if (row.state === "activating") {
+      let schema: Awaited<ReturnType<RuntimePort["appSchemaState"]>>;
+      let manifest: ReleaseManifest | null;
+      try {
+        [schema, manifest] = await Promise.all([
+          this.runtime.appSchemaState(), this.releases.releaseManifest(row.current_sha),
+        ]);
+      } catch {
+        this.needsReview(row, "quiesce_recovery_schema_unverified");
+        return;
+      }
+      this.assertLease(row);
+      if (!manifest || schema.user_version !== manifest.compatibility.app_schema_write ||
+          !schema.integrity_ok || schema.foreign_key_violations !== 0) {
+        this.needsReview(row, "quiesce_recovery_schema_incompatible");
+        return;
+      }
+    }
     const failure: { code?: string; message?: string } = {};
+    const scope = { dispatcherQuiesced, slackQuiesced: true };
     const dispatcherRestored = !dispatcherQuiesced || await this.restartQuiescedService(
       row, "restart_current_dispatcher", "dispatcher", causeCode,
-      () => this.runtime.startDispatcher(), row.current_sha, failure,
+      () => this.runtime.startDispatcher(), row.current_sha, failure, scope,
     );
     const slackRestored = await this.restartQuiescedService(
       row, "restart_current_slack", "slack_adapter", causeCode,
-      () => this.runtime.startSlack(), row.current_sha, failure,
+      () => this.runtime.startSlack(), row.current_sha, failure, scope,
     );
     // Restore supervision and ingress even if the previous main agent cannot
     // start. A surviving worker still needs Dispatcher to collect its Result.

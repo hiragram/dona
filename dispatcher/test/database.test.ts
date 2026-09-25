@@ -1705,6 +1705,23 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("update safety counts an uncertain steer on a terminal job as one unresolved worker", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-update-terminal-steer")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "操舵受理確認",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',steer_state='dispatching' WHERE job_id=?").run(job.job_id);
+    raw.close();
+    const safety = database.updateSafetyStatus();
+    assert.equal(safety.safe, false);
+    assert.equal(safety.active_worker_count, 1);
+    assert.equal(safety.worker_recovery_state, "handoff_unavailable");
+    assert.ok(safety.unsafe_states.includes("jobs.steer_acceptance_unknown:1"));
+    database.close();
+  });
+
   test("update safety excludes only definite absence for retryable workers", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);

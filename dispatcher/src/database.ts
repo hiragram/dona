@@ -775,6 +775,7 @@ export class DispatcherDatabase {
             WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)))
         OR (status = 'retryable_failed' AND (last_error_code = 'stale_preparing' OR
           (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
+        OR steer_state = 'dispatching'
       GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
     for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);

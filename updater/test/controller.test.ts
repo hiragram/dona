@@ -272,6 +272,7 @@ class FakeRuntime implements RuntimePort {
   workerAppearsOnSafetyCall: number | undefined;
   private workerSafetyCalls = 0;
   dispatcherDrainIncomplete = false;
+  dispatcherRestartedDuringDrain = false;
   rollbackDispatcherDrainIncomplete = false;
   targetRecoveryDispatcherStartUnknownOnce = false;
   targetRecoveryDispatcherStartRejectedOnce = false;
@@ -355,6 +356,9 @@ class FakeRuntime implements RuntimePort {
   }
   async quiesceDispatcher(): Promise<DrainSnapshot> {
     this.calls.push("quiesceDispatcher");
+    if (this.dispatcherRestartedDuringDrain) {
+      return { service: "dispatcher", quiescing: false, drained: false, in_flight: 0, unsafe_states: [] };
+    }
     if (this.dispatcherDrainIncomplete || (this.rollbackDispatcherDrainIncomplete && this.mainAgentSha === targetSha)) {
       this.dispatcherLive = false;
       return { service: "dispatcher", quiescing: true, drained: false, in_flight: 1, unsafe_states: ["jobs.handoff_unavailable:1"] };
@@ -572,6 +576,22 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
+  test("does not restart an unquiesced Dispatcher after drain polling loses its state", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-dispatcher-restarted" });
+    f.dispatcher.terminal = true;
+    f.runtime.dispatcherRestartedDuringDrain = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed");
+    assert.equal(row.last_error_code, "dispatcher_drain_incomplete");
+    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "startSlack"]);
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher"), undefined);
+    f.database.close();
+  });
   test("restores current supervision when a worker appears after forward service stop", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -648,9 +668,9 @@ describe("UpdateController isolated end-to-end", () => {
         ["restart_current_dispatcher", "dispatcher"], ["restart_current_slack", "slack_adapter"],
       ] as const) {
         f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, currentSha, null,
-          { cause_code: "active_worker_handoff_unavailable" });
+          { cause_code: "active_worker_handoff_unavailable", dispatcher_quiesced: true, slack_quiesced: true });
         if (phase !== "prepared") f.database.recordRuntimeOperation(row.request_id, row.fence, kind, phase, null,
-          { cause_code: "active_worker_handoff_unavailable" });
+          { cause_code: "active_worker_handoff_unavailable", dispatcher_quiesced: true, slack_quiesced: true });
       }
       f.advance(f.policy.timeouts.lease_ms + 1);
       await f.controller.processNext();
@@ -690,6 +710,38 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.get(row.request_id)?.last_error_code, "pre_activation_stop_recovery");
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls.slice(-3), ["startDispatcher", "startSlack", `startMainAgent:${currentSha}`]);
+    f.database.close();
+  });
+  test("refuses old runtime recovery after an incompatible schema migration", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-incompatible-recovery" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    row = f.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced");
+    for (const [kind, targetRef, expectedSha, previousSessionId] of [
+      ["stop_main_agent", "w1:p1", currentSha, `session-${currentSha}`],
+      ["stop_slack", "slack_adapter", null, null],
+      ["stop_dispatcher", "dispatcher", null, null],
+    ] as const) {
+      f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, targetRef, expectedSha, previousSessionId);
+      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, {});
+    }
+    f.runtime.appSchemaStateResult = { user_version: 3, integrity_ok: true, foreign_key_violations: 0 };
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.activeWorkerCount = 1;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    assert.equal(await f.controller.processNext(), true);
+    assert.equal(f.database.get(row.request_id)?.state, "needs_review",
+      JSON.stringify({ row: f.database.get(row.request_id), calls: f.runtime.calls }));
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "quiesce_recovery_schema_incompatible");
+    assert.equal(f.runtime.calls.includes("startDispatcher"), false);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    assert.equal(f.runtime.calls.some(call => call.startsWith("startMainAgent:")), false);
     f.database.close();
   });
   test("does not restart a live Dispatcher when forward Slack drain fails", async () => {
@@ -1781,7 +1833,7 @@ describe("UpdateController isolated end-to-end", () => {
         service,
         currentSha,
         null,
-        { cause_code: "main_agent_blocked" },
+        { cause_code: "main_agent_blocked", dispatcher_quiesced: true, slack_quiesced: true },
       );
       f.database.recordRuntimeOperation(
         requestId,
@@ -1789,7 +1841,7 @@ describe("UpdateController isolated end-to-end", () => {
         kind,
         "observed",
         null,
-        { cause_code: "main_agent_blocked" },
+        { cause_code: "main_agent_blocked", dispatcher_quiesced: true, slack_quiesced: true },
       );
     }
     await f.controller.processNext();
@@ -1809,9 +1861,9 @@ describe("UpdateController isolated end-to-end", () => {
     row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
     row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
     f.database.prepareRuntimeOperation(row.request_id, row.fence, "restart_current_slack",
-      "slack_adapter", currentSha, null, { cause_code: "slack_adapter_drain_incomplete" });
+      "slack_adapter", currentSha, null, { cause_code: "slack_adapter_drain_incomplete", dispatcher_quiesced: false, slack_quiesced: true });
     f.database.recordRuntimeOperation(row.request_id, row.fence, "restart_current_slack", "observed", null,
-      { cause_code: "slack_adapter_drain_incomplete" });
+      { cause_code: "slack_adapter_drain_incomplete", dispatcher_quiesced: false, slack_quiesced: true });
     await f.controller.processNext();
     assert.equal(f.database.get(row.request_id)?.state, "failed");
     assert.equal(f.database.get(row.request_id)?.last_error_code, "slack_adapter_drain_incomplete");
