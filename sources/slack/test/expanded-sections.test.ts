@@ -113,3 +113,9 @@ test("grapheme clusters stay in one section", () => {
     assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
   }
 });
+
+test("many short fences stay below the decorated section limit", () => {
+  const blocks = expandedSections(`*${"```\n```\n".repeat(400)}*`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});

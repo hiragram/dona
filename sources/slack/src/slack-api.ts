@@ -118,12 +118,19 @@ function advanceMrkdwnState(
   }
 }
 
-export function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
+type ExpandedSection = {
+  type: "section";
+  block_id?: string;
+  text: { type: "mrkdwn"; text: string; verbatim: boolean } | { type: "plain_text"; text: string };
+  expand: boolean;
+};
+
+function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, maxRawLength: number): ExpandedSection[] {
   const chunks: string[] = [];
   const graphemeBoundaries = [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(text)].map((part) => part.index);
   graphemeBoundaries.push(text.length);
   for (let offset = 0; offset < text.length;) {
-    let end = Math.min(offset + 2_900, text.length);
+    let end = Math.min(offset + maxRawLength, text.length);
     if (end < text.length) {
       const prefix = text.slice(offset, end);
       const newline = prefix.lastIndexOf("\n");
@@ -164,7 +171,7 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
   }
   const state: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
   let rawOffset = 0;
-  return chunks.map((rawChunk, index) => {
+  const blocks = chunks.map((rawChunk, index) => {
     const startsInsideFence = state.fence;
     const startsInsideInline = [...state.inline];
     let rendered = startsInsideFence ? "```\n" : startsInsideInline.join("");
@@ -197,7 +204,18 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
     expand: true,
     });
   });
+  if (blocks.some((block) => block.text.text.length > 3_000)) {
+    if (maxRawLength <= 32) throw new Error("Section text cannot fit within Slack's 3,000 character limit");
+    return splitExpandedSections(text, blockId, mrkdwn, Math.floor(maxRawLength / 2));
+  }
+  return blocks;
 }
+
+function sectionBlocks(text: string, blockId: string, mrkdwn: boolean): ExpandedSection[] {
+  return splitExpandedSections(text, blockId, mrkdwn, 2_900);
+}
+
+export const expandedSections = sectionBlocks;
 
 export type SlackAgentSessionStatus = "active" | "processing" | "suspended" | "closed";
 
