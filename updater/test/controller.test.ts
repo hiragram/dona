@@ -842,6 +842,33 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.runtimeOperation(row.request_id, "stop_target_main_agent"), undefined);
     f.database.close();
   });
+  for (const stopFailure of ["blocked", "rejected", "acceptance_unknown"] as const) {
+    test(`restores target services when rollback main agent stop is ${stopFailure}`, async () => {
+      const f = await fixture();
+      const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+      const plan = planned.plan as { plan_id: string; plan_hash: string };
+      f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+        plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: `human-approval-rollback-main-${stopFailure}` });
+      f.dispatcher.terminal = true;
+      f.runtime.wrongSlackOnce = true;
+      f.runtime.afterSlackStart = async () => {
+        f.runtime.afterSlackStart = undefined;
+        if (stopFailure === "blocked") {
+          f.runtime.mainWaitStatus = "blocked";
+          f.runtime.mainObserveStatus = "blocked";
+        }
+        else f.runtime.mainStopOutcome = stopFailure === "rejected" ? "rejected" : "accepted_unknown";
+      };
+      await f.controller.processNext();
+      const row = f.database.get(planned.request_id as string)!;
+      assert.equal(row.state, "needs_review");
+      assert.equal((await f.store.observe()).current_sha, targetSha);
+      assert.deepEqual(f.runtime.calls.slice(-2), ["startDispatcher", "startSlack"]);
+      assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_dispatcher_after_drain")?.phase, "observed");
+      assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_slack_after_drain")?.phase, "observed");
+      f.database.close();
+    });
+  }
   test("reconciles ambiguous target restart before restoring the other service", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -1978,6 +2005,41 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(observed.current_sha, currentSha);
     assert.equal(observed.previous_sha, targetSha);
     assert.equal(observed.receipt?.to_sha, currentSha);
+    f.database.close();
+  });
+  test("resumes rollback after the target services were durably stopped", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    const requestId = planned.request_id as string;
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stopped-target-resume" });
+    let row = f.database.claim(requestId, "controller-test", 10_000, new Date("2026-09-02T00:00:00.000Z"))!;
+    const staging = await f.store.prepareStaging(requestId, row.fence);
+    await fs.writeFile(path.join(staging, "app.js"), "export {};\n", { mode: 0o600 });
+    const release = await f.store.publish(staging, manifest(targetSha));
+    row = f.database.transition(requestId, row.fence, "staged", "release_staged");
+    row = f.database.transition(requestId, row.fence, "quiescing", "runtime_quiesce_started");
+    row = f.database.transition(requestId, row.fence, "activating", "runtime_quiesced");
+    const activation = await f.store.activate(row, release);
+    f.database.recordActivationGeneration(requestId, row.fence, activation.generation);
+    row = f.database.transition(requestId, row.fence, "restarting", "pointer_activated", {
+      activation_generation: activation.generation,
+    });
+    row = f.database.transition(requestId, row.fence, "rolling_back", "rollback_started");
+    for (const [kind, service] of [
+      ["stop_target_slack", "slack_adapter"], ["stop_target_dispatcher", "dispatcher"],
+    ] as const) {
+      f.database.prepareRuntimeOperation(requestId, row.fence, kind, service, null, null);
+      f.database.recordRuntimeOperation(requestId, row.fence, kind, "observed", null, {});
+    }
+    f.runtime.simulateStoppedRuntime();
+    await f.runtime.startMainAgent("w1:p1", path.join(f.policy.release_root, targetSha));
+    f.runtime.calls.length = 0;
+    await f.controller.processNext();
+    assert.equal(f.database.get(requestId)?.state, "rolled_back");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.equal(f.runtime.calls.filter((call) => call === "stopDispatcher").length, 0);
     f.database.close();
   });
 

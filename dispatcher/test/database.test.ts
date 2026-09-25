@@ -1705,6 +1705,22 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("update safety excludes only definite absence for retryable workers", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-retryable-worker-absence")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "再試行", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='retryable_failed',herdr_workspace_id='recorded',last_error_code='agent_not_found' WHERE job_id=?")
+      .run(job.job_id);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    raw.prepare("UPDATE jobs SET last_error_code='stale_preparing' WHERE job_id=?").run(job.job_id);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    raw.close();
+    database.close();
+  });
+
   test("update safety excludes a proven pre-prepare result path collision", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);

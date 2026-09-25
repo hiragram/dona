@@ -515,14 +515,16 @@ export class RealRuntime implements RuntimePort {
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
               ('invalid_result_agent_stopped','agent_not_found','agent_not_running'))
             ${stoppedLegacyClause})
-            OR (status='retryable_failed' AND (herdr_workspace_id IS NOT NULL OR last_error_code='stale_preparing'))
+            OR (status='retryable_failed' AND (last_error_code='stale_preparing' OR
+              (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
             OR steer_state='dispatching'`)
           .get() as { count: number }).count;
         if (legacyTable) active += (database.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
           JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
             AND j.status NOT IN ('completed','failed','cancelled')
             AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
-            AND NOT (j.status='retryable_failed' AND (j.herdr_workspace_id IS NOT NULL OR j.last_error_code='stale_preparing'))`)
+            AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
+              (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)
           .get() as { count: number }).count;
         return { safe: active === 0, active_worker_count: active };
       } finally { database.close(); }

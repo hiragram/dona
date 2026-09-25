@@ -901,7 +901,9 @@ export class UpdateController {
         const targetDispatcherNeverStarted =
           this.database.runtimeOperation(row.request_id, "stop_dispatcher")?.phase === "observed" &&
           this.database.runtimeOperation(row.request_id, "start_target_dispatcher") === undefined;
-        if (!dispatcherBeforeDrain.live && !targetDispatcherNeverStarted) {
+        const targetDispatcherStoppedForRollback =
+          this.database.runtimeOperation(row.request_id, "stop_target_dispatcher")?.phase === "observed";
+        if (!dispatcherBeforeDrain.live && !targetDispatcherNeverStarted && !targetDispatcherStoppedForRollback) {
           this.needsReview(row, "rollback_dispatcher_unavailable");
           return;
         }
@@ -936,8 +938,13 @@ export class UpdateController {
             workerAfterStop.error_code ?? "rollback_active_worker_handoff_unavailable", true, true);
           return;
         }
-        const stoppedMain = await this.ensureRollbackMainAgentStopped(row, knownPaneId);
-        if (!stoppedMain) return;
+        const stopFailure: { code?: string; message?: string } = {};
+        const stoppedMain = await this.ensureRollbackMainAgentStopped(row, knownPaneId, stopFailure);
+        if (!stoppedMain) {
+          await this.restoreTargetAfterDrain(row,
+            stopFailure.code ?? "rollback_main_agent_stop_unverified", true, true);
+          return;
+        }
         knownPaneId = stoppedMain;
       } else {
         const stoppedKinds = ["stop_target_main_agent", "stop_target_slack", "stop_target_dispatcher"] as const;
@@ -1238,21 +1245,34 @@ export class UpdateController {
     );
   }
 
-  private async ensureRollbackMainAgentStopped(row: UpdateRow, fallbackPaneId?: string): Promise<string | undefined> {
+  private async ensureRollbackMainAgentStopped(
+    row: UpdateRow, fallbackPaneId?: string, recoveryFailure?: { code?: string; message?: string },
+  ): Promise<string | undefined> {
     const kind = "stop_target_main_agent" as const;
+    const fail = (code: string, message?: string): void => {
+      if (recoveryFailure) {
+        recoveryFailure.code = code;
+        if (message !== undefined) recoveryFailure.message = message;
+      }
+      else this.needsReview(row, code, message);
+    };
+    const defer = (code: string, message: string): void => {
+      if (recoveryFailure) { recoveryFailure.code = code; recoveryFailure.message = message; }
+      else this.deferOrReview(row, code, message);
+    };
     const targetRelease = path.join(this.policy.release_root, row.target_sha);
     const existing = this.database.runtimeOperation(row.request_id, kind);
     if (existing && (existing.expected_sha !== row.target_sha ||
       (fallbackPaneId !== undefined && existing.target_ref !== fallbackPaneId))) {
-      this.needsReview(row, "rollback_main_agent_stop_intent_mismatch");
+      fail("rollback_main_agent_stop_intent_mismatch");
       return undefined;
     }
     if (existing?.phase === "rejected") {
-      this.needsReview(row, "rollback_main_agent_stop_rejected");
+      fail("rollback_main_agent_stop_rejected");
       return undefined;
     }
     if (existing?.phase === "prepared") {
-      this.deferOrReview(row, `${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
+      defer(`${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
       return undefined;
     }
     if (existing) {
@@ -1264,10 +1284,10 @@ export class UpdateController {
       }
       if (observed.pane_id !== existing.target_ref || observed.session_id !== existing.previous_session_id ||
         !observed.matches_release || observed.name !== this.policy.main_agent.name || observed.kind !== "codex") {
-        this.needsReview(row, "rollback_main_agent_identity_changed");
+        fail("rollback_main_agent_identity_changed");
         return undefined;
       }
-      this.deferOrReview(row, "rollback_main_agent_stop_acceptance_unknown", "Persisted target main-agent stop has not been observed");
+      defer("rollback_main_agent_stop_acceptance_unknown", "Persisted target main-agent stop has not been observed");
       return undefined;
     }
 
@@ -1275,7 +1295,7 @@ export class UpdateController {
     this.assertLease(row);
     if (!drainedMainAgent.exists) {
       if (!fallbackPaneId) {
-        this.needsReview(row, "rollback_main_agent_pane_not_recorded");
+        fail("rollback_main_agent_pane_not_recorded");
         return undefined;
       }
       this.database.prepareRuntimeOperation(
@@ -1292,10 +1312,7 @@ export class UpdateController {
     if (!sameDrainedIdentity || !["idle", "done"].includes(mainAgent.status ?? "") || !mainAgent.matches_release ||
       mainAgent.name !== this.policy.main_agent.name || mainAgent.kind !== "codex" ||
       !mainAgent.pane_id || !mainAgent.session_id || (fallbackPaneId && mainAgent.pane_id !== fallbackPaneId)) {
-      this.needsReview(
-        row,
-        mainAgent.status === "blocked" ? "rollback_main_agent_blocked" : "rollback_main_agent_identity_changed",
-      );
+      fail(mainAgent.status === "blocked" ? "rollback_main_agent_blocked" : "rollback_main_agent_identity_changed");
       return undefined;
     }
     this.database.prepareRuntimeOperation(
@@ -1308,14 +1325,14 @@ export class UpdateController {
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "rejected", null, {
         error_code: stopped.error_code,
       }, this.clock.now());
-      this.needsReview(row, stopped.error_code ?? "rollback_main_agent_stop_rejected");
+      fail(stopped.error_code ?? "rollback_main_agent_stop_rejected");
       return undefined;
     }
     if (stopped.outcome !== "stopped" || !stopped.pane_id) {
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "acceptance_unknown", null, {
         error_code: stopped.error_code,
       }, this.clock.now());
-      this.deferOrReview(row, "rollback_main_agent_stop_acceptance_unknown", "Target main-agent stop acceptance is unknown");
+      defer("rollback_main_agent_stop_acceptance_unknown", "Target main-agent stop acceptance is unknown");
       return undefined;
     }
     this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, {}, this.clock.now());

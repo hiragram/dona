@@ -237,7 +237,7 @@ test("RealRuntime refuses a legacy drained response while a durable worker remai
   }
 });
 
-test("RealRuntime keeps a completed job unsafe while steer acceptance is unresolved", async () => {
+test("RealRuntime distinguishes unresolved steer from definite retryable agent absence", async () => {
   const { root, policy } = await tempPolicy();
   await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
@@ -254,6 +254,14 @@ test("RealRuntime keeps a completed job unsafe while steer acceptance is unresol
     settled.prepare("UPDATE jobs SET steer_state='accepted'").run();
     settled.close();
     assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    const retryable = new Database(databasePath);
+    retryable.prepare("UPDATE jobs SET status='retryable_failed',herdr_workspace_id='recorded',last_error_code='agent_not_found'").run();
+    retryable.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    const uncertain = new Database(databasePath);
+    uncertain.prepare("UPDATE jobs SET last_error_code='stale_preparing'").run();
+    uncertain.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
   } finally { await removeTree(root); }
 });
 

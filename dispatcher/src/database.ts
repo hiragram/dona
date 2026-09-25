@@ -773,7 +773,8 @@ export class DispatcherDatabase {
         AND NOT (status='needs_review'
           AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l
             WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)))
-        OR (status = 'retryable_failed' AND (herdr_workspace_id IS NOT NULL OR last_error_code = 'stale_preparing'))
+        OR (status = 'retryable_failed' AND (last_error_code = 'stale_preparing' OR
+          (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
       GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
     for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
@@ -785,7 +786,8 @@ export class DispatcherDatabase {
       JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
         AND j.status NOT IN ('completed','failed','cancelled')
         AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
-        AND NOT (j.status='retryable_failed' AND (j.herdr_workspace_id IS NOT NULL OR j.last_error_code='stale_preparing'))`)
+        AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
+          (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)
       .get() as { count: number };
     if (legacy.count > 0) unsafe.push(`jobs.legacy_shared_grant:${legacy.count}`);
     const activeWorkerCount = jobRows.reduce((count, row) => count + row.count, 0) + legacy.count;
