@@ -258,6 +258,13 @@ test("RealRuntime excludes only a proven pre-prepare result collision", async ()
     stopped.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped'").run();
     stopped.close();
     assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    for (const code of ["agent_not_found", "agent_not_running", "steer_acceptance_unknown"]) {
+      const state = new Database(databasePath);
+      state.prepare("UPDATE jobs SET last_error_code=?").run(code);
+      state.close();
+      assert.equal((await runtime.workerSafety()).active_worker_count,
+        code === "steer_acceptance_unknown" ? 1 : 0);
+    }
   } finally {
     await removeTree(root);
   }

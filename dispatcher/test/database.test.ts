@@ -1452,6 +1452,13 @@ describe("DispatcherDatabase", () => {
     stopped.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped' WHERE job_id=?").run(job.job_id);
     stopped.close();
     assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    for (const code of ["agent_not_found", "agent_not_running", "steer_acceptance_unknown"]) {
+      const state = new Database(config.databasePath);
+      state.prepare("UPDATE jobs SET last_error_code=? WHERE job_id=?").run(code, job.job_id);
+      state.close();
+      assert.equal(database.updateSafetyStatus().active_worker_count,
+        code === "steer_acceptance_unknown" ? 1 : 0);
+    }
     database.close();
   });
 

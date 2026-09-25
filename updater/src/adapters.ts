@@ -508,7 +508,8 @@ export class RealRuntime implements RuntimePort {
           WHERE (status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
               AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
-            AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='invalid_result_agent_stopped'))
+            AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
+              ('invalid_result_agent_stopped','agent_not_found','agent_not_running')))
             OR (status='retryable_failed' AND (herdr_workspace_id IS NOT NULL OR last_error_code='stale_preparing'))`)
           .get() as { count: number }).count;
         const legacyTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get();
