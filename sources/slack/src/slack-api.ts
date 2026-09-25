@@ -42,6 +42,38 @@ export interface SlackPostResult {
 
 type InlineMarker = "`" | "*" | "_" | "~";
 
+function hasMatchingClose(text: string, start: number, marker: InlineMarker): boolean {
+  let inFence = false;
+  let inCode = false;
+  for (let index = start + 1; index < text.length; index++) {
+    if (text.startsWith("```", index)) {
+      inFence = !inFence;
+      index += 2;
+      continue;
+    }
+    if (inFence) continue;
+    if (text[index] === "\\") {
+      index++;
+      continue;
+    }
+    if (text.startsWith("<http", index)) {
+      const close = text.indexOf(">", index + 5);
+      if (close !== -1) {
+        index = close;
+        continue;
+      }
+    }
+    if (text[index] === "`" && marker !== "`") {
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode || text[index] !== marker) continue;
+    if (marker === "_" && /[\w]/.test(text[index + 1] ?? "")) continue;
+    return true;
+  }
+  return false;
+}
+
 function advanceMrkdwnState(
   text: string,
   state: { fence: boolean; inline: InlineMarker[] },
@@ -76,11 +108,7 @@ function advanceMrkdwnState(
     }
     const absoluteIndex = offset + index;
     if (marker === "_" && /[\w]/.test(fullText[absoluteIndex - 1] ?? "")) continue;
-    let close = fullText.indexOf(marker, absoluteIndex + 1);
-    while (close !== -1 && (fullText[close - 1] === "\\" || (marker === "_" && /[\w]/.test(fullText[close + 1] ?? "")))) {
-      close = fullText.indexOf(marker, close + 1);
-    }
-    if (close !== -1) state.inline.push(marker);
+    if (hasMatchingClose(fullText, absoluteIndex, marker)) state.inline.push(marker);
   }
 }
 
@@ -94,11 +122,15 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
       const fenceCount = (prefix.match(/```/g) ?? []).length;
       if (newline > 0 && (!mrkdwn || fenceCount % 2 === 0)) end = offset + newline + 1;
       else if (mrkdwn) {
+        const partialLink = /<(?:h(?:t(?:t(?:p)?)?)?)?$/.exec(prefix)?.index;
+        if (partialLink !== undefined && partialLink > 0 && text.startsWith("<http", offset + partialLink)) {
+          end = offset + partialLink;
+        }
         const lastOpenLink = prefix.lastIndexOf("<http");
         const lastCloseLink = prefix.lastIndexOf(">");
         const lastFence = prefix.lastIndexOf("```");
         const protectedStart = lastOpenLink > lastCloseLink ? lastOpenLink : fenceCount % 2 ? lastFence : -1;
-        if (protectedStart > 0) end = offset + protectedStart;
+        if (protectedStart > 0) end = Math.min(end, offset + protectedStart);
       }
     }
     if (end < text.length && end > offset + 1 && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;

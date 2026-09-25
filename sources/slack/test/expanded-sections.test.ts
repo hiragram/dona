@@ -55,3 +55,17 @@ test("combined inline and fence continuation stays within the section limit", ()
   const unmatched = expandedSections(`job_id ~x\n\`\`\`\n${"x".repeat(9_000)}\n\`\`\``, "identity", true);
   assert.ok(unmatched.every((block) => block.text.text.length <= 3_000));
 });
+
+test("a link opener straddling the split stays intact", () => {
+  const link = "<https://example.com|PR>";
+  const blocks = expandedSections(`${"a".repeat(2_979)}${link}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(link)));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
+
+test("a marker inside a code fence does not close an earlier unmatched marker", () => {
+  const text = `*未閉鎖 ${"a".repeat(3_000)}\n\`\`\`\n*\n${"b".repeat(3_000)}\n\`\`\``;
+  const blocks = expandedSections(text, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.equal(blocks[0]?.text.text, text.slice(0, blocks[0]?.text.text.length));
+});
