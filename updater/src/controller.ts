@@ -331,7 +331,12 @@ export class UpdateController {
     }
     const claimed = this.database.claim(requestId, this.owner, this.policy.timeouts.lease_ms, this.clock.now());
     if (!claimed) throw new Error("Update request is leased by another controller");
-    if (["quiescing", "restarting", "verifying", "rolling_back"].includes(claimed.state)) {
+    const activatingRecovery = claimed.state === "activating" && (
+      this.database.runtimeOperation(requestId, "restart_current_dispatcher") ||
+      this.database.runtimeOperation(requestId, "restart_current_slack") ||
+      this.database.runtimeOperation(requestId, "start_previous_main_agent")
+    );
+    if (["quiescing", "restarting", "verifying", "rolling_back"].includes(claimed.state) || activatingRecovery) {
       await this.withLeaseHeartbeat(claimed, () => this.runClaimed(claimed));
       return this.status(requestId);
     }
@@ -708,6 +713,17 @@ export class UpdateController {
       row = this.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced", {}, this.clock.now());
     }
     if (row.state === "activating") {
+      const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
+        this.database.runtimeOperation(row.request_id, "restart_current_slack") ??
+        this.database.runtimeOperation(row.request_id, "start_previous_main_agent");
+      if (persistedRecovery) {
+        let evidence: Record<string, unknown> = {};
+        try { evidence = JSON.parse(persistedRecovery.evidence_json) as Record<string, unknown>; }
+        catch { /* Invalid evidence cannot authorize a new activation. */ }
+        await this.restoreQuiescedServices(row,
+          typeof evidence.cause_code === "string" ? evidence.cause_code : "pre_activation_recovery_unverified");
+        return;
+      }
       const workerBeforeActivation = await this.runtime.workerSafety();
       this.assertLease(row);
       if (!workerBeforeActivation.safe) {
@@ -1611,6 +1627,12 @@ export class UpdateController {
   private async restoreQuiescedServices(
     row: UpdateRow, causeCode: string, dispatcherQuiesced = true,
   ): Promise<void> {
+    const pointerBeforeRecovery = await this.releases.observe();
+    this.assertLease(row);
+    if (pointerBeforeRecovery.current_sha !== row.current_sha) {
+      this.needsReview(row, "quiesce_recovery_pointer_mismatch");
+      return;
+    }
     const failure: { code?: string; message?: string } = {};
     const dispatcherRestored = !dispatcherQuiesced || await this.restartQuiescedService(
       row, "restart_current_dispatcher", "dispatcher", causeCode,

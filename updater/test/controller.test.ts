@@ -632,6 +632,36 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.runtime.calls.includes(`startMainAgent:${targetSha}`), false);
     f.database.close();
   });
+  for (const phase of ["prepared", "accepted", "observed"] as const) {
+    test(`reconciles ${phase} recovery intent before resuming activation`, async () => {
+      const f = await fixture();
+      const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+      const plan = planned.plan as { plan_id: string; plan_hash: string };
+      f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+        plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: `human-approval-recovery-${phase}` });
+      let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+        new Date("2026-09-02T00:00:00.000Z"))!;
+      row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+      row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+      row = f.database.transition(row.request_id, row.fence, "activating", "runtime_quiesced");
+      for (const [kind, service] of [
+        ["restart_current_dispatcher", "dispatcher"], ["restart_current_slack", "slack_adapter"],
+      ] as const) {
+        f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, currentSha, null,
+          { cause_code: "active_worker_handoff_unavailable" });
+        if (phase !== "prepared") f.database.recordRuntimeOperation(row.request_id, row.fence, kind, phase, null,
+          { cause_code: "active_worker_handoff_unavailable" });
+      }
+      f.advance(f.policy.timeouts.lease_ms + 1);
+      await f.controller.processNext();
+      const final = f.database.get(row.request_id)!;
+      assert.equal(final.state, "failed");
+      assert.equal(final.last_error_code, "active_worker_handoff_unavailable");
+      assert.equal((await f.store.observe()).current_sha, currentSha);
+      assert.equal(f.runtime.calls.includes(`startMainAgent:${targetSha}`), false);
+      f.database.close();
+    });
+  }
   test("does not restart a live Dispatcher when forward Slack drain fails", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

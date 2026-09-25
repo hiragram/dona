@@ -105,6 +105,28 @@ afterEach(async () => {
 });
 
 describe("JobSupervisor", () => {
+  for (const agentPresent of [true, false]) {
+    test(`cancel of stale preparation ${agentPresent ? "retains unknown agent" : "confirms agent absent"}`, async () => {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      const database = new DispatcherDatabase(config.databasePath);
+      const job = createScratchJob(database, config, `Ev-stale-preparing-cancel-${agentPresent}`);
+      database.beginJobPreparation(job.job_id);
+      database.recoverStaleJobs();
+      let cancelCalls = 0;
+      const supervisor = new JobSupervisor(database, fakeRuntime({
+        async get() { return agentPresent ? ok("working") : failed("agent_not_found"); },
+        async cancel() { cancelCalls += 1; return ok("idle"); },
+      }), config, logger, () => undefined);
+      if (agentPresent) await assert.rejects(supervisor.cancel(job.job_id, job.source_event_id), /requires review/);
+      else await supervisor.cancel(job.job_id, job.source_event_id);
+      assert.equal(cancelCalls, 0);
+      assert.equal(database.getJob(job.job_id)?.status, agentPresent ? "needs_review" : "cancelled");
+      assert.equal(database.updateSafetyStatus().active_worker_count, agentPresent ? 1 : 0);
+      database.close();
+    });
+  }
+
   test("keeps a stale preparation with unknown agent identity in review after a later prepare failure", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

@@ -287,6 +287,23 @@ export class JobSupervisor {
       this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
       if (before.status === "cancelled") return { row: before, duplicate: true };
       const cancelling = this.database.beginJobCancellation(jobId, sourceEventId);
+      if (before.status === "retryable_failed" && before.last_error_code === "stale_preparing" &&
+          before.herdr_workspace_id === null) {
+        let absent = false;
+        try {
+          const observed = await this.runtime.get(cancelling.agent_name, this.abortController.signal);
+          absent = !observed.ok && !observed.timedOut &&
+            ["agent_not_found", "agent_not_running"].includes(observed.errorCode ?? "");
+        } catch {
+          // A failed read is not evidence that the unbound agent is absent.
+        }
+        if (!absent) {
+          this.database.markJobNeedsReview(jobId, "stale_preparing_agent_unverified",
+            "Cancellation cannot prove that the unbound preparation agent is absent");
+          this.wake();
+          throw new Error(`Job ${jobId} cancellation requires review`);
+        }
+      }
       if (["queued", "retryable_failed"].includes(before.status)) {
         this.database.markJobCancelled(jobId, reason);
         this.wake();
