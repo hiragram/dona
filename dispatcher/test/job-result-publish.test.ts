@@ -322,6 +322,8 @@ describe("job result publish contract", () => {
     }
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: "private *objective* text" } },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: "private _objective_ text" } },
+      () => current), code("content_requires_redaction"));
     const decoratedCapability = `${grant.capability.slice(0, 20)}*${grant.capability.slice(20)}`;
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: grant.capability } },
       () => current), code("content_requires_redaction"));

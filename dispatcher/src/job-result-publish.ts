@@ -238,6 +238,7 @@ function fingerprint(value: string): number {
 }
 function displayProjection(value: string): string {
   return value.replace(/<[A-Za-z][A-Za-z0-9+.-]*:[^|>\s]+\|([^>]+)>/g, "$1")
+    .replace(/(?<![A-Za-z0-9])_([^_\r\n]+)_(?![A-Za-z0-9])/g, "$1")
     .replace(/(?<!\\)[*~`]/g, "")
     .replace(/&(?:amp|lt|gt);/g, entity => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[entity]!)
     .normalize("NFC");
