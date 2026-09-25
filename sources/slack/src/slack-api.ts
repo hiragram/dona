@@ -282,7 +282,8 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     }
     const graphemeEnd = graphemeBoundaries[low - 1] ?? end;
     const nextBoundary = graphemeBoundaries[low];
-    if (nextBoundary !== undefined && nextBoundary - offset <= 3_000 && end - graphemeEnd > maxRawLength / 4) end = nextBoundary;
+    if (nextBoundary !== undefined && graphemeEnd > offset && nextBoundary - graphemeEnd > maxRawLength / 2 && !isEscaped(text, graphemeEnd)) end = graphemeEnd;
+    else if (nextBoundary !== undefined && nextBoundary - offset <= 3_000 && end - graphemeEnd > maxRawLength / 4) end = nextBoundary;
     else if (graphemeEnd > offset) end = graphemeEnd;
     else if (nextBoundary !== undefined && nextBoundary - offset <= 3_000) end = nextBoundary;
     if (mrkdwn && end < text.length) {
@@ -347,7 +348,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       chunk = `${quoteMarker}${markers}${chunk.slice(markers.length + quoteMarker.length)}`;
     }
     if (mrkdwn && startsInsideInline.length === 1 && rawChunk.startsWith(startsInsideInline[0]!) && state.inline.length === 0 && !startsInsideFence) {
-      chunk = chunk.slice(startsInsideInline[0]!.length + 1);
+      chunk = `${chunk.slice(0, quotePrefix.length)}${chunk.slice(quotePrefix.length + startsInsideInline[0]!.length + 1)}`;
     }
     let plainFallback = false;
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && isSlackAngleToken(rawChunk) && rawChunk.length <= 3_000) {
@@ -416,7 +417,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     expand: true,
     });
   });
-  const nonEmptyBlocks = blocks.filter((block) => block.text.text.length > 0);
+  const nonEmptyBlocks = blocks.filter((block, index) => block.text.text.length > 0 && !(index > 0 && /^>+$/.test(block.text.text) && /^[*_~`]+$/.test(chunks[index] ?? "")));
   if (nonEmptyBlocks[0] && nonEmptyBlocks[0].block_id !== blockId) nonEmptyBlocks[0] = { ...nonEmptyBlocks[0], block_id: blockId };
   if (nonEmptyBlocks.some((block) => block.text.text.length > 3_000)) {
     if (maxRawLength <= 32) throw new Error("Section text cannot fit within Slack's 3,000 character limit");

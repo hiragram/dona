@@ -511,3 +511,20 @@ test("an existing single-line quote marker precedes reopened inline formatting",
   const blocks = expandedSections(`>*intro\n${"a".repeat(2_885)}\n>second ${"b".repeat(300)}*`, "identity", true);
   assert.ok(blocks.slice(1).some((block) => block.text.text.startsWith(">*second")));
 });
+
+test("ordinary text before a long grapheme is split first", () => {
+  const grapheme = `a${"\u0301".repeat(2_997)}`;
+  const blocks = expandedSections(`*x${grapheme}*`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.some((block) => block.text.text.includes(grapheme)));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});
+
+test("removing a final inline closer preserves the quote prefix", () => {
+  const token = `<https://${"a".repeat(2_987)}|P>`;
+  for (const quote of [">", ">>>"]) {
+    const blocks = expandedSections(`${quote}*\\${token}*`, "identity", true);
+    assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+    assert.ok(blocks.every((block) => block.text.text !== quote));
+  }
+});
