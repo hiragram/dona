@@ -339,6 +339,12 @@ describe("job result publish contract", () => {
       summary: Buffer.from(grant.capability, "utf8").toString("base64url") }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from("private objective text", "utf8").toString("base64") }, () => current), code("content_requires_redaction"));
+    const longObjective = "private-long-objective-".repeat(500);
+    const longGrant = new JobResultPublishCapabilities(() => "session-long-base64");
+    const longIssued = longGrant.issue(row({ objective: longObjective }), "session-long-base64");
+    assert.throws(() => longGrant.validate(longIssued.capability, "session-long-base64", { ...base,
+      summary: Buffer.from(longObjective, "utf8").toString("base64") },
+      () => row({ status: "running", objective: longObjective })), code("content_requires_redaction"));
     const decoratedCapability = `${grant.capability.slice(0, 20)}*${grant.capability.slice(20)}`;
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: grant.capability } },
       () => current), code("content_requires_redaction"));

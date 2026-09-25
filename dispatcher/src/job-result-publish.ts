@@ -340,7 +340,7 @@ class ForbiddenValueMatcher {
 
 function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher): boolean {
   const decoder = new TextDecoder("utf-8", { fatal: true });
-  for (const match of value.matchAll(/[A-Za-z0-9+/_-]{8,8192}={0,2}/g)) {
+  for (const match of value.matchAll(/[A-Za-z0-9+/_-]{8,}={0,2}/g)) {
     const encoded = match[0];
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
