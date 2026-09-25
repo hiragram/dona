@@ -258,3 +258,10 @@ test("a fence-like sequence inside a Slack token does not split the token", () =
   const blocks = expandedSections(`${token}${"end".repeat(100)}`, "identity", true);
   assert.ok(blocks.some((block) => block.text.text.includes(token)));
 });
+
+test("a near-limit grapheme falls back to a plain section when formatting exceeds the limit", () => {
+  const grapheme = `a${"\u0301".repeat(2_998)}`;
+  const blocks = expandedSections(`*prefix\n${grapheme}tail*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === grapheme));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});

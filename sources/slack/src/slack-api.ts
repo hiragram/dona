@@ -272,16 +272,21 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     let chunk = mrkdwn
       ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? "\n```" : ""}`
       : rawChunk;
+    let plainFallback = false;
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^:[a-z0-9_+-]+:$/i.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
+    if (chunk.length > 3_000 && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk)].length === 1) {
+      chunk = rawChunk;
+      plainFallback = true;
+    }
     return ({
     type: "section" as const,
     ...(index === 0 ? { block_id: blockId } : {}),
-    text: mrkdwn ? { type: "mrkdwn" as const, text: chunk, verbatim: true } : { type: "plain_text" as const, text: chunk },
+    text: mrkdwn && !plainFallback ? { type: "mrkdwn" as const, text: chunk, verbatim: true } : { type: "plain_text" as const, text: chunk },
     expand: true,
     });
   });
