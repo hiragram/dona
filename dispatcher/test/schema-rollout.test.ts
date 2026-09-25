@@ -22,7 +22,7 @@ const bridge = { app_schema_read_min: 2, app_schema_read_max: 3, app_schema_writ
 const activation = { ...bridge, app_schema_write: 3 };
 
 async function runRolloutCli(databasePath: string, backupPath: string, receiptPath: string) {
-  const child = spawn(path.resolve("node_modules/.bin/tsx"), [
+  const child = spawn(process.execPath, ["--import", "tsx",
     fileURLToPath(new URL("../src/schema-rollout-cli.ts", import.meta.url)),
     databasePath, backupPath, receiptPath, JSON.stringify(bridge), JSON.stringify(activation),
   ]);
@@ -162,7 +162,7 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
     ...receipt,
     rollback: { ...receipt.rollback, backup_restore_opened: false },
   }));
-  const legacyReceiptChild = spawn(path.resolve("node_modules/.bin/tsx"), [
+  const legacyReceiptChild = spawn(process.execPath, ["--import", "tsx",
     fileURLToPath(new URL("../src/schema-rollout-cli.ts", import.meta.url)),
     databasePath,
     backupPath,
@@ -200,7 +200,7 @@ test("WAL v2 database is backed up, restored, migrated transactionally, and pres
   backupRead.close();
 
   const recoveryReceiptPath = path.join(root, "recovered-receipt.json");
-  const child = spawn(path.resolve("node_modules/.bin/tsx"), [
+  const child = spawn(process.execPath, ["--import", "tsx",
     fileURLToPath(new URL("../src/schema-rollout-cli.ts", import.meta.url)),
     databasePath,
     backupPath,
@@ -243,7 +243,7 @@ test("v2-only source receipt requires backup restore instead of claiming direct 
   const receiptPath = path.join(root, "migration-receipt.json");
   await publishMigrationReceipt(receiptPath, receipt);
   await fs.copyFile(backupPath, databasePath);
-  const child = spawn(path.resolve("node_modules/.bin/tsx"), [
+  const child = spawn(process.execPath, ["--import", "tsx",
     fileURLToPath(new URL("../src/schema-rollout-cli.ts", import.meta.url)),
     databasePath, backupPath, receiptPath,
     JSON.stringify({ ...bridge, app_schema_read_max: 2 }), JSON.stringify(activation),
