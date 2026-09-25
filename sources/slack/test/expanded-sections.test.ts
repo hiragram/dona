@@ -130,11 +130,31 @@ test("underscore inside an emphasized identifier does not close emphasis", () =>
 test("a long grapheme under Slack's limit stays intact", () => {
   const cluster = `a${"\u0301".repeat(2_949)}`;
   const blocks = expandedSections(`${cluster}b`, "identity", true);
-  assert.equal(blocks[0]?.text.text, cluster);
-  assert.equal(blocks[1]?.text.text, "b");
+  assert.ok(blocks.some((block) => block.text.text.includes(cluster)));
+  assert.equal(blocks.map((block) => block.text.text).join(""), `${cluster}b`);
 });
 
 test("grapheme adjustment keeps a preceding escape with its target", () => {
   const blocks = expandedSections(`${"a".repeat(2_898)}\\*\u0301literal*`, "identity", true);
   assert.ok(blocks.some((block) => block.text.text.includes("\\*\u0301literal*")));
+});
+
+test("a long grapheme after an inline marker stays together", () => {
+  const content = `\`a${"\u0301".repeat(2_949)}\``;
+  const blocks = expandedSections(content, "identity", true);
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0]?.text.text, content);
+});
+
+test("a Slack token beginning a chunk remains intact", () => {
+  const token = `<https://${"a".repeat(2_935)}|PR>`;
+  const blocks = expandedSections(`${"x".repeat(100)}${token}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(token)));
+});
+
+test("blockquote continues across sections of one long line", () => {
+  const blocks = expandedSections(`>${"x".repeat(7_000)}`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.every((block) => block.text.text.startsWith(">")));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });

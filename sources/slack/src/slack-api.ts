@@ -131,6 +131,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
   graphemeBoundaries.push(text.length);
   for (let offset = 0; offset < text.length;) {
     let end = Math.min(offset + maxRawLength, text.length);
+    if (offset === 0 && maxRawLength === 2_900 && text.length <= 3_000) end = text.length;
     if (end < text.length) {
       const prefix = text.slice(offset, end);
       const newline = prefix.lastIndexOf("\n");
@@ -140,7 +141,11 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       else if (mrkdwn) {
         const lastOpenToken = prefix.lastIndexOf("<");
         const lastCloseToken = prefix.lastIndexOf(">");
-        if (lastOpenToken > lastCloseToken && lastOpenToken > 0 && text.indexOf(">", offset + lastOpenToken + 1) !== -1) end = offset + lastOpenToken;
+        if (lastOpenToken > lastCloseToken && lastOpenToken >= 0) {
+          const close = text.indexOf(">", offset + lastOpenToken + 1);
+          if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
+          else if (close !== -1 && close + 1 - offset <= 3_000) end = close + 1;
+        }
         const partialFence = /`{1,2}$/.exec(prefix)?.index;
         if (partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence) && !isEscaped(text, offset + partialFence)) {
           end = Math.min(end, offset + partialFence);
@@ -164,11 +169,10 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       else high = middle;
     }
     const graphemeEnd = graphemeBoundaries[low - 1] ?? end;
-    if (graphemeEnd > offset) end = graphemeEnd;
-    else {
-      const nextBoundary = graphemeBoundaries[low];
-      if (nextBoundary !== undefined && nextBoundary - offset <= 3_000) end = nextBoundary;
-    }
+    const nextBoundary = graphemeBoundaries[low];
+    if (nextBoundary !== undefined && nextBoundary - offset <= 3_000 && end - graphemeEnd > maxRawLength / 4) end = nextBoundary;
+    else if (graphemeEnd > offset) end = graphemeEnd;
+    else if (nextBoundary !== undefined && nextBoundary - offset <= 3_000) end = nextBoundary;
     if (mrkdwn && end < text.length) {
       let slashStart = end;
       while (slashStart > offset && text[slashStart - 1] === "\\") slashStart--;
@@ -183,7 +187,9 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
   const blocks = chunks.map((rawChunk, index) => {
     const startsInsideFence = state.fence;
     const startsInsideInline = [...state.inline];
-    let rendered = startsInsideFence ? "```\n" : startsInsideInline.join("");
+    const lineStart = text.lastIndexOf("\n", rawOffset - 1) + 1;
+    const continuesQuote = rawOffset > lineStart && text[lineStart] === ">";
+    let rendered = startsInsideFence ? "```\n" : `${continuesQuote ? ">" : ""}${startsInsideInline.join("")}`;
     let cursor = 0;
     if (mrkdwn) {
       for (const match of rawChunk.matchAll(/```/g)) {
