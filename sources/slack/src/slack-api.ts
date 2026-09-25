@@ -188,10 +188,16 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
           else if (close !== -1 && close + 1 - offset <= 3_000) end = close + 1;
         }
         const lastEntity = prefix.lastIndexOf("&");
-        if (lastEntity > prefix.lastIndexOf(";") && lastEntity >= 0) {
+        if (end <= offset + maxRawLength && lastEntity > prefix.lastIndexOf(";") && lastEntity >= 0) {
           const entity = /^(?:&amp;|&lt;|&gt;)/.exec(text.slice(offset + lastEntity));
           if (entity && lastEntity > 0) end = Math.min(end, offset + lastEntity);
           else if (entity && offset + lastEntity + entity[0].length - offset <= 3_000) end = offset + lastEntity + entity[0].length;
+        }
+        const lastColon = prefix.lastIndexOf(":");
+        if (end <= offset + maxRawLength && lastColon >= 0 && !fenceOpenAt(text, offset + lastColon) && !inlineCodeOpenAt(text, offset + lastColon)) {
+          const alias = /^:[a-z0-9_+-]+:/i.exec(text.slice(offset + lastColon));
+          if (alias && lastColon > 0) end = Math.min(end, offset + lastColon);
+          else if (alias && alias[0].length <= 3_000) end = offset + lastColon + alias[0].length;
         }
         const partialFence = /`{1,2}$/.exec(prefix)?.index;
         if (partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence) && !isEscaped(text, offset + partialFence)) {
@@ -261,7 +267,9 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     let chunk = mrkdwn
       ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? "\n```" : ""}`
       : rawChunk;
-    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) chunk = rawChunk;
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
+      chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
+    }
     return ({
     type: "section" as const,
     ...(index === 0 ? { block_id: blockId } : {}),

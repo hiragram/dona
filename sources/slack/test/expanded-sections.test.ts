@@ -226,3 +226,22 @@ test("a greater-than sign inside code does not continue a quote", () => {
   const inline = expandedSections(`\`\n>${"x".repeat(7_000)}\n\``, "identity", true);
   assert.ok(inline.slice(1).every((block) => !block.text.text.startsWith(">")));
 });
+
+test("a near-limit link in a multi-line quote remains quoted", () => {
+  const token = `<https://${"a".repeat(2_987)}|P>`;
+  const blocks = expandedSections(`>>>intro\n${token}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === `>${token}`));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
+
+test("emoji aliases stay in one section", () => {
+  const alias = ":white_check_mark:";
+  const blocks = expandedSections(`${"a".repeat(2_895)}${alias}${"b".repeat(100)}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(alias)));
+});
+
+test("an entity inside a long Slack link does not break the link", () => {
+  const token = `<https://${"a".repeat(2_889)}&amp;tail|P>`;
+  const blocks = expandedSections(`${token}end`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(token)));
+});
