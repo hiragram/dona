@@ -35,7 +35,7 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const sensitive = /(?:xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
@@ -451,10 +451,11 @@ interface Grant {
   herdrWorkspaceId: string | null;
   privateValues: readonly string[];
   runtimeValues: readonly string[];
+  objective: string;
   expiresAt: number;
   monotonicDeadline: number;
   expired: boolean;
-  renewableAt: number;
+  monotonicRenewableAt: number;
   revoked: boolean;
   fingerprint: number;
 }
@@ -483,6 +484,7 @@ export class JobResultPublishCapabilities {
   constructor(
     private readonly currentSession: (jobId: string) => string | undefined,
     private readonly now: () => number = Date.now,
+    private readonly monotonicNow: () => number = () => performance.now(),
   ) {}
 
   private pruneExpiredGrants(): void {
@@ -514,14 +516,16 @@ export class JobResultPublishCapabilities {
     // The previous token remains valid until its own expiry. A lost response can
     // safely repeat the same renewal and recover the same successor token.
     const predecessor = this.grants.get(createHash("sha256").update(capability).digest("hex"));
-    if (!predecessor || this.now() < predecessor.renewableAt) throw new JobResultPublishError("renewal_not_due");
+    if (!predecessor || this.monotonicNow() < predecessor.monotonicRenewableAt) throw new JobResultPublishError("renewal_not_due");
     const expiresAt = this.now() + jobResultPublishTtlMs;
     this.grants.set(key, { jobId: job.job_id, generation: predecessor.generation, session, attemptCount: job.attempt_count,
       paneId: job.herdr_pane_id, agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
       runtimeValues: grantRuntimeValues(job, session),
-      expiresAt, monotonicDeadline: performance.now() + jobResultPublishTtlMs, expired: false,
-      renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(next) });
+      objective: job.objective,
+      expiresAt, monotonicDeadline: this.monotonicNow() + jobResultPublishTtlMs, expired: false,
+      monotonicRenewableAt: this.monotonicNow() + jobResultPublishTtlMs / 2,
+      revoked: false, fingerprint: fingerprint(next) });
     return { capability: next, expiresAt: new Date(expiresAt).toISOString() };
   }
 
@@ -537,8 +541,10 @@ export class JobResultPublishCapabilities {
       agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
       runtimeValues: grantRuntimeValues(job, session),
-      expiresAt, monotonicDeadline: performance.now() + jobResultPublishTtlMs, expired: false,
-      renewableAt: this.now() + jobResultPublishTtlMs / 2, revoked: false, fingerprint: fingerprint(capability),
+      objective: job.objective,
+      expiresAt, monotonicDeadline: this.monotonicNow() + jobResultPublishTtlMs, expired: false,
+      monotonicRenewableAt: this.monotonicNow() + jobResultPublishTtlMs / 2,
+      revoked: false, fingerprint: fingerprint(capability),
     });
     return { capability, expiresAt: new Date(expiresAt).toISOString() };
   }
@@ -559,7 +565,7 @@ export class JobResultPublishCapabilities {
     }
     if (!grant) throw new JobResultPublishError("capability_invalid");
     if (grant.revoked) throw new JobResultPublishError("capability_revoked");
-    if (grant.expired || this.now() >= grant.expiresAt || performance.now() >= grant.monotonicDeadline) {
+    if (grant.expired || this.now() >= grant.expiresAt || this.monotonicNow() >= grant.monotonicDeadline) {
       grant.expired = true;
       throw new JobResultPublishError("capability_expired");
     }
@@ -595,6 +601,9 @@ export class JobResultPublishCapabilities {
       .flatMap(candidate => candidate.runtimeValues)
       .map(value => value.normalize("NFC"))
       .filter(value => value.length < 8));
+    for (const objective of [job.objective, ...[...this.grants.values()].map(candidate => candidate.objective)]) {
+      if (objective) shortRuntimeValues.add(objective.normalize("NFC"));
+    }
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);
@@ -603,7 +612,10 @@ export class JobResultPublishCapabilities {
         attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session },
       assertCurrentGrant: () => {
         if (grant.revoked || this.generations.get(grant.jobId) !== grant.generation) throw new JobResultPublishError("capability_revoked");
-        if (this.now() >= grant.expiresAt) throw new JobResultPublishError("capability_expired");
+        if (grant.expired || this.now() >= grant.expiresAt || this.monotonicNow() >= grant.monotonicDeadline) {
+          grant.expired = true;
+          throw new JobResultPublishError("capability_expired");
+        }
       } };
   }
 }

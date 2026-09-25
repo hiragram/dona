@@ -97,7 +97,7 @@ describe("job result publish contract", () => {
       "https://example.com/file?access%5Ftoken=CANARY_VALUE", "https://example.com/file?client%5Fsecret=CANARY_VALUE",
       "prefix_https://10.0.0.1/private", "prefix_https://user:CANARY_VALUE@cdn.example.com/file", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
-      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ", "xoxc-abcdefghijkl", "xoxd-abcdefghijkl", "xoxe-abcdefghijkl",
+      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ", "xoxc-abcdefghijkl", "xoxd-abcdefghijkl", "xoxe-abcdefghijkl", "ASIA1234567890ABCDEF",
       "https://example.com/?id=eyJhbGciOiJIUzI1NiJ9%2Ee30%2EdGVzdHNpZ25hdHVyZQ",
       "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
@@ -159,8 +159,9 @@ describe("job result publish contract", () => {
 
   test("単一job、失効、revocation、stale worker、restart時fail closed", () => {
     let now = Date.parse("2026-09-24T00:00:00Z");
+    let monotonic = 0;
     let persistedSession = "session-1";
-    const grants = new JobResultPublishCapabilities(() => persistedSession, () => now);
+    const grants = new JobResultPublishCapabilities(() => persistedSession, () => now, () => monotonic);
     const original = row();
     const grant = grants.issue(original, "session-1");
     const instructions = buildJobResultPublishInstructions();
@@ -190,6 +191,7 @@ describe("job result publish contract", () => {
     current = row({ status: "running" });
     assert.throws(() => grants.renew(grant.capability, "session-1", getJob), code("renewal_not_due"));
     now += 15 * 60_000;
+    monotonic += 15 * 60_000;
     const renewed = grants.renew(grant.capability, "session-1", getJob);
     assert.notEqual(renewed.capability, grant.capability);
     assert.throws(() => grants.renew(renewed.capability, "session-1", getJob), code("renewal_not_due"));
@@ -202,6 +204,7 @@ describe("job result publish contract", () => {
     now = Date.parse(grant.expiresAt);
     assert.equal(grants.renew(grant.capability, "session-1", getJob).capability, renewed.capability);
     now = Date.parse(renewed.expiresAt);
+    monotonic += jobResultPublishTtlMs;
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_expired"));
     now -= 1;
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_expired"), "時計が巻き戻っても失効は不可逆");
@@ -223,6 +226,20 @@ describe("job result publish contract", () => {
     assert.equal(next.fence.grantGeneration, 2);
     grants.revokeJob("job_one");
     assert.throws(() => next.assertCurrentGrant(), code("capability_revoked"));
+  });
+
+  test("wall clockの巻き戻しでも更新とcommit期限は単調時計で判定する", () => {
+    let wall = Date.parse("2026-09-24T00:00:00Z");
+    let monotonic = 0;
+    const grants = new JobResultPublishCapabilities(() => "session-one", () => wall, () => monotonic);
+    const grant = grants.issue(row(), "session-one");
+    const current = row({ status: "running" });
+    const candidate = grants.validate(grant.capability, "session-one", base, () => current);
+    wall -= 60 * 60_000;
+    monotonic += jobResultPublishTtlMs / 2;
+    assert.ok(grants.renew(grant.capability, "session-one", () => current).capability);
+    monotonic += jobResultPublishTtlMs / 2;
+    assert.throws(() => candidate.assertCurrentGrant(), code("capability_expired"));
   });
 
   test("期限切れgrantと終了jobの世代を次の発行前に解放する", () => {
@@ -301,12 +318,12 @@ describe("job result publish contract", () => {
       () => row({ status: "running", agent_name: "aaaaaaa\u0301" })), code("content_requires_redaction"));
   });
 
-  test("短いobjectiveは全文一致時だけ拒否する", () => {
+  test("短いobjectiveも文章中で拒否する", () => {
     const grants = new JobResultPublishCapabilities(() => "session-one");
-    const grant = grants.issue(row({ objective: "test" }), "session-one");
-    const current = row({ status: "running", objective: "test" });
-    assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "tests passed" }, () => current).envelope.status, "completed");
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "test" }, () => current), code("content_requires_redaction"));
+    const grant = grants.issue(row({ objective: "秘密" }), "session-one");
+    const current = row({ status: "running", objective: "秘密" });
+    assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "対応完了" }, () => current).envelope.status, "completed");
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "対応完了: 秘密" }, () => current), code("content_requires_redaction"));
   });
 
   test("固定schema keyは他jobのprivate valueに左右されない", () => {
@@ -363,7 +380,8 @@ describe("job result publish contract", () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-contract-"));
     const socket = path.join(directory, "p.sock");
     let now = Date.now();
-    const grants = new JobResultPublishCapabilities(() => "session-1", () => now);
+    let monotonic = 0;
+    const grants = new JobResultPublishCapabilities(() => "session-1", () => now, () => monotonic);
     const grant = grants.issue(row(), "session-1");
     let current = row({ status: "running" });
     const accepted: string[] = [];
@@ -417,6 +435,7 @@ describe("job result publish contract", () => {
       assert.equal(earlyRenewal.status, 425);
       assert.notEqual(earlyRenewal.connection, "close");
       now += 15 * 60_000;
+      monotonic += 15 * 60_000;
       const renewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew", reusableAgent);
       assert.equal(renewal.status, 200);
       const retriedRenewal = await post("", grant.capability, "session-1", "/v1/job-result-publish/renew", reusableAgent);
@@ -539,7 +558,8 @@ describe("job result publish contract", () => {
       const response = new Promise<string>(resolve => client!.once("data", chunk => resolve(String(chunk))));
       client.write(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nContent-Length: ${Buffer.byteLength(body)}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${body}`);
       assert.match(await response, /^HTTP\/1\.1 202 /);
-      await new Promise(resolve => setTimeout(resolve, 10));
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(client.destroyed, false, "完了requestのdataで次header期限を起動しない");
       client.write("POST /v1/job-result-publish HTTP/1.1\r\n");
       await new Promise(resolve => setTimeout(resolve, 10));
       assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);

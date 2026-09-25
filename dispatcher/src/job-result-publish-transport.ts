@@ -79,6 +79,7 @@ export class JobResultPublishServer {
   private readonly publishingSockets = new Set<net.Socket>();
   private readonly activeRequests = new Set<net.Socket>();
   private readonly activeMessages = new Map<net.Socket, IncomingMessage>();
+  private readonly completedData = new WeakSet<IncomingMessage>();
   private readonly publishing = new Set<Promise<void>>();
   private stopping = false;
   constructor(
@@ -113,6 +114,12 @@ export class JobResultPublishServer {
         if (this.headerDeadlines.has(socket)) return;
         const active = this.activeMessages.get(socket);
         if (active && !active.complete) return;
+        // The HTTP parser sees the data event before this listener. The chunk
+        // that completed the current request is not a new header.
+        if (active?.complete && !this.completedData.has(active)) {
+          this.completedData.add(active);
+          return;
+        }
         const nextDeadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
         nextDeadline.unref();
         this.headerDeadlines.set(socket, nextDeadline);
