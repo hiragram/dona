@@ -10,7 +10,7 @@
 
 ### Closed grammar v1
 
-受信したraw UTF-8 bytesを厳密にdecodeし、正規化を行う前にASCII byte以外をすべて拒否する。最大256 byte、ASCII space 1個で区切った次の完全一致だけを受理する。NFKC等による互換文字のASCII変換は行わない。前後空白、連続空白、改行、引用、escape、Unicode類似字、追加引数、未知versionは拒否する。Slackへ登録するcommand名は`/dona`のみで、versionはserver側のcontract `runtime-control.v1`へ固定する。将来versionは明示的な別schemaとrolloutを要する。
+HTTP raw bodyは後述の上限内で未変更のまま署名検証に用いる。検証後に`application/x-www-form-urlencoded`を厳密に一度だけdecodeし、重複`text`、不正percent escape、不正UTF-8を拒否する。decode済み`text`のUTF-8 bytesを正規化前に検査し、ASCII byte以外をすべて拒否する。最大256 byte、ASCII space 1個で区切った次の完全一致だけを受理する。NFKC等による互換文字のASCII変換や二重decodeは行わない。前後空白、連続空白、改行、引用、escape、Unicode類似字、追加引数、未知versionは拒否する。Slackへ登録するcommand名は`/dona`のみで、versionはserver側のcontract `runtime-control.v1`へ固定する。将来versionは明示的な別schemaとrolloutを要する。
 
 | 入力 | typed operation | 効果 |
 |---|---|---|
@@ -28,7 +28,7 @@ slashに表示するopaque IDはserver生成の`rc_`と32文字のbase64url toke
 
 | asset / actor | trust boundaryとproof | 決定 |
 |---|---|---|
-| Slack request / Slack platform | v1 slash ingressは署名済みHTTP requestに限定。raw bodyの署名とtimestampの現在時刻からの差が絶対値5分以内であることを永続record参照より前に検証する。通常message用Socket Modeは継続するがslash payloadはside effect前に拒否する | raw text、trigger ID、Slack表示名は命令・認可にしない |
+| Slack request / Slack platform | v1 slash ingressは署名済みHTTP requestに限定。受信raw bodyは全体8 KiBを上限とし、超過時はbufferingを中断して署名・form parse前に拒否する。raw bodyの署名とtimestampの現在時刻からの差が絶対値5分以内であることを永続record参照より前に検証する。通常message用Socket Modeは継続するがslash payloadはside effect前に拒否する | raw text、trigger ID、Slack表示名は命令・認可にしない |
 | tenant / workspace | app ID、team ID、enterprise ID（該当時）、configured workspace aliasをserver側で完全一致 | Slack Connectやcross-workspaceを推測で統合しない |
 | human principal | verified requestのactor ID、非bot性、現在のworkspace membership、管理者policy/owner bindingをserver側で照合 | user ID単体、channel、DM参加、approval code単体をcapabilityにしない |
 | destination | requestのchannel IDとchannel typeを受付証拠として保存し、本人DMへの現在accessを通知直前に再検証 | request ACKはslashのephemeral応答。plan・承認・結果は後述の永続DM root threadへ定型文で表示。DM不可なら操作を開始せず安全な最小ephemeral案内だけを返す |
@@ -45,7 +45,7 @@ serverだけが`{schema_version, operation_kind, instance_id, workspace_id, requ
 
 状態は`planned → awaiting_approval → approved → accepted → quiescing → activating → healthy → notified`。`rejected`、`cancelled`、`expired`、`failed`、`known_rejected`、`needs_review`、`rolled_back`も永続terminal/attention状態として区別する。Updaterのplanning/preparing/stagedなど、外部mutation前の既知の失敗だけを`failed`へ写像してactive leaseを解放する。quiescingは既にservice停止を含み得る。mutation開始後はexact runtimeの復旧とhealthを証明してから`failed`または`rolled_back`とし、証明不能または外部write受理不明なら`needs_review`でleaseを保持する。`approved`は実行権ではなく、consumeと再検証に成功して初めて`accepted`となる。Updaterがactivationをclaimする直前の同じfenced transaction境界でapproval receiptのone-shot消費状態・期限、plan hash、current principal role、workspace/instance binding、policy revision、target generationを再検証する。既に消費済みなら同一operationの保存済みconsume receiptとfenceへの一致を要求し、別operationへの再利用を拒否する。event terminal確認だけでclaimしない。失効・不一致なら外部mutation前にrequestを`failed`または`cancelled`へterminal化して通知し、検証不能なら`needs_review`に固定する。`accepted`はactivation成功ではない。健康確認と通知receiptを分離し、read statusはdurable stateから得る。operation ID、request identity、delivery IDにunique制約を設け、duplicate delivery/confirmは同じrecordを返す。競合するrestart/updateはinstance単位の単一active leaseとgeneration CASで拒否し、別operationへ暗黙に乗り換えない。
 
-ACK前に受付を永続化できない場合は一時失敗を返し、成功ACKを偽らない。3秒内に結果が未確定なら「受付照合中」とopaque request IDだけを返す。ACK後の実行はdurable queue/outboxから再開する。v1のrequest identityは署名検証済みHTTP raw body bytesと署名timestamp、app/teamのSHA-256から決定的に導出する。同じ配送の再送で同じbytesとなることをcontract testで確認し、Socket Mode slashや安定fieldが欠けるtransportはside effect前に拒否する。slashのplan、confirm、cancelそれぞれに通常messageとは別のstrict `source: slack_runtime_control` eventを永続化し、server由来のverified principal、固定reply target、operation ID、plan hashまたはcancel対象IDだけを保持する。既存`source: slack`専用self-update APIを直接呼ばず、専用typed bridgeが各操作と承認拒否で保存済みslash identity、本人権限、plan時のreply target、operation bindingを検証してUpdaterのplan/apply/cancelへ渡す。認可済み`cancel`は対象operationへdurable cancel fenceを先に設定し、claimとのCASで勝者を決める。その後だけ元plan rootへの通知をoutboxで配送・照合する。通知失敗を理由にcancel fenceを遅らせず、既にmutationが始まっていれば取消済みと偽らずreconcileする。confirm bridgeは同等のevent terminal barrierとUpdaterの`approval_event_id`を結ぶ。承認受付eventのResult Envelopeをatomic公開・再読してterminal化するまでUpdaterはactivationをclaimしない。barrierの照合が不明なら`needs_review`とし、approvalを再消費しない。受付応答喪失時は同じrequest identityの永続recordをread-only照合し、不明なら再実行せず`needs_review`へ送る。通知は保存済み本人destinationへboundedな定型文で行い、post応答喪失時は保存済みnotification IDとSlack上のexact receiptを照合する。照合不能なら再投稿しない。
+ACK前に受付を永続化できない場合は一時失敗を返し、成功ACKを偽らない。3秒内に結果が未確定なら「受付照合中」とopaque request IDだけを返す。ACK後の実行はdurable queue/outboxから再開する。v1のrequest identityは署名検証済みHTTP raw body bytesと署名timestamp、app/teamのSHA-256から決定的に導出する。同じ配送の再送で同じbytesとなることをcontract testで確認し、Socket Mode slashや安定fieldが欠けるtransportはside effect前に拒否する。slashのplan、confirm、cancelそれぞれに通常messageとは別のstrict `source: slack_runtime_control` eventを永続化し、server由来のverified principal、固定reply target、operation ID、plan hashまたはcancel対象IDだけを保持する。既存`source: slack`専用self-update APIを直接呼ばず、専用typed bridgeが各操作と承認拒否で保存済みslash identity、本人権限、plan時のreply target、operation bindingを検証してUpdaterのplan/apply/cancelへ渡す。認可済み`cancel`は対象operationへdurable cancel fenceを先に設定し、claimとのCASで勝者を決める。その後だけ元plan rootへの通知をoutboxで配送・照合する。通知失敗を理由にcancel fenceを遅らせず、既にmutationが始まっていれば取消済みと偽らずreconcileする。confirm eventはapproval要求までを表す。後続のverified approver decisionは別のstrict `source: slack_runtime_decision` eventとしてrequest/decision ID、保存済みplan hash、固定reply targetへ束縛して永続化し、decision transactionとResult Envelopeをatomic公開・再読してterminal化する。そのdecision event IDをUpdaterの`approval_event_id`へ渡し、confirm eventだけをbarrierにしない。decision eventがterminalでない間はactivationをclaimしない。barrierの照合が不明なら`needs_review`とし、approvalを再消費しない。受付応答喪失時は同じrequest identityの永続recordをread-only照合し、不明なら再実行せず`needs_review`へ送る。通知は保存済み本人destinationへboundedな定型文で行い、post応答喪失時は保存済みnotification IDとSlack上のexact receiptを照合する。照合不能なら再投稿しない。
 
 ## Quiesceとrecovery
 
@@ -59,6 +59,7 @@ stop/start応答喪失、process crash、identity drift、health failureでは�
 |---|---|---|
 | valid command | `status`、`restart plan`、`update plan` | typed unionだけを生成し、statusはbounded projection |
 | invalid / injection | `restart now`、`update plan main;...`、改行・引用 | parse拒否。shell等へ転送しない |
+| HTTP encoding / oversize | `text=restart+plan`、非ASCII percent escape、重複text、8 KiB超 | 署名検証後に一度だけdecode。超過bodyは署名前に拒否 |
 | unknown version / extra argument | 未知schema、`status x` | side effectなしで拒否 |
 | wrong actor/team/workspace/channel | 保存済みplanと別principal/tenant/宛先 | read/confirm/通知を拒否。cross-workspace漏出なし |
 | replay / CSRF相当 | duplicate envelope、偽button、異なるmessage座標 | request identityとsigned proof、保存済み座標を照合し、効果は最大1回 |
