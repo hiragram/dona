@@ -318,6 +318,7 @@ class FakeRuntime implements RuntimePort {
   mainStopOutcome: "stopped" | "rejected" | "accepted_unknown" = "stopped";
   mainStartUnknownOnce = false;
   targetMainStartRejectedOnce = false;
+  previousMainStartRejectedOnce = false;
   previousMainStartUnknownOnce = false;
   mainAgentSessionGeneration = 0;
   rotateMainAgentSessionOnStart = false;
@@ -421,6 +422,11 @@ class FakeRuntime implements RuntimePort {
     assert.equal(paneId, "w1:p1");
     if (this.targetMainStartRejectedOnce && path.basename(releasePath) === targetSha) {
       this.targetMainStartRejectedOnce = false;
+      return { outcome: "rejected" as const, observation: this.mainAgent(this.mainAgentSha, "unknown", releasePath),
+        error_code: "main_agent_start_rejected" };
+    }
+    if (this.previousMainStartRejectedOnce && path.basename(releasePath) === currentSha) {
+      this.previousMainStartRejectedOnce = false;
       return { outcome: "rejected" as const, observation: this.mainAgent(this.mainAgentSha, "unknown", releasePath),
         error_code: "main_agent_start_rejected" };
     }
@@ -582,9 +588,32 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.last_error_code, "active_worker_handoff_unavailable");
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.equal(f.runtime.calls.includes(`startMainAgent:${targetSha}`), false);
-    assert.deepEqual(f.runtime.calls.slice(-3), [`startMainAgent:${currentSha}`, "startDispatcher", "startSlack"]);
+    assert.deepEqual(f.runtime.calls.slice(-3), ["startDispatcher", "startSlack", `startMainAgent:${currentSha}`]);
     f.database.close();
   });
+  for (const outcome of ["rejected", "acceptance_unknown"] as const) {
+    test(`restores worker supervision when previous main agent start is ${outcome}`, async () => {
+      const f = await fixture();
+      const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+      const plan = planned.plan as { plan_id: string; plan_hash: string };
+      f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+        plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: `human-approval-main-${outcome}` });
+      f.dispatcher.terminal = true;
+      f.runtime.workerAppearsAfterForwardStop = true;
+      if (outcome === "rejected") f.runtime.previousMainStartRejectedOnce = true;
+      else f.runtime.mainStartUnknownOnce = true;
+      await f.controller.processNext();
+      const row = f.database.get(planned.request_id as string)!;
+      assert.equal(row.state, outcome === "rejected" ? "needs_review" : "quiescing");
+      assert.equal(row.last_error_code,
+        outcome === "rejected" ? "main_agent_start_rejected" : "rollback_main_agent_start_acceptance_unknown");
+      assert.deepEqual(f.runtime.calls.slice(-3), ["startDispatcher", "startSlack", `startMainAgent:${currentSha}`]);
+      assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher")?.phase, "observed");
+      assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
+      assert.equal((await f.store.observe()).current_sha, currentSha);
+      f.database.close();
+    });
+  }
   test("checks worker safety again immediately before forward pointer activation", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -1034,7 +1063,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.last_error_code, "stable_updater_schema_migration_capability_unverified");
     assert.equal(row.observed_active_sha, currentSha);
     assert.deepEqual(f.runtime.calls.slice(-3), [
-      `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
+      "startDispatcher", "startSlack", `startMainAgent:${currentSha}`,
     ]);
     f.database.close();
   });
@@ -1078,7 +1107,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.observed_active_sha, currentSha);
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls.slice(-5), [
-      "migrateAppSchema", "appSchemaState", `startMainAgent:${currentSha}`, "startDispatcher", "startSlack",
+      "migrateAppSchema", "appSchemaState", "startDispatcher", "startSlack", `startMainAgent:${currentSha}`,
     ]);
     f.database.close();
   });

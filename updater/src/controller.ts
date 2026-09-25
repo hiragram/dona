@@ -1611,14 +1611,6 @@ export class UpdateController {
   private async restoreQuiescedServices(
     row: UpdateRow, causeCode: string, dispatcherQuiesced = true,
   ): Promise<void> {
-    const stoppedMainAgent = this.database.runtimeOperation(row.request_id, "stop_main_agent");
-    if (stoppedMainAgent?.phase === "observed") {
-      if (!stoppedMainAgent.target_ref || !(await this.ensurePreviousMainAgentStarted(
-        row,
-        stoppedMainAgent.target_ref,
-        stoppedMainAgent.previous_session_id ?? undefined,
-      ))) return;
-    }
     const failure: { code?: string; message?: string } = {};
     const dispatcherRestored = !dispatcherQuiesced || await this.restartQuiescedService(
       row, "restart_current_dispatcher", "dispatcher", causeCode,
@@ -1628,6 +1620,15 @@ export class UpdateController {
       row, "restart_current_slack", "slack_adapter", causeCode,
       () => this.runtime.startSlack(), row.current_sha, failure,
     );
+    // Restore supervision and ingress even if the previous main agent cannot
+    // start. A surviving worker still needs Dispatcher to collect its Result.
+    const stoppedMainAgent = this.database.runtimeOperation(row.request_id, "stop_main_agent");
+    if (stoppedMainAgent?.phase === "observed" &&
+        (!stoppedMainAgent.target_ref || !(await this.ensurePreviousMainAgentStarted(
+          row,
+          stoppedMainAgent.target_ref,
+          stoppedMainAgent.previous_session_id ?? undefined,
+        )))) return;
     if (!dispatcherRestored || !slackRestored) {
       this.needsReview(row, failure.code ?? "quiesce_recovery_unverified", failure.message);
       return;
