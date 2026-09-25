@@ -104,9 +104,12 @@ describe("job result publish contract", () => {
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "0x7f000001/private/result", "017700000001/download/file", "0x7f.1/private/result", "0177.0.0.1/download/file", "artifact.internal./private/result",
       "GET /run/secrets/db-password returned 200", "GET /proc/self/environ returned 200", "POST /dev/null", "GET /sys/kernel", "保存先は/home/worker/private.txt", "結果を/workspace/dona/privateへ保存", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
-      "path:/root/.dona/result.json", "保存先:/home/worker/private.txt"]) {
+      "path:/root/.dona/result.json", "保存先:/home/worker/private.txt", "保存先は/mnt/private/result.json", "結果は/srv/dona/secretへ保存"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
+    assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "to\u200bken": "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "to\u001b[31mken": "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "to\\u200bken": "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     for (const value of ["//cdn.example.com/assets/report.json", "//[2606:4700:4700::1111]/dns-query", '{"kty":"RSA","n":"public"} {"d":"done"}', "成功/失敗の内訳", "実装/テスト完了", "GET /health returned 200", "POST /v1/job-result-publish", "Updated dispatcher/src/job.ts", "See docs/guide", "build/test passed", "Bearer authentication is enabled", "Bearer credentials were removed", 'payload={\\"status\\":\\"ok\\"}']) {
       assert.doesNotThrow(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), value);
     }
@@ -209,7 +212,7 @@ describe("job result publish contract", () => {
     now -= 1;
     assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_expired"), "時計が巻き戻っても失効は不可逆");
     grants.revokeJob("job_one");
-    assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_revoked"));
+    assert.throws(() => grants.validate(renewed.capability, "session-1", base, getJob), code("capability_invalid"));
   });
 
   test("検証後の再発行とrevokeはcommit直前のgrant照合で拒否する", () => {
@@ -239,6 +242,18 @@ describe("job result publish contract", () => {
     monotonic += jobResultPublishTtlMs / 2;
     assert.ok(grants.renew(grant.capability, "session-one", () => current).capability);
     monotonic += jobResultPublishTtlMs / 2;
+    assert.throws(() => candidate.assertCurrentGrant(), code("capability_expired"));
+  });
+
+  test("pruneしたgrantのcandidateは時計が戻っても復活しない", () => {
+    let wall = Date.parse("2026-09-24T00:00:00Z");
+    let monotonic = 0;
+    const grants = new JobResultPublishCapabilities(() => "session-one", () => wall, () => monotonic);
+    const first = grants.issue(row(), "session-one");
+    const candidate = grants.validate(first.capability, "session-one", base, () => row({ status: "running" }));
+    wall += jobResultPublishTtlMs;
+    grants.issue(row(), "session-one");
+    wall -= jobResultPublishTtlMs;
     assert.throws(() => candidate.assertCurrentGrant(), code("capability_expired"));
   });
 
@@ -296,6 +311,7 @@ describe("job result publish contract", () => {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
     }
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com/status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "GET /status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: 'payload={"detail":"private\\u0020objective\\u0020two"}' }, () => current), code("content_requires_redaction"));
@@ -544,6 +560,7 @@ describe("job result publish contract", () => {
         return { outcome: "created" };
       }, reconcile: async () => ({ outcome: "reused" }) }, 32, 40);
     let client: net.Socket | undefined;
+    let combined: net.Socket | undefined;
     let overlapping: net.Socket | undefined;
     let stalled: net.Socket | undefined;
     let waiting: net.Socket | undefined;
@@ -565,6 +582,16 @@ describe("job result publish contract", () => {
       assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);
       await new Promise(resolve => setTimeout(resolve, 60));
       assert.equal(client.destroyed, true, "keep-alive上の次のpartial headerも期限で閉じる");
+      combined = net.createConnection(socket);
+      combined.on("error", () => {});
+      await new Promise<void>(resolve => combined!.once("connect", resolve));
+      const combinedResponse = new Promise<string>(resolve => combined!.once("data", chunk => resolve(String(chunk))));
+      combined.write(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nContent-Length: ${Buffer.byteLength(body)}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${body}POST /v1/job-result-publish HTTP/1.1\r\n`);
+      assert.match(await combinedResponse, /^HTTP\/1\.1 202 /);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(combined.destroyed, true, "同じchunk内の後続partial headerも期限で閉じる");
       blockCommit = true;
       overlapping = net.createConnection(socket);
       overlapping.on("error", () => {});
@@ -593,6 +620,7 @@ describe("job result publish contract", () => {
       await new Promise<void>(resolve => beforeData.once("close", resolve));
     } finally {
       client?.destroy();
+      combined?.destroy();
       releaseCommit?.();
       overlapping?.destroy();
       stalled?.destroy();

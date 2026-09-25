@@ -112,6 +112,8 @@ function hasPrivateJwkText(value: string): boolean {
 const localPath = /(?:^|[\s"'<>`()[\]{},:=])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/))/i;
 function hasLocalPath(value: string): boolean {
   if (/(?<![A-Za-z0-9/])\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run|proc|dev|sys)(?:\/|$)/i.test(value)) return true;
+  // Japanese prose can adjoin an arbitrary filesystem root without whitespace.
+  if (/(?<=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])\/[A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+/u.test(value)) return true;
   const candidate = new RegExp(localPath.source, "gi");
   for (const match of value.matchAll(candidate)) {
     const route = match[0].trimStart();
@@ -141,6 +143,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
+const schemelessUrlCandidate = /(?:^|[\s"'`(])((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{1,5})?\/[^\s"'<>`]+)/g;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
 const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
@@ -257,6 +260,19 @@ function forbiddenKey(key: string): boolean {
     /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
     normalized.startsWith("herdr_");
 }
+function normalizedStructuredKey(key: string): string {
+  let normalized = key.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
+  for (let depth = 0; depth < 3; depth++) {
+    const decoded = normalized.replace(/\\u([0-9A-Fa-f]{4})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+    if (decoded === normalized) break;
+    normalized = decoded.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
+  }
+  for (let depth = 0; depth < 3 && /%[0-9A-Fa-f]{2}/.test(normalized); depth++) {
+    try { normalized = decodeURIComponent(normalized).replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, ""); }
+    catch { break; }
+  }
+  return normalized.normalize("NFC");
+}
 const hasInvalidUnicode = (value: string): boolean => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
 
 class ForbiddenValueMatcher {
@@ -284,6 +300,15 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       try { url = new URL(match[0]); } catch { throw new JobResultPublishError("content_requires_redaction"); }
       if (url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(match[0])) throw new JobResultPublishError("content_requires_redaction");
       if (hasForbiddenUrlParameters(url, forbiddenValues)) throw new JobResultPublishError("content_requires_redaction");
+    }
+    for (const match of value.matchAll(schemelessUrlCandidate)) {
+      const candidate = match[1]!;
+      let url: URL;
+      try { url = new URL(`https://${candidate}`); }
+      catch { throw new JobResultPublishError("content_requires_redaction"); }
+      if (hasSignedQueryKey(candidate) || hasForbiddenUrlParameters(url, forbiddenValues)) {
+        throw new JobResultPublishError("content_requires_redaction");
+      }
     }
     for (const match of value.matchAll(rootRelativeUrlCandidate)) {
       const route = match[0].trimStart();
@@ -343,7 +368,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   } else if (value !== null && typeof value === "object") {
     if (hasPrivateJwkFields(value as Record<string, unknown>)) throw new JobResultPublishError("content_requires_redaction");
     for (const [key, item] of Object.entries(value)) {
-      if (forbiddenKey(key) && !isPublicCountField(key, item)) throw new JobResultPublishError("content_requires_redaction");
+      if (forbiddenKey(normalizedStructuredKey(key)) && !isPublicCountField(key, item)) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
       assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
     }
@@ -488,7 +513,10 @@ export class JobResultPublishCapabilities {
   ) {}
 
   private pruneExpiredGrants(): void {
-    for (const [key, grant] of this.grants) if (grant.expiresAt <= this.now()) this.grants.delete(key);
+    for (const [key, grant] of this.grants) if (grant.expiresAt <= this.now() || this.monotonicNow() >= grant.monotonicDeadline) {
+      grant.expired = true;
+      this.grants.delete(key);
+    }
     const retainedJobs = new Set([...this.grants.values()].map(grant => grant.jobId));
     for (const jobId of this.generations.keys()) if (!retainedJobs.has(jobId)) this.generations.delete(jobId);
   }

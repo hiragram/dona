@@ -34,6 +34,25 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
   reply(response, status, code);
 }
 
+function hasNextHeaderInChunk(chunk: Buffer, request: IncomingMessage): boolean {
+  const headerEnd = chunk.indexOf("\r\n\r\n");
+  if (headerEnd < 0) return false;
+  const header = chunk.subarray(0, headerEnd).toString("latin1");
+  if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(header)) return false;
+  const length = Number(request.headers["content-length"] ?? "0");
+  return Number.isSafeInteger(length) && length >= 0 && chunk.length > headerEnd + 4 + length;
+}
+
+function hasNextHeaderInInitialChunk(chunk: Buffer): boolean {
+  const headerEnd = chunk.indexOf("\r\n\r\n");
+  if (headerEnd < 0) return false;
+  const header = chunk.subarray(0, headerEnd).toString("latin1");
+  if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(header)) return false;
+  const match = header.match(/\r\ncontent-length:\s*(\d+)/i);
+  const length = Number(match?.[1] ?? "0");
+  return Number.isSafeInteger(length) && chunk.length > headerEnd + 4 + length;
+}
+
 function recoverableReject(request: IncomingMessage, response: ServerResponse, status: number, code: string, timeoutMs: number): void {
   if (request.complete) { reply(response, status, code); return; }
   // The authenticated worker may correct its payload on the same FD after
@@ -80,6 +99,7 @@ export class JobResultPublishServer {
   private readonly activeRequests = new Set<net.Socket>();
   private readonly activeMessages = new Map<net.Socket, IncomingMessage>();
   private readonly completedData = new WeakSet<IncomingMessage>();
+  private readonly initialPipelinedHeader = new WeakSet<net.Socket>();
   private readonly publishing = new Set<Promise<void>>();
   private stopping = false;
   constructor(
@@ -104,13 +124,14 @@ export class JobResultPublishServer {
     // Keep the FD outside the HTTP parser until its first byte. The worker may
     // run for hours before publishing; a partial first header gets a deadline.
     socket.once("data", chunk => {
+      if (hasNextHeaderInInitialChunk(chunk)) this.initialPipelinedHeader.add(socket);
       const deadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
       deadline.unref();
       this.headerDeadlines.set(socket, deadline);
       socket.pause();
       socket.unshift(chunk);
       this.server.emit("connection", socket);
-      socket.on("data", () => {
+      socket.on("data", chunk => {
         if (this.headerDeadlines.has(socket)) return;
         const active = this.activeMessages.get(socket);
         if (active && !active.complete) return;
@@ -118,7 +139,7 @@ export class JobResultPublishServer {
         // that completed the current request is not a new header.
         if (active?.complete && !this.completedData.has(active)) {
           this.completedData.add(active);
-          return;
+          if (!hasNextHeaderInChunk(chunk, active)) return;
         }
         const nextDeadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
         nextDeadline.unref();
@@ -155,6 +176,15 @@ export class JobResultPublishServer {
     const headerDeadline = this.headerDeadlines.get(request.socket);
     if (headerDeadline) clearTimeout(headerDeadline);
     this.headerDeadlines.delete(request.socket);
+    if (this.initialPipelinedHeader.has(request.socket)) {
+      this.initialPipelinedHeader.delete(request.socket);
+      request.once("end", () => {
+        if (request.socket.destroyed || this.headerDeadlines.has(request.socket)) return;
+        const deadline = setTimeout(() => request.socket.destroy(), this.bodyTimeoutMs);
+        deadline.unref();
+        this.headerDeadlines.set(request.socket, deadline);
+      });
+    }
     if (request.method !== "POST" || !["/v1/job-result-publish", "/v1/job-result-publish/renew"].includes(request.url ?? "")) {
       reject(request, response, 404, "not_found"); return;
     }
