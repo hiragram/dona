@@ -272,3 +272,22 @@ test("an escaped near-limit link fits within a decorated inline section", () => 
   assert.ok(blocks.some((block) => block.text.type === "mrkdwn" && block.text.text === `\\${token}`));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("an escaped near-limit link keeps its quote prefix", () => {
+  const token = `<https://${"a".repeat(2_986)}|P>`;
+  const blocks = expandedSections(`>>>intro\n\\${token}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === `>\\${token}`));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
+
+test("a closing fence at the split boundary stays in the preceding section", () => {
+  const blocks = expandedSections(`\`\`\`\n${"x".repeat(2_892)}\n\`\`\`\n${"y".repeat(100)}`, "identity", true);
+  assert.ok(blocks[0]?.text.text.includes(`\n\`\`\``));
+  assert.ok(blocks.every((block) => !block.text.text.startsWith("```\n```")));
+});
+
+test("asterisks surrounded by spaces do not become emphasis across sections", () => {
+  const blocks = expandedSections(`2 * 3\n${"x".repeat(7_000)}\n4 * 5`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("*")));
+});

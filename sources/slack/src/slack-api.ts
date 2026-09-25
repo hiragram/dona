@@ -118,6 +118,7 @@ function hasMatchingClose(text: string, start: number, marker: InlineMarker): bo
     }
     if (inCode || text[index] !== marker) continue;
     if (marker === "_" && /[\w]/.test(text[index - 1] ?? "") && /[\w]/.test(text[index + 1] ?? "")) continue;
+    if (marker !== "`" && /\s/.test(text[index - 1] ?? "")) continue;
     return true;
   }
   return false;
@@ -154,9 +155,11 @@ function advanceMrkdwnState(
     if (marker === "_" && /[\w]/.test(fullText[absoluteIndex - 1] ?? "") && /[\w]/.test(fullText[absoluteIndex + 1] ?? "")) continue;
     const existing = state.inline.lastIndexOf(marker);
     if (existing !== -1) {
+      if (marker !== "`" && /\s/.test(fullText[absoluteIndex - 1] ?? "")) continue;
       state.inline.splice(existing, 1);
       continue;
     }
+    if (marker !== "`" && /\s/.test(fullText[absoluteIndex + 1] ?? "")) continue;
     if (hasMatchingClose(fullText, absoluteIndex, marker)) state.inline.push(marker);
   }
 }
@@ -180,9 +183,10 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       const newline = prefix.lastIndexOf("\n");
       const fences = [...prefix.matchAll(/```/g)].map((match) => match.index).filter((index) => !isEscaped(text, offset + index) && !insideAngleToken(text, offset + index));
       const fenceCount = fences.length;
+      const lastFence = fences.at(-1) ?? -1;
       const startsInsideFence = mrkdwn && fenceOpenAt(text, offset);
       const endsInsideFence = startsInsideFence !== (fenceCount % 2 === 1);
-      if (newline > 0 && (!mrkdwn || !endsInsideFence)) end = offset + newline + 1;
+      if (newline > 0 && (!mrkdwn || !endsInsideFence) && !(mrkdwn && !endsInsideFence && lastFence > newline)) end = offset + newline + 1;
       else if (mrkdwn) {
         const lastOpenToken = prefix.lastIndexOf("<");
         const lastCloseToken = prefix.lastIndexOf(">");
@@ -208,7 +212,6 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
         if (end <= offset + maxRawLength && partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence) && !isEscaped(text, offset + partialFence) && !insideAngleToken(text, offset + partialFence)) {
           end = Math.min(end, offset + partialFence);
         }
-        const lastFence = fences.at(-1) ?? -1;
         const protectedStart = endsInsideFence && !startsInsideFence ? lastFence : -1;
         if (protectedStart > 0) end = Math.min(end, offset + protectedStart);
       }
@@ -277,7 +280,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^\\<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
-      chunk = rawChunk;
+      chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^:[a-z0-9_+-]+:$/i.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
