@@ -74,7 +74,7 @@ function hasMatchingClose(text: string, start: number, marker: InlineMarker): bo
       continue;
     }
     if (inCode || text[index] !== marker) continue;
-    if (marker === "_" && /[\w]/.test(text[index + 1] ?? "")) continue;
+    if (marker === "_" && /[\w]/.test(text[index - 1] ?? "") && /[\w]/.test(text[index + 1] ?? "")) continue;
     return true;
   }
   return false;
@@ -107,13 +107,13 @@ function advanceMrkdwnState(
     const marker = text[index];
     if (marker !== "`" && marker !== "*" && marker !== "_" && marker !== "~") continue;
     if (state.inline.includes("`") && marker !== "`") continue;
+    const absoluteIndex = offset + index;
+    if (marker === "_" && /[\w]/.test(fullText[absoluteIndex - 1] ?? "") && /[\w]/.test(fullText[absoluteIndex + 1] ?? "")) continue;
     const existing = state.inline.lastIndexOf(marker);
     if (existing !== -1) {
       state.inline.splice(existing, 1);
       continue;
     }
-    const absoluteIndex = offset + index;
-    if (marker === "_" && /[\w]/.test(fullText[absoluteIndex - 1] ?? "")) continue;
     if (hasMatchingClose(fullText, absoluteIndex, marker)) state.inline.push(marker);
   }
 }
@@ -165,6 +165,15 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     }
     const graphemeEnd = graphemeBoundaries[low - 1] ?? end;
     if (graphemeEnd > offset) end = graphemeEnd;
+    else {
+      const nextBoundary = graphemeBoundaries[low];
+      if (nextBoundary !== undefined && nextBoundary - offset <= 3_000) end = nextBoundary;
+    }
+    if (mrkdwn && end < text.length) {
+      let slashStart = end;
+      while (slashStart > offset && text[slashStart - 1] === "\\") slashStart--;
+      if ((end - slashStart) % 2 === 1) end = slashStart > offset ? slashStart : end + 1;
+    }
     if (end <= offset) end = offset + 1;
     chunks.push(text.slice(offset, end));
     offset = end;

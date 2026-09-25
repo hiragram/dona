@@ -119,3 +119,22 @@ test("many short fences stay below the decorated section limit", () => {
   assert.ok(blocks.length > 1);
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("underscore inside an emphasized identifier does not close emphasis", () => {
+  const blocks = expandedSections(`_job_id ${"x".repeat(6_000)}_`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.every((block) => block.text.text.startsWith("_")));
+  assert.ok(blocks.every((block) => block.text.text.endsWith("_")));
+});
+
+test("a long grapheme under Slack's limit stays intact", () => {
+  const cluster = `a${"\u0301".repeat(2_949)}`;
+  const blocks = expandedSections(`${cluster}b`, "identity", true);
+  assert.equal(blocks[0]?.text.text, cluster);
+  assert.equal(blocks[1]?.text.text, "b");
+});
+
+test("grapheme adjustment keeps a preceding escape with its target", () => {
+  const blocks = expandedSections(`${"a".repeat(2_898)}\\*\u0301literal*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes("\\*\u0301literal*")));
+});
