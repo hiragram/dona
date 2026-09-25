@@ -48,6 +48,30 @@ function isEscaped(text: string, index: number): boolean {
   return (index - start) % 2 === 1;
 }
 
+function fenceOpenAt(text: string, end: number): boolean {
+  let open = false;
+  for (const match of text.slice(0, end).matchAll(/```/g)) {
+    if (!isEscaped(text, match.index)) open = !open;
+  }
+  return open;
+}
+
+function findMultiQuoteStart(text: string): number {
+  let inFence = false;
+  let inCode = false;
+  for (let index = 0; index < text.length; index++) {
+    if (text.startsWith("```", index) && !isEscaped(text, index)) {
+      inFence = !inFence;
+      index += 2;
+      continue;
+    }
+    if (inFence || isEscaped(text, index)) continue;
+    if (text[index] === "`") inCode = !inCode;
+    if (!inCode && (index === 0 || text[index - 1] === "\n") && text.startsWith(">>>", index)) return index;
+  }
+  return -1;
+}
+
 function hasMatchingClose(text: string, start: number, marker: InlineMarker): boolean {
   let inFence = false;
   let inCode = false;
@@ -137,21 +161,29 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       const newline = prefix.lastIndexOf("\n");
       const fences = [...prefix.matchAll(/```/g)].map((match) => match.index).filter((index) => !isEscaped(text, offset + index));
       const fenceCount = fences.length;
-      if (newline > 0 && (!mrkdwn || fenceCount % 2 === 0)) end = offset + newline + 1;
+      const startsInsideFence = mrkdwn && fenceOpenAt(text, offset);
+      const endsInsideFence = startsInsideFence !== (fenceCount % 2 === 1);
+      if (newline > 0 && (!mrkdwn || !endsInsideFence)) end = offset + newline + 1;
       else if (mrkdwn) {
         const lastOpenToken = prefix.lastIndexOf("<");
         const lastCloseToken = prefix.lastIndexOf(">");
-        if (lastOpenToken > lastCloseToken && lastOpenToken >= 0) {
+        if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken)) {
           const close = text.indexOf(">", offset + lastOpenToken + 1);
           if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
           else if (close !== -1 && close + 1 - offset <= 3_000) end = close + 1;
+        }
+        const lastEntity = prefix.lastIndexOf("&");
+        if (lastEntity > prefix.lastIndexOf(";") && lastEntity >= 0) {
+          const entity = /^(?:&amp;|&lt;|&gt;)/.exec(text.slice(offset + lastEntity));
+          if (entity && lastEntity > 0) end = Math.min(end, offset + lastEntity);
+          else if (entity && offset + lastEntity + entity[0].length - offset <= 3_000) end = offset + lastEntity + entity[0].length;
         }
         const partialFence = /`{1,2}$/.exec(prefix)?.index;
         if (partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence) && !isEscaped(text, offset + partialFence)) {
           end = Math.min(end, offset + partialFence);
         }
         const lastFence = fences.at(-1) ?? -1;
-        const protectedStart = fenceCount % 2 ? lastFence : -1;
+        const protectedStart = endsInsideFence && !startsInsideFence ? lastFence : -1;
         if (protectedStart > 0) end = Math.min(end, offset + protectedStart);
       }
     }
@@ -183,7 +215,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     offset = end;
   }
   const state: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
-  const multiQuoteStart = text.startsWith(">>>") ? 0 : text.indexOf("\n>>>") >= 0 ? text.indexOf("\n>>>") + 1 : -1;
+  const multiQuoteStart = findMultiQuoteStart(text);
   let rawOffset = 0;
   const blocks = chunks.map((rawChunk, index) => {
     const startsInsideFence = state.fence;
@@ -214,7 +246,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     let chunk = mrkdwn
       ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? "\n```" : ""}`
       : rawChunk;
-    if (chunk.length > 3_000 && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) chunk = rawChunk;
+    if (chunk.length > 3_000 && !startsInsideFence && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) chunk = rawChunk;
     return ({
     type: "section" as const,
     ...(index === 0 ? { block_id: blockId } : {}),

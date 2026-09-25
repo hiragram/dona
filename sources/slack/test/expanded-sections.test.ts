@@ -171,3 +171,29 @@ test("multi-line blockquote continues in later sections", () => {
   assert.ok(blocks.length > 1);
   assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith(">>>")));
 });
+
+test("code fence content does not start a multi-line quote", () => {
+  const blocks = expandedSections(`\`\`\`\n>>> Python出力\n\`\`\`\n${"x".repeat(6_000)}`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith(">>>")));
+});
+
+test("a closing fence in a continued chunk does not create an empty block", () => {
+  const blocks = expandedSections(`\`\`\`\n${"x".repeat(4_000)}\n\`\`\`\n${"結論".repeat(2_000)}`, "identity", true);
+  assert.ok(blocks.length > 2);
+  assert.ok(blocks.every((block) => !block.text.text.startsWith("```\n```")));
+});
+
+test("a long angle string inside a fence keeps code formatting", () => {
+  const blocks = expandedSections(`\`\`\`\n<${"x".repeat(2_993)}>\n\`\`\``, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+  assert.ok(blocks.every((block) => block.text.text.includes("```")));
+});
+
+test("Slack entities stay in one section", () => {
+  for (const entity of ["&amp;", "&lt;", "&gt;"]) {
+    const blocks = expandedSections(`${"a".repeat(2_898)}${entity}`, "identity", true);
+    assert.ok(blocks.some((block) => block.text.text.includes(entity)));
+  }
+});
