@@ -562,12 +562,14 @@ export class UpdateController {
             : typeof evidence.error_code === "string"
               ? evidence.error_code
               : "main_agent_stop_rejected";
-        if (persistedRecovery && typeof evidence.dispatcher_quiesced !== "boolean") {
+        if (persistedRecovery && (typeof evidence.dispatcher_quiesced !== "boolean" ||
+            typeof evidence.slack_quiesced !== "boolean")) {
           this.needsReview(row, "quiesce_recovery_scope_unverified");
           return;
         }
         await this.restoreQuiescedServices(row, causeCode,
-          persistedRecovery ? evidence.dispatcher_quiesced as boolean : true);
+          persistedRecovery ? evidence.dispatcher_quiesced as boolean : true,
+          persistedRecovery ? evidence.slack_quiesced as boolean : true);
         return;
       }
       // Reboot can restart a previously stopped launchd service. Re-observe each
@@ -579,7 +581,7 @@ export class UpdateController {
         const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
         this.assertLease(row);
         if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-          await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false);
+          await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false, slackDrain.quiescing);
           return;
         }
       } else if (persistedSlackStop?.phase !== "observed") {
@@ -922,7 +924,7 @@ export class UpdateController {
           const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
           this.assertLease(row);
           if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-            await this.restoreTargetAfterDrain(row, "rollback_slack_drain_incomplete", false, true);
+            await this.restoreTargetAfterDrain(row, "rollback_slack_drain_incomplete", false, slackDrain.quiescing);
             return;
           }
         }
@@ -1653,7 +1655,7 @@ export class UpdateController {
   }
 
   private async restoreQuiescedServices(
-    row: UpdateRow, causeCode: string, dispatcherQuiesced = true,
+    row: UpdateRow, causeCode: string, dispatcherQuiesced = true, slackQuiesced = true,
   ): Promise<void> {
     const pointerBeforeRecovery = await this.releases.observe();
     this.assertLease(row);
@@ -1680,12 +1682,12 @@ export class UpdateController {
       }
     }
     const failure: { code?: string; message?: string } = {};
-    const scope = { dispatcherQuiesced, slackQuiesced: true };
+    const scope = { dispatcherQuiesced, slackQuiesced };
     const dispatcherRestored = !dispatcherQuiesced || await this.restartQuiescedService(
       row, "restart_current_dispatcher", "dispatcher", causeCode,
       () => this.runtime.startDispatcher(), row.current_sha, failure, scope,
     );
-    const slackRestored = await this.restartQuiescedService(
+    const slackRestored = !slackQuiesced || await this.restartQuiescedService(
       row, "restart_current_slack", "slack_adapter", causeCode,
       () => this.runtime.startSlack(), row.current_sha, failure, scope,
     );
@@ -1708,6 +1710,15 @@ export class UpdateController {
       this.assertLease(row);
       if (!currentManifest || !this.healthMatches(health, row.current_sha, false, currentManifest.compatibility)) {
         this.needsReview(row, "quiesce_recovery_dispatcher_health_failed");
+        return;
+      }
+    }
+    if (!slackQuiesced) {
+      const currentManifest = await this.releases.releaseManifest(row.current_sha);
+      const health = await this.runtime.slackHealth();
+      this.assertLease(row);
+      if (!currentManifest || !this.healthMatches(health, row.current_sha, true, currentManifest.compatibility)) {
+        this.needsReview(row, "quiesce_recovery_slack_health_failed");
         return;
       }
     }

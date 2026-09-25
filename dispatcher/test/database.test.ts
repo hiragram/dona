@@ -1657,7 +1657,7 @@ describe("DispatcherDatabase", () => {
     reopened.close();
   });
 
-  test("does not stop terminal jobs solely because they retain a legacy result path", async () => {
+  test("keeps terminal legacy agents unsafe until a durable stop is recorded", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const jobs = ["completed","failed","cancelled"].map((status,index) => {
@@ -1674,8 +1674,9 @@ describe("DispatcherDatabase", () => {
     const reopened = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(reopened.listLegacySharedGrantJobs(),[]);
     for(const {status,job} of jobs) assert.equal(reopened.getJob(job.job_id)?.status,status);
-    assert.equal(reopened.updateSafetyStatus().safe,true);
-    assert.equal(reopened.updateSafetyStatus().active_worker_count,0);
+    assert.equal(reopened.updateSafetyStatus().safe,false);
+    assert.equal(reopened.updateSafetyStatus().active_worker_count,3);
+    assert.ok(reopened.updateSafetyStatus().unsafe_states.includes("jobs.legacy_shared_grant:3"));
     reopened.close();
   });
 
