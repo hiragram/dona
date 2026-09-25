@@ -265,6 +265,10 @@ function displayProjection(value: string): string {
 function containsForbiddenCapability(value: string, digests: ReadonlySet<string>, fingerprints: ReadonlySet<number>): boolean {
   for (const match of value.matchAll(capabilityRun)) {
     const run = match[0];
+    if (run.length === capabilityWindowLength * 2 && /^[0-9a-f]+$/i.test(run)) {
+      const raw = Buffer.from(run, "hex").toString("ascii");
+      if (fingerprints.has(fingerprint(raw)) && digests.has(createHash("sha256").update(raw).digest("hex"))) return true;
+    }
     if (run.length === 58) {
       const decoded = Buffer.from(run, "base64url");
       if (decoded.length === capabilityWindowLength && decoded.toString("base64url") === run) {

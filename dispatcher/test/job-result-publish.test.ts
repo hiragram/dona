@@ -343,6 +343,8 @@ describe("job result publish contract", () => {
       summary: "AAAAAAAA ".repeat(1_025) }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from('{"password":"hunter2"}', "utf8").toString("base64") }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: Buffer.from(grant.capability, "utf8").toString("hex") }, () => current), code("content_requires_redaction"));
     const longObjective = "private-long-objective-".repeat(500);
     const longGrant = new JobResultPublishCapabilities(() => "session-long-base64");
     const longIssued = longGrant.issue(row({ objective: longObjective }), "session-long-base64");
