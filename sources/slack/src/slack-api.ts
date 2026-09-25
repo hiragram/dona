@@ -378,6 +378,11 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
           chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
         }
       }
+      const grapheme = rawChunk.slice(opening.length);
+      if (opening && grapheme.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(grapheme)].length === 1) {
+        chunk = grapheme;
+        plainFallback = true;
+      }
     }
     const escapedAngle = /^(\\+)<[^>]+>$/.exec(rawChunk);
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && escapedAngle && escapedAngle[1]!.length % 2 === 1 && rawChunk.length <= 3_000) {
