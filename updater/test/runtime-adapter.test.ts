@@ -171,7 +171,7 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
   const dispatcherDatabasePath = path.join(root, "Dona", "dona.sqlite3");
   const dispatcherDatabase = new Database(dispatcherDatabasePath);
-  dispatcherDatabase.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT)");
+  dispatcherDatabase.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
   dispatcherDatabase.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
   dispatcherDatabase.exec("ALTER TABLE jobs ADD COLUMN job_id TEXT");
   dispatcherDatabase.prepare("INSERT INTO jobs (status,job_id) VALUES ('completed','old-terminal')").run();
@@ -218,7 +218,7 @@ test("RealRuntime refuses a legacy drained response while a durable worker remai
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
   const databasePath = path.join(root, "Dona", "dona.sqlite3");
   const database = new Database(databasePath);
-  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT)");
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
   database.prepare("INSERT INTO jobs (status,herdr_workspace_id) VALUES ('running','private-agent')").run();
   database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('retryable_failed','stale_preparing')").run();
   database.close();
@@ -233,6 +233,28 @@ test("RealRuntime refuses a legacy drained response while a durable worker remai
     assert.equal(JSON.stringify(snapshot).includes("private-agent"), false);
   } finally {
     await new Promise<void>((resolve) => dispatcher.close(() => resolve()));
+    await removeTree(root);
+  }
+});
+
+test("RealRuntime excludes only a proven pre-prepare result collision", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('needs_review','result_path_exists')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).safe, true);
+    const guarded = new Database(databasePath);
+    guarded.prepare("UPDATE jobs SET herdr_workspace_id='possible-worker'").run();
+    guarded.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+  } finally {
     await removeTree(root);
   }
 });

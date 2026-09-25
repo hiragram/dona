@@ -270,9 +270,15 @@ class FakeRuntime implements RuntimePort {
   dispatcherDrainIncomplete = false;
   rollbackDispatcherDrainIncomplete = false;
   targetRecoveryDispatcherStartUnknownOnce = false;
+  targetRecoveryDispatcherStartRejectedOnce = false;
+  reviveDispatcherOnWorkerSafety = false;
   rollbackSlackDrainIncomplete = false;
   forwardSlackDrainIncomplete = false;
   workerSafety(): Promise<{ safe: boolean; active_worker_count: number }> {
+    if (this.reviveDispatcherOnWorkerSafety && this.mainAgentSha === targetSha && !this.dispatcherLive) {
+      this.dispatcherLive = true;
+      this.reviveDispatcherOnWorkerSafety = false;
+    }
     return Promise.resolve({ safe: this.activeWorkerCount === 0, active_worker_count: this.activeWorkerCount });
   }
   readonly calls: string[] = [];
@@ -350,6 +356,10 @@ class FakeRuntime implements RuntimePort {
   async stopDispatcher() { this.calls.push("stopDispatcher"); this.dispatcherLive = false; return ok; }
   async startDispatcher() {
     this.calls.push("startDispatcher");
+    if (this.targetRecoveryDispatcherStartRejectedOnce && this.calls.filter(call => call === "quiesceDispatcher").length > 1) {
+      this.targetRecoveryDispatcherStartRejectedOnce = false;
+      return { ...ok, exit_code: 1 };
+    }
     if (this.targetRecoveryDispatcherStartUnknownOnce && this.calls.filter(call => call === "quiesceDispatcher").length > 1) {
       this.targetRecoveryDispatcherStartUnknownOnce = false;
       this.dispatcherLive = true;
@@ -713,6 +723,60 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
+  test("attempts Slack restoration even when target Dispatcher restart is rejected", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-reject" });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    f.runtime.rollbackDispatcherDrainIncomplete = true;
+    f.runtime.targetRecoveryDispatcherStartRejectedOnce = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "rollback_drain_recovery_dispatcher_restart_rejected");
+    assert.deepEqual(f.runtime.calls.slice(-4), ["quiesceSlack", "quiesceDispatcher", "startDispatcher", "startSlack"]);
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_slack_after_drain")?.phase, "observed");
+    f.database.close();
+  });
+
+  test("resumes persisted rollback drain restoration before another drain", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-resume" });
+    f.dispatcher.terminal = true;
+    const requestId = planned.request_id as string;
+    let row = f.database.claim(requestId, "controller-test", 10_000, new Date("2026-09-02T00:00:00.000Z"))!;
+    const staging = await f.store.prepareStaging(requestId, row.fence);
+    await fs.writeFile(path.join(staging, "app.js"), "export {};\n", { mode: 0o600 });
+    const release = await f.store.publish(staging, manifest(targetSha));
+    row = f.database.transition(requestId, row.fence, "staged", "release_staged");
+    row = f.database.transition(requestId, row.fence, "quiescing", "runtime_quiesce_started");
+    row = f.database.transition(requestId, row.fence, "activating", "runtime_quiesced");
+    const activation = await f.store.activate(row, release);
+    f.database.recordActivationGeneration(requestId, row.fence, activation.generation);
+    row = f.database.transition(requestId, row.fence, "restarting", "pointer_activated", {
+      activation_generation: activation.generation,
+    });
+    row = f.database.transition(requestId, row.fence, "rolling_back", "rollback_started");
+    f.database.prepareRuntimeOperation(requestId, row.fence, "restart_target_dispatcher_after_drain",
+      "dispatcher", targetSha, null, { cause_code: "rollback_dispatcher_drain_incomplete",
+        dispatcher_quiesced: true, slack_quiesced: true });
+    f.database.recordRuntimeOperation(requestId, row.fence, "restart_target_dispatcher_after_drain",
+      "observed", null, { cause_code: "rollback_dispatcher_drain_incomplete",
+        dispatcher_quiesced: true, slack_quiesced: true });
+    await f.controller.processNext();
+    assert.equal(f.database.get(requestId)?.state, "needs_review");
+    assert.equal(f.database.get(requestId)?.last_error_code, "rollback_dispatcher_drain_incomplete");
+    assert.equal(f.runtime.calls.filter(call => call === "quiesceDispatcher").length, 0);
+    assert.equal(f.runtime.calls.filter(call => call === "startSlack").length, 1);
+    f.database.close();
+  });
+
   test("does not restart a live Dispatcher when only rollback Slack drain fails", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -772,6 +836,25 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, targetSha);
     assert.equal(f.runtime.calls.filter(call => call === "quiesceSlack").length, 1);
     assert.equal(f.database.runtimeOperation(row.request_id, "stop_target_dispatcher"), undefined);
+    f.database.close();
+  });
+
+  test("quiesces Dispatcher when KeepAlive revives it after rollback worker inspection", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-revive" });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    f.runtime.reviveDispatcherOnWorkerSafety = true;
+    f.runtime.afterSlackStart = async () => {
+      if ((await f.store.observe()).current_sha === targetSha) f.runtime.simulateDispatcherStopped();
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "rolled_back");
+    assert.equal(f.runtime.calls.filter(call => call === "quiesceDispatcher").length, 2);
     f.database.close();
   });
 
@@ -1548,10 +1631,9 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(JSON.parse(f.database.outboxFor(requestId)!.payload_json).payload.active_sha, null);
     await assert.rejects(f.controller.operatorRollback(requestId, "f".repeat(64)), /matching needs_review plan/);
     await f.controller.operatorRollback(requestId, plan.plan_hash);
-    assert.equal(f.database.get(requestId)?.state, "rolled_back");
-    assert.equal((await f.store.observe()).current_sha, currentSha);
-    assert.match(f.database.outboxFor(requestId)?.external_event_id ?? "", /:terminal:3$/);
-    assert.equal(JSON.parse(f.database.outboxFor(requestId)!.payload_json).payload.active_sha, currentSha);
+    assert.equal(f.database.get(requestId)?.state, "needs_review");
+    assert.equal(f.database.get(requestId)?.last_error_code, "rollback_dispatcher_unavailable");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
     f.database.close();
   });
 

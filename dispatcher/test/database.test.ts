@@ -1420,6 +1420,8 @@ describe("DispatcherDatabase", () => {
     for (const { status, row } of jobs) raw.prepare("UPDATE jobs SET status=? WHERE job_id=?").run(status, row.job_id);
     raw.prepare("UPDATE jobs SET last_error_code='stale_preparing',herdr_workspace_id=NULL WHERE job_id=?")
       .run(jobs.at(-1)!.row.job_id);
+    raw.prepare("UPDATE jobs SET herdr_workspace_id='known-worker' WHERE job_id=?")
+      .run(jobs[2]!.row.job_id);
     raw.close();
     const safety = database.updateSafetyStatus();
     assert.equal(safety.safe, false);
@@ -1428,6 +1430,24 @@ describe("DispatcherDatabase", () => {
     assert.deepEqual(safety.unsafe_states.sort(), ["jobs.blocked:1", "jobs.needs_review:1", "jobs.retryable_failed:1", "jobs.running:1"]);
     assert.equal(JSON.stringify(safety).includes("秘密"), false);
     assert.equal(JSON.stringify(safety).includes(config.jobResultsDir), false);
+    database.close();
+  });
+
+  test("update safety excludes a proven pre-prepare result path collision", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-update-pre-prepare-collision")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "結果先衝突",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='needs_review',last_error_code='result_path_exists' WHERE job_id=?")
+      .run(job.job_id);
+    raw.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    const guarded = new Database(config.databasePath);
+    guarded.prepare("UPDATE jobs SET herdr_workspace_id='possible-worker' WHERE job_id=?").run(job.job_id);
+    guarded.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.close();
   });
 
