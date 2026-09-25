@@ -1045,6 +1045,7 @@ describe("UpdateController isolated end-to-end", () => {
       plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-main-wait-worker" });
     f.dispatcher.terminal = true;
     f.runtime.wrongSlackOnce = true;
+    f.runtime.rotateMainAgentSessionOnStart = true;
     f.runtime.afterMainWait = async call => {
       if (call === 2) f.runtime.activeWorkerCount = 1;
     };
@@ -1053,6 +1054,8 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.state, "needs_review");
     assert.equal(row.last_error_code, "rollback_active_worker_handoff_unavailable");
     assert.equal((await f.store.observe()).current_sha, targetSha);
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_main_agent_after_drain")?.phase, "observed");
+    assert.deepEqual(f.runtime.calls.slice(-3), ["startDispatcher", "startSlack", `startMainAgent:${targetSha}`]);
     f.database.close();
   });
   for (const stopFailure of ["blocked", "rejected", "acceptance_unknown"] as const) {

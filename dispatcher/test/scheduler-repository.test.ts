@@ -352,6 +352,7 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   assert.ok(raw.prepare("SELECT 1 FROM job_completion_results WHERE job_id=? AND job_status='needs_review'").get(job.job_id));
   assert.equal(repo.getRun(run.run_id)?.status, "needs_review"); assert.equal(repo.get("review_work")?.state, "needs_review");
   raw.prepare("UPDATE jobs SET status='blocked' WHERE job_id=?").run(job.job_id);
+  raw.prepare("UPDATE jobs SET herdr_workspace_id='workspace-reconcile' WHERE job_id=?").run(job.job_id);
   assert.throws(() => repo.reconcileWorkRun(run.run_id, "failed", actor, due), /admin_required/);
   dispatcher.reconcileScheduledRun(run.run_id,"failed",new Date(due));
   assert.equal(repo.getRun(run.run_id)?.status, "failed");
@@ -360,6 +361,9 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,"schedule_reconcile_worker_unverified");
   assert.equal(dispatcher.updateSafetyStatus().worker_recovery_state,"handoff_unavailable");
   assert.equal(dispatcher.updateSafetyStatus().active_worker_count,1);
+  dispatcher.markJobRuntimeCleaned(job.job_id);
+  assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,null);
+  assert.equal(dispatcher.updateSafetyStatus().active_worker_count,0);
   assert.equal((raw.prepare("SELECT work_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {work_state:string}).work_state, "failed");
   assert.equal(dispatcher.get(oldNotification)?.last_error_code,"job_result_superseded");
   assert.equal(dispatcher.getJob(job.job_id)?.completion_event_id,null);
@@ -377,8 +381,10 @@ test("workspace cleanup失敗のscheduled jobを再cleanup対象に保持する"
   dispatcher.markJobNeedsReview(job.job_id,"workspace_cleanup_failed","workspace close failed");
   dispatcher.enqueueJobNotification(job.job_id,new Date(due));
   assert.equal(dispatcher.listTerminalScheduledJobsNeedingCleanup().some(row=>row.job_id===job.job_id),true);
+  raw.prepare("INSERT INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(job.job_id);
   dispatcher.markJobRuntimeCleaned(job.job_id);
   assert.equal(dispatcher.getJob(job.job_id)?.herdr_workspace_id,null);
+  assert.ok((raw.prepare("SELECT stopped_at FROM legacy_job_agents_to_stop WHERE job_id=?").get(job.job_id) as {stopped_at:string|null}).stopped_at);
 });
 
 test("delegated needs_review eventのResultをcontent deadlineで削除する", () => {

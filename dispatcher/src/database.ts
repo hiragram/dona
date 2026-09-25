@@ -1078,9 +1078,15 @@ export class DispatcherDatabase {
 
   markJobRuntimeCleaned(jobId: string): void {
     this.db.transaction(()=>{
-      const changed=this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,updated_at=?
-        WHERE job_id=? AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId).changes;
-      if(changed===1)this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
+      const changed=this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,
+        last_error_code=CASE WHEN last_error_code='schedule_reconcile_worker_unverified' THEN NULL ELSE last_error_code END,
+        updated_at=? WHERE job_id=? AND herdr_workspace_id IS NOT NULL
+        AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId).changes;
+      if(changed===1) {
+        this.db.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=COALESCE(stopped_at,?) WHERE job_id=?")
+          .run(nowUtc(),jobId);
+        this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
+      }
     }).immediate();
   }
 

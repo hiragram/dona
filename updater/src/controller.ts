@@ -883,7 +883,8 @@ export class UpdateController {
           return;
         }
         const recoveryIntent = this.database.runtimeOperation(row.request_id, "restart_target_dispatcher_after_drain") ??
-          this.database.runtimeOperation(row.request_id, "restart_target_slack_after_drain");
+          this.database.runtimeOperation(row.request_id, "restart_target_slack_after_drain") ??
+          this.database.runtimeOperation(row.request_id, "restart_target_main_agent_after_drain");
         if (recoveryIntent) {
           let evidence: Record<string, unknown> = {};
           try { evidence = JSON.parse(recoveryIntent.evidence_json) as Record<string, unknown>; } catch { /* fail closed below */ }
@@ -975,7 +976,13 @@ export class UpdateController {
       const workerBeforeRollback = await this.runtime.workerSafety();
       this.assertLease(row);
       if (!workerBeforeRollback.safe) {
-        this.needsReview(row, workerBeforeRollback.error_code ?? "rollback_active_worker_handoff_unavailable");
+        const [dispatcherRecoveryHealth, slackRecoveryHealth] = await Promise.all([
+          this.runtime.dispatcherHealth(), this.runtime.slackHealth(),
+        ]);
+        this.assertLease(row);
+        await this.restoreTargetAfterDrain(row,
+          workerBeforeRollback.error_code ?? "rollback_active_worker_handoff_unavailable",
+          !dispatcherRecoveryHealth.live, !slackRecoveryHealth.live);
         return;
       }
       receipt = await this.releases.rollback(row);
@@ -1084,6 +1091,14 @@ export class UpdateController {
         this.needsReview(row, "rollback_drain_slack_health_unverified");
         return;
       }
+    }
+    const stoppedMain = this.database.runtimeOperation(row.request_id, "stop_target_main_agent");
+    if (stoppedMain?.phase === "observed") {
+      if (!stoppedMain.target_ref || !(await this.ensureMainAgentRestarted(
+        row, stoppedMain.target_ref, stoppedMain.previous_session_id ?? undefined,
+        "restart_target_main_agent_after_drain", row.target_sha,
+        { cause_code: causeCode, dispatcher_quiesced: dispatcherQuiesced, slack_quiesced: slackQuiesced },
+      ))) return;
     }
     const pointer = await this.releases.observe();
     this.assertLease(row);
@@ -1237,7 +1252,8 @@ export class UpdateController {
 
   private mainAgentMatchesOperation(
     row: UpdateRow,
-    kind: Extract<RuntimeOperationKind, "start_target_main_agent" | "start_previous_main_agent">,
+    kind: Extract<RuntimeOperationKind, "start_target_main_agent" | "start_previous_main_agent" |
+      "restart_target_main_agent_after_drain">,
     sha: string,
     agent: MainAgentObservation,
   ): boolean {
@@ -1369,10 +1385,18 @@ export class UpdateController {
     paneId: string,
     previousSessionId?: string,
   ): Promise<boolean> {
-    const kind = "start_previous_main_agent" as const;
-    const release = path.join(this.policy.release_root, row.current_sha);
+    return this.ensureMainAgentRestarted(row, paneId, previousSessionId,
+      "start_previous_main_agent", row.current_sha);
+  }
+
+  private async ensureMainAgentRestarted(
+    row: UpdateRow, paneId: string, previousSessionId: string | undefined,
+    kind: "start_previous_main_agent" | "restart_target_main_agent_after_drain", sha: string,
+    recoveryEvidence: Record<string, unknown> = {},
+  ): Promise<boolean> {
+    const release = path.join(this.policy.release_root, sha);
     const existing = this.database.runtimeOperation(row.request_id, kind);
-    if (existing && (existing.target_ref !== paneId || existing.expected_sha !== row.current_sha ||
+    if (existing && (existing.target_ref !== paneId || existing.expected_sha !== sha ||
       existing.previous_session_id !== (previousSessionId ?? null))) {
       this.needsReview(row, "rollback_main_agent_start_intent_mismatch");
       return false;
@@ -1383,22 +1407,24 @@ export class UpdateController {
     }
     const observed = await this.runtime.mainAgentStatus(release);
     this.assertLease(row);
-    if (this.mainAgentMatchesOperation(row, kind, row.current_sha, observed)) return true;
+    if (this.mainAgentMatchesOperation(row, kind, sha, observed)) return true;
     if (existing && mainAgentMatches(observed) && observed.pane_id === paneId &&
       observed.session_id !== previousSessionId) {
       this.database.recordRuntimeOperation(
-        row.request_id, row.fence, kind, "observed", observed.session_id, { observation: observed }, this.clock.now(),
+        row.request_id, row.fence, kind, "observed", observed.session_id,
+        { ...recoveryEvidence, observation: observed }, this.clock.now(),
       );
       return true;
     }
     if (!existing && mainAgentMatches(observed) && observed.pane_id === paneId &&
       observed.session_id !== previousSessionId) {
       this.database.prepareRuntimeOperation(
-        row.request_id, row.fence, kind, paneId, row.current_sha, previousSessionId ?? null,
-        { observation: observed }, this.clock.now(),
+        row.request_id, row.fence, kind, paneId, sha, previousSessionId ?? null,
+        { ...recoveryEvidence, observation: observed }, this.clock.now(),
       );
       this.database.recordRuntimeOperation(
-        row.request_id, row.fence, kind, "observed", observed.session_id, { observation: observed }, this.clock.now(),
+        row.request_id, row.fence, kind, "observed", observed.session_id,
+        { ...recoveryEvidence, observation: observed }, this.clock.now(),
       );
       return true;
     }
@@ -1415,12 +1441,13 @@ export class UpdateController {
       return false;
     }
     this.database.prepareRuntimeOperation(
-      row.request_id, row.fence, kind, paneId, row.current_sha, previousSessionId ?? null, {}, this.clock.now(),
+      row.request_id, row.fence, kind, paneId, sha, previousSessionId ?? null, recoveryEvidence, this.clock.now(),
     );
     const result = await this.runtime.startMainAgent(paneId, release, previousSessionId);
     this.assertLease(row);
     if (result.outcome === "rejected") {
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "rejected", null, {
+        ...recoveryEvidence,
         error_code: result.error_code,
         observation: result.observation,
       }, this.clock.now());
@@ -1431,11 +1458,12 @@ export class UpdateController {
       result.observation.session_id !== previousSessionId && result.observation.matches_release) {
       this.database.recordRuntimeOperation(
         row.request_id, row.fence, kind, "observed", result.observation.session_id,
-        { observation: result.observation }, this.clock.now(),
+        { ...recoveryEvidence, observation: result.observation }, this.clock.now(),
       );
       return true;
     }
     this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "acceptance_unknown", null, {
+      ...recoveryEvidence,
       error_code: result.error_code,
       observation: result.observation,
     }, this.clock.now());
