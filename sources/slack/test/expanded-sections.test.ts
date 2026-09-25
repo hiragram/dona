@@ -307,3 +307,16 @@ test("a backtick in a Slack token does not hide a following single-line quote", 
   const blocks = expandedSections(`<https://example.com/\`tick|P>\n>${"x".repeat(7_000)}`, "identity", true);
   assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith(">")));
 });
+
+test("a closing inline-code marker at the split boundary stays in the first section", () => {
+  const blocks = expandedSections(`\`${"a".repeat(2_899)}\` ${"b".repeat(1_000)}`, "identity", true);
+  assert.ok(blocks[0]?.text.text.endsWith("`"));
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("``")));
+});
+
+test("an existing multi-line quote marker is not duplicated after a split", () => {
+  const blocks = expandedSections(`>>>intro\n${"a".repeat(2_890)}\n>>>second${"b".repeat(300)}`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.some((block) => block.text.text.startsWith(">>>second")));
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith(">>>>>>")));
+});

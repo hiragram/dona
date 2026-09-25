@@ -241,7 +241,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     }
     if (mrkdwn && end < text.length && end - offset < 3_000 && !isEscaped(text, end)) {
       const marker = text[end] as InlineMarker;
-      if (marker === "*" || marker === "_" || marker === "~") {
+      if (marker === "*" || marker === "_" || marker === "~" || marker === "`") {
         const boundaryState: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
         advanceMrkdwnState(text.slice(0, end), boundaryState, text, 0);
         if (boundaryState.inline.includes(marker) && !boundaryState.fence) end++;
@@ -259,7 +259,9 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     const startsInsideInline = [...state.inline];
     const lineStart = text.lastIndexOf("\n", rawOffset - 1) + 1;
     const continuesQuote = rawOffset > lineStart && text[lineStart] === ">" && !fenceOpenAt(text, lineStart) && !inlineCodeOpenAt(text, lineStart);
-    const quotePrefix = multiQuoteStart >= 0 && rawOffset > multiQuoteStart ? ">>>" : continuesQuote ? ">" : "";
+    const quotePrefix = multiQuoteStart >= 0 && rawOffset > multiQuoteStart
+      ? rawOffset === lineStart && rawChunk.startsWith(">>>") ? "" : ">>>"
+      : continuesQuote ? ">" : "";
     let rendered = `${quotePrefix}${startsInsideFence ? "```\n" : startsInsideInline.join("")}`;
     let cursor = 0;
     if (mrkdwn) {
