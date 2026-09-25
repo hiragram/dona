@@ -35,7 +35,7 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const sensitive = /(?:xox[a-z]-|xapp-|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
@@ -109,12 +109,10 @@ function hasPrivateJwkText(value: string): boolean {
   }
   return scopes.some(scope => scope.keyType && scope.privateParameter);
 }
-const localPath = /(?:^|[\s"'<>`()[\]{},:=])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/))/i;
+const localPath = /(?:^|[\s"'<>`()[\]{},:=])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9._~:/-])\/[A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/))/iu;
 function hasLocalPath(value: string): boolean {
   if (/(?<![A-Za-z0-9/])\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run|proc|dev|sys)(?:\/|$)/i.test(value)) return true;
-  // Japanese prose can adjoin an arbitrary filesystem root without whitespace.
-  if (/(?<=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])\/[A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+/u.test(value)) return true;
-  const candidate = new RegExp(localPath.source, "gi");
+  const candidate = new RegExp(localPath.source, "giu");
   for (const match of value.matchAll(candidate)) {
     const route = match[0].trimStart();
     const prefix = value.slice(0, match.index);
@@ -143,7 +141,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const schemelessUrlCandidate = /(?:^|[\s"'`(])((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{1,5})?\/[^\s"'<>`]+)/g;
+const schemelessUrlCandidate = /(?:^|[\s"'`(])((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/g;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
 const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
@@ -177,9 +175,12 @@ function hasPrivateHttpHost(candidate: string): boolean {
   if (isIP(host) === 0 && (!host.includes(".") || /\.(?:internal|local|lan|home\.arpa)$/.test(host))) return true;
   if (isIP(host) === 4) {
     const [a, b] = host.split(".").map(Number) as [number, number];
-    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
+    const c = Number(host.split(".")[2]);
+    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) ||
       (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127);
+      (a === 100 && b >= 64 && b <= 127) || (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+      (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+      (a === 203 && b === 0 && c === 113);
   }
   if (isIP(host) === 6) {
     const first = Number.parseInt(host.split(":")[0] || "0", 16);
@@ -263,7 +264,10 @@ function forbiddenKey(key: string): boolean {
 function normalizedStructuredKey(key: string): string {
   let normalized = key.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
   for (let depth = 0; depth < 3; depth++) {
-    const decoded = normalized.replace(/\\u([0-9A-Fa-f]{4})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+    const decoded = normalized.replace(/\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g, escaped => {
+      if (escaped[1] === "u") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
+      return ({ b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" } as Record<string, string>)[escaped[1]!] ?? escaped[1]!;
+    });
     if (decoded === normalized) break;
     normalized = decoded.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
   }
@@ -366,7 +370,9 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
   } else if (value !== null && typeof value === "object") {
-    if (hasPrivateJwkFields(value as Record<string, unknown>)) throw new JobResultPublishError("content_requires_redaction");
+    const normalizedObject = Object.fromEntries(Object.entries(value).map(([key, item]) =>
+      [normalizedStructuredKey(key), typeof item === "string" ? normalizedStructuredKey(item) : item]));
+    if (hasPrivateJwkFields(normalizedObject)) throw new JobResultPublishError("content_requires_redaction");
     for (const [key, item] of Object.entries(value)) {
       if (forbiddenKey(normalizedStructuredKey(key)) && !isPublicCountField(key, item)) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(key, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
@@ -413,7 +419,7 @@ const jsonValue: z.ZodType<unknown> = z.json();
 const requestSchema = z.object({
   schema_version: z.literal(1),
   status: z.enum(["completed", "failed"]),
-  summary: z.string().min(1).refine(value => value.replace(/[\p{Cc}\p{Cf}]/gu, "").trim().length > 0),
+  summary: z.string().min(1).refine(value => value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "").trim().length > 0),
   output: z.object({ format: z.enum(["markdown", "text"]), text: z.string() }).strict().optional(),
   artifacts: z.array(z.record(z.string(), jsonValue)).optional(),
   actions: z.array(jsonValue).optional(),
