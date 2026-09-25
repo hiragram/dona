@@ -9,6 +9,7 @@ import type { ApprovalTransactionProviders } from "./transaction.js";
 import { ApprovalHistoryTransaction } from "./history-transaction.js";
 import { ApprovalRecordRepository } from "./record-repository.js";
 import { ApprovalRecordMutation } from "./record-mutation.js";
+import { ApprovalRequestLifecycle } from "./request-lifecycle.js";
 import type { ApprovalRecord, ApprovalRecordScope } from "./record-codec.js";
 import { ApprovalPayloadMutation } from "./payload-mutation.js";
 import { approvalCreationKey, decodeApprovalSnapshot, encodeApprovalSnapshot, type ApprovalSnapshot, type ApprovalSourceContext } from "./snapshot.js";
@@ -16,6 +17,8 @@ import { approvalExpiry, consumeTtlMs, type ClockMark } from "./clock.js";
 import { createApprovalContentBinding, matchesApprovalContentBinding, sealApprovalPayload, type ApprovalPayloadKey } from "./payload-protection.js";
 import { encodeApprovalPayloadEnvelope } from "./payload-metadata.js";
 import { signApprovalNotificationMarker, type ApprovalNotificationKey } from "./notification-marker.js";
+import { approvalSupervisorBindingRequired } from "./schema.js";
+import type { SupervisorBindingGuard } from "./supervisor-binding.js";
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const intentSchema = z.strictObject({ source_ref: id, operation_slot: id,
   target: z.strictObject({ channel_id: id, thread_ts: z.string().regex(/^[0-9]{10}\.[0-9]{6}$/) }), text: z.string().min(1).max(3000) });
@@ -68,13 +71,16 @@ export class ApprovalCreateBroker {
  private readonly transaction:ApprovalHistoryTransaction;
  private readonly records:ApprovalRecordRepository;
  private readonly recordMutation:ApprovalRecordMutation;
+ private readonly lifecycle:ApprovalRequestLifecycle;
  private readonly payloadMutation:ApprovalPayloadMutation;
  private readonly keys:ApprovalCreateKeyLookup;
- constructor(db:Database.Database,providers:ApprovalTransactionProviders,scope:ApprovalRecordScope,
-   private readonly authorize:ApprovalCreateAuthority,keys:ApprovalCreateKeyLookup){
+ constructor(private readonly db:Database.Database,providers:ApprovalTransactionProviders,scope:ApprovalRecordScope,
+   private readonly authorize:ApprovalCreateAuthority,keys:ApprovalCreateKeyLookup,
+   private readonly bindingGuard?:SupervisorBindingGuard){
   try{
    assertSynchronousResult(scope);this.scope=Object.freeze(z.strictObject({instance_id:id,workspace_id:id}).parse(scope));
    assertSynchronousCallback(authorize);
+   if(approvalSupervisorBindingRequired(db)&&(bindingGuard===undefined||!bindingGuard.matchesScope(this.scope)))throw Error();
    // Read descriptors rather than invoking accessor-backed configuration.
    if(keys===null||typeof keys!=="object"||types.isProxy(keys)||Object.getPrototypeOf(keys)!==Object.prototype)throw Error();
    const descriptors=Object.getOwnPropertyDescriptors(keys);
@@ -85,11 +91,12 @@ export class ApprovalCreateBroker {
     notification:()=>Reflect.apply(descriptors.notification!.value!,undefined,[]) as ApprovalNotificationKey});
    this.transaction=new ApprovalHistoryTransaction(db,providers,this.scope);
    this.records=new ApprovalRecordRepository(db,providers.auditAnchors,providers.auditKeys,this.scope);
-   this.recordMutation=new ApprovalRecordMutation(db,this.scope);this.payloadMutation=new ApprovalPayloadMutation(db,this.scope);
+   this.recordMutation=new ApprovalRecordMutation(db,this.scope);this.lifecycle=new ApprovalRequestLifecycle(db,providers,this.scope);this.payloadMutation=new ApprovalPayloadMutation(db,this.scope);
   }catch{throw new ApprovalCreateError();}
  }
  create(transactionId:string,input:ApprovalCreateIntent):ApprovalCreateResult {
   try{
+   if(approvalSupervisorBindingRequired(this.db)&&(this.bindingGuard===undefined||!this.bindingGuard.matchesScope(this.scope)))throw Error();
    assertSynchronousResult(input);const intent=freeze(intentSchema.parse(input));
    return this.transaction.runPrepared<()=>ApprovalCreateResult>(transactionId,(mark,state)=>{
     const raw=this.authorize(intent,mark,state);assertSynchronousResult(raw);const parsed=grantSchema.parse(raw);
@@ -114,6 +121,15 @@ export class ApprovalCreateBroker {
      const saved=decodeApprovalSnapshot(prior.row.snapshot_json,prior.row.semantic_hash,{...this.scope,request_source:stored.request_source}).snapshot;
      if(!Object.keys(saved.request_source).every(field=>saved.request_source[field as keyof ApprovalSourceContext["request_source"]]===context.request_source[field as keyof ApprovalSourceContext["request_source"]]))
       return denied({status:"denied",reason:"unauthorized"},{...event,reason:"unauthorized"});
+     if(this.bindingGuard && !this.bindingGuard.current(state,mark,"create",{binding_id:prior.row.binding_id,
+       revision:prior.row.binding_revision,actor_id:null},saved.target)) {
+      if(["requested","delivery_pending","delivery_unknown","sent","approved"].includes(prior.row.state)) {
+       const change=this.lifecycle.change(mark,state,prior,"needs_review",null,{...event,resource_id:prior.row.request_id,
+        outcome:"needs_review",reason:"revision_mismatch"});
+       return {...change,mutation:()=>{change.mutation();return {status:"denied" as const,reason:"binding_revoked" as const};}};
+      }
+      return denied({status:"denied",reason:"binding_revoked"},{...event,reason:"binding_revoked"});
+     }
      const sameBody=matchesApprovalContentBinding(intent.text,this.scope,"draft",{key_version:saved.content_hmac_key_version,mac:saved.content_hmac_sha256,signed_at:prior.row.created_at},this.keys.content(saved.content_hmac_key_version));
      if(!sameBody)return denied({status:"denied",reason:"idempotency_conflict"},{...event,reason:"idempotency_conflict"});
      const candidate=encodeApprovalSnapshot({...source,encrypted_content_ref:saved.encrypted_content_ref,content_hmac_sha256:saved.content_hmac_sha256,content_hmac_key_version:saved.content_hmac_key_version},context);
@@ -122,6 +138,9 @@ export class ApprovalCreateBroker {
      return {event:{...event,resource_id:prior.row.request_id,outcome:"succeeded" as const,reason:"none" as const},resource_digest:null,
       mutation:()=>({status:"reused" as const,request_handle:prior.row.request_id,request_state:prior.row.state,expires_at:prior.row.expires_at})};
     }
+    if(this.bindingGuard&&!this.bindingGuard.current(state,mark,"create",{binding_id:grant.binding_id,
+      revision:source.preconditions.workspace_binding_revision,actor_id:null},source.target))
+      return denied({status:"denied",reason:"binding_revoked"},{...baseEvent,reason:"binding_revoked"});
     const contentKey=this.keys.content(null),wrapKey=this.keys.wrapping(),notificationKey=this.keys.notification();
     if(!(notificationKey.secret instanceof Uint8Array)||notificationKey.secret.byteLength!==32
       ||timingSafeEqual(notificationKey.secret,contentKey.secret)||timingSafeEqual(notificationKey.secret,wrapKey.secret))throw Error();

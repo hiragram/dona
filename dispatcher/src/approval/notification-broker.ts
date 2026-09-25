@@ -17,6 +17,8 @@ import { ApprovalPayloadMutation } from "./payload-mutation.js";
 import { openApprovalPayload, type ApprovalPayloadKey } from "./payload-protection.js";
 import { verifyApprovalNotificationMarker, type ApprovalNotificationKey } from "./notification-marker.js";
 import { settleDelivery, recoverDelivery, requestPayloadRequired, type RequestState, type DeliveryState } from "./domain.js";
+import { approvalSupervisorBindingRequired } from "./schema.js";
+import type { SupervisorBindingGuard } from "./supervisor-binding.js";
 import { notificationCommandSchema, notificationClaimGrantSchema, notificationRecoveryGrantSchema, notificationReceiptGrantSchema,
   type NotificationCommand, type NotificationClaimAuthority, type NotificationRecoveryAuthority, type NotificationReceiptAuthority } from "./notification-authority.js";
 type Request = Extract<ApprovalRecord, { kind: "request" }>;
@@ -40,13 +42,15 @@ export class ApprovalNotificationBroker {
   private readonly lifecycle: ApprovalRequestLifecycle;
   private readonly payloads: ApprovalPayloadRepository;
   private readonly payloadMutation: ApprovalPayloadMutation;
-  constructor(db: Database.Database, providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
+  constructor(private readonly db: Database.Database, providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
     private readonly authorizeClaim: NotificationClaimAuthority, private readonly authorizeRecovery: NotificationRecoveryAuthority,
     private readonly authorizeReceipt: NotificationReceiptAuthority, private readonly contentKey: (version: number) => ApprovalPayloadKey,
-    private readonly wrappingKey: (version: number) => ApprovalPayloadKey, private readonly markerKey: (version: number) => ApprovalNotificationKey) {
+    private readonly wrappingKey: (version: number) => ApprovalPayloadKey, private readonly markerKey: (version: number) => ApprovalNotificationKey,
+    private readonly bindingGuard?: SupervisorBindingGuard) {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(z.strictObject({ instance_id: id, workspace_id: id }).parse(scope));
       for (const callback of [authorizeClaim, authorizeRecovery, authorizeReceipt, contentKey, wrappingKey, markerKey]) assertSynchronousCallback(callback);
+      if (approvalSupervisorBindingRequired(db) && (bindingGuard === undefined || !bindingGuard.matchesScope(this.scope))) throw Error();
       this.transaction = new ApprovalHistoryTransaction(db, providers, this.scope); this.history = new ApprovalClockHistory(db, this.scope);
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
       this.mutations = new ApprovalRecordMutation(db, this.scope); this.lifecycle = new ApprovalRequestLifecycle(db, providers, this.scope);
@@ -56,6 +60,7 @@ export class ApprovalNotificationBroker {
   }
   claim(transactionId: string, input: NotificationCommand): ApprovalNotificationResult {
     try {
+      if (approvalSupervisorBindingRequired(this.db) && (this.bindingGuard === undefined || !this.bindingGuard.matchesScope(this.scope))) throw Error();
       assertSynchronousResult(input); const command = Object.freeze(notificationCommandSchema.parse(input));
       return this.transaction.runPrepared<() => ApprovalNotificationResult>(transactionId, (mark, state) => {
         const base = this.base(), found = this.load(state, command); if (found === null) return this.denied(base, "unauthorized");
@@ -70,7 +75,9 @@ export class ApprovalNotificationBroker {
         if (!undecided.has(request.row.state)) return this.change(mark, state, request, notification, request.row.state, "aborted", null, event, "none");
         if (approvalExpired(request.row.expires_at, mark)) return this.expire(mark, state, request, event);
         const snapshot = this.lifecycle.snapshot(request);
-        if (grant.stale_reason !== null || grant.binding_id !== request.row.binding_id || grant.binding_revision !== request.row.binding_revision
+        const currentBinding = this.bindingGuard?.current(state, mark, "delivery", { binding_id: request.row.binding_id,
+          revision: request.row.binding_revision, actor_id: null }, snapshot.target) ?? true;
+        if (!currentBinding || grant.stale_reason !== null || grant.binding_id !== request.row.binding_id || grant.binding_revision !== request.row.binding_revision
           || grant.policy_revision !== request.row.policy_revision || grant.semantic_hash !== request.row.semantic_hash
           || grant.requester_authorization_revision !== snapshot.preconditions.requester_authorization_revision)
           return this.lifecycle.change(mark, state, request, "needs_review", null, { ...event, outcome: "needs_review", reason: grant.stale_reason ?? "revision_mismatch" });

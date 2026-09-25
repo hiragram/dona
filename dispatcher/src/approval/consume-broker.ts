@@ -16,6 +16,8 @@ import { ApprovalPayloadMutation } from "./payload-mutation.js";
 import { openApprovalPayload, sealApprovalPayload, type ApprovalPayloadBinding, type ApprovalPayloadKey, type SealedApprovalPayload } from "./payload-protection.js";
 import { encodeApprovalPayloadEnvelope } from "./payload-metadata.js";
 import { verifyApprovalNotificationMarker, type ApprovalNotificationKey } from "./notification-marker.js";
+import { approvalSupervisorBindingRequired } from "./schema.js";
+import type { SupervisorBindingGuard } from "./supervisor-binding.js";
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const positive = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const scopeSchema = z.strictObject({ instance_id: id, workspace_id: id });
@@ -55,15 +57,17 @@ export class ApprovalConsumeBroker {
   private readonly lifecycle: ApprovalRequestLifecycle;
   private readonly payloads: ApprovalPayloadRepository;
   private readonly payloadMutation: ApprovalPayloadMutation;
-  constructor(db: Database.Database, providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
+  constructor(private readonly db: Database.Database, providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
     private readonly authorize: ApprovalConsumeAuthority,
     private readonly contentKey: (version: number) => ApprovalPayloadKey,
     /** nullは新規seal用active鍵、versionは既存envelopeの保持鍵を選ぶ。 */
     private readonly wrappingKey: (version: number | null) => ApprovalPayloadKey,
-    private readonly notificationKey: (version: number) => ApprovalNotificationKey) {
+    private readonly notificationKey: (version: number) => ApprovalNotificationKey,
+    private readonly bindingGuard?: SupervisorBindingGuard) {
     try {
       assertSynchronousResult(scope); this.scope = Object.freeze(scopeSchema.parse(scope));
       for (const callback of [authorize, contentKey, wrappingKey, notificationKey]) assertSynchronousCallback(callback);
+      if (approvalSupervisorBindingRequired(db) && (bindingGuard === undefined || !bindingGuard.matchesScope(this.scope))) throw Error();
       this.transaction = new ApprovalHistoryTransaction(db, providers, this.scope);
       this.history = new ApprovalClockHistory(db, this.scope);
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
@@ -75,6 +79,7 @@ export class ApprovalConsumeBroker {
   }
   consume(transactionId: string, input: ApprovalConsumeCommand): ApprovalConsumeResult {
     try {
+      if (approvalSupervisorBindingRequired(this.db) && (this.bindingGuard === undefined || !this.bindingGuard.matchesScope(this.scope))) throw Error();
       assertSynchronousResult(input); const command = Object.freeze(commandSchema.parse(input));
       return this.transaction.runPrepared<() => ApprovalConsumeResult>(transactionId, (mark, state) => {
         const base: Omit<AuditEvent, "occurred_at"> = { scope: { instance_id: this.scope.instance_id, tenant_id: this.scope.workspace_id },
@@ -99,7 +104,9 @@ export class ApprovalConsumeBroker {
         const prior = this.records.readInState(state, "consume", request.row.request_id);
         if (prior === null && (request.row.state !== "approved" || command.expected_revision !== request.row.revision))
           return denied(request.row.state !== "approved" ? "decision_conflict" : "revision_mismatch", event);
-        const drift = grant.stale_reason !== null || grant.binding_id !== request.row.binding_id || grant.binding_revision !== request.row.binding_revision
+        const currentBinding = this.bindingGuard?.current(state, mark, "consume", { binding_id: request.row.binding_id,
+          revision: request.row.binding_revision, actor_id: decision.row.actor_id }, snapshot.target) ?? true;
+        const drift = !currentBinding || grant.stale_reason !== null || grant.binding_id !== request.row.binding_id || grant.binding_revision !== request.row.binding_revision
           || grant.policy_revision !== request.row.policy_revision || grant.semantic_hash !== request.row.semantic_hash
           || grant.requester_authorization_revision !== snapshot.preconditions.requester_authorization_revision;
         const change = (next: "needs_review" | "consume_expired", reason: AuditEvent["reason"]) => {
