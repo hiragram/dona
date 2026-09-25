@@ -135,7 +135,9 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
     try { url = new URL(`https:${match[0]}`); } catch { return true; }
     if ((!host.includes(".") && !host.startsWith("[")) || url.username || url.password || hasSignedQueryKey(match[0]) || hasPrivateHttpHost(url.href)) return true;
     for (const parameters of [url.searchParams, new URLSearchParams(url.hash.slice(1))]) {
-      for (const [, parameterValue] of parameters) if (forbiddenValues?.contains(parameterValue)) return true;
+      for (const [parameterKey, parameterValue] of parameters) {
+        if (forbiddenValues?.contains(parameterKey) || forbiddenValues?.contains(parameterValue)) return true;
+      }
     }
   }
   return false;
@@ -300,7 +302,8 @@ class ForbiddenValueMatcher {
   private readonly substrings: string[] = [];
   constructor(values: readonly string[], substringShortValues: ReadonlySet<string> = new Set()) {
     const display = (value: string) => value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "").normalize("NFC");
-    const normalizedShortValues = new Set([...substringShortValues].flatMap(value => [value.normalize("NFC"), display(value)]));
+    const normalizedShortValues = new Set([...substringShortValues].flatMap(value =>
+      [value.normalize("NFC"), display(value), displayProjection(display(value))]));
     for (const value of new Set(values.flatMap(item => [item.normalize("NFC"), display(item), displayProjection(display(item))]))) {
       if (!value) continue;
       if (value.length < 8 && !normalizedShortValues.has(value)) { this.exact.add(value); continue; }
@@ -409,6 +412,9 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     }
   } else if (typeof value === "number" && !Number.isSafeInteger(value)) {
     throw new JobResultPublishError("invalid_request");
+  } else if ((typeof value === "number" || typeof value === "boolean" || value === null) &&
+    forbiddenValues?.contains(JSON.stringify(value))) {
+    throw new JobResultPublishError("content_requires_redaction");
   } else if (typeof value !== "boolean" && typeof value !== "number" && value !== null) {
     throw new JobResultPublishError("invalid_request");
   }
@@ -481,6 +487,8 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
   // Fixed schema keys are Dispatcher-owned; inspect only worker-provided fields.
   assertSafeJson(parsed.data.summary, 0, forbiddenDigests, matcher, forbiddenFingerprints);
   if (parsed.data.output !== undefined) assertSafeJson(parsed.data.output.text, 0, forbiddenDigests, matcher, forbiddenFingerprints);
+  if (parsed.data.output?.text.trim()) assertSafeJson(`${parsed.data.summary}\n\n${parsed.data.output.text}`, 0,
+    forbiddenDigests, matcher, forbiddenFingerprints);
   if (parsed.data.artifacts !== undefined) assertSafeJson(parsed.data.artifacts, 0, forbiddenDigests, matcher, forbiddenFingerprints);
   if (parsed.data.actions !== undefined) assertSafeJson(parsed.data.actions, 0, forbiddenDigests, matcher, forbiddenFingerprints);
   const envelope: JobResultEnvelope = {

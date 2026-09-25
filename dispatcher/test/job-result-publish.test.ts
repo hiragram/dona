@@ -348,6 +348,7 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "参照example.com?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.xn--p1ai?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?private+objective+text=x" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "GET /status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: 'payload={"detail":"private\\u0020objective\\u0020two"}' }, () => current), code("content_requires_redaction"));
     const multiline = new JobResultPublishCapabilities(() => "session-multiline");
@@ -358,6 +359,18 @@ describe("job result publish contract", () => {
     const invisibleGrant = invisible.issue(row({ objective: "secret\u200bplan" }), "session-invisible");
     assert.throws(() => invisible.validate(invisibleGrant.capability, "session-invisible", { ...base, summary: "secretplan" },
       () => row({ status: "running", objective: "secret\u200bplan" })), code("content_requires_redaction"));
+    const shortInvisible = new JobResultPublishCapabilities(() => "session-short-invisible");
+    const shortInvisibleGrant = shortInvisible.issue(row({ objective: "秘\u034f密" }), "session-short-invisible");
+    assert.throws(() => shortInvisible.validate(shortInvisibleGrant.capability, "session-short-invisible", { ...base, summary: "対応完了: 秘密" },
+      () => row({ status: "running", objective: "秘\u034f密" })), code("content_requires_redaction"));
+    const split = new JobResultPublishCapabilities(() => "session-split");
+    const splitGrant = split.issue(row({ objective: "private\n\nobjective" }), "session-split");
+    assert.throws(() => split.validate(splitGrant.capability, "session-split", { ...base, summary: "private", output: { format: "markdown", text: "objective" } },
+      () => row({ status: "running", objective: "private\n\nobjective" })), code("content_requires_redaction"));
+    const numeric = new JobResultPublishCapabilities(() => "session-numeric");
+    const numericGrant = numeric.issue(row({ objective: "1234" }), "session-numeric");
+    assert.throws(() => numeric.validate(numericGrant.capability, "session-numeric", { ...base, artifacts: [{ id: 1234 }] },
+      () => row({ status: "running", objective: "1234" })), code("content_requires_redaction"));
     const entity = new JobResultPublishCapabilities(() => "session-entity");
     const entityGrant = entity.issue(row({ objective: "private & objective" }), "session-entity");
     assert.throws(() => entity.validate(entityGrant.capability, "session-entity", { ...base, output: { format: "markdown", text: "private &amp; objective" } },
