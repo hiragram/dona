@@ -378,7 +378,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
           chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
         }
       }
-      const grapheme = rawChunk.slice(opening.length);
+      const grapheme = rawChunk.slice(opening.length, consumedClosing ? -consumedClosing.length : undefined);
       if (opening && grapheme.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(grapheme)].length === 1) {
         chunk = grapheme;
         plainFallback = true;
