@@ -343,13 +343,13 @@ class ForbiddenValueMatcher {
   }
 }
 
-function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, decodeDepth: number, budget: { count: number }): boolean {
+function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, decodeDepth: number, budget: { count: number }, digests?: ReadonlySet<string>, fingerprints?: ReadonlySet<number>): boolean {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const inspect = (bytes: Buffer): boolean => {
     try {
       const decoded = decoder.decode(bytes);
       if (matcher.contains(decoded)) return true;
-      assertSafeJson(decoded, 0, undefined, matcher, undefined, decodeDepth + 1, budget);
+      assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget);
     } catch (error) {
       if (error instanceof JobResultPublishError) return true;
       // Non-UTF-8 data is not worker-visible text.
@@ -450,7 +450,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/i.test(value) || sensitive.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/i.test(value) || sensitive.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);

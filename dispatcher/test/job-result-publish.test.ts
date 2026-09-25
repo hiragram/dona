@@ -352,6 +352,9 @@ describe("job result publish contract", () => {
       artifacts: Array.from({ length: 600 }, () => ({ part: "AAAAAAAA" })),
       actions: Array.from({ length: 600 }, () => ({ part: "AAAAAAAA" })) },
       () => current), code("content_requires_redaction"));
+    const doubleEncoded = Buffer.from(Buffer.from(grant.capability, "utf8").toString("base64url"), "utf8").toString("base64url");
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: doubleEncoded }, () => current), code("content_requires_redaction"));
     const longObjective = "private-long-objective-".repeat(500);
     const longGrant = new JobResultPublishCapabilities(() => "session-long-base64");
     const longIssued = longGrant.issue(row({ objective: longObjective }), "session-long-base64");
