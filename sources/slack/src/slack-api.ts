@@ -359,7 +359,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       }
     }
     if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length === 0 && state.inline.length === 0) {
-      const opening = /^([*_~]+)/.exec(rawChunk)?.[1] ?? "";
+      const opening = /^([*_~`]+)/.exec(rawChunk)?.[1] ?? "";
       const closing = [...opening].reverse().join("");
       if (opening && rawChunk.endsWith(closing)) {
         const token = rawChunk.slice(opening.length, -closing.length);
@@ -369,7 +369,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       }
     }
     if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length === 0 && state.inline.length === 1) {
-      const opening = /^([*_~]+)/.exec(rawChunk)?.[1] ?? "";
+      const opening = /^([*_~`]+)/.exec(rawChunk)?.[1] ?? "";
       const closing = [...opening].reverse().join("");
       const consumedClosing = closing.slice(0, -state.inline.length);
       if (opening && consumedClosing && rawChunk.endsWith(consumedClosing)) {

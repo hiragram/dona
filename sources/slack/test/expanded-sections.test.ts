@@ -486,3 +486,10 @@ test("a long grapheme enclosed by inline markers falls back to plain text", () =
   assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === grapheme));
   assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
 });
+
+test("a long grapheme enclosed by inline code falls back to plain text", () => {
+  const grapheme = `a${"\u0301".repeat(2_998)}`;
+  const blocks = expandedSections(`\`${grapheme}\``, "identity", true);
+  assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === grapheme));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});
