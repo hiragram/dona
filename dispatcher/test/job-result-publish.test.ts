@@ -607,6 +607,7 @@ describe("job result publish contract", () => {
     let combined: net.Socket | undefined;
     let chunked: net.Socket | undefined;
     let split: net.Socket | undefined;
+    let splitBody: net.Socket | undefined;
     let overlapping: net.Socket | undefined;
     let stalled: net.Socket | undefined;
     let waiting: net.Socket | undefined;
@@ -656,6 +657,19 @@ describe("job result publish contract", () => {
       assert.match(await splitResponse, /^HTTP\/1\.1 202 /);
       await new Promise(resolve => setTimeout(resolve, 60));
       assert.equal(split.destroyed, true, "分割request直後のpartial headerも期限で閉じる");
+      splitBody = net.createConnection(socket);
+      splitBody.on("error", () => {});
+      await new Promise<void>(resolve => splitBody!.once("connect", resolve));
+      const splitBodyResponse = new Promise<string>(resolve => splitBody!.once("data", data => resolve(String(data))));
+      const splitAt = Math.floor(body.length / 2);
+      splitBody.write(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nContent-Length: ${Buffer.byteLength(body)}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${body.slice(0, splitAt)}`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      splitBody.write(`${body.slice(splitAt)}POST /v1/job-result-publish HTTP/1.1\r\n`);
+      assert.match(await splitBodyResponse, /^HTTP\/1\.1 202 /);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(splitBody.destroyed, true, "分割本文の直後のpartial headerも期限で閉じる");
       blockCommit = true;
       overlapping = net.createConnection(socket);
       overlapping.on("error", () => {});
@@ -687,6 +701,7 @@ describe("job result publish contract", () => {
       combined?.destroy();
       chunked?.destroy();
       split?.destroy();
+      splitBody?.destroy();
       releaseCommit?.();
       overlapping?.destroy();
       stalled?.destroy();
