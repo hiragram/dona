@@ -42,11 +42,17 @@ export interface SlackPostResult {
 
 type InlineMarker = "`" | "*" | "_" | "~";
 
+function isEscaped(text: string, index: number): boolean {
+  let start = index;
+  while (start > 0 && text[start - 1] === "\\") start--;
+  return (index - start) % 2 === 1;
+}
+
 function hasMatchingClose(text: string, start: number, marker: InlineMarker): boolean {
   let inFence = false;
   let inCode = false;
   for (let index = start + 1; index < text.length; index++) {
-    if (text.startsWith("```", index)) {
+    if (text.startsWith("```", index) && !isEscaped(text, index)) {
       inFence = !inFence;
       index += 2;
       continue;
@@ -56,8 +62,8 @@ function hasMatchingClose(text: string, start: number, marker: InlineMarker): bo
       index++;
       continue;
     }
-    if (text.startsWith("<http", index)) {
-      const close = text.indexOf(">", index + 5);
+    if (text[index] === "<") {
+      const close = text.indexOf(">", index + 1);
       if (close !== -1) {
         index = close;
         continue;
@@ -81,7 +87,7 @@ function advanceMrkdwnState(
   offset: number,
 ): void {
   for (let index = 0; index < text.length; index++) {
-    if (text.startsWith("```", index)) {
+    if (text.startsWith("```", index) && !isEscaped(text, offset + index)) {
       state.fence = !state.fence;
       index += 2;
       continue;
@@ -91,8 +97,8 @@ function advanceMrkdwnState(
       index++;
       continue;
     }
-    if (text.startsWith("<http", index)) {
-      const close = text.indexOf(">", index + 5);
+    if (text[index] === "<") {
+      const close = text.indexOf(">", index + 1);
       if (close !== -1) {
         index = close;
         continue;
@@ -119,21 +125,19 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
     if (end < text.length) {
       const prefix = text.slice(offset, end);
       const newline = prefix.lastIndexOf("\n");
-      const fenceCount = (prefix.match(/```/g) ?? []).length;
+      const fences = [...prefix.matchAll(/```/g)].map((match) => match.index).filter((index) => !isEscaped(text, offset + index));
+      const fenceCount = fences.length;
       if (newline > 0 && (!mrkdwn || fenceCount % 2 === 0)) end = offset + newline + 1;
       else if (mrkdwn) {
-        const partialLink = /<(?:h(?:t(?:t(?:p)?)?)?)?$/.exec(prefix)?.index;
-        if (partialLink !== undefined && partialLink > 0 && text.startsWith("<http", offset + partialLink)) {
-          end = offset + partialLink;
-        }
+        const lastOpenToken = prefix.lastIndexOf("<");
+        const lastCloseToken = prefix.lastIndexOf(">");
+        if (lastOpenToken > lastCloseToken && lastOpenToken > 0 && text.indexOf(">", offset + lastOpenToken + 1) !== -1) end = offset + lastOpenToken;
         const partialFence = /`{1,2}$/.exec(prefix)?.index;
-        if (partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence)) {
+        if (partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence) && !isEscaped(text, offset + partialFence)) {
           end = Math.min(end, offset + partialFence);
         }
-        const lastOpenLink = prefix.lastIndexOf("<http");
-        const lastCloseLink = prefix.lastIndexOf(">");
-        const lastFence = prefix.lastIndexOf("```");
-        const protectedStart = lastOpenLink > lastCloseLink ? lastOpenLink : fenceCount % 2 ? lastFence : -1;
+        const lastFence = fences.at(-1) ?? -1;
+        const protectedStart = fenceCount % 2 ? lastFence : -1;
         if (protectedStart > 0) end = Math.min(end, offset + protectedStart);
       }
     }
@@ -154,8 +158,8 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
     const startsInsideInline = [...state.inline];
     if (mrkdwn) advanceMrkdwnState(rawChunk, state, text, rawOffset);
     rawOffset += rawChunk.length;
-    const inlinePrefix = startsInsideInline.join("");
-    const inlineSuffix = index < chunks.length - 1 ? [...state.inline].reverse().join("") : "";
+    const inlinePrefix = startsInsideFence ? "" : startsInsideInline.join("");
+    const inlineSuffix = !state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : "";
     const chunk = mrkdwn
       ? `${startsInsideFence ? "```\n" : ""}${inlinePrefix}${rawChunk}${inlineSuffix}${state.fence ? "\n```" : ""}`
       : rawChunk;

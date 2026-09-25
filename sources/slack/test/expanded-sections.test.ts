@@ -83,3 +83,23 @@ test("an escape and its marker stay in the same section", () => {
   assert.ok(blocks.some((block) => block.text.text.includes("\\*literal*")));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("Slack angle tokens stay in one section", () => {
+  for (const token of ["<@U123>", "<#C123>", "<!date^123^{date_short}|today>"]) {
+    const blocks = expandedSections(`${"a".repeat(2_979)}${token}`, "identity", true);
+    assert.ok(blocks.some((block) => block.text.text.includes(token)));
+  }
+});
+
+test("an escaped fence stays literal at a section boundary", () => {
+  const blocks = expandedSections(`${"a".repeat(100)}\\\`\`\`literal\n${"x".repeat(6_000)}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes("\\```literal")));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
+
+test("inline delimiters are not synthesized inside a continued fence", () => {
+  const blocks = expandedSections(`*説明\n\`\`\`\n${"x".repeat(6_000)}\n\`\`\`\n続き*`, "identity", true);
+  const logBlocks = blocks.flatMap((block) => [...block.text.text.matchAll(/```([\s\S]*?)```/g)].map((match) => match[1] ?? ""));
+  assert.ok(logBlocks.length > 1);
+  assert.ok(logBlocks.every((content) => !content.includes("*")));
+});
