@@ -360,3 +360,14 @@ test("a split code fence does not insert an extra blank line", () => {
   assert.ok(blocks.length > 1);
   assert.ok(blocks.slice(0, -1).every((block) => !block.text.text.endsWith("\n\n```")));
 });
+
+test("an unmatched backtick does not hide a multi-line quote", () => {
+  const blocks = expandedSections("`typo\n>>>intro\n" + "x".repeat(7_000), "identity", true);
+  assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith(">>>")));
+});
+
+test("consecutive closing inline markers stay in the preceding section", () => {
+  const blocks = expandedSections(`*_${"a".repeat(2_898)}_* ${"b".repeat(1_000)}`, "identity", true);
+  assert.ok(blocks[0]?.text.text.endsWith("_*"));
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("**")));
+});
