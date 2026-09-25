@@ -540,3 +540,10 @@ test("an invalid user mention is not protected as a Slack token", () => {
   const blocks = expandedSections(`*bold ${"x".repeat(7_000)}<@not-a-user*>`, "identity", true);
   assert.ok(blocks.slice(1).some((block) => block.text.text.startsWith("*")));
 });
+
+test("a Slack date token stays together at a section boundary", () => {
+  const token = "<!date^1392734382^{date_short_pretty} at {time}|Posted on February 18>";
+  const blocks = expandedSections("x".repeat(2_880) + token + "y".repeat(500), "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(token)));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
