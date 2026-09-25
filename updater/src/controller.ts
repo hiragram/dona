@@ -658,9 +658,15 @@ export class UpdateController {
       if (!(await this.ensureServiceStopped(
         row, "stop_slack", "slack_adapter", row.current_sha, () => this.runtime.stopSlack(),
       ))) return;
-      if (!(await this.ensureServiceStopped(
-        row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
-      ))) return;
+      try {
+        if (!(await this.ensureServiceStopped(
+          row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
+        ))) return;
+      } catch {
+        this.assertLease(row);
+        await this.restoreQuiescedServices(row, "stop_dispatcher_registration_unverified");
+        return;
+      }
       const workerAfterStop = await this.runtime.workerSafety();
       this.assertLease(row);
       if (!workerAfterStop.safe) {
@@ -746,7 +752,7 @@ export class UpdateController {
       }
       if (dispatcherRegistered) {
         this.assertLease(row);
-        this.needsReview(row, "dispatcher_registration_restored_before_activation");
+        await this.restoreQuiescedServices(row, "dispatcher_registration_restored_before_activation", false, true);
         return;
       }
       this.assertLease(row);
@@ -924,9 +930,11 @@ export class UpdateController {
             this.runtime.dispatcherHealth(), this.runtime.slackHealth(),
           ]);
           this.assertLease(row);
+          const recoveryScope = await this.rollbackQuiescedScope(dispatcherRecoveryHealth, slackRecoveryHealth);
+          this.assertLease(row);
           await this.restoreTargetAfterDrain(row,
             workerSafety.error_code ?? "rollback_active_worker_handoff_unavailable",
-            !dispatcherRecoveryHealth.live, !slackRecoveryHealth.live);
+            recoveryScope.dispatcherQuiesced, recoveryScope.slackQuiesced);
           return;
         }
         // KeepAlive may have restarted Dispatcher after the first observation.
@@ -962,9 +970,15 @@ export class UpdateController {
         if (!(await this.ensureServiceStopped(
           row, "stop_target_slack", "slack_adapter", null, () => this.runtime.stopSlack(),
         ))) return;
-        if (!(await this.ensureServiceStopped(
-          row, "stop_target_dispatcher", "dispatcher", null, () => this.runtime.stopDispatcher(),
-        ))) return;
+        try {
+          if (!(await this.ensureServiceStopped(
+            row, "stop_target_dispatcher", "dispatcher", null, () => this.runtime.stopDispatcher(),
+          ))) return;
+        } catch {
+          this.assertLease(row);
+          await this.restoreTargetAfterDrain(row, "stop_target_dispatcher_registration_unverified", true, true);
+          return;
+        }
         // A KeepAlive restart between the earlier observation and stop must
         // not carry a newly created external worker across the pointer switch.
         const workerAfterStop = await this.runtime.workerSafety();
@@ -999,9 +1013,11 @@ export class UpdateController {
           this.runtime.dispatcherHealth(), this.runtime.slackHealth(),
         ]);
         this.assertLease(row);
+        const recoveryScope = await this.rollbackQuiescedScope(dispatcherRecoveryHealth, slackRecoveryHealth);
+        this.assertLease(row);
         await this.restoreTargetAfterDrain(row,
           workerBeforeRollback.error_code ?? "rollback_active_worker_handoff_unavailable",
-          !dispatcherRecoveryHealth.live, !slackRecoveryHealth.live);
+          recoveryScope.dispatcherQuiesced, recoveryScope.slackQuiesced);
         return;
       }
       receipt = await this.releases.rollback(row);
@@ -1072,6 +1088,19 @@ export class UpdateController {
       activation_generation: observation.receipt!.generation,
       observed_active_sha: row.current_sha,
     }, this.clock.now());
+  }
+
+  private async rollbackQuiescedScope(dispatcher: HealthSnapshot, slack: HealthSnapshot): Promise<{
+    dispatcherQuiesced: boolean; slackQuiesced: boolean;
+  }> {
+    const [dispatcherDrain, slackDrain] = await Promise.all([
+      dispatcher.live ? this.runtime.dispatcherDrainStatus() : Promise.resolve(null),
+      slack.live ? this.runtime.slackDrainStatus() : Promise.resolve(null),
+    ]);
+    return {
+      dispatcherQuiesced: !dispatcher.live || dispatcherDrain!.quiescing,
+      slackQuiesced: !slack.live || slackDrain!.quiescing,
+    };
   }
 
   private async restoreTargetAfterDrain(

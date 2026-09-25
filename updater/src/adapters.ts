@@ -551,6 +551,16 @@ export class RealRuntime implements RuntimePort {
     return snapshot;
   }
 
+  async slackDrainStatus(): Promise<DrainSnapshot> {
+    return drainSnapshot(await udsRequest(this.policy.slack_socket, "GET", "/v1/admin/drain-status",
+      undefined, this.policy.timeouts.health_ms), "slack_adapter");
+  }
+
+  async dispatcherDrainStatus(): Promise<DrainSnapshot> {
+    return drainSnapshot(await udsRequest(this.policy.dispatcher_socket, "GET", "/v1/admin/drain-status",
+      undefined, this.policy.timeouts.health_ms), "dispatcher");
+  }
+
   async quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot> {
     let snapshot = drainSnapshot(await udsRequest(this.policy.dispatcher_socket, "POST", "/v1/admin/quiesce", {
       schema_version: 1, protocol: 1, operation_id: requestId, target_sha: targetSha,

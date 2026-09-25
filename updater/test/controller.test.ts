@@ -338,6 +338,8 @@ class FakeRuntime implements RuntimePort {
   private mainAgentExists = true;
   private dispatcherLive = true;
   private slackLive = true;
+  slackQuiescing = false;
+  dispatcherQuiescing = false;
   mainAgentSha = currentSha;
   constructor(
     private readonly store: ReleaseStore,
@@ -357,8 +359,10 @@ class FakeRuntime implements RuntimePort {
     this.calls.push("quiesceSlack");
     if (this.slackRestartedDuringDrain ||
         (this.slackRestartedDuringRollbackDrain && this.mainAgentSha === targetSha)) {
+      this.slackQuiescing = false;
       return { service: "slack_adapter", quiescing: false, drained: false, in_flight: 0, unsafe_states: [] };
     }
+    this.slackQuiescing = true;
     if ((this.rollbackSlackDrainIncomplete && this.mainAgentSha === targetSha) ||
       (this.forwardSlackDrainIncomplete && this.mainAgentSha === currentSha)) {
       this.slackLive = false;
@@ -370,13 +374,23 @@ class FakeRuntime implements RuntimePort {
     this.calls.push("quiesceDispatcher");
     if (this.dispatcherRestartedDuringDrain ||
         (this.dispatcherRestartedDuringRollbackDrain && this.mainAgentSha === targetSha)) {
+      this.dispatcherQuiescing = false;
       return { service: "dispatcher", quiescing: false, drained: false, in_flight: 0, unsafe_states: [] };
     }
+    this.dispatcherQuiescing = true;
     if (this.dispatcherDrainIncomplete || (this.rollbackDispatcherDrainIncomplete && this.mainAgentSha === targetSha)) {
       this.dispatcherLive = false;
       return { service: "dispatcher", quiescing: true, drained: false, in_flight: 1, unsafe_states: ["jobs.handoff_unavailable:1"] };
     }
     return { service: "dispatcher", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] };
+  }
+  async slackDrainStatus(): Promise<DrainSnapshot> {
+    return { service: "slack_adapter", quiescing: this.slackQuiescing,
+      drained: this.slackQuiescing, in_flight: 0, unsafe_states: [] };
+  }
+  async dispatcherDrainStatus(): Promise<DrainSnapshot> {
+    return { service: "dispatcher", quiescing: this.dispatcherQuiescing,
+      drained: this.dispatcherQuiescing, in_flight: 0, unsafe_states: [] };
   }
   async stopSlack() { this.calls.push("stopSlack"); this.slackLive = false; return ok; }
   async stopDispatcher() {
@@ -393,11 +407,13 @@ class FakeRuntime implements RuntimePort {
     }
     if (this.dispatcherRegistrationAppearsOnCall === this.dispatcherRegistrationCalls) {
       this.dispatcherRegistrationOverride = true;
+      this.dispatcherLive = true;
     }
     return this.dispatcherRegistrationOverride ?? this.dispatcherLive;
   }
   async startDispatcher() {
     this.calls.push("startDispatcher");
+    this.dispatcherQuiescing = false;
     if (this.dispatcherStartThrows) throw new Error("dispatcher_registration_unverified");
     if (this.currentRecoveryDispatcherStartRejectedOnce && this.mainAgentSha === currentSha) {
       this.currentRecoveryDispatcherStartRejectedOnce = false;
@@ -422,6 +438,7 @@ class FakeRuntime implements RuntimePort {
   }
   async startSlack() {
     this.calls.push("startSlack");
+    this.slackQuiescing = false;
     this.slackLive = true;
     await this.afterSlackStart?.();
     return ok;
@@ -685,6 +702,7 @@ describe("UpdateController isolated end-to-end", () => {
       plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-registration-race" });
     f.dispatcher.terminal = true;
     f.runtime.dispatcherRegistrationAppearsOnCall = 2;
+    f.runtime.rotateMainAgentSessionOnStart = true;
     await f.controller.processNext();
     assert.equal(f.database.get(planned.request_id as string)?.last_error_code,
       "dispatcher_registration_restored_before_activation");
@@ -705,6 +723,24 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.state, "failed", JSON.stringify({ error: row.last_error_code, calls: f.runtime.calls,
       operations: f.database.runtimeOperations(row.request_id) }));
     assert.equal(row.last_error_code, "dispatcher_registration_unverified");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher")?.phase, "observed");
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
+  test("restores old runtime when Dispatcher stop registration proof is unreadable", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stop-registration-read" });
+    f.dispatcher.terminal = true;
+    f.runtime.dispatcherRegistrationThrowsOnCall = 1;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "failed");
+    assert.equal(row.last_error_code, "stop_dispatcher_registration_unverified");
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher")?.phase, "observed");
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
     assert.equal((await f.store.observe()).current_sha, currentSha);
@@ -1116,6 +1152,36 @@ describe("UpdateController isolated end-to-end", () => {
     await f.controller.processNext();
     assert.equal(f.database.get(requestId)?.last_error_code, "rollback_active_worker_handoff_unavailable");
     assert.equal((await f.store.observe()).current_sha, targetSha);
+    assert.equal(f.database.runtimeOperation(requestId, "restart_target_slack_after_drain")?.phase, "observed");
+    assert.equal(f.runtime.calls.at(-1), "startSlack");
+    f.database.close();
+  });
+  test("restores live quiesced Slack when resumed rollback finds a worker", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-live-quiesced-slack" });
+    const requestId = planned.request_id as string;
+    let row = f.database.claim(requestId, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    const staging = await f.store.prepareStaging(requestId, row.fence);
+    await fs.writeFile(path.join(staging, "app.js"), "export {};\n", { mode: 0o600 });
+    const release = await f.store.publish(staging, manifest(targetSha));
+    row = f.database.transition(requestId, row.fence, "staged", "release_staged");
+    row = f.database.transition(requestId, row.fence, "quiescing", "runtime_quiesce_started");
+    row = f.database.transition(requestId, row.fence, "activating", "runtime_quiesced");
+    const activation = await f.store.activate(row, release);
+    f.database.recordActivationGeneration(requestId, row.fence, activation.generation);
+    row = f.database.transition(requestId, row.fence, "restarting", "pointer_activated",
+      { activation_generation: activation.generation });
+    f.database.transition(requestId, row.fence, "rolling_back", "rollback_started");
+    f.runtime.mainAgentSha = targetSha;
+    await f.runtime.quiesceSlack();
+    f.runtime.activeWorkerCount = 1;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(requestId)?.last_error_code, "rollback_active_worker_handoff_unavailable");
     assert.equal(f.database.runtimeOperation(requestId, "restart_target_slack_after_drain")?.phase, "observed");
     assert.equal(f.runtime.calls.at(-1), "startSlack");
     f.database.close();

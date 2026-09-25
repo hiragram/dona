@@ -275,7 +275,14 @@ export class JobSupervisor {
         throw new Error(`Job ${jobId} is blocked and could not accept steer input`);
       }
       if (!prompted.timedOut && ["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
-        this.database.markJobNeedsReview(jobId, prompted.errorCode!, commandMessage(prompted));
+        this.database.clearJobSteer(jobId, sourceEventId);
+        const current = this.database.getJob(jobId);
+        if (current && ["completed", "failed", "cancelled"].includes(current.status) &&
+          current.last_error_code === "terminal_steer_worker_unverified") {
+          this.database.markTerminalJobWorkerStopped(jobId, "terminal_steer_worker_unverified");
+        } else {
+          this.database.markJobNeedsReview(jobId, prompted.errorCode!, commandMessage(prompted));
+        }
         this.wake();
         throw new Error(commandMessage(prompted));
       }

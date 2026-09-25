@@ -995,6 +995,27 @@ describe("JobSupervisor", () => {
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
     database.close();
   });
+  test("definitive steer absence clears a terminal dispatching marker", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-steer-terminal-source")).row;
+    const followUp = database.enqueue(eventEnvelope("Ev-steer-terminal-follow-up")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "完了と競合",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    markRunning(database, job.job_id);
+    const runtime = fakeRuntime({ async prompt() {
+      database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id,
+        status: "completed", summary: "完了", completed_at: new Date().toISOString() }, job.result_path);
+      return failed("agent_not_found");
+    } });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    await assert.rejects(supervisor.steer(job.job_id, followUp.event_id, "追加条件"), /agent_not_found/);
+    assert.equal(database.getJob(job.job_id)?.status, "completed");
+    assert.equal(database.getJob(job.job_id)?.steer_state, null);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, null);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    database.close();
+  });
 
   test("uses the persisted agent name when monitoring a job after restart", async () => {
     const { root, config } = await tempConfig();
