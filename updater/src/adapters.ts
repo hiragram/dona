@@ -601,7 +601,17 @@ export class RealRuntime implements RuntimePort {
   }
 
   stopDispatcher(): Promise<CommandResult> {
-    return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    return this.launchctl(["bootout", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+  }
+
+  async dispatcherRegistered(): Promise<boolean> {
+    const result = await this.launchctl(["print", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    if (result.timed_out || result.output_truncated || result.exit_code === null) {
+      throw new Error("dispatcher_registration_unverified");
+    }
+    if (result.exit_code === 0) return true;
+    if (/Could not find (?:specified )?service/i.test(result.stderr)) return false;
+    throw new Error("dispatcher_registration_unverified");
   }
 
   migrateAppSchema(_requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
@@ -673,8 +683,14 @@ export class RealRuntime implements RuntimePort {
     return resolved;
   }
 
-  startDispatcher(): Promise<CommandResult> {
-    return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+  async startDispatcher(): Promise<CommandResult> {
+    if (await this.dispatcherRegistered()) {
+      return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    }
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("launchctl_requires_unix_uid");
+    return this.launchctl(["bootstrap", `gui/${uid}`,
+      path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")]);
   }
 
   startSlack(): Promise<CommandResult> {

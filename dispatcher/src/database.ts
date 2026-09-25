@@ -645,7 +645,9 @@ export class DispatcherDatabase {
         const mayHaveLiveLegacyAgent=["retryable_failed","preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status);
         if(mayHaveLiveLegacyAgent) this.db.prepare("INSERT OR IGNORE INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(row.job_id);
         if(mayHaveLiveLegacyAgent) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
-          last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
+          last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?
+          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop marker WHERE marker.job_id=jobs.job_id AND marker.stopped_at IS NULL)`)
+          .run(new Date().toISOString(),row.job_id);
         else if(row.status==="queued") this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
       }
       if(["status","result_path","last_error_code","last_error_message","updated_at"].every(column=>eventColumns.has(column))) {
@@ -1098,13 +1100,15 @@ export class DispatcherDatabase {
   listTerminalJobsNeedingWorkerStopProof(afterJobId = "", limit = 100): JobRow[] {
     return this.db.prepare(`SELECT * FROM jobs WHERE job_id>? AND status IN ('completed','failed','cancelled')
       AND last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+      AND COALESCE(steer_state,'') <> 'dispatching'
       ORDER BY job_id LIMIT ?`).all(afterJobId,limit) as JobRow[];
   }
 
   markTerminalJobWorkerStopped(jobId: string, expectedCode: string): void {
     this.db.prepare(`UPDATE jobs SET last_error_code=CASE WHEN status='failed' THEN 'agent_reported_failure' ELSE NULL END,
       last_error_message=NULL,steer_state=NULL,updated_at=? WHERE job_id=? AND status IN ('completed','failed','cancelled')
-      AND last_error_code=? AND last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')`)
+      AND last_error_code=? AND last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+      AND COALESCE(steer_state,'') <> 'dispatching'`)
       .run(nowUtc(),jobId,expectedCode);
   }
 

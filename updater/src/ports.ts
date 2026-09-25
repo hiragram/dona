@@ -63,6 +63,7 @@ export interface RuntimePort {
   quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot>;
   stopSlack(): Promise<CommandResult>;
   stopDispatcher(): Promise<CommandResult>;
+  dispatcherRegistered(): Promise<boolean>;
   migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult>;
   appSchemaState(): Promise<{ user_version: number; integrity_ok: boolean; foreign_key_violations: number }>;
   schemaMigrationCapability(capability: string): Promise<{ ready: boolean; build_sha: string | null }>;

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import Database from "better-sqlite3";
@@ -20,6 +21,28 @@ class RecordingRunner {
     return this.result;
   }
 }
+
+test("Dispatcher registration read distinguishes bootout from an ambiguous launchctl failure", async () => {
+  const { root, policy } = await tempPolicy();
+  try {
+    const recording = new RecordingRunner();
+    const runtime = new RealRuntime(policy, recording as unknown as ProcessRunner);
+    assert.equal(await runtime.dispatcherRegistered(), true);
+    recording.result = { ...ok, exit_code: 113, stderr: "Could not find service" };
+    assert.equal(await runtime.dispatcherRegistered(), false);
+    await runtime.startDispatcher();
+    recording.result = { ...ok, exit_code: 1, stderr: "permission denied" };
+    await assert.rejects(runtime.dispatcherRegistered(), /dispatcher_registration_unverified/);
+    const uid = process.getuid!();
+    assert.deepEqual(recording.calls.map(call => call.args), [
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["bootstrap", `gui/${uid}`, path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+    ]);
+  } finally { await removeTree(root); }
+});
 
 function agentResponse(cwd: string, sessionId: string | null, interactiveReady = true): string {
   return JSON.stringify({
@@ -201,7 +224,8 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
     const uid = process.getuid!();
     assert.deepEqual(recording.calls.map(({ executable, args }) => [executable, ...args]), [
       [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.slack_label}`],
-      [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "bootout", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
       [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.dispatcher_label}`],
       [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.slack_label}`],
     ]);

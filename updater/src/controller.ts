@@ -737,6 +737,12 @@ export class UpdateController {
           typeof evidence.cause_code === "string" ? evidence.cause_code : "pre_activation_recovery_unverified");
         return;
       }
+      if (await this.runtime.dispatcherRegistered()) {
+        this.assertLease(row);
+        this.needsReview(row, "dispatcher_registration_restored_before_activation");
+        return;
+      }
+      this.assertLease(row);
       const workerBeforeActivation = await this.runtime.workerSafety();
       this.assertLease(row);
       if (!workerBeforeActivation.safe) {
@@ -1493,14 +1499,13 @@ export class UpdateController {
       this.needsReview(row, `${kind}_rejected`, `The persisted ${kind} operation was definitively rejected`);
       return false;
     }
-    if (existing?.phase === "prepared") {
-      this.deferOrReview(row, `${kind}_acceptance_unknown`, `The prepared ${kind} intent has no stop acceptance evidence`);
-      return false;
-    }
+    const dispatcherUnregistered = async (): Promise<boolean> =>
+      service !== "dispatcher" || !(await this.runtime.dispatcherRegistered());
     if (existing) {
       const health = await this.waitForStopped(service);
       this.assertLease(row);
-      if (!health.live) {
+      if (!health.live && await dispatcherUnregistered()) {
+        this.assertLease(row);
         this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health }, this.clock.now());
         return true;
       }
@@ -1510,7 +1515,8 @@ export class UpdateController {
 
     const before = service === "dispatcher" ? await this.runtime.dispatcherHealth() : await this.runtime.slackHealth();
     this.assertLease(row);
-    if (!before.live) {
+    if (!before.live && await dispatcherUnregistered()) {
+      this.assertLease(row);
       this.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, expectedSha, null, {}, this.clock.now());
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health: before }, this.clock.now());
       return true;
@@ -1543,7 +1549,8 @@ export class UpdateController {
     }, this.clock.now());
     const health = await this.waitForStopped(service);
     this.assertLease(row);
-    if (!health.live) {
+    if (!health.live && await dispatcherUnregistered()) {
+      this.assertLease(row);
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health }, this.clock.now());
       return true;
     }

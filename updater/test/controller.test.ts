@@ -266,6 +266,9 @@ class FakeDispatcher implements DispatcherPort {
 }
 
 class FakeRuntime implements RuntimePort {
+  dispatcherRegistrationOverride: boolean | undefined;
+  dispatcherRegistrationAppearsOnCall: number | undefined;
+  private dispatcherRegistrationCalls = 0;
   activeWorkerCount = 0;
   workerAppearsAfterForwardStop = false;
   workerAppearsAfterRollbackStop = false;
@@ -380,6 +383,13 @@ class FakeRuntime implements RuntimePort {
     if ((this.workerAppearsAfterForwardStop && this.mainAgentSha === currentSha) ||
       (this.workerAppearsAfterRollbackStop && this.mainAgentSha === targetSha)) this.activeWorkerCount = 1;
     return ok;
+  }
+  async dispatcherRegistered() {
+    this.dispatcherRegistrationCalls += 1;
+    if (this.dispatcherRegistrationAppearsOnCall === this.dispatcherRegistrationCalls) {
+      this.dispatcherRegistrationOverride = true;
+    }
+    return this.dispatcherRegistrationOverride ?? this.dispatcherLive;
   }
   async startDispatcher() {
     this.calls.push("startDispatcher");
@@ -658,6 +668,20 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(row.last_error_code, "active_worker_handoff_unavailable");
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.equal(f.runtime.calls.includes(`startMainAgent:${targetSha}`), false);
+    f.database.close();
+  });
+  test("refuses activation when Dispatcher becomes registered again after stop", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-registration-race" });
+    f.dispatcher.terminal = true;
+    f.runtime.dispatcherRegistrationAppearsOnCall = 2;
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.last_error_code,
+      "dispatcher_registration_restored_before_activation");
+    assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
   for (const phase of ["prepared", "accepted", "observed"] as const) {

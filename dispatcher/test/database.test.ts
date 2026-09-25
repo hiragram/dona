@@ -1657,6 +1657,24 @@ describe("DispatcherDatabase", () => {
     reopened.close();
   });
 
+  test("preserves an invalid Result diagnosis after legacy agent stop across restart", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-legacy-stopped-diagnosis")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "結果確認",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    database.close();
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='needs_review',result_path=?,last_error_code='invalid_result' WHERE job_id=?")
+      .run(`${config.jobResultsDir}/${job.job_id}.json`, job.job_id);
+    raw.prepare("INSERT INTO legacy_job_agents_to_stop(job_id,stopped_at) VALUES(?,?)")
+      .run(job.job_id, new Date().toISOString());
+    raw.close();
+    const reopened = new DispatcherDatabase(config.databasePath);
+    assert.equal(reopened.getJob(job.job_id)?.last_error_code, "invalid_result");
+    reopened.close();
+  });
+
   test("keeps terminal legacy agents unsafe until a durable stop is recorded", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -1737,6 +1755,24 @@ describe("DispatcherDatabase", () => {
     database.markJobSteerAccepted(job.job_id, "evt-followup");
     assert.equal(database.getJob(job.job_id)?.last_error_code, "terminal_steer_worker_unverified");
     assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    database.close();
+  });
+
+  test("terminal stop proof waits for dispatching steer acceptance", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-terminal-pending-steer-proof")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "受理待ちsteer",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',steer_state='dispatching',steer_event_id='evt-followup',last_error_code='terminal_steer_worker_unverified' WHERE job_id=?")
+      .run(job.job_id);
+    raw.close();
+    assert.deepEqual(database.listTerminalJobsNeedingWorkerStopProof().map(row => row.job_id), []);
+    database.markTerminalJobWorkerStopped(job.job_id, "terminal_steer_worker_unverified");
+    assert.equal(database.getJob(job.job_id)?.steer_state, "dispatching");
+    database.markJobSteerAccepted(job.job_id, "evt-followup");
+    assert.deepEqual(database.listTerminalJobsNeedingWorkerStopProof().map(row => row.job_id), [job.job_id]);
     database.close();
   });
 
