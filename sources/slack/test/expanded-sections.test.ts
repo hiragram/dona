@@ -217,3 +217,12 @@ test("an escaped long angle token stays with its preceding slash", () => {
   assert.ok(blocks.some((block) => block.text.text.includes(`\\${token}`)));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("a greater-than sign inside code does not continue a quote", () => {
+  const blocks = expandedSections(`\`\`\`\n>${"x".repeat(7_000)}\n\`\`\``, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith(">")));
+
+  const inline = expandedSections(`\`\n>${"x".repeat(7_000)}\n\``, "identity", true);
+  assert.ok(inline.slice(1).every((block) => !block.text.text.startsWith(">")));
+});

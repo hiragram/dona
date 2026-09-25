@@ -236,7 +236,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     const startsInsideFence = state.fence;
     const startsInsideInline = [...state.inline];
     const lineStart = text.lastIndexOf("\n", rawOffset - 1) + 1;
-    const continuesQuote = rawOffset > lineStart && text[lineStart] === ">";
+    const continuesQuote = rawOffset > lineStart && text[lineStart] === ">" && !fenceOpenAt(text, lineStart) && !inlineCodeOpenAt(text, lineStart);
     const quotePrefix = multiQuoteStart >= 0 && rawOffset > multiQuoteStart ? ">>>" : continuesQuote ? ">" : "";
     let rendered = `${quotePrefix}${startsInsideFence ? "```\n" : startsInsideInline.join("")}`;
     let cursor = 0;
