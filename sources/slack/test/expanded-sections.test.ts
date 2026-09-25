@@ -554,3 +554,10 @@ test("a Slack phone link stays together at a section boundary", () => {
   assert.ok(blocks.some((block) => block.text.text.includes(token)));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("a Slack deep link stays together at a section boundary", () => {
+  const token = "<slack://channel?team=T123&id=C123|Open channel>";
+  const blocks = expandedSections("x".repeat(2_890) + token + "y".repeat(500), "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(token)));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
