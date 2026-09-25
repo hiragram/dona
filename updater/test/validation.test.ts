@@ -52,6 +52,9 @@ describe("fixed self-update surface", () => {
     const { root, policy } = await tempPolicy();
     try {
       assert.throws(() => parsePolicy({ ...policy, canonical_remote: "https://example.invalid/other.git" }), /canonical_remote/);
+      assert.throws(() => parsePolicy({ ...policy,
+        diagnostic_aggregate_limit_bytes: policy.diagnostic_log_limit_bytes,
+      }), /both command and observation logs/);
       assert.throws(() => parsePolicy({ ...policy, control_root: `${policy.release_root}/control` }), /outside/);
       assert.throws(() => parsePolicy({ ...policy, config_root: "/tmp/unrelated-config" }), /fixed base/);
       assert.throws(() => parsePolicy({ ...policy, main_agent: { ...policy.main_agent, session: "other" } }), /main_agent/);

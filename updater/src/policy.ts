@@ -199,8 +199,8 @@ export function parsePolicy(input: unknown): UpdatePolicy {
   if (new Set(transitionKeys).size !== transitionKeys.length) throw new ValidationError("compatibility_transitions contains duplicates");
   const diagnosticLogLimitBytes = integer(value.diagnostic_log_limit_bytes, "diagnostic_log_limit_bytes", 4_096);
   const diagnosticAggregateLimitBytes = integer(value.diagnostic_aggregate_limit_bytes, "diagnostic_aggregate_limit_bytes", 4_096);
-  if (diagnosticAggregateLimitBytes < diagnosticLogLimitBytes) {
-    throw new ValidationError("diagnostic_aggregate_limit_bytes must cover at least one diagnostic log");
+  if (diagnosticAggregateLimitBytes < diagnosticLogLimitBytes * 2) {
+    throw new ValidationError("diagnostic_aggregate_limit_bytes must cover both command and observation logs");
   }
   return {
     schema_version: 1,
