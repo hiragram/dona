@@ -51,16 +51,15 @@ function isEscaped(text: string, index: number): boolean {
 function insideAngleToken(text: string, index: number): boolean {
   const open = text.lastIndexOf("<", index);
   if (open < 0 || open < text.lastIndexOf("\n", index) || open < text.lastIndexOf(">", index)) return false;
-  const close = text.indexOf(">", index + 1);
-  if (close === -1) return false;
-  const newline = text.indexOf("\n", index + 1);
-  return newline === -1 || newline > close;
+  return angleTokenClose(text, open) !== -1;
 }
 
 function angleTokenClose(text: string, open: number): number {
   const close = text.indexOf(">", open + 1);
   const newline = text.indexOf("\n", open + 1);
-  return close !== -1 && (newline === -1 || close < newline) ? close : -1;
+  if (close === -1 || (newline !== -1 && newline < close)) return -1;
+  const content = text.slice(open + 1, close);
+  return /^(?:https?:\/\/|mailto:|[@#!])\S+$/i.test(content) ? close : -1;
 }
 
 function fenceOpenAt(text: string, end: number): boolean {
@@ -133,6 +132,10 @@ function hasMatchingClose(text: string, start: number, marker: InlineMarker, can
         continue;
       }
     }
+    if (text[index] === ":") {
+      const alias = /^:[a-z0-9_+-]+:/i.exec(text.slice(index));
+      if (alias) { index += alias[0].length - 1; continue; }
+    }
     if (text[index] === "`" && marker !== "`" && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`", candidates))) {
       inCode = !inCode;
       continue;
@@ -169,6 +172,10 @@ function advanceMrkdwnState(
         index = close;
         continue;
       }
+    }
+    if (text[index] === ":") {
+      const alias = /^:[a-z0-9_+-]+:/i.exec(text.slice(index));
+      if (alias) { index += alias[0].length - 1; continue; }
     }
     const marker = text[index];
     if (marker !== "`" && marker !== "*" && marker !== "_" && marker !== "~") continue;
@@ -319,6 +326,13 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     let chunk = mrkdwn
       ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? `${rendered.endsWith("\n") ? "" : "\n"}\`\`\`` : ""}`
       : rawChunk;
+    if (mrkdwn && !quotePrefix && rawOffset - rawChunk.length === lineStart && rawChunk.startsWith(">>>") && startsInsideInline.length && !startsInsideFence) {
+      const markers = startsInsideInline.join("");
+      chunk = `>>>${markers}${chunk.slice(markers.length + 3)}`;
+    }
+    if (mrkdwn && startsInsideInline.length === 1 && rawChunk.startsWith(startsInsideInline[0]!) && state.inline.length === 0 && !startsInsideFence) {
+      chunk = chunk.slice(startsInsideInline[0]!.length + 1);
+    }
     let plainFallback = false;
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
@@ -326,8 +340,32 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     const closingMarkers = [...startsInsideInline].reverse().join("");
     if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
       const token = rawChunk.slice(0, -closingMarkers.length);
-      if ((/^<[^>]+>$/.test(token) || /^:[a-z0-9_+-]+:$/i.test(token)) && token.length <= 3_000) {
+      const escapedToken = /^(\\+)<[^>]+>$/.exec(token);
+      if ((/^<[^>]+>$/.test(token) || /^:[a-z0-9_+-]+:$/i.test(token) || (escapedToken && escapedToken[1]!.length % 2 === 1)) && token.length <= 3_000) {
         chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
+      }
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length === 0 && state.inline.length === 0) {
+      const opening = /^([*_~]+)/.exec(rawChunk)?.[1] ?? "";
+      const closing = [...opening].reverse().join("");
+      if (opening && rawChunk.endsWith(closing)) {
+        const token = rawChunk.slice(opening.length, -closing.length);
+        const escapedToken = /^(\\+)<[^>]+>$/.exec(token);
+        if ((/^<[^>]+>$/.test(token) || /^:[a-z0-9_+-]+:$/i.test(token) || (escapedToken && escapedToken[1]!.length % 2 === 1)) && token.length <= 3_000) {
+          chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
+        }
+      }
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && startsInsideInline.length === 0 && state.inline.length === 1) {
+      const opening = /^([*_~]+)/.exec(rawChunk)?.[1] ?? "";
+      const closing = [...opening].reverse().join("");
+      const consumedClosing = closing.slice(0, -state.inline.length);
+      if (opening && consumedClosing && rawChunk.endsWith(consumedClosing)) {
+        const token = rawChunk.slice(opening.length, -consumedClosing.length);
+        const escapedToken = /^(\\+)<[^>]+>$/.exec(token);
+        if ((/^<[^>]+>$/.test(token) || /^:[a-z0-9_+-]+:$/i.test(token) || (escapedToken && escapedToken[1]!.length % 2 === 1)) && token.length <= 3_000) {
+          chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
+        }
       }
     }
     const escapedAngle = /^(\\+)<[^>]+>$/.exec(rawChunk);

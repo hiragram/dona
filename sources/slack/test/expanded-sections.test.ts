@@ -414,3 +414,26 @@ test("a near-limit emoji alias followed by nested closing markers is delivered",
   assert.ok(blocks.some((block) => block.text.text === alias));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("a comparison sign is not treated as a long Slack token", () => {
+  const blocks = expandedSections(`*bold < threshold ${"x".repeat(7_000)}* > threshold`, "identity", true);
+  assert.ok(blocks.slice(1, -1).every((block) => block.text.text.startsWith("*")));
+});
+
+test("an escaped near-limit link followed by nested closers is delivered", () => {
+  const token = `<https://${"a".repeat(2_982)}|P>`;
+  const escaped = `\\\\\\${token}`;
+  const blocks = expandedSections(`*_${escaped}_*tail${"x".repeat(100)}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === escaped));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
+
+test("an existing quote marker precedes reopened inline formatting", () => {
+  const blocks = expandedSections(`>>>*intro\n${"a".repeat(2_890)}\n>>>second${"b".repeat(300)}*`, "identity", true);
+  assert.ok(blocks.slice(1).some((block) => block.text.text.startsWith(">>>*second")));
+});
+
+test("an underscore inside an emoji alias does not create emphasis", () => {
+  const blocks = expandedSections(`:foo-_bar:${"x".repeat(7_000)}_`, "identity", true);
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("_")));
+});
