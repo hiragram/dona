@@ -85,7 +85,7 @@ function findMultiQuoteStart(text: string): number {
       continue;
     }
     if (inFence || isEscaped(text, index)) continue;
-    if (text[index] === "`") inCode = !inCode;
+    if (text[index] === "`" && !insideAngleToken(text, index)) inCode = !inCode;
     if (!inCode && (index === 0 || text[index - 1] === "\n") && text.startsWith(">>>", index)) return index;
   }
   return -1;
@@ -238,6 +238,14 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       let slashStart = end;
       while (slashStart > offset && text[slashStart - 1] === "\\") slashStart--;
       if ((end - slashStart) % 2 === 1) end = slashStart > offset ? slashStart : end + 1;
+    }
+    if (mrkdwn && end < text.length && end - offset < 3_000 && !isEscaped(text, end)) {
+      const marker = text[end] as InlineMarker;
+      if (marker === "*" || marker === "_" || marker === "~") {
+        const boundaryState: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
+        advanceMrkdwnState(text.slice(0, end), boundaryState, text, 0);
+        if (boundaryState.inline.includes(marker) && !boundaryState.fence) end++;
+      }
     }
     if (end <= offset) end = offset + 1;
     chunks.push(text.slice(offset, end));

@@ -303,6 +303,19 @@ describe("Dona Slack MCP server", () => {
         event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
       });
 
+      const mentionResult = await client.callTool({
+        name: "post_message",
+        arguments: {
+          workspace: "company",
+          channel_id: "C123",
+          text: "<https://example.com|link> <!channel> <!here> <@U123> <@U123|name> <!subteam^S123>",
+          event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+        },
+      });
+      const safeText = "<https://example.com|link> &lt;!channel> &lt;!here> &lt;@U123> &lt;@U123|name> &lt;!subteam^S123>";
+      assert.equal(fake.posts.at(-1)?.text, safeText);
+      assert.equal((mentionResult.structuredContent as { body_sha256?: string })?.body_sha256, createHash("sha256").update(safeText).digest("hex"));
+
       const plainScheduledResult = await client.callTool({
         name: "post_message",
         arguments: {

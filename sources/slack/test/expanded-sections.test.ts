@@ -291,3 +291,14 @@ test("asterisks surrounded by spaces do not become emphasis across sections", ()
   assert.ok(blocks.length > 1);
   assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("*")));
 });
+
+test("a closing inline marker at the split boundary stays in the first section", () => {
+  const blocks = expandedSections(`*${"a".repeat(2_899)}* ${"b".repeat(1_000)}`, "identity", true);
+  assert.ok(blocks[0]?.text.text.endsWith("*"));
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("**")));
+});
+
+test("a backtick in a Slack token does not hide a following multi-line quote", () => {
+  const blocks = expandedSections(`<https://example.com/\`tick|P>\n>>>intro\n${"x".repeat(7_000)}`, "identity", true);
+  assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith(">>>")));
+});

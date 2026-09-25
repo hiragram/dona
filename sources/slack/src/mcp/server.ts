@@ -508,9 +508,12 @@ export function createSlackMcpServer(
         const connection = registry.get(workspace);
         const effectiveMrkdwn=event_id?(mrkdwn??true):mrkdwn;
         const effectiveParse=event_id?"none" as const:parse;
+        const safeText=event_id&&effectiveMrkdwn
+          ? text.replace(/<!(?:channel|here|everyone)(?:\|[^>]+)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>|<@[A-Z0-9]+(?:\|[^>]+)?>/gi, (mention) => `&lt;${mention.slice(1)}`)
+          : text;
         const result = await connection.client.postMessage({
           channelId: channel_id,
-          text,
+          text: safeText,
           ...(thread_ts ? { threadTs: thread_ts } : {}),
           replyBroadcast: reply_broadcast,
           ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
@@ -525,7 +528,7 @@ export function createSlackMcpServer(
           message_ts: result.messageTs,
           ...(result.threadTs ? { thread_ts: result.threadTs } : {}),
         });
-        const body_sha256=createHash("sha256").update(text).digest("hex");
+        const body_sha256=createHash("sha256").update(safeText).digest("hex");
         return success({
           workspace,
           channel_id: result.channelId,
