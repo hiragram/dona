@@ -204,3 +204,16 @@ test("a long angle string inside inline code stays literal", () => {
   assert.ok(blocks.every((block) => block.text.text.startsWith("`") && block.text.text.endsWith("`")));
   assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
 });
+
+test("multi-line quote continues through a split code fence", () => {
+  const blocks = expandedSections(`>>>intro\n\`\`\`\n${"x".repeat(7_000)}\n\`\`\`\nend`, "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith(">>>")));
+});
+
+test("an escaped long angle token stays with its preceding slash", () => {
+  const token = `<https://${"a".repeat(2_888)}|P>`;
+  const blocks = expandedSections(`\\${token}${"tail".repeat(100)}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(`\\${token}`)));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});

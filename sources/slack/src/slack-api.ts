@@ -183,7 +183,8 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
         const lastCloseToken = prefix.lastIndexOf(">");
         if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken) && !inlineCodeOpenAt(text, offset + lastOpenToken)) {
           const close = text.indexOf(">", offset + lastOpenToken + 1);
-          if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
+          if (close !== -1 && isEscaped(text, offset + lastOpenToken) && close + 1 - offset <= 3_000) end = close + 1;
+          else if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
           else if (close !== -1 && close + 1 - offset <= 3_000) end = close + 1;
         }
         const lastEntity = prefix.lastIndexOf("&");
@@ -237,7 +238,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     const lineStart = text.lastIndexOf("\n", rawOffset - 1) + 1;
     const continuesQuote = rawOffset > lineStart && text[lineStart] === ">";
     const quotePrefix = multiQuoteStart >= 0 && rawOffset > multiQuoteStart ? ">>>" : continuesQuote ? ">" : "";
-    let rendered = startsInsideFence ? "```\n" : `${quotePrefix}${startsInsideInline.join("")}`;
+    let rendered = `${quotePrefix}${startsInsideFence ? "```\n" : startsInsideInline.join("")}`;
     let cursor = 0;
     if (mrkdwn) {
       for (const match of rawChunk.matchAll(/```/g)) {
