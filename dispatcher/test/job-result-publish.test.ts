@@ -130,6 +130,7 @@ describe("job result publish contract", () => {
     }
     assert.equal(validateJobResultPublish({ ...base, summary: "coverage 95% complete" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.equal(validateJobResultPublish({ ...base, artifacts: [{ session_count: 3 }], actions: [{ token_count: 100 }] }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    assert.equal(validateJobResultPublish({ ...base, summary: "token_count: 123 session_count=3" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ session_count: "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     for (const assignment of ["AWS_SECRET_ACCESS_KEY=CANARY_VALUE", "PGPASSWORD=CANARY_VALUE", "GITHUB_TOKEN=CANARY_VALUE", '{"client_secret":"CANARY_VALUE"}', '{"client-secret":"CANARY_VALUE"}', '{"set-cookie":"sessionid=CANARY_VALUE"}', '"password" = "CANARY_VALUE"']) {
       assert.throws(() => validateJobResultPublish({ ...base, output: { format: "text", text: assignment } }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
@@ -336,6 +337,8 @@ describe("job result publish contract", () => {
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from(grant.capability, "utf8").toString("base64url") }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: Buffer.from("private objective text", "utf8").toString("base64") }, () => current), code("content_requires_redaction"));
     const decoratedCapability = `${grant.capability.slice(0, 20)}*${grant.capability.slice(20)}`;
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: grant.capability } },
       () => current), code("content_requires_redaction"));

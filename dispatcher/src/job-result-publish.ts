@@ -338,6 +338,19 @@ class ForbiddenValueMatcher {
   }
 }
 
+function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher): boolean {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (const match of value.matchAll(/[A-Za-z0-9+/_-]{8,8192}={0,2}/g)) {
+    const encoded = match[0];
+    const format = /[+/]/.test(encoded) ? "base64" : "base64url";
+    const bytes = Buffer.from(encoded, format);
+    if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
+    try { if (matcher.contains(decoder.decode(bytes))) return true; }
+    catch { /* Non-UTF-8 data is not worker-visible text. */ }
+  }
+  return false;
+}
+
 function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
@@ -373,7 +386,11 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
         try { key = JSON.parse(rawKey); }
         catch { key = rawKey.replace(/\\"/g, '"').replace(/^"|"$/g, ""); }
       } else if (rawKey.startsWith("'")) key = rawKey.slice(1, -1);
-      if (forbiddenKey(key)) throw new JobResultPublishError("content_requires_redaction");
+      if (forbiddenKey(key)) {
+        const remaining = value.slice(match.index! + match[0].length);
+        const count = /^\s*(\d+)(?=$|[\s,;)}\]])/.exec(remaining);
+        if (!count || !isPublicCountField(key, Number(count[1]))) throw new JobResultPublishError("content_requires_redaction");
+      }
     }
     for (const match of value.matchAll(cliCredentialCandidate)) {
       if (forbiddenKey(match[1]!)) throw new JobResultPublishError("content_requires_redaction");
@@ -413,7 +430,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1);
     }
-    if (sensitive.test(value) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (sensitive.test(value) || (forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
