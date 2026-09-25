@@ -35,7 +35,7 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:\bmachine\s+[^\s]+\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const sensitive = /(?:(?:^|\s)(?:-u\s*|--user(?:=|\s+))[^:\s]+:[^\s]+|\bmachine\s+[^\s]+\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
@@ -284,7 +284,7 @@ function forbiddenKey(key: string): boolean {
     /^(?:sig|signature|x_amz_signature|x_goog_signature)$/.test(normalized) ||
     /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|accountkey|privatekey|capability|cookie|sessionid)$/.test(normalized.replaceAll("_", "")) ||
     /(?:^|_)(?:api|access|account|private)_key(?:_|$)/.test(normalized) ||
-    /^(?:api_key|access_key|private_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
+    /^(?:api_key|access_key|private_key|client_key_data|tls_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
     normalized.startsWith("herdr_");
 }
 function normalizedStructuredKey(key: string): string {
@@ -496,8 +496,12 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
   // Fixed schema keys are Dispatcher-owned; inspect only worker-provided fields.
   assertSafeJson(parsed.data.summary, 0, forbiddenDigests, matcher, forbiddenFingerprints);
   if (parsed.data.output !== undefined) assertSafeJson(parsed.data.output.text, 0, forbiddenDigests, matcher, forbiddenFingerprints);
-  if (parsed.data.output?.text.trim()) assertSafeJson(`${parsed.data.summary}\n\n${parsed.data.output.text}`, 0,
-    forbiddenDigests, matcher, forbiddenFingerprints);
+  if (parsed.data.output?.text.trim()) {
+    assertSafeJson(`${parsed.data.summary}\n\n${parsed.data.output.text}`, 0,
+      forbiddenDigests, matcher, forbiddenFingerprints);
+    assertSafeJson(`${parsed.data.summary}${parsed.data.output.text}`, 0,
+      forbiddenDigests, matcher, forbiddenFingerprints);
+  }
   if (parsed.data.artifacts !== undefined) assertSafeJson(parsed.data.artifacts, 0, forbiddenDigests, matcher, forbiddenFingerprints);
   if (parsed.data.actions !== undefined) assertSafeJson(parsed.data.actions, 0, forbiddenDigests, matcher, forbiddenFingerprints);
   const envelope: JobResultEnvelope = {
