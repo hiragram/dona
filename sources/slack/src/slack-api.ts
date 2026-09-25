@@ -326,7 +326,9 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     const closingMarkers = [...startsInsideInline].reverse().join("");
     if (chunk.length > 3_000 && !startsInsideFence && closingMarkers && state.inline.length === 0 && rawChunk.endsWith(closingMarkers)) {
       const token = rawChunk.slice(0, -closingMarkers.length);
-      if (/^<[^>]+>$/.test(token) && token.length <= 3_000) chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
+      if ((/^<[^>]+>$/.test(token) || /^:[a-z0-9_+-]+:$/i.test(token)) && token.length <= 3_000) {
+        chunk = quotePrefix && token.length <= 2_999 ? `>${token}` : token;
+      }
     }
     const escapedAngle = /^(\\+)<[^>]+>$/.exec(rawChunk);
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && escapedAngle && escapedAngle[1]!.length % 2 === 1 && rawChunk.length <= 3_000) {

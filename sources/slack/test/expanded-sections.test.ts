@@ -407,3 +407,10 @@ test("comparison signs on separate lines do not hide an emphasis close", () => {
   const blocks = expandedSections(`*bold < threshold\n${"x".repeat(7_000)}*\nvalue > threshold`, "identity", true);
   assert.ok(blocks.slice(1, -1).every((block) => block.text.text.startsWith("*")));
 });
+
+test("a near-limit emoji alias followed by nested closing markers is delivered", () => {
+  const alias = `:${"a".repeat(2_995)}:`;
+  const blocks = expandedSections(`*_${alias}_*tail${"x".repeat(100)}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === alias));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
