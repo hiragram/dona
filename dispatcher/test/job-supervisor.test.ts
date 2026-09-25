@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, test } from "node:test";
+import Database from "better-sqlite3";
 
 import { DispatcherDatabase } from "../src/database.js";
 import type { DispatcherConfig } from "../src/config.js";
@@ -105,6 +106,103 @@ afterEach(async () => {
 });
 
 describe("JobSupervisor", () => {
+  for (const agentPresent of [true, false]) {
+    test(`cancel of stale preparation ${agentPresent ? "retains unknown agent" : "confirms agent absent"}`, async () => {
+      const { root, config } = await tempConfig();
+      roots.push(root);
+      const database = new DispatcherDatabase(config.databasePath);
+      const job = createScratchJob(database, config, `Ev-stale-preparing-cancel-${agentPresent}`);
+      database.beginJobPreparation(job.job_id);
+      database.recoverStaleJobs();
+      let cancelCalls = 0;
+      const supervisor = new JobSupervisor(database, fakeRuntime({
+        async get() { return agentPresent ? ok("working") : failed("agent_not_found"); },
+        async cancel() { cancelCalls += 1; return ok("idle"); },
+      }), config, logger, () => undefined);
+      if (agentPresent) await assert.rejects(supervisor.cancel(job.job_id, job.source_event_id), /requires review/);
+      else await supervisor.cancel(job.job_id, job.source_event_id);
+      assert.equal(cancelCalls, 0);
+      assert.equal(database.getJob(job.job_id)?.status, agentPresent ? "needs_review" : "cancelled");
+      assert.equal(database.updateSafetyStatus().active_worker_count, agentPresent ? 1 : 0);
+      database.close();
+    });
+  }
+  test("cancel stops an identity-recorded stale preparation agent before terminal status", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-known-cancel");
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "workspace", "pane");
+    database.recoverStaleJobs();
+    let cancelled = false;
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async get() { return ok(cancelled ? "idle" : "working"); },
+      async cancel() { cancelled = true; return ok("idle"); },
+    }), config, logger, () => undefined);
+    await supervisor.cancel(job.job_id, job.source_event_id);
+    assert.equal(cancelled, true);
+    assert.equal(database.getJob(job.job_id)?.status, "cancelled");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    database.close();
+  });
+
+  test("keeps a stale preparation with unknown agent identity in review after a later prepare failure", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.maxAttempts = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-orphan");
+    database.beginJobPreparation(job.job_id);
+    database.recoverStaleJobs();
+    let prepares = 0;
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async prepare() { prepares += 1; throw new Error("worktree verification failed"); },
+    }), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    assert.equal(prepares, 1);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "stale_preparing_agent_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    await supervisor.stop();
+    database.close();
+  });
+  test("keeps an identity-recorded stale agent in review after a later prepare failure", async () => {
+    const { root, config } = await tempConfig();
+    roots.push(root);
+    config.maxAttempts = 1;
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-known-orphan");
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id, "workspace", "pane");
+    database.recoverStaleJobs();
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async prepare() { throw new Error("worktree verification failed"); },
+    }), config, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.status === "needs_review");
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "stale_preparing_agent_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    await supervisor.stop();
+    database.close();
+  });
+
+  test("accepts definitive agent absence when cancelling a stale preparation review", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-stale-preparing-reviewed-cancel");
+    database.beginJobPreparation(job.job_id);
+    database.recoverStaleJobs();
+    database.markJobNeedsReview(job.job_id, "stale_preparing_agent_unverified", "agent state unknown");
+    const supervisor = new JobSupervisor(database, fakeRuntime({
+      async cancel() { return failed("agent_not_found"); },
+    }), config, logger, () => undefined);
+    await supervisor.cancel(job.job_id, job.source_event_id);
+    assert.equal(database.getJob(job.job_id)?.status, "cancelled");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    database.close();
+  });
+
   test("fills global slots round-robin without exceeding the per-event limit", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -897,6 +995,42 @@ describe("JobSupervisor", () => {
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
     database.close();
   });
+  test("queued follow-up receipt reports a duplicate after another follow-up", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-queued-followup-source")).row;
+    const first = database.enqueue(eventEnvelope("Ev-queued-followup-first")).row;
+    const second = database.enqueue(eventEnvelope("Ev-queued-followup-second")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "調査",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+    assert.equal((await supervisor.steer(job.job_id, first.event_id, "A")).duplicate, false);
+    assert.equal((await supervisor.steer(job.job_id, second.event_id, "B")).duplicate, false);
+    assert.equal((await supervisor.steer(job.job_id, first.event_id, "A")).duplicate, true);
+    assert.equal(database.getJob(job.job_id)?.objective.split("[DONA_FOLLOW_UP]").length, 3);
+    database.close();
+  });
+  test("definitive steer absence clears a terminal dispatching marker", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-steer-terminal-source")).row;
+    const followUp = database.enqueue(eventEnvelope("Ev-steer-terminal-follow-up")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "完了と競合",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    markRunning(database, job.job_id);
+    const runtime = fakeRuntime({ async prompt() {
+      database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id,
+        status: "completed", summary: "完了", completed_at: new Date().toISOString() }, job.result_path);
+      return failed("agent_not_found");
+    } });
+    const supervisor = new JobSupervisor(database, runtime, config, logger, () => undefined);
+    await assert.rejects(supervisor.steer(job.job_id, followUp.event_id, "追加条件"), /agent_not_found/);
+    assert.equal(database.getJob(job.job_id)?.status, "completed");
+    assert.equal(database.getJob(job.job_id)?.steer_state, null);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, null);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    database.close();
+  });
 
   test("uses the persisted agent name when monitoring a job after restart", async () => {
     const { root, config } = await tempConfig();
@@ -1086,7 +1220,7 @@ describe("JobSupervisor", () => {
     const updated = database.getJob(job.job_id)!;
     assert.equal(updated.status, "completed", `${updated.last_error_code}: ${updated.last_error_message}`);
     assert.equal(prompts, 1);
-    assert.equal(gets, 2);
+    assert.ok(gets >= 2);
     assert.ok(database.getJob(job.job_id)?.prompt_accepted_at);
     database.close();
   });
@@ -1668,6 +1802,55 @@ describe("JobSupervisor", () => {
     await (supervisor as unknown as {stopLegacySharedGrantAgents():Promise<void>}).stopLegacySharedGrantAgents();
     assert.deepEqual(calls,["cancel","close","get"]); assert.equal(marked,true);
     database.close();
+  });
+  test("terminal jobのworker停止を読み取りで確認して安全markerを解除する",async()=>{
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-stop-proof");
+    const raw=new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',last_error_code='terminal_steer_worker_unverified' WHERE job_id=?")
+      .run(job.job_id);
+    raw.close();
+    let reads=0;
+    const runtime=fakeRuntime({async get(){reads+=1;return ok(reads===1?"working":"idle");}});
+    const supervisor=new JobSupervisor(database,runtime,{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();
+    await waitFor(()=>database.getJob(job.job_id)?.last_error_code===null);
+    assert.ok(reads>=2);
+    assert.equal(database.updateSafetyStatus().active_worker_count,0);
+    await supervisor.stop();database.close();
+  });
+  test("legacy terminal accepted steer is counted until a bounded stop proof", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-legacy-terminal-accepted-steer");
+    const raw = new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET status='completed',steer_state='accepted' WHERE job_id=?").run(job.job_id);
+    raw.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    const supervisor = new JobSupervisor(database, fakeRuntime({ async get() { return failed("agent_not_found"); } }),
+      { ...config, queuePollMs: 5 }, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.steer_state === null);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    await supervisor.stop(); database.close();
+  });
+  test("normal terminal worker is excluded after a durable bounded stop proof", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const job = createScratchJob(database, config, "Ev-normal-terminal-stop-proof");
+    markRunning(database, job.job_id);
+    database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id,
+      status: "completed", summary: "完了", completed_at: new Date().toISOString() }, job.result_path);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    const supervisor = new JobSupervisor(database, fakeRuntime({ async get() { return failed("agent_not_found"); } }),
+      { ...config, queuePollMs: 5 }, logger, () => undefined);
+    supervisor.start();
+    await waitFor(() => database.updateSafetyStatus().active_worker_count === 0);
+    const raw = new Database(config.databasePath);
+    assert.ok(raw.prepare("SELECT stopped_at FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(job.job_id));
+    raw.close();
+    await supervisor.stop(); database.close();
   });
   test("discovers cleanup candidates from progress directories instead of cancelled history", async () => {
     const { root, config } = await tempConfig();

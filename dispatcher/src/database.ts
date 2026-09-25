@@ -640,12 +640,24 @@ export class DispatcherDatabase {
         throw error;
       }
       this.db.exec("CREATE TABLE IF NOT EXISTS legacy_job_agents_to_stop(job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,stopped_at TEXT)");
+      this.db.exec(`CREATE TABLE IF NOT EXISTS job_queued_steer_receipts(
+        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+        source_event_id TEXT NOT NULL,
+        PRIMARY KEY(job_id,source_event_id))`);
+      this.db.prepare(`INSERT OR IGNORE INTO job_queued_steer_receipts(job_id,source_event_id)
+        SELECT job_id,steer_event_id FROM jobs WHERE steer_event_id IS NOT NULL AND steer_state='accepted'
+          AND status IN ('queued','retryable_failed')`).run();
+      this.db.exec(`CREATE TABLE IF NOT EXISTS job_terminal_worker_stop_proofs(
+        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+        stopped_at TEXT NOT NULL)`);
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
         const mayHaveLiveLegacyAgent=["retryable_failed","preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status);
         if(mayHaveLiveLegacyAgent) this.db.prepare("INSERT OR IGNORE INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(row.job_id);
         if(mayHaveLiveLegacyAgent) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
-          last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?`).run(new Date().toISOString(),row.job_id);
+          last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?
+          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop marker WHERE marker.job_id=jobs.job_id AND marker.stopped_at IS NULL)`)
+          .run(new Date().toISOString(),row.job_id);
         else if(row.status==="queued") this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
       }
       if(["status","result_path","last_error_code","last_error_message","updated_at"].every(column=>eventColumns.has(column))) {
@@ -756,7 +768,7 @@ export class DispatcherDatabase {
       .get(eventId) !== undefined;
   }
 
-  updateSafetyStatus(): { safe: boolean; unsafe_states: string[] } {
+  updateSafetyStatus(): { safe: boolean; unsafe_states: string[]; active_worker_count: number; worker_recovery_state: "clear" | "handoff_unavailable" } {
     const unsafe: string[] = [];
     const eventRows = this.db.prepare(`
       SELECT status, COUNT(*) AS count FROM events
@@ -765,13 +777,51 @@ export class DispatcherDatabase {
     for (const row of eventRows) unsafe.push(`events.${row.status}:${row.count}`);
     const jobRows = this.db.prepare(`
       SELECT status, COUNT(*) AS count FROM jobs
-      WHERE status IN ('dispatching', 'cancelling') GROUP BY status
+      WHERE (status IN ('preparing', 'dispatching', 'running', 'blocked', 'needs_review', 'cancelling')
+        AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
+          AND attempt_count=0 AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
+        AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
+          ('invalid_result_agent_stopped','agent_not_found','agent_not_running','workspace_cleanup_agent_stopped'))
+        AND NOT (status='needs_review'
+          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l
+            WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)))
+        OR (status = 'retryable_failed' AND (last_error_code = 'stale_preparing' OR
+          (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
+        OR steer_state = 'dispatching'
+        OR (status IN ('completed','failed','cancelled') AND steer_state='accepted')
+        OR (status IN ('completed','failed','cancelled') AND last_error_code='schedule_reconcile_worker_unverified')
+        OR (status IN ('completed','failed','cancelled') AND last_error_code IN
+          ('terminal_steer_worker_unverified','cancel_worker_unverified'))
+        OR (status IN ('completed','failed','cancelled') AND herdr_workspace_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM job_terminal_worker_stop_proofs p WHERE p.job_id=jobs.job_id)
+          AND COALESCE(last_error_code,'') NOT IN
+            ('agent_not_found','agent_not_running','invalid_result_agent_stopped',
+             'workspace_cleanup_agent_stopped','cancel_worker_stopped'))
+      GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
     for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
+    // The current release protocol has no durable handoff receipt binding an
+    // isolated result grant and Herdr session to the next Dispatcher. A stopped
+    // supervisor is not proof that the external agent stopped. Refuse activation
+    // while any such worker may exist, including legacy agents marked for stop.
+    const legacy = this.db.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
+      JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
+        AND COALESCE(j.steer_state,'') NOT IN ('dispatching','accepted')
+        AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
+        AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+        AND NOT (j.status IN ('completed','failed','cancelled') AND j.herdr_workspace_id IS NOT NULL)
+        AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
+        AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
+          (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)
+      .get() as { count: number };
+    if (legacy.count > 0) unsafe.push(`jobs.legacy_shared_grant:${legacy.count}`);
+    const activeWorkerCount = jobRows.reduce((count, row) => count + row.count, 0) + legacy.count;
     const steer = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE steer_state = 'dispatching'")
       .get() as { count: number };
     if (steer.count > 0) unsafe.push(`jobs.steer_acceptance_unknown:${steer.count}`);
-    return { safe: unsafe.length === 0, unsafe_states: unsafe };
+    return { safe: unsafe.length === 0, unsafe_states: unsafe,
+      active_worker_count: activeWorkerCount,
+      worker_recovery_state: activeWorkerCount === 0 ? "clear" : "handoff_unavailable" };
   }
 
   getBySequence(sequence: number): EventRow | undefined {
@@ -959,7 +1009,7 @@ export class DispatcherDatabase {
 
   listLegacySharedGrantJobs():JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN legacy_job_agents_to_stop l USING(job_id) WHERE l.stopped_at IS NULL
-      AND j.status IN ('retryable_failed','preparing','dispatching','running','blocked','needs_review','cancelling') ORDER BY j.created_at,j.job_id`).all() as JobRow[];
+      ORDER BY j.created_at,j.job_id`).all() as JobRow[];
   }
 
   markLegacySharedGrantAgentStopped(jobId:string):void {this.db.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=? WHERE job_id=?").run(nowUtc(),jobId);}
@@ -1050,10 +1100,53 @@ export class DispatcherDatabase {
 
   markJobRuntimeCleaned(jobId: string): void {
     this.db.transaction(()=>{
-      const changed=this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,updated_at=?
-        WHERE job_id=? AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId).changes;
-      if(changed===1)this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
+      const changed=this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,
+        last_error_code=CASE WHEN last_error_code='workspace_cleanup_failed'
+          THEN 'workspace_cleanup_agent_stopped' WHEN last_error_code IN
+          ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified')
+          THEN NULL ELSE last_error_code END,
+        updated_at=? WHERE job_id=? AND herdr_workspace_id IS NOT NULL
+        AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId).changes;
+      if(changed===1) {
+        this.db.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=COALESCE(stopped_at,?) WHERE job_id=?")
+          .run(nowUtc(),jobId);
+        this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
+      }
     }).immediate();
+  }
+
+  listTerminalJobsNeedingWorkerStopProof(afterJobId = "", limit = 100): JobRow[] {
+    return this.db.prepare(`SELECT * FROM jobs WHERE job_id>? AND status IN ('completed','failed','cancelled')
+      AND (steer_state='accepted' OR last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+        OR (last_error_code='schedule_reconcile_worker_unverified' AND herdr_workspace_id IS NULL)
+        OR (herdr_workspace_id IS NOT NULL AND NOT EXISTS
+          (SELECT 1 FROM job_terminal_worker_stop_proofs p WHERE p.job_id=jobs.job_id)))
+      AND COALESCE(steer_state,'') <> 'dispatching'
+      ORDER BY job_id LIMIT ?`).all(afterJobId,limit) as JobRow[];
+  }
+
+  markTerminalJobWorkerStopped(jobId: string, expectedCode: string): void {
+    this.db.prepare(`UPDATE jobs SET last_error_code=CASE
+      WHEN last_error_code='schedule_reconcile_worker_unverified' AND status='failed' THEN 'schedule_reconciled_failed'
+      WHEN status='failed' THEN 'agent_reported_failure' ELSE NULL END,
+      last_error_message=NULL,steer_state=NULL,updated_at=? WHERE job_id=? AND status IN ('completed','failed','cancelled')
+      AND last_error_code=? AND (last_error_code IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+        OR (last_error_code='schedule_reconcile_worker_unverified' AND herdr_workspace_id IS NULL))
+      AND COALESCE(steer_state,'') <> 'dispatching'`)
+      .run(nowUtc(),jobId,expectedCode);
+  }
+
+  markTerminalAcceptedSteerStopped(jobId: string): void {
+    this.db.prepare(`UPDATE jobs SET steer_state=NULL,updated_at=? WHERE job_id=?
+      AND status IN ('completed','failed','cancelled') AND steer_state='accepted'`)
+      .run(nowUtc(),jobId);
+  }
+
+  markTerminalWorkerStopProof(jobId: string): void {
+    this.db.prepare(`INSERT OR IGNORE INTO job_terminal_worker_stop_proofs(job_id,stopped_at)
+      SELECT job_id,? FROM jobs WHERE job_id=? AND status IN ('completed','failed','cancelled')
+        AND herdr_workspace_id IS NOT NULL AND COALESCE(steer_state,'') <> 'dispatching'`)
+      .run(nowUtc(),jobId);
   }
 
   getJobGroup(sourceEventId: string): JobGroupRow | undefined {
@@ -1229,7 +1322,8 @@ export class DispatcherDatabase {
     const timestamp = at.toISOString();
     const changed = this.db.prepare(`
       UPDATE jobs SET status = 'preparing', attempt_count = attempt_count + 1,
-        last_error_code = NULL, last_error_message = NULL, updated_at = ?
+        last_error_code = NULL, last_error_message = NULL,
+        steer_event_id = NULL, steer_state = NULL, updated_at = ?
       WHERE job_id = ? AND status IN ('queued', 'retryable_failed') AND available_at <= ?
     `).run(timestamp, jobId, timestamp).changes;
     if (changed !== 1) throw new Error(`Job ${jobId} is no longer ready to prepare`);
@@ -1644,7 +1738,13 @@ export class DispatcherDatabase {
       }
       const result=this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
       if(row.job_id) {
-        this.db.prepare("UPDATE jobs SET status=?,completed_at=?,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status IN ('needs_review','blocked')")
+        this.db.prepare(`UPDATE jobs SET status=?,completed_at=?,
+          last_error_code=CASE WHEN (dispatch_started_at IS NOT NULL OR prompt_accepted_at IS NOT NULL OR herdr_workspace_id IS NOT NULL
+              OR COALESCE(last_error_code,'') IN ('stale_preparing_agent_unverified','legacy_agent_sandbox_unknown'))
+            AND COALESCE(last_error_code,'') NOT IN ('invalid_result_agent_stopped','agent_not_found','agent_not_running')
+            AND NOT EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)
+            THEN 'schedule_reconcile_worker_unverified' ELSE NULL END,
+          last_error_message=NULL,updated_at=? WHERE job_id=? AND status IN ('needs_review','blocked')`)
           .run(outcome,reconciledAt,reconciledAt,row.job_id);
         this.db.prepare("UPDATE job_completion_results SET work_state=? WHERE job_id=? AND work_state='needs_review'").run(outcome,row.job_id);
       }
@@ -1698,7 +1798,9 @@ export class DispatcherDatabase {
         if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
         this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running","cancelling"], status, {
           result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
-          last_error_code: result.status === "failed" ? "agent_reported_failure" : null,
+          last_error_code: job.status === "cancelling" && job.last_error_code !== "cancel_worker_stopped"
+            ? "cancel_worker_unverified" : job.steer_state === "dispatching" || job.steer_state === "accepted"
+              ? "terminal_steer_worker_unverified" : result.status === "failed" ? "agent_reported_failure" : null,
           last_error_message: result.status === "failed" ? result.summary : null,
         });
         if (recoverAmbiguous && attentionEventId && binding?.owner.kind === "slack_thread") {
@@ -1710,13 +1812,14 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): JobRow {
+  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): { row: JobRow; duplicate: boolean } {
     return this.db.transaction(() => {
       this.assertJobSourceMatchesThread(jobId, sourceEventId);
       this.assertJobSteerAllowed(jobId);
       if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
       const row = this.getJobRequired(jobId);
-      if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return row;
+      if (this.db.prepare("SELECT 1 FROM job_queued_steer_receipts WHERE job_id=? AND source_event_id=?")
+        .get(jobId,sourceEventId)) return { row, duplicate: true };
       if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
       const addition = `\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
       const objective = row.objective + addition;
@@ -1728,7 +1831,9 @@ export class DispatcherDatabase {
       if (attempted > maximum) throw new JobCreationError("job_group_limit_exceeded","Effective job group objective limit exceeded",{resource:"objective_utf8_bytes_per_event",current,attempted,maximum});
       this.db.prepare(`UPDATE jobs SET objective=?,steer_event_id=?,steer_state='accepted',updated_at=? WHERE job_id=?`)
         .run(objective,sourceEventId,nowUtc(),jobId);
-      return this.getJobRequired(jobId);
+      this.db.prepare("INSERT INTO job_queued_steer_receipts(job_id,source_event_id) VALUES(?,?)")
+        .run(jobId,sourceEventId);
+      return { row: this.getJobRequired(jobId), duplicate: false };
     }).immediate();
   }
 
@@ -1737,6 +1842,8 @@ export class DispatcherDatabase {
     this.assertJobSteerAllowed(jobId);
     if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
     const row = this.getJobRequired(jobId);
+    if (this.db.prepare("SELECT 1 FROM job_queued_steer_receipts WHERE job_id=? AND source_event_id=?")
+      .get(jobId,sourceEventId)) return { row, duplicate: true };
     if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return { row, duplicate: true };
     if (row.status !== "running") throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
     this.db.prepare(`
@@ -1747,7 +1854,9 @@ export class DispatcherDatabase {
 
   markJobSteerAccepted(jobId: string, sourceEventId: string): void {
     const changed = this.db.prepare(`
-      UPDATE jobs SET steer_state = 'accepted', updated_at = ?
+      UPDATE jobs SET steer_state = 'accepted',
+        last_error_code=CASE WHEN status IN ('completed','failed','cancelled') THEN 'terminal_steer_worker_unverified' ELSE last_error_code END,
+        updated_at = ?
       WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
     `).run(nowUtc(), jobId, sourceEventId).changes;
     if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
@@ -1803,17 +1912,21 @@ export class DispatcherDatabase {
       this.db.prepare("UPDATE job_groups SET all_terminal_event_id=NULL WHERE source_event_id=?")
         .run(row.source_event_id);
       this.updateJob(jobId, [row.status], "cancelling", { completion_event_id: null });
+      this.db.prepare("UPDATE jobs SET last_error_code='cancel_worker_unverified' WHERE job_id=? AND status='cancelling'")
+        .run(jobId);
     }).immediate();
     return this.getJobRequired(jobId);
   }
 
   markJobCancelled(jobId: string, reason: string, at = new Date()): void {
     this.db.transaction(() => {
+      const workerStopped = this.getJobRequired(jobId).last_error_code === "cancel_worker_stopped";
       this.updateJob(jobId, ["cancelling"], "cancelled", {
         completed_at: at.toISOString(),
         last_error_code: "cancelled",
         last_error_message: reason,
       });
+      if (workerStopped) this.markTerminalWorkerStopProof(jobId);
       const job=this.getJobRequired(jobId);
       const attentionEventId=this.getJobGroup(job.source_event_id)?.attention_event_id;
       if(attentionEventId && readEventJobBinding(this.db,job.source_event_id)?.owner.kind==="slack_thread") {
@@ -1821,6 +1934,16 @@ export class DispatcherDatabase {
         if(payload.job_id===jobId) this.recordAttentionResolution(jobId,attentionEventId,"cancelled","operator_reconcile",null,at);
       }
     }).immediate();
+  }
+
+  markJobCancellationWorkerStopped(jobId: string): void {
+    this.db.prepare(`UPDATE jobs SET last_error_code=CASE
+      WHEN status='cancelling' THEN 'cancel_worker_stopped'
+      WHEN status='failed' THEN 'agent_reported_failure'
+      ELSE NULL END, last_error_message=NULL, updated_at=?
+      WHERE job_id=? AND (status='cancelling' OR
+        (status IN ('completed','failed','cancelled') AND last_error_code='cancel_worker_unverified'))`)
+      .run(nowUtc(),jobId);
   }
 
   enqueueJobNotification(jobId: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): EnqueueResult {

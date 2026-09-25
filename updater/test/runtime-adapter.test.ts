@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import Database from "better-sqlite3";
@@ -20,6 +21,28 @@ class RecordingRunner {
     return this.result;
   }
 }
+
+test("Dispatcher registration read distinguishes bootout from an ambiguous launchctl failure", async () => {
+  const { root, policy } = await tempPolicy();
+  try {
+    const recording = new RecordingRunner();
+    const runtime = new RealRuntime(policy, recording as unknown as ProcessRunner);
+    assert.equal(await runtime.dispatcherRegistered(), true);
+    recording.result = { ...ok, exit_code: 113, stderr: "Could not find service" };
+    assert.equal(await runtime.dispatcherRegistered(), false);
+    await runtime.startDispatcher();
+    recording.result = { ...ok, exit_code: 1, stderr: "permission denied" };
+    await assert.rejects(runtime.dispatcherRegistered(), /dispatcher_registration_unverified/);
+    const uid = process.getuid!();
+    assert.deepEqual(recording.calls.map(call => call.args), [
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      ["bootstrap", `gui/${uid}`, path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")],
+      ["print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+    ]);
+  } finally { await removeTree(root); }
+});
 
 function agentResponse(cwd: string, sessionId: string | null, interactiveReady = true): string {
   return JSON.stringify({
@@ -167,6 +190,17 @@ async function listen(
 
 test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without live process access", async () => {
   const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const dispatcherDatabasePath = path.join(root, "Dona", "dona.sqlite3");
+  const dispatcherDatabase = new Database(dispatcherDatabasePath);
+  dispatcherDatabase.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  dispatcherDatabase.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  dispatcherDatabase.exec("ALTER TABLE jobs ADD COLUMN job_id TEXT");
+  dispatcherDatabase.prepare("INSERT INTO jobs (status,job_id) VALUES ('completed','old-terminal')").run();
+  dispatcherDatabase.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('old-terminal','2026-09-25T00:00:00Z')").run();
+  dispatcherDatabase.close();
+  await fs.chmod(dispatcherDatabasePath, 0o600);
   const requests: unknown[] = [];
   const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests, 1);
   const slack = await listen(policy.slack_socket, "slack_adapter", requests);
@@ -189,14 +223,176 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
     ]);
     const uid = process.getuid!();
     assert.deepEqual(recording.calls.map(({ executable, args }) => [executable, ...args]), [
-      [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.slack_label}`],
-      [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "bootout", `gui/${uid}/${policy.launchd.slack_label}`],
+      [policy.executables.launchctl, "bootout", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
       [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "print", `gui/${uid}/${policy.launchd.slack_label}`],
       [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.slack_label}`],
     ]);
     assert.equal(Object.values(recording.calls[0]!.options.env ?? {}).some((value) => /token|secret/i.test(value)), false);
   } finally {
     await Promise.all([new Promise<void>((resolve) => dispatcher.close(() => resolve())), new Promise<void>((resolve) => slack.close(() => resolve()))]);
+    await removeTree(root);
+  }
+});
+
+test("RealRuntime refuses a legacy drained response while a durable worker remains active", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.prepare("INSERT INTO jobs (status,herdr_workspace_id) VALUES ('running','private-agent')").run();
+  database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('retryable_failed','stale_preparing')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const requests: unknown[] = [];
+  const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    const snapshot = await runtime.quiesceDispatcher("upd_01m1es03xy5cf8d9pm5cwx4srv", targetSha);
+    assert.equal(snapshot.drained, false);
+    assert.deepEqual(snapshot.unsafe_states, ["jobs.handoff_unavailable:2"]);
+    assert.equal(JSON.stringify(snapshot).includes("private-agent"), false);
+  } finally {
+    await new Promise<void>((resolve) => dispatcher.close(() => resolve()));
+    await removeTree(root);
+  }
+});
+
+test("RealRuntime counts terminal legacy agents until durable stop", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  database.prepare("INSERT INTO jobs (job_id,status) VALUES ('legacy-terminal','failed')").run();
+  database.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('legacy-terminal',NULL)").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at='2026-09-25T00:00:00Z'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+  } finally { await removeTree(root); }
+});
+
+test("RealRuntime counts a reconciled terminal schedule worker without stop proof", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  for (const code of ["schedule_reconcile_worker_unverified", "terminal_steer_worker_unverified",
+    "cancel_worker_unverified"]) {
+    database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('failed',?)").run(code);
+  }
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).active_worker_count, 3);
+  } finally { await removeTree(root); }
+});
+
+test("RealRuntime distinguishes unresolved steer from definite retryable agent absence", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.prepare("INSERT INTO jobs (status,steer_state) VALUES ('completed','dispatching')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const settled = new Database(databasePath);
+    settled.prepare("UPDATE jobs SET steer_state='accepted'").run();
+    settled.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const retryable = new Database(databasePath);
+    retryable.prepare("UPDATE jobs SET status='retryable_failed',herdr_workspace_id='recorded',last_error_code='agent_not_found'").run();
+    retryable.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    const uncertain = new Database(databasePath);
+    uncertain.prepare("UPDATE jobs SET last_error_code='stale_preparing'").run();
+    uncertain.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const terminalCancel = new Database(databasePath);
+    terminalCancel.prepare("UPDATE jobs SET status='completed',steer_state=NULL,last_error_code=NULL,herdr_workspace_id='recorded'").run();
+    terminalCancel.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const proof = new Database(databasePath);
+    proof.exec("ALTER TABLE jobs ADD COLUMN job_id TEXT");
+    proof.prepare("UPDATE jobs SET job_id='terminal-job'").run();
+    proof.exec("CREATE TABLE job_terminal_worker_stop_proofs(job_id TEXT PRIMARY KEY,stopped_at TEXT NOT NULL)");
+    proof.prepare("INSERT INTO job_terminal_worker_stop_proofs VALUES('terminal-job',?)").run(new Date().toISOString());
+    proof.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE jobs SET last_error_code='agent_not_found'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+  } finally { await removeTree(root); }
+});
+
+test("RealRuntime excludes only a proven pre-prepare result collision", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  database.prepare("INSERT INTO jobs (job_id,status,last_error_code) VALUES ('collision-job','needs_review','result_path_exists')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).safe, true);
+    const retried = new Database(databasePath);
+    retried.prepare("UPDATE jobs SET attempt_count=1").run();
+    retried.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const firstAttempt = new Database(databasePath);
+    firstAttempt.prepare("UPDATE jobs SET attempt_count=0").run();
+    firstAttempt.close();
+    const guarded = new Database(databasePath);
+    guarded.prepare("UPDATE jobs SET herdr_workspace_id='possible-worker'").run();
+    guarded.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    for (const code of ["agent_not_found", "agent_not_running", "steer_acceptance_unknown"]) {
+      const state = new Database(databasePath);
+      state.prepare("UPDATE jobs SET last_error_code=?").run(code);
+      state.close();
+      assert.equal((await runtime.workerSafety()).active_worker_count,
+        code === "steer_acceptance_unknown" ? 1 : 0);
+    }
+    const legacy = new Database(databasePath);
+    legacy.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown'").run();
+    legacy.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('collision-job',?)")
+      .run(new Date().toISOString());
+    legacy.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    const invalid = new Database(databasePath);
+    invalid.prepare("UPDATE jobs SET last_error_code='invalid_result'").run();
+    invalid.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+  } finally {
     await removeTree(root);
   }
 });

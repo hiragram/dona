@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseDotenv } from "dotenv";
+import Database from "better-sqlite3";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { BuildPort, DispatcherPort, GitPort, RuntimePort } from "./ports.js";
@@ -499,6 +500,55 @@ function shellSingleQuote(value: string): string {
 export class RealRuntime implements RuntimePort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
 
+  async workerSafety(): Promise<{ safe: boolean; active_worker_count: number; error_code?: string }> {
+    try {
+      const database = new Database(this.dispatcherDatabasePath(), { readonly: true, fileMustExist: true });
+      try {
+        const legacyTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get();
+        const stoppedLegacyClause = legacyTable ? `AND NOT (status='needs_review'
+          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l
+            WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL))` : "";
+        const terminalStoppedLegacyClause = legacyTable ? `AND NOT EXISTS
+          (SELECT 1 FROM legacy_job_agents_to_stop l WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)` : "";
+        const terminalProofTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_terminal_worker_stop_proofs'").get();
+        const terminalStopProofClause = terminalProofTable ? `AND NOT EXISTS
+          (SELECT 1 FROM job_terminal_worker_stop_proofs p WHERE p.job_id=jobs.job_id)` : "";
+        let active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs
+          WHERE (status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
+            AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
+              AND attempt_count=0 AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
+            AND NOT (status='needs_review' AND COALESCE(last_error_code,'') IN
+              ('invalid_result_agent_stopped','agent_not_found','agent_not_running','workspace_cleanup_agent_stopped'))
+            ${stoppedLegacyClause})
+            OR (status='retryable_failed' AND (last_error_code='stale_preparing' OR
+              (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
+            OR steer_state='dispatching'
+            OR (status IN ('completed','failed','cancelled') AND steer_state='accepted')
+            OR (status IN ('completed','failed','cancelled') AND herdr_workspace_id IS NOT NULL
+              AND COALESCE(last_error_code,'') NOT IN
+                ('agent_not_found','agent_not_running','invalid_result_agent_stopped',
+                 'workspace_cleanup_agent_stopped','cancel_worker_stopped')
+              ${terminalStopProofClause}
+              ${terminalStoppedLegacyClause})
+            OR (status IN ('completed','failed','cancelled') AND last_error_code IN
+              ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified'))`)
+          .get() as { count: number }).count;
+        if (legacyTable) active += (database.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
+          JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
+            AND COALESCE(j.steer_state,'') NOT IN ('dispatching','accepted')
+            AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
+            AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
+            AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
+            AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
+              (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)
+          .get() as { count: number }).count;
+        return { safe: active === 0, active_worker_count: active };
+      } finally { database.close(); }
+    } catch {
+      return { safe: false, active_worker_count: 0, error_code: "worker_state_unverified" };
+    }
+  }
+
   async quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot> {
     let snapshot = drainSnapshot(await udsRequest(this.policy.slack_socket, "POST", "/v1/admin/quiesce", {
       schema_version: 1, protocol: 1, operation_id: requestId, target_sha: targetSha,
@@ -513,6 +563,16 @@ export class RealRuntime implements RuntimePort {
     return snapshot;
   }
 
+  async slackDrainStatus(): Promise<DrainSnapshot> {
+    return drainSnapshot(await udsRequest(this.policy.slack_socket, "GET", "/v1/admin/drain-status",
+      undefined, this.policy.timeouts.health_ms), "slack_adapter");
+  }
+
+  async dispatcherDrainStatus(): Promise<DrainSnapshot> {
+    return drainSnapshot(await udsRequest(this.policy.dispatcher_socket, "GET", "/v1/admin/drain-status",
+      undefined, this.policy.timeouts.health_ms), "dispatcher");
+  }
+
   async quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot> {
     let snapshot = drainSnapshot(await udsRequest(this.policy.dispatcher_socket, "POST", "/v1/admin/quiesce", {
       schema_version: 1, protocol: 1, operation_id: requestId, target_sha: targetSha,
@@ -523,6 +583,15 @@ export class RealRuntime implements RuntimePort {
       snapshot = drainSnapshot(await udsRequest(
         this.policy.dispatcher_socket, "GET", "/v1/admin/drain-status", undefined, this.policy.timeouts.health_ms,
       ), "dispatcher");
+    }
+    if (snapshot.drained) {
+      // A pre-handoff Dispatcher can report a drained supervisor while Herdr
+      // workers still run. Independently inspect durable job state before any
+      // service stop, schema migration or pointer switch. No worker is stopped.
+      const worker = await this.workerSafety();
+      if (!worker.safe) snapshot = { ...snapshot, drained: false, in_flight: Math.max(snapshot.in_flight, 1),
+        unsafe_states: [...snapshot.unsafe_states, worker.error_code
+          ? "jobs.handoff_observation_unknown" : `jobs.handoff_unavailable:${worker.active_worker_count}`] };
     }
     return snapshot;
   }
@@ -550,11 +619,31 @@ export class RealRuntime implements RuntimePort {
   }
 
   stopSlack(): Promise<CommandResult> {
-    return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.slack_label)]);
+    return this.launchctl(["bootout", this.domainTarget(this.policy.launchd.slack_label)]);
+  }
+
+  slackRegistered(): Promise<boolean> {
+    return this.serviceRegistered(this.policy.launchd.slack_label);
   }
 
   stopDispatcher(): Promise<CommandResult> {
-    return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    return this.launchctl(["bootout", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+  }
+
+  async dispatcherRegistered(): Promise<boolean> {
+    return this.serviceRegistered(this.policy.launchd.dispatcher_label);
+  }
+
+  private async serviceRegistered(label: string): Promise<boolean> {
+    const errorCode = label === this.policy.launchd.dispatcher_label
+      ? "dispatcher_registration_unverified" : "slack_registration_unverified";
+    const result = await this.launchctl(["print", this.domainTarget(label)]);
+    if (result.timed_out || result.output_truncated || result.exit_code === null) {
+      throw new Error(errorCode);
+    }
+    if (result.exit_code === 0) return true;
+    if (/Could not find (?:specified )?service/i.test(result.stderr)) return false;
+    throw new Error(errorCode);
   }
 
   migrateAppSchema(_requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
@@ -626,12 +715,24 @@ export class RealRuntime implements RuntimePort {
     return resolved;
   }
 
-  startDispatcher(): Promise<CommandResult> {
-    return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+  async startDispatcher(): Promise<CommandResult> {
+    if (await this.dispatcherRegistered()) {
+      return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    }
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("launchctl_requires_unix_uid");
+    return this.launchctl(["bootstrap", `gui/${uid}`,
+      path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")]);
   }
 
-  startSlack(): Promise<CommandResult> {
-    return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.slack_label)]);
+  async startSlack(): Promise<CommandResult> {
+    if (await this.slackRegistered()) {
+      return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.slack_label)]);
+    }
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("launchctl_requires_unix_uid");
+    return this.launchctl(["bootstrap", `gui/${uid}`,
+      path.join(os.homedir(), "Library/LaunchAgents/dev.dona.slack-adapter.plist")]);
   }
 
   async waitForMainAgentIdle(): Promise<MainAgentObservation> {
@@ -848,6 +949,7 @@ export class RealRuntime implements RuntimePort {
       const response = parsedObject(await udsRequest(socketPath, "GET", "/health/version", undefined, this.policy.timeouts.health_ms));
       return {
         service,
+        observed: true,
         live: response.status === "live" || response.status === "ready",
         ready: response.status === "ready",
         build_sha: typeof response.build_sha === "string" ? response.build_sha : null,
@@ -869,7 +971,7 @@ export class RealRuntime implements RuntimePort {
         ...(service === "slack_adapter" ? { workspaces_ready: response.workspaces_ready === true } : {}),
       };
     } catch {
-      return { service, live: false, ready: false, build_sha: null, protocol: null, app_schema: null, config: null };
+      return { service, observed: false, live: false, ready: false, build_sha: null, protocol: null, app_schema: null, config: null };
     }
   }
 }

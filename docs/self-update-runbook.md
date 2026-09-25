@@ -36,6 +36,12 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 5. updaterは新規Slack ingressとDispatcher dequeueを止め、処理中の1件と`dona-main`のidleを待ってからCodexを終了します。owner-onlyの`config/dispatcher.env`と`config/slack.env`をMCPへ接続し、target releaseから同じpaneへ新しい`dona-main`を起動した後、Dispatcher、Slack Adapterの順に再開します。
 6. `get_self_update_status`で`runtime_state`、`runtime_operations`、`notification_state`、outbox、`main_agent`のcwd/sessionを確認します。terminal通知はmain agentを経由せず、専用workerから元Slack threadへ戻ります。`notification_state: reported`になるまで次のupdateは開始されません。
 
+### 稼働中のbackground worker
+
+現行のrelease間には、Herdr agent identityとjob単位のresult grantを次のDispatcherへ引き継いだことを証明するreceiptがありません。このため、`running`、`blocked`、`needs_review`等のworkerが残る場合は、isolated result pathでも更新を継続しません。stable Updaterはquiesce前とDispatcher drain後にowner-privateなjob DBを再読し、handoff不能または観測不能ならservice停止、schema migration、pointer切替より前に停止します。workerをcancel/closeしたり、promptを再送したりしません。
+
+Dispatcherの`update-safety`と`drain-status`に出るworker件数と`unsafe_states`は集計値だけです。`active_worker_handoff_unavailable`ならworkerのterminal Resultとnotificationを通常のDispatcherで回収・確認してから、新しいexact planで再開します。`worker_state_unverified`や`jobs.handoff_observation_unknown`ではDBの所有者、状態、healthを読み取りで照合し、更新writeを反復しません。稼働workerを跨ぐ更新は、release間のidentity・grant・terminal ownerを検証するhandoff契約とprocess境界テストが完成するまで未対応です。
+
 ### 失敗診断log
 
 pre-activation中の`npm ci/test/typecheck/build`は、memory上の`output_limit_bytes`とは独立して、受信時からstdout/stderrをstream種別付きで保存します。保存先はstable Updaterの`control_root/diagnostics/logs`だけで、directoryは0700、fileは0600です。request/attempt/stepとDBでbindしたopaque `log_id`からのみ参照し、caller指定path、絶対path、symlink、hard link、管理root外の参照は拒否します。

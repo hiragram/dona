@@ -319,6 +319,8 @@ export class DispatcherApi {
             !this.worker.isRunning() && !this.jobs.isRunning(),
           in_flight: unsafeStates.length,
           unsafe_states: unsafeStates,
+          active_worker_count: safety.active_worker_count,
+          worker_recovery_state: safety.worker_recovery_state,
         });
         return;
       }
@@ -359,6 +361,8 @@ export class DispatcherApi {
           drained,
           in_flight: unsafeStates.length,
           unsafe_states: unsafeStates,
+          active_worker_count: safety.active_worker_count,
+          worker_recovery_state: safety.worker_recovery_state,
         });
         return;
       }

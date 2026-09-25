@@ -113,6 +113,7 @@ export class JobSupervisor {
   private running = false;
   private stopping = false;
   private staleJobsRecovered = false;
+  private terminalStopProofCursor = "";
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -206,7 +207,9 @@ export class JobSupervisor {
       const stopped=await this.runtime.cancel(job.agent_name,this.abortController.signal);
       if(!stopped.ok&&["agent_not_found","agent_not_running"].includes(stopped.errorCode??"")) {
         this.database.markLegacySharedGrantAgentStopped(job.job_id);
-        await this.tryComplete(this.database.getJob(job.job_id)!,false);
+        const current = this.database.getJob(job.job_id)!;
+        if (!["completed","failed","cancelled"].includes(current.status))
+          await this.tryComplete(current,false);
         continue;
       }
       if(!stopped.ok) throw new Error(`Legacy agent ${job.agent_name} could not be stopped before isolated jobs start`);
@@ -223,7 +226,9 @@ export class JobSupervisor {
       }
       if(!exited) throw new Error(`Legacy agent ${job.agent_name} exit was not observed`);
       this.database.markLegacySharedGrantAgentStopped(job.job_id);
-      await this.tryComplete(this.database.getJob(job.job_id)!,false);
+      const current = this.database.getJob(job.job_id)!;
+      if (!["completed","failed","cancelled"].includes(current.status))
+        await this.tryComplete(current,false);
     }
   }
 
@@ -252,9 +257,9 @@ export class JobSupervisor {
       const current = this.database.getJob(jobId);
       if (!current) throw new Error(`Job ${jobId} was not found`);
       if (["queued", "retryable_failed"].includes(current.status)) {
-        const row = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction);
+        const result = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction);
         this.wake();
-        return { row, duplicate: current.steer_event_id === sourceEventId && current.steer_state === "accepted" };
+        return result;
       }
       const begun = this.database.beginJobSteer(jobId, sourceEventId);
       if (begun.duplicate) return begun;
@@ -270,7 +275,15 @@ export class JobSupervisor {
         throw new Error(`Job ${jobId} is blocked and could not accept steer input`);
       }
       if (!prompted.timedOut && ["agent_not_found", "agent_not_running"].includes(prompted.errorCode ?? "")) {
-        this.database.markJobNeedsReview(jobId, prompted.errorCode!, commandMessage(prompted));
+        this.database.clearJobSteer(jobId, sourceEventId);
+        const current = this.database.getJob(jobId);
+        if (current && ["completed", "failed", "cancelled"].includes(current.status) &&
+          current.last_error_code === "terminal_steer_worker_unverified") {
+          this.database.markTerminalJobWorkerStopped(jobId, "terminal_steer_worker_unverified");
+          this.database.markTerminalWorkerStopProof(jobId);
+        } else {
+          this.database.markJobNeedsReview(jobId, prompted.errorCode!, commandMessage(prompted));
+        }
         this.wake();
         throw new Error(commandMessage(prompted));
       }
@@ -287,7 +300,31 @@ export class JobSupervisor {
       this.database.assertJobSourceMatchesThread(jobId, sourceEventId);
       if (before.status === "cancelled") return { row: before, duplicate: true };
       const cancelling = this.database.beginJobCancellation(jobId, sourceEventId);
-      if (["queued", "retryable_failed"].includes(before.status)) {
+      if (before.status === "retryable_failed" && before.last_error_code === "stale_preparing") {
+        let absent = false;
+        let observedAgent = false;
+        try {
+          const observed = await this.runtime.get(cancelling.agent_name, this.abortController.signal);
+          absent = !observed.ok && !observed.timedOut &&
+            ["agent_not_found", "agent_not_running"].includes(observed.errorCode ?? "");
+          observedAgent = observed.ok;
+        } catch {
+          // A failed read is not evidence that the preparation agent is absent.
+        }
+        if (!absent && (!observedAgent || before.herdr_workspace_id === null)) {
+          this.database.markJobNeedsReview(jobId, "stale_preparing_agent_unverified",
+            "Cancellation cannot establish the preparation agent state");
+          this.wake();
+          throw new Error(`Job ${jobId} cancellation requires review`);
+        }
+        if (absent) {
+          this.database.markJobCancelled(jobId, reason);
+          this.wake();
+          return { row: this.database.getJob(jobId)!, duplicate: false };
+        }
+      }
+      if (before.status === "queued" ||
+          (before.status === "retryable_failed" && before.last_error_code !== "stale_preparing")) {
         this.database.markJobCancelled(jobId, reason);
         this.wake();
         return { row: this.database.getJob(jobId)!, duplicate: false };
@@ -298,9 +335,20 @@ export class JobSupervisor {
         return {row:this.database.getJob(jobId)!,duplicate:false};
       }
       const cancelled = await this.runtime.cancel(cancelling.agent_name, this.abortController.signal);
-      if(before.status==="preparing"&&!cancelled.timedOut&&["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
+      if((before.status==="preparing" || ["stale_preparing", "stale_preparing_agent_unverified"].includes(before.last_error_code ?? "")) &&
+          !cancelled.timedOut && ["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
         this.database.markJobCancelled(jobId,reason); this.wake();
         return {row:this.database.getJob(jobId)!,duplicate:false};
+      }
+      if (!cancelled.ok && !cancelled.timedOut &&
+          ["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
+        this.database.markJobCancellationWorkerStopped(jobId);
+        if (await this.tryComplete(cancelling,false)) {
+          this.database.markTerminalWorkerStopProof(jobId);
+          return { row: this.database.getJob(jobId)!, duplicate:false };
+        }
+        this.database.markJobCancelled(jobId,reason); this.wake();
+        return { row:this.database.getJob(jobId)!, duplicate:false };
       }
       if (!cancelled.ok) {
         this.database.markJobNeedsReview(
@@ -324,7 +372,11 @@ export class JobSupervisor {
         this.database.markJobNeedsReview(jobId,"cancel_exit_unknown","Agent exit was not observed after cancellation acceptance");
         this.wake(); throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
       }
-      if(await this.tryComplete(cancelling,false)) return {row:this.database.getJob(jobId)!,duplicate:false};
+      this.database.markJobCancellationWorkerStopped(jobId);
+      if(await this.tryComplete(cancelling,false)) {
+        this.database.markTerminalWorkerStopProof(jobId);
+        return {row:this.database.getJob(jobId)!,duplicate:false};
+      }
       this.database.markJobCancelled(jobId, reason);
       this.trackCancelledWorkerCleanup(cancelling);
       this.wake();
@@ -418,6 +470,35 @@ export class JobSupervisor {
           this.logger.warn("Terminal scheduled job cleanup will be retried", {
             job_id: job.job_id,
             error_message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      let terminalProofJobs = this.database.listTerminalJobsNeedingWorkerStopProof(this.terminalStopProofCursor,8);
+      if (terminalProofJobs.length === 0 && this.terminalStopProofCursor) {
+        this.terminalStopProofCursor = "";
+        terminalProofJobs = this.database.listTerminalJobsNeedingWorkerStopProof("",8);
+      }
+      for (const job of terminalProofJobs) {
+        this.terminalStopProofCursor = job.job_id;
+        try {
+          const observed = await this.runtime.get(job.agent_name, this.abortController.signal,
+            Math.min(2_000,this.config.jobCommandTimeoutMs));
+          const expectedIdentity = expectedLiveSessionIdentity(job,this.database.getJobLiveSessionIdentity(job.job_id));
+          const absent = !observed.ok && !observed.timedOut &&
+            ["agent_not_found","agent_not_running"].includes(observed.errorCode??"");
+          const stopped = observed.ok && ["idle","done"].includes(observed.agentStatus??"") &&
+            (!expectedIdentity || observed.agentIdentity === expectedIdentity);
+          if (absent || stopped) {
+            if (job.last_error_code && ["terminal_steer_worker_unverified", "cancel_worker_unverified",
+              "schedule_reconcile_worker_unverified"].includes(job.last_error_code)) {
+              this.database.markTerminalJobWorkerStopped(job.job_id, job.last_error_code);
+            }
+            if (job.steer_state === "accepted") this.database.markTerminalAcceptedSteerStopped(job.job_id);
+            this.database.markTerminalWorkerStopProof(job.job_id);
+          }
+        } catch (error) {
+          this.logger.warn("Terminal job worker stop proof is still unavailable", {
+            job_id: job.job_id, error_message: error instanceof Error ? error.message : String(error),
           });
         }
       }
@@ -669,6 +750,13 @@ export class JobSupervisor {
       }
       if (this.stopping) return;
       if (this.database.getJob(row.job_id)?.status !== "preparing") return;
+      if (row.last_error_code === "stale_preparing") {
+        // The previous attempt may have left an agent, even when its workspace
+        // identity was recorded. A later preparation failure does not stop it.
+        this.database.markJobNeedsReview(row.job_id, "stale_preparing_agent_unverified",
+          "A previous preparation may have left an agent without verified termination");
+        return;
+      }
       const updated = this.database.recordJobPreparationFailure(
         row.job_id,
         errorCode(error),

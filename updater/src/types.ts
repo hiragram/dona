@@ -177,6 +177,9 @@ export const runtimeOperationKinds = [
   "start_target_slack",
   "restart_current_dispatcher",
   "restart_current_slack",
+  "restart_target_dispatcher_after_drain",
+  "restart_target_slack_after_drain",
+  "restart_target_main_agent_after_drain",
   "stop_target_slack",
   "stop_target_dispatcher",
   "stop_target_main_agent",
@@ -219,6 +222,7 @@ export type CompletionLookupResult =
 export interface HealthSnapshot {
   service: "dispatcher" | "slack_adapter";
   live: boolean;
+  observed?: boolean;
   ready: boolean;
   build_sha: string | null;
   protocol: number | null;
