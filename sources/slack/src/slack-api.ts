@@ -260,7 +260,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     const lineStart = text.lastIndexOf("\n", rawOffset - 1) + 1;
     const continuesQuote = rawOffset > lineStart && text[lineStart] === ">" && !fenceOpenAt(text, lineStart) && !inlineCodeOpenAt(text, lineStart);
     const quotePrefix = multiQuoteStart >= 0 && rawOffset > multiQuoteStart
-      ? rawOffset === lineStart && rawChunk.startsWith(">>>") ? "" : ">>>"
+      ? rawOffset === lineStart && rawChunk.startsWith(">>>") && !startsInsideFence && !startsInsideInline.includes("`") ? "" : ">>>"
       : continuesQuote ? ">" : "";
     let rendered = `${quotePrefix}${startsInsideFence ? "```\n" : startsInsideInline.join("")}`;
     let cursor = 0;
@@ -296,6 +296,10 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
     if (chunk.length > 3_000 && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk)].length === 1) {
+      chunk = rawChunk;
+      plainFallback = true;
+    }
+    if (chunk.length > 3_000 && rawChunk.startsWith("\\") && rawChunk.length <= 3_000 && [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(rawChunk.slice(1))].length === 1) {
       chunk = rawChunk;
       plainFallback = true;
     }

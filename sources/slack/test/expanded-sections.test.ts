@@ -320,3 +320,18 @@ test("an existing multi-line quote marker is not duplicated after a split", () =
   assert.ok(blocks.some((block) => block.text.text.startsWith(">>>second")));
   assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith(">>>>>>")));
 });
+
+test("a code line starting with quote characters keeps its outer quote", () => {
+  const prefix = ">>>intro\n```\n";
+  const padding = "x".repeat(2_895);
+  const blocks = expandedSections(prefix + padding + "\n>>>code" + "y".repeat(300) + "\n```", "identity", true);
+  assert.ok(blocks.length > 1);
+  assert.ok(blocks.slice(1).some((block) => block.text.text.startsWith(">>>```\n>>>code")));
+});
+
+test("an escape and near-limit grapheme fall back together", () => {
+  const grapheme = `a${"\u0301".repeat(2_998)}`;
+  const blocks = expandedSections(`*prefix\n\\${grapheme}tail*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.type === "plain_text" && block.text.text === `\\${grapheme}`));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
