@@ -34,34 +34,72 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
   reply(response, status, code);
 }
 
-function requestEndOffset(chunk: Buffer): number | null {
-  const headerEnd = chunk.indexOf("\r\n\r\n");
-  if (headerEnd < 0) return null;
-  const header = chunk.subarray(0, headerEnd).toString("latin1");
-  if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(header)) return null;
-  if (/\r\ntransfer-encoding:\s*chunked\s*(?:\r\n|$)/i.test(header)) {
-    let cursor = headerEnd + 4;
-    while (cursor < chunk.length) {
-      const sizeEnd = chunk.indexOf("\r\n", cursor);
-      if (sizeEnd < 0) return null;
-      const sizeText = chunk.subarray(cursor, sizeEnd).toString("latin1").split(";", 1)[0]!.trim();
-      if (!/^[0-9a-f]+$/i.test(sizeText)) return null;
-      const size = Number.parseInt(sizeText, 16);
-      if (!Number.isSafeInteger(size)) return null;
-      cursor = sizeEnd + 2;
-      if (size === 0) {
-        const trailerEnd = chunk.indexOf("\r\n\r\n", cursor);
-        const end = trailerEnd >= 0 ? trailerEnd + 4 : chunk.subarray(cursor, cursor + 2).toString("latin1") === "\r\n" ? cursor + 2 : -1;
-        return end >= 0 ? end : null;
+class WireRequestBoundary {
+  private state: "header" | "fixed" | "size" | "data" | "data_crlf" | "trailer" = "header";
+  private pending = Buffer.alloc(0);
+  private remaining = 0;
+  private crlfIndex = 0;
+  private completed = false;
+
+  /** Consume framing without retaining the decoded body or completed chunks. */
+  feed(chunk: Buffer): boolean {
+    let offset = 0;
+    while (offset < chunk.length) {
+      if (this.state === "fixed" || this.state === "data") {
+        const consumed = Math.min(this.remaining, chunk.length - offset);
+        this.remaining -= consumed;
+        offset += consumed;
+        if (this.remaining === 0) {
+          if (this.state === "fixed") this.finish();
+          else this.state = "data_crlf";
+        }
+        continue;
       }
-      if (chunk.length < cursor + size + 2 || chunk.subarray(cursor + size, cursor + size + 2).toString("latin1") !== "\r\n") return null;
-      cursor += size + 2;
+      if (this.state === "data_crlf") {
+        if (chunk[offset++] !== (this.crlfIndex++ === 0 ? 13 : 10)) throw new Error("invalid_chunk_framing");
+        if (this.crlfIndex === 2) { this.crlfIndex = 0; this.state = "size"; }
+        continue;
+      }
+      const marker = this.state === "header" ? "\r\n\r\n" : "\r\n";
+      const limit = (this.state === "size" ? 256 : 16_384) - this.pending.length;
+      if (limit <= 0) throw new Error("oversize_wire_header");
+      const window = Buffer.concat([this.pending, chunk.subarray(offset, Math.min(chunk.length, offset + limit))]);
+      const end = window.indexOf(marker);
+      if (end < 0) {
+        if (offset + limit < chunk.length) throw new Error("oversize_wire_header");
+        this.pending = window;
+        offset = chunk.length;
+        break;
+      }
+      offset += end + marker.length - this.pending.length;
+      const line = window.subarray(0, end).toString("latin1");
+      this.pending = Buffer.alloc(0);
+      if (this.state === "header") {
+        if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(line)) throw new Error("invalid_wire_header");
+        if (/\r\ntransfer-encoding:\s*chunked\s*(?:\r\n|$)/i.test(line)) this.state = "size";
+        else {
+          const match = line.match(/\r\ncontent-length:\s*(\d+)/i);
+          this.remaining = Number(match?.[1] ?? "0");
+          if (!Number.isSafeInteger(this.remaining)) throw new Error("invalid_wire_length");
+          if (this.remaining === 0) this.finish();
+          else this.state = "fixed";
+        }
+      } else if (this.state === "size") {
+        const sizeText = line.split(";", 1)[0]!.trim();
+        if (!/^[0-9a-f]+$/i.test(sizeText)) throw new Error("invalid_chunk_size");
+        this.remaining = Number.parseInt(sizeText, 16);
+        if (!Number.isSafeInteger(this.remaining)) throw new Error("invalid_chunk_size");
+        this.state = this.remaining === 0 ? "trailer" : "data";
+      } else if (line === "") this.finish();
     }
-    return null;
+    return this.completed && this.state === "header" && this.pending.length > 0;
   }
-  const match = header.match(/\r\ncontent-length:\s*(\d+)/i);
-  const length = Number(match?.[1] ?? "0");
-  return Number.isSafeInteger(length) && chunk.length >= headerEnd + 4 + length ? headerEnd + 4 + length : null;
+
+  private finish(): void {
+    this.completed = true;
+    this.state = "header";
+    this.pending = Buffer.alloc(0);
+  }
 }
 
 function recoverableReject(request: IncomingMessage, response: ServerResponse, status: number, code: string, timeoutMs: number): void {
@@ -130,38 +168,22 @@ export class JobResultPublishServer {
     if (this.stopping || new Set([...this.sockets, ...this.publishingSockets]).size >= this.maxConnections) { socket.destroy(); return; }
     this.sockets.add(socket);
     socket.on("error", () => socket.destroy());
-    let rawChunks: Buffer[] = [];
-    let rawBytes = 0;
-    let completedOnce = false;
+    const boundary = new WireRequestBoundary();
     const armHeaderDeadline = () => {
       if (socket.destroyed || this.headerDeadlines.has(socket)) return;
       const deadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
       deadline.unref();
       this.headerDeadlines.set(socket, deadline);
     };
-    const inspectRaw = () => {
+    const inspectRaw = (chunk: Buffer) => {
       if (socket.destroyed) return;
-      if (rawBytes === 0) return;
-      const active = this.activeMessages.get(socket);
-      if (active && !active.complete) return;
-      const raw = Buffer.concat(rawChunks, rawBytes);
-      const end = requestEndOffset(raw);
-      if (end !== null) {
-        completedOnce = true;
-        const remainder = Buffer.from(raw.subarray(end));
-        rawChunks = remainder.length ? [remainder] : [];
-        rawBytes = remainder.length;
-        if (remainder.length) armHeaderDeadline();
-      } else if (completedOnce) {
-        armHeaderDeadline();
-      }
+      try { if (boundary.feed(chunk)) armHeaderDeadline(); }
+      catch { socket.destroy(); }
     };
     // Keep the FD outside the HTTP parser until its first byte. The worker may
     // run for hours before publishing; a partial first header gets a deadline.
     socket.once("data", chunk => {
       const initial = Buffer.from(chunk);
-      rawChunks = [initial];
-      rawBytes = initial.length;
       let firstReplay = true;
       armHeaderDeadline();
       socket.pause();
@@ -170,20 +192,14 @@ export class JobResultPublishServer {
       socket.on("data", chunk => {
         if (firstReplay && chunk.equals(initial)) {
           firstReplay = false;
-          queueMicrotask(inspectRaw);
           return;
         }
         firstReplay = false;
-        rawBytes += chunk.length;
-        // This is a separate wire framing bound. The decoded request body has
-        // its own 1 MiB limit; one-byte chunks can use six wire bytes each.
-        if (rawBytes > jobResultEnvelopeMaxBytes * 8 + 16_384) { socket.destroy(); return; }
-        rawChunks.push(Buffer.from(chunk));
         // Observe the HTTP parser's state after it has handled this data event.
-        queueMicrotask(inspectRaw);
+        queueMicrotask(() => inspectRaw(Buffer.from(chunk)));
       });
       socket.resume();
-      queueMicrotask(inspectRaw);
+      queueMicrotask(() => inspectRaw(initial));
     });
     socket.once("close", () => {
       this.sockets.delete(socket);
