@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import type { DiagnosticLogIdentity, CommandResult } from "./types.js";
 import type { DiagnosticCaptureSession, DiagnosticLogStore } from "./diagnostic-log.js";
 import { ProcessCheckpointTracker } from "./process-checkpoint.js";
+import { observeProcessTree } from "./process-observation.js";
 
 export interface RunOptions {
   cwd?: string;
@@ -58,6 +59,22 @@ export class ProcessRunner {
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let truncated = false;
       const checkpoints = new ProcessCheckpointTracker();
+      const observe = options.diagnostic?.identity.step === "dispatcher:npm-test";
+      const startedAt = Date.now();
+      const observations: NodeJS.Timeout[] = [];
+      const sample = (phase: string): void => {
+        if (!observe) return;
+        const record = `[preflight-observation] phase=${phase} elapsed_ms=${Date.now() - startedAt} root_pid=${child.pid ?? "unknown"} checkpoint=${checkpoints.checkpoint() ?? "none"} ${observeProcessTree(child.pid)}\n`;
+        try { diagnostic?.write("stderr", Buffer.from(record)); } catch { /* diagnostic only */ }
+      };
+      if (observe) {
+        sample("start");
+        for (const fraction of [0.25, 0.75]) {
+          const observation = setTimeout(() => sample(`checkpoint_${Math.round(fraction * 100)}`), Math.max(1, Math.floor(options.timeoutMs * fraction)));
+          observation.unref();
+          observations.push(observation);
+        }
+      }
       let timedOut = false;
       let readinessFailed = false;
       let settled = false;
@@ -99,6 +116,8 @@ export class ProcessRunner {
       let exitSignal: NodeJS.Signals | null = null;
       const finish = (): void => {
         if (closedCode === undefined || settled) return;
+        for (const observation of observations) clearTimeout(observation);
+        sample(timedOut ? "cleanup" : "exit");
         settled = true;
         const outputCheckpoint = checkpoints.checkpoint();
         const cleanupStatus = timedOut || readinessFailed
@@ -157,6 +176,7 @@ export class ProcessRunner {
         if (reason === "timeout") {
           timedOut = true;
           checkpoints.freezeTimeout();
+          sample("timeout");
         } else {
           readinessFailed = true;
         }
@@ -188,6 +208,7 @@ export class ProcessRunner {
         if (cleanupPollTimer) clearTimeout(cleanupPollTimer);
         if (settled) return;
         settled = true;
+        for (const observation of observations) clearTimeout(observation);
         const diagnosticLog = finishDiagnostic(true);
         resolve({
           exit_code: null,
