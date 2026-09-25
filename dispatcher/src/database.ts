@@ -776,6 +776,7 @@ export class DispatcherDatabase {
         OR (status = 'retryable_failed' AND (last_error_code = 'stale_preparing' OR
           (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
         OR steer_state = 'dispatching'
+        OR (status IN ('completed','failed','cancelled') AND last_error_code='schedule_reconcile_worker_unverified')
       GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
     for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
@@ -786,6 +787,7 @@ export class DispatcherDatabase {
     const legacy = this.db.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
       JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
         AND COALESCE(j.steer_state,'') <> 'dispatching'
+        AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
         AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
         AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
           (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)
@@ -1670,7 +1672,12 @@ export class DispatcherDatabase {
       }
       const result=this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
       if(row.job_id) {
-        this.db.prepare("UPDATE jobs SET status=?,completed_at=?,last_error_code=NULL,last_error_message=NULL,updated_at=? WHERE job_id=? AND status IN ('needs_review','blocked')")
+        this.db.prepare(`UPDATE jobs SET status=?,completed_at=?,
+          last_error_code=CASE WHEN (dispatch_started_at IS NOT NULL OR prompt_accepted_at IS NOT NULL OR herdr_workspace_id IS NOT NULL)
+            AND COALESCE(last_error_code,'') NOT IN ('invalid_result_agent_stopped','agent_not_found','agent_not_running')
+            AND NOT EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)
+            THEN 'schedule_reconcile_worker_unverified' ELSE NULL END,
+          last_error_message=NULL,updated_at=? WHERE job_id=? AND status IN ('needs_review','blocked')`)
           .run(outcome,reconciledAt,reconciledAt,row.job_id);
         this.db.prepare("UPDATE job_completion_results SET work_state=? WHERE job_id=? AND work_state='needs_review'").run(outcome,row.job_id);
       }

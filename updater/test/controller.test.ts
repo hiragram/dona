@@ -1036,6 +1036,25 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.runtimeOperation(row.request_id, "stop_target_main_agent"), undefined);
     f.database.close();
   });
+
+  test("refuses pointer rollback when a worker appears during target main-agent stop", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-rollback-main-wait-worker" });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    f.runtime.afterMainWait = async call => {
+      if (call === 2) f.runtime.activeWorkerCount = 1;
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "rollback_active_worker_handoff_unavailable");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
+    f.database.close();
+  });
   for (const stopFailure of ["blocked", "rejected", "acceptance_unknown"] as const) {
     test(`restores target services when rollback main agent stop is ${stopFailure}`, async () => {
       const f = await fixture();

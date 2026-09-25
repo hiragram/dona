@@ -259,6 +259,22 @@ test("RealRuntime counts terminal legacy agents until durable stop", async () =>
   } finally { await removeTree(root); }
 });
 
+test("RealRuntime counts a reconciled terminal schedule worker without stop proof", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  database.prepare("INSERT INTO jobs (status,last_error_code) VALUES ('failed','schedule_reconcile_worker_unverified')").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+  } finally { await removeTree(root); }
+});
+
 test("RealRuntime distinguishes unresolved steer from definite retryable agent absence", async () => {
   const { root, policy } = await tempPolicy();
   await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });

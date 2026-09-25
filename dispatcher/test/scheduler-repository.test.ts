@@ -357,6 +357,9 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   assert.equal(repo.getRun(run.run_id)?.status, "failed");
   assert.ok((repo.auditHistory("review_work") as Array<{ operation: string }>).some(row => row.operation === "reconcile_work_failed"));
   assert.equal(dispatcher.getJob(job.job_id)?.status,"failed");
+  assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,"schedule_reconcile_worker_unverified");
+  assert.equal(dispatcher.updateSafetyStatus().worker_recovery_state,"handoff_unavailable");
+  assert.equal(dispatcher.updateSafetyStatus().active_worker_count,1);
   assert.equal((raw.prepare("SELECT work_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {work_state:string}).work_state, "failed");
   assert.equal(dispatcher.get(oldNotification)?.last_error_code,"job_result_superseded");
   assert.equal(dispatcher.getJob(job.job_id)?.completion_event_id,null);

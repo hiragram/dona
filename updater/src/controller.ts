@@ -969,6 +969,15 @@ export class UpdateController {
           return;
         }
       }
+      // Main-agent shutdown can wait long enough for KeepAlive to restart a
+      // Dispatcher that has lost its drain fence. Re-read durable worker state
+      // immediately before changing the pointer and result grant.
+      const workerBeforeRollback = await this.runtime.workerSafety();
+      this.assertLease(row);
+      if (!workerBeforeRollback.safe) {
+        this.needsReview(row, workerBeforeRollback.error_code ?? "rollback_active_worker_handoff_unavailable");
+        return;
+      }
       receipt = await this.releases.rollback(row);
       this.assertLease(row);
       this.database.recordActivationGeneration(row.request_id, row.fence, receipt.generation, this.clock.now());
