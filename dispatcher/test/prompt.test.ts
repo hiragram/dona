@@ -20,6 +20,7 @@ test("通常のSlack eventとdona_jobだけにスレッド開示方針と安全�
     assert.match(prompt, /保存済みreply_targetと同じworkspace、channel、thread/);
     assert.match(prompt, /PR\/Issue URL、CI・review結果、worker進捗/);
     assert.match(prompt, /group.transitionがprogressの中間通知ではSlackへ投稿せず/);
+    assert.match(prompt, /group.attention_resolution_stateがnot_requiredまたはresolved/);
     assert.match(prompt, /automatic approvalで拒否された場合/);
     assert.match(prompt, /実質的に安全な短い要約を同じスレッドへ1回だけ投稿/);
     assert.match(prompt, /安全な要約も拒否されたら繰り返さず失敗として記録/);
