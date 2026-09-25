@@ -1058,8 +1058,8 @@ export class UpdateController {
   private async restoreTargetAfterDrain(
     row: UpdateRow, causeCode: string, dispatcherQuiesced: boolean, slackQuiesced: boolean,
   ): Promise<void> {
-    // Rollback has not switched the pointer or stopped the main agent. Restore
-    // only services that entered quiesce. A live Dispatcher may own a worker.
+    // Rollback has not switched the pointer. Restore only services that entered
+    // quiesce, and restore the target main agent if its stop was observed.
     const failure: { code?: string; message?: string } = {};
     const scope = { dispatcherQuiesced, slackQuiesced };
     const dispatcherRestored = !dispatcherQuiesced || await this.restartQuiescedService(row,
@@ -1068,6 +1068,14 @@ export class UpdateController {
     const slackRestored = !slackQuiesced || await this.restartQuiescedService(row,
       "restart_target_slack_after_drain", "slack_adapter", causeCode,
       () => this.runtime.startSlack(), row.target_sha, failure, scope);
+    const stoppedMain = this.database.runtimeOperation(row.request_id, "stop_target_main_agent");
+    if (stoppedMain?.phase === "observed") {
+      if (!stoppedMain.target_ref || !(await this.ensureMainAgentRestarted(
+        row, stoppedMain.target_ref, stoppedMain.previous_session_id ?? undefined,
+        "restart_target_main_agent_after_drain", row.target_sha,
+        { cause_code: causeCode, dispatcher_quiesced: dispatcherQuiesced, slack_quiesced: slackQuiesced },
+      ))) return;
+    }
     if (!dispatcherRestored || !slackRestored) {
       this.needsReview(row, failure.code ?? "rollback_drain_recovery_unverified", failure.message);
       return;
@@ -1091,14 +1099,6 @@ export class UpdateController {
         this.needsReview(row, "rollback_drain_slack_health_unverified");
         return;
       }
-    }
-    const stoppedMain = this.database.runtimeOperation(row.request_id, "stop_target_main_agent");
-    if (stoppedMain?.phase === "observed") {
-      if (!stoppedMain.target_ref || !(await this.ensureMainAgentRestarted(
-        row, stoppedMain.target_ref, stoppedMain.previous_session_id ?? undefined,
-        "restart_target_main_agent_after_drain", row.target_sha,
-        { cause_code: causeCode, dispatcher_quiesced: dispatcherQuiesced, slack_quiesced: slackQuiesced },
-      ))) return;
     }
     const pointer = await this.releases.observe();
     this.assertLease(row);

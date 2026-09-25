@@ -1058,6 +1058,29 @@ describe("UpdateController isolated end-to-end", () => {
     assert.deepEqual(f.runtime.calls.slice(-3), ["startDispatcher", "startSlack", `startMainAgent:${targetSha}`]);
     f.database.close();
   });
+
+  test("restarts the stopped target main agent when final-barrier service recovery fails", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-final-barrier-recovery-failure" });
+    f.dispatcher.terminal = true;
+    f.runtime.wrongSlackOnce = true;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.runtime.targetRecoveryDispatcherStartRejectedOnce = true;
+    f.runtime.afterMainWait = async call => {
+      if (call === 2) f.runtime.activeWorkerCount = 1;
+    };
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "rollback_drain_recovery_dispatcher_restart_rejected");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_main_agent_after_drain")?.phase, "observed");
+    assert.equal(f.runtime.calls.at(-1), `startMainAgent:${targetSha}`);
+    f.database.close();
+  });
   for (const stopFailure of ["blocked", "rejected", "acceptance_unknown"] as const) {
     test(`restores target services when rollback main agent stop is ${stopFailure}`, async () => {
       const f = await fixture();

@@ -1082,7 +1082,9 @@ export class DispatcherDatabase {
   markJobRuntimeCleaned(jobId: string): void {
     this.db.transaction(()=>{
       const changed=this.db.prepare(`UPDATE jobs SET herdr_workspace_id=NULL,herdr_pane_id=NULL,
-        last_error_code=CASE WHEN last_error_code='schedule_reconcile_worker_unverified' THEN NULL ELSE last_error_code END,
+        last_error_code=CASE WHEN last_error_code IN
+          ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified')
+          THEN NULL ELSE last_error_code END,
         updated_at=? WHERE job_id=? AND herdr_workspace_id IS NOT NULL
         AND (status IN ('completed','failed','cancelled') OR (status='needs_review' AND last_error_code='workspace_cleanup_failed'))`).run(nowUtc(),jobId).changes;
       if(changed===1) {
