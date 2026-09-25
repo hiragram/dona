@@ -97,7 +97,7 @@ describe("job result publish contract", () => {
       "https://example.com/file?access%5Ftoken=CANARY_VALUE", "https://example.com/file?client%5Fsecret=CANARY_VALUE",
       "prefix_https://10.0.0.1/private", "prefix_https://user:CANARY_VALUE@cdn.example.com/file", "https://example.com/callback#access%5Ftoken=CANARY_VALUE",
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
-      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ", "xoxc-abcdefghijkl", "xoxd-abcdefghijkl", "xoxe-abcdefghijkl", "ASIA1234567890ABCDEF",
+      "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ", "xoxc-abcdefghijkl", "xoxd-abcdefghijkl", "xoxe-abcdefghijkl", "ASIA1234567890ABCDEF", `AIza${"A".repeat(35)}`,
       "https://example.com/?id=eyJhbGciOiJIUzI1NiJ9%2Ee30%2EdGVzdHNpZ25hdHVyZQ",
       "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
@@ -561,6 +561,7 @@ describe("job result publish contract", () => {
       }, reconcile: async () => ({ outcome: "reused" }) }, 32, 40);
     let client: net.Socket | undefined;
     let combined: net.Socket | undefined;
+    let chunked: net.Socket | undefined;
     let overlapping: net.Socket | undefined;
     let stalled: net.Socket | undefined;
     let waiting: net.Socket | undefined;
@@ -592,6 +593,14 @@ describe("job result publish contract", () => {
       assert.equal((server as unknown as { headerDeadlines: Map<net.Socket, NodeJS.Timeout> }).headerDeadlines.size, 1);
       await new Promise(resolve => setTimeout(resolve, 60));
       assert.equal(combined.destroyed, true, "同じchunk内の後続partial headerも期限で閉じる");
+      chunked = net.createConnection(socket);
+      chunked.on("error", () => {});
+      await new Promise<void>(resolve => chunked!.once("connect", resolve));
+      const chunkedResponse = new Promise<string>(resolve => chunked!.once("data", data => resolve(String(data))));
+      chunked.write(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nTransfer-Encoding: chunked\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${Buffer.byteLength(body).toString(16)}\r\n${body}\r\n0\r\n\r\n`);
+      assert.match(await chunkedResponse, /^HTTP\/1\.1 202 /);
+      await new Promise(resolve => setTimeout(resolve, 60));
+      assert.equal(chunked.destroyed, false, "chunked本文を後続headerと誤認しない");
       blockCommit = true;
       overlapping = net.createConnection(socket);
       overlapping.on("error", () => {});
@@ -621,6 +630,7 @@ describe("job result publish contract", () => {
     } finally {
       client?.destroy();
       combined?.destroy();
+      chunked?.destroy();
       releaseCommit?.();
       overlapping?.destroy();
       stalled?.destroy();

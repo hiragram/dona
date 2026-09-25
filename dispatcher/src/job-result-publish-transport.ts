@@ -34,20 +34,31 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
   reply(response, status, code);
 }
 
-function hasNextHeaderInChunk(chunk: Buffer, request: IncomingMessage): boolean {
+function hasBytesAfterRequest(chunk: Buffer): boolean {
   const headerEnd = chunk.indexOf("\r\n\r\n");
   if (headerEnd < 0) return false;
   const header = chunk.subarray(0, headerEnd).toString("latin1");
   if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(header)) return false;
-  const length = Number(request.headers["content-length"] ?? "0");
-  return Number.isSafeInteger(length) && length >= 0 && chunk.length > headerEnd + 4 + length;
-}
-
-function hasNextHeaderInInitialChunk(chunk: Buffer): boolean {
-  const headerEnd = chunk.indexOf("\r\n\r\n");
-  if (headerEnd < 0) return false;
-  const header = chunk.subarray(0, headerEnd).toString("latin1");
-  if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(header)) return false;
+  if (/\r\ntransfer-encoding:\s*chunked\s*(?:\r\n|$)/i.test(header)) {
+    let cursor = headerEnd + 4;
+    while (cursor < chunk.length) {
+      const sizeEnd = chunk.indexOf("\r\n", cursor);
+      if (sizeEnd < 0) return false;
+      const sizeText = chunk.subarray(cursor, sizeEnd).toString("latin1").split(";", 1)[0]!.trim();
+      if (!/^[0-9a-f]+$/i.test(sizeText)) return false;
+      const size = Number.parseInt(sizeText, 16);
+      if (!Number.isSafeInteger(size)) return false;
+      cursor = sizeEnd + 2;
+      if (size === 0) {
+        const trailerEnd = chunk.indexOf("\r\n\r\n", cursor);
+        const end = trailerEnd >= 0 ? trailerEnd + 4 : chunk.subarray(cursor, cursor + 2).toString("latin1") === "\r\n" ? cursor + 2 : -1;
+        return end >= 0 && chunk.length > end;
+      }
+      if (chunk.length < cursor + size + 2 || chunk.subarray(cursor + size, cursor + size + 2).toString("latin1") !== "\r\n") return false;
+      cursor += size + 2;
+    }
+    return false;
+  }
   const match = header.match(/\r\ncontent-length:\s*(\d+)/i);
   const length = Number(match?.[1] ?? "0");
   return Number.isSafeInteger(length) && chunk.length > headerEnd + 4 + length;
@@ -124,7 +135,7 @@ export class JobResultPublishServer {
     // Keep the FD outside the HTTP parser until its first byte. The worker may
     // run for hours before publishing; a partial first header gets a deadline.
     socket.once("data", chunk => {
-      if (hasNextHeaderInInitialChunk(chunk)) this.initialPipelinedHeader.add(socket);
+      if (hasBytesAfterRequest(chunk)) this.initialPipelinedHeader.add(socket);
       const deadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
       deadline.unref();
       this.headerDeadlines.set(socket, deadline);
@@ -139,7 +150,7 @@ export class JobResultPublishServer {
         // that completed the current request is not a new header.
         if (active?.complete && !this.completedData.has(active)) {
           this.completedData.add(active);
-          if (!hasNextHeaderInChunk(chunk, active)) return;
+          if (!hasBytesAfterRequest(chunk)) return;
         }
         const nextDeadline = setTimeout(() => socket.destroy(), this.bodyTimeoutMs);
         nextDeadline.unref();
