@@ -564,7 +564,8 @@ export class UpdateController {
         const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
         this.assertLease(row);
         if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-          throw new Error("slack_adapter_drain_incomplete");
+          await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete");
+          return;
         }
       } else if (persistedSlackStop?.phase !== "observed") {
         throw new Error("slack_adapter_current_state_unverified");
@@ -575,7 +576,8 @@ export class UpdateController {
         const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
         this.assertLease(row);
         if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-          throw new Error("dispatcher_drain_incomplete");
+          await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete");
+          return;
         }
       } else if (persistedDispatcherStop?.phase !== "observed") {
         throw new Error("dispatcher_current_state_unverified");

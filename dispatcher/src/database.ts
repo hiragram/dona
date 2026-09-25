@@ -642,6 +642,7 @@ export class DispatcherDatabase {
     // while any such worker may exist, including legacy agents marked for stop.
     const legacy = this.db.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
       JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
+        AND j.status NOT IN ('completed','failed','cancelled')
         AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
         AND NOT (j.status='retryable_failed' AND j.herdr_workspace_id IS NOT NULL)`)
       .get() as { count: number };

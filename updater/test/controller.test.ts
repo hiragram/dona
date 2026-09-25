@@ -267,6 +267,7 @@ class FakeDispatcher implements DispatcherPort {
 
 class FakeRuntime implements RuntimePort {
   activeWorkerCount = 0;
+  dispatcherDrainIncomplete = false;
   workerSafety(): Promise<{ safe: boolean; active_worker_count: number }> {
     return Promise.resolve({ safe: this.activeWorkerCount === 0, active_worker_count: this.activeWorkerCount });
   }
@@ -323,7 +324,14 @@ class FakeRuntime implements RuntimePort {
     this.healthCompatibility.set(sha, compatibility);
   }
   async quiesceSlack(): Promise<DrainSnapshot> { this.calls.push("quiesceSlack"); return { service: "slack_adapter", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] }; }
-  async quiesceDispatcher(): Promise<DrainSnapshot> { this.calls.push("quiesceDispatcher"); return { service: "dispatcher", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] }; }
+  async quiesceDispatcher(): Promise<DrainSnapshot> {
+    this.calls.push("quiesceDispatcher");
+    if (this.dispatcherDrainIncomplete) {
+      this.dispatcherLive = false;
+      return { service: "dispatcher", quiescing: true, drained: false, in_flight: 1, unsafe_states: ["jobs.handoff_unavailable:1"] };
+    }
+    return { service: "dispatcher", quiescing: true, drained: true, in_flight: 0, unsafe_states: [] };
+  }
   async stopSlack() { this.calls.push("stopSlack"); this.slackLive = false; return ok; }
   async stopDispatcher() { this.calls.push("stopDispatcher"); this.dispatcherLive = false; return ok; }
   async startDispatcher() {
@@ -484,6 +492,21 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.get(planned.request_id as string)?.state, "failed");
     assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "active_worker_handoff_unavailable");
     assert.deepEqual(f.runtime.calls, []);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
+  test("restores the current Dispatcher when a worker appears during drain", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-drain-race" });
+    f.dispatcher.terminal = true;
+    f.runtime.dispatcherDrainIncomplete = true;
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.state, "failed");
+    assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "dispatcher_drain_incomplete");
+    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "startDispatcher", "startSlack"]);
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });

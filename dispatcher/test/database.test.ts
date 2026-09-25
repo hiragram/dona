@@ -1402,6 +1402,8 @@ describe("DispatcherDatabase", () => {
     const reopened = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(reopened.listLegacySharedGrantJobs(),[]);
     for(const {status,job} of jobs) assert.equal(reopened.getJob(job.job_id)?.status,status);
+    assert.equal(reopened.updateSafetyStatus().safe,true);
+    assert.equal(reopened.updateSafetyStatus().active_worker_count,0);
     reopened.close();
   });
 

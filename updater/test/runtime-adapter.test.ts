@@ -172,6 +172,10 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
   const dispatcherDatabasePath = path.join(root, "Dona", "dona.sqlite3");
   const dispatcherDatabase = new Database(dispatcherDatabasePath);
   dispatcherDatabase.exec("CREATE TABLE jobs (status TEXT NOT NULL, herdr_workspace_id TEXT)");
+  dispatcherDatabase.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
+  dispatcherDatabase.exec("ALTER TABLE jobs ADD COLUMN job_id TEXT");
+  dispatcherDatabase.prepare("INSERT INTO jobs (status,job_id) VALUES ('completed','old-terminal')").run();
+  dispatcherDatabase.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('old-terminal',NULL)").run();
   dispatcherDatabase.close();
   await fs.chmod(dispatcherDatabasePath, 0o600);
   const requests: unknown[] = [];
