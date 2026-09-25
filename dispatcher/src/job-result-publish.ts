@@ -234,6 +234,11 @@ function fingerprint(value: string): number {
   for (let index = 0; index < value.length; index++) hash = (Math.imul(hash, capabilityHashBase) + value.charCodeAt(index)) | 0;
   return hash;
 }
+function displayProjection(value: string): string {
+  return value.replace(/(?<!\\)[*~`]/g, "")
+    .replace(/&(?:amp|lt|gt);/g, entity => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[entity]!)
+    .normalize("NFC");
+}
 function containsForbiddenCapability(value: string, digests: ReadonlySet<string>, fingerprints: ReadonlySet<number>): boolean {
   for (const match of value.matchAll(capabilityRun)) {
     const run = match[0];
@@ -287,7 +292,7 @@ class ForbiddenValueMatcher {
   constructor(values: readonly string[], substringShortValues: ReadonlySet<string> = new Set()) {
     const display = (value: string) => value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "").normalize("NFC");
     const normalizedShortValues = new Set([...substringShortValues].flatMap(value => [value.normalize("NFC"), display(value)]));
-    for (const value of new Set(values.flatMap(item => [item.normalize("NFC"), display(item)]))) {
+    for (const value of new Set(values.flatMap(item => [item.normalize("NFC"), display(item), displayProjection(display(item))]))) {
       if (!value) continue;
       if (value.length < 8 && !normalizedShortValues.has(value)) { this.exact.add(value); continue; }
       this.substrings.push(value);
@@ -295,7 +300,7 @@ class ForbiddenValueMatcher {
   }
   contains(value: string): boolean {
     value = value.normalize("NFC");
-    const displayed = value.replace(/(?<!\\)[*_~`]/g, "");
+    const displayed = displayProjection(value);
     for (const candidate of [value, displayed]) {
       if (this.exact.has(candidate) || this.substrings.some(privateValue => candidate.includes(privateValue))) return true;
     }
@@ -344,7 +349,8 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (forbiddenKey(match[1]!)) throw new JobResultPublishError("content_requires_redaction");
     }
     if (forbiddenDigests && forbiddenFingerprints) {
-      if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
+      if (containsForbiddenCapability(value, forbiddenDigests, forbiddenFingerprints) ||
+        containsForbiddenCapability(displayProjection(value), forbiddenDigests, forbiddenFingerprints)) throw new JobResultPublishError("content_requires_redaction");
     }
     if (/[\p{Cc}\p{Cf}]/u.test(value)) {
       if (value.includes("\u001b]")) throw new JobResultPublishError("content_requires_redaction");

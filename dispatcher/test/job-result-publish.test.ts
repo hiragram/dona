@@ -322,6 +322,11 @@ describe("job result publish contract", () => {
     }
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: "private *objective* text" } },
       () => current), code("content_requires_redaction"));
+    const decoratedCapability = `${grant.capability.slice(0, 20)}*${grant.capability.slice(20)}`;
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: grant.capability } },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: decoratedCapability } },
+      () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com/status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
@@ -336,6 +341,10 @@ describe("job result publish contract", () => {
     const invisibleGrant = invisible.issue(row({ objective: "secret\u200bplan" }), "session-invisible");
     assert.throws(() => invisible.validate(invisibleGrant.capability, "session-invisible", { ...base, summary: "secretplan" },
       () => row({ status: "running", objective: "secret\u200bplan" })), code("content_requires_redaction"));
+    const entity = new JobResultPublishCapabilities(() => "session-entity");
+    const entityGrant = entity.issue(row({ objective: "private & objective" }), "session-entity");
+    assert.throws(() => entity.validate(entityGrant.capability, "session-entity", { ...base, output: { format: "markdown", text: "private &amp; objective" } },
+      () => row({ status: "running", objective: "private & objective" })), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "private%252520objective%252520text" }, () => current), code("content_requires_redaction"));
     const japanese = new JobResultPublishCapabilities(() => "session-ja");
     const jaGrant = japanese.issue(row({ objective: "秘密 計画" }), "session-ja");
