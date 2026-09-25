@@ -922,6 +922,7 @@ export class RealRuntime implements RuntimePort {
       const response = parsedObject(await udsRequest(socketPath, "GET", "/health/version", undefined, this.policy.timeouts.health_ms));
       return {
         service,
+        observed: true,
         live: response.status === "live" || response.status === "ready",
         ready: response.status === "ready",
         build_sha: typeof response.build_sha === "string" ? response.build_sha : null,
@@ -943,7 +944,7 @@ export class RealRuntime implements RuntimePort {
         ...(service === "slack_adapter" ? { workspaces_ready: response.workspaces_ready === true } : {}),
       };
     } catch {
-      return { service, live: false, ready: false, build_sha: null, protocol: null, app_schema: null, config: null };
+      return { service, observed: false, live: false, ready: false, build_sha: null, protocol: null, app_schema: null, config: null };
     }
   }
 }

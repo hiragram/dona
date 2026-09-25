@@ -222,6 +222,7 @@ export type CompletionLookupResult =
 export interface HealthSnapshot {
   service: "dispatcher" | "slack_adapter";
   live: boolean;
+  observed?: boolean;
   ready: boolean;
   build_sha: string | null;
   protocol: number | null;

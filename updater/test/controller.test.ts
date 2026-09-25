@@ -18,6 +18,7 @@ import type {
   MainAgentObservation,
   OutboxRow,
   SchemaRollout,
+  UpdateRow,
 } from "../src/types.js";
 import { currentSha, installPointers, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
@@ -342,6 +343,7 @@ class FakeRuntime implements RuntimePort {
   dispatcherQuiescing = false;
   slackDrainStatusThrows = false;
   slackHealthUnreadyWhenQuiescing = false;
+  slackHealthUnavailableOnce = false;
   mainAgentSha = currentSha;
   constructor(
     private readonly store: ReleaseStore,
@@ -524,6 +526,10 @@ class FakeRuntime implements RuntimePort {
     return this.health("dispatcher", current, true);
   }
   async slackHealth(): Promise<HealthSnapshot> {
+    if (this.slackHealthUnavailableOnce) {
+      this.slackHealthUnavailableOnce = false;
+      return { ...this.health("slack_adapter", null, false, false), observed: false };
+    }
     if (!this.slackLive) return { ...this.health("slack_adapter", null, false, false), workspaces_ready: false };
     const current = (await this.store.observe()).current_sha;
     if (this.wrongSlackOnce && current === targetSha) {
@@ -1278,6 +1284,24 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_dispatcher_after_drain")?.phase, "observed");
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_target_main_agent_after_drain")?.phase, "observed");
     assert.equal((await f.store.observe()).current_sha, targetSha);
+    f.database.close();
+  });
+  test("rollback scope requires a stop receipt when health is unreadable", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const requestId = planned.request_id as string;
+    const row = f.database.claim(requestId, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    const controller = f.controller as unknown as { rollbackQuiescedScope(
+      row: UpdateRow, dispatcher: HealthSnapshot, slack: HealthSnapshot,
+    ): Promise<{ dispatcherQuiesced: boolean; slackQuiesced: boolean }> };
+    const dispatcher = await f.runtime.dispatcherHealth();
+    f.runtime.slackHealthUnavailableOnce = true;
+    const slack = await f.runtime.slackHealth();
+    assert.equal((await controller.rollbackQuiescedScope(row, dispatcher, slack)).slackQuiesced, false);
+    f.database.prepareRuntimeOperation(requestId, row.fence, "stop_target_slack", "slack_adapter", null, null);
+    f.database.recordRuntimeOperation(requestId, row.fence, "stop_target_slack", "observed", null, {});
+    assert.equal((await controller.rollbackQuiescedScope(row, dispatcher, slack)).slackQuiesced, true);
     f.database.close();
   });
   for (const stopFailure of ["blocked", "rejected", "acceptance_unknown"] as const) {

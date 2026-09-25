@@ -930,7 +930,7 @@ export class UpdateController {
             this.runtime.dispatcherHealth(), this.runtime.slackHealth(),
           ]);
           this.assertLease(row);
-          const recoveryScope = await this.rollbackQuiescedScope(dispatcherRecoveryHealth, slackRecoveryHealth);
+          const recoveryScope = await this.rollbackQuiescedScope(row, dispatcherRecoveryHealth, slackRecoveryHealth);
           this.assertLease(row);
           await this.restoreTargetAfterDrain(row,
             workerSafety.error_code ?? "rollback_active_worker_handoff_unavailable",
@@ -1013,7 +1013,7 @@ export class UpdateController {
           this.runtime.dispatcherHealth(), this.runtime.slackHealth(),
         ]);
         this.assertLease(row);
-        const recoveryScope = await this.rollbackQuiescedScope(dispatcherRecoveryHealth, slackRecoveryHealth);
+        const recoveryScope = await this.rollbackQuiescedScope(row, dispatcherRecoveryHealth, slackRecoveryHealth);
         this.assertLease(row);
         await this.restoreTargetAfterDrain(row,
           workerBeforeRollback.error_code ?? "rollback_active_worker_handoff_unavailable",
@@ -1090,7 +1090,7 @@ export class UpdateController {
     }, this.clock.now());
   }
 
-  private async rollbackQuiescedScope(dispatcher: HealthSnapshot, slack: HealthSnapshot): Promise<{
+  private async rollbackQuiescedScope(row: UpdateRow, dispatcher: HealthSnapshot, slack: HealthSnapshot): Promise<{
     dispatcherQuiesced: boolean; slackQuiesced: boolean;
   }> {
     const [dispatcherDrain, slackDrain] = await Promise.allSettled([
@@ -1098,8 +1098,12 @@ export class UpdateController {
       slack.live ? this.runtime.slackDrainStatus() : Promise.resolve(null),
     ]);
     return {
-      dispatcherQuiesced: !dispatcher.live || (dispatcherDrain.status === "fulfilled" && dispatcherDrain.value!.quiescing),
-      slackQuiesced: !slack.live || (slackDrain.status === "fulfilled" && slackDrain.value!.quiescing),
+      dispatcherQuiesced: (!dispatcher.live && (dispatcher.observed !== false ||
+        this.database.runtimeOperation(row.request_id, "stop_target_dispatcher")?.phase === "observed")) ||
+        (dispatcherDrain.status === "fulfilled" && dispatcherDrain.value?.quiescing === true),
+      slackQuiesced: (!slack.live && (slack.observed !== false ||
+        this.database.runtimeOperation(row.request_id, "stop_target_slack")?.phase === "observed")) ||
+        (slackDrain.status === "fulfilled" && slackDrain.value?.quiescing === true),
     };
   }
 
