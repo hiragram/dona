@@ -34,6 +34,7 @@ class MemoryKeychain implements KeychainStore {
 }
 
 class FakeSlackClient implements SlackApiClient {
+  channelLookups = 0;
   readonly posts: Array<{
     channelId: string;
     text: string;
@@ -67,14 +68,16 @@ class FakeSlackClient implements SlackApiClient {
       ],
     };
   }
-  async getChannel(): Promise<SlackChannel> {
+  async getChannel(channelId: string): Promise<SlackChannel> {
+    this.channelLookups += 1;
     return {
-      id: "C123",
+      id: channelId,
       name: "general",
-      isPrivate: false,
+      isPrivate: channelId.startsWith("G"),
       isArchived: false,
       isMember: true,
       isShared: false,
+      isMpim: channelId === "GMPIM",
     };
   }
   async hasChannelMember(_channelId:string,userId:string):Promise<boolean> { return userId==="U1"; }
@@ -259,7 +262,7 @@ describe("Dona Slack MCP server", () => {
           channelId: "C123",
           text: "hello",
           threadTs: "1.2",
-          replyBroadcast: false,
+          replyBroadcast: true,
           mrkdwn: false,
           parse: "none",
         },
@@ -270,7 +273,7 @@ describe("Dona Slack MCP server", () => {
         message_ts: "2.3",
         body_sha256: createHash("sha256").update("hello").digest("hex"),
         thread_ts: "1.2",
-        reply_broadcast: false,
+        reply_broadcast: true,
         mrkdwn: false,
         parse: "none",
       });
@@ -328,6 +331,35 @@ describe("Dona Slack MCP server", () => {
       });
       assert.equal(fake.posts.at(-1)?.mrkdwn, false);
       assert.equal((plainScheduledResult.structuredContent as { mrkdwn?: boolean })?.mrkdwn, false);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "D123", text: "dm", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      const lookupsBeforeExplicitFalse = fake.channelLookups;
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GMPIM", text: "quiet", thread_ts: "1.2",
+        reply_broadcast: false,
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+      assert.equal(fake.channelLookups, lookupsBeforeExplicitFalse);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GPRIVATE", text: "private", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, true);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GMPIM", text: "group dm", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "C123", text: "job", thread_ts: "1.2",
+        event_id: "evt_01m1zfewbjx8v0844yrrkqwzc7",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
 
       const fileResult = await client.callTool({
         name: "get_file",

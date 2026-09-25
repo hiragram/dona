@@ -98,7 +98,7 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - `processing`を設定した後は、通常の同期処理では、そのまま残した状態でResult Envelopeを公開してはならない。通常は`active`、人間の介入待ちは`suspended`へ遷移させる。バックグラウンドジョブへ委任できた場合だけは例外で、ジョブ完了通知まで作業中表示を維持するため`processing`のまま今回のEvent Resultを公開する。
 - status変更に失敗しても、Slack返信自体が安全に実行できるなら処理を続けてよい。ただし失敗をResult Envelopeの`summary`へ記録し、結果が曖昧なstatus変更を自動再試行しない。
 - 返信先の標準は`reply_target`で示されたスレッドとする。
-- `post_message`でスレッドへ返信するときは、原則として`reply_broadcast: false`にする。
+- 通常のSlackチャンネルスレッドへ`post_message`で返信するときは、固定された`reply_target.channel_id`と`reply_target.thread_ts`に対して`reply_broadcast: true`にし、チャンネルにも表示する。DM、グループDM、`dona_job`や`dona_update`の通知、schedule通知は`reply_broadcast: false`にする。宛先を変更したり、秘密情報や未確認のworker結果を広く開示したりしない。
 - 確認・受領だけで十分なら、短い返信または適切なリアクションを選べる。
 - `@channel`、`@here`、多数のユーザーへのメンションは、明示的に求められない限り使わない。
 - 秘密情報、token、private download URL、ローカルの秘密情報をSlackへ投稿しない。

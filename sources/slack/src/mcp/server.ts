@@ -496,7 +496,7 @@ export function createSlackMcpServer(
         channel_id: channelSchema,
         text: z.string().min(1).max(12_000).describe("Slack message body"),
         thread_ts: timestampSchema.optional(),
-        reply_broadcast: z.boolean().default(false),
+        reply_broadcast: z.boolean().optional().describe("Defaults to true for ordinary channel thread replies; false for DMs and job notifications"),
         mrkdwn: z.boolean().optional(),
         parse: z.literal("none").optional(),
         event_id: z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i).optional().describe("Dona job通知時のcurrent event ID"),
@@ -506,6 +506,11 @@ export function createSlackMcpServer(
     async ({ workspace, channel_id, text, thread_ts, reply_broadcast, mrkdwn, parse, event_id }) => {
       try {
         const connection = registry.get(workspace);
+        const channel = thread_ts && channel_id.startsWith("G") && !event_id && reply_broadcast !== false
+          ? await connection.client.getChannel(channel_id) : undefined;
+        const isChannel = channel_id.startsWith("C") || (channel?.isPrivate === true && channel.isMpim !== true && channel.isIm !== true);
+        const effectiveReplyBroadcast = Boolean(thread_ts) && !event_id && isChannel && (reply_broadcast ?? true);
+        if (event_id && reply_broadcast === true) throw new Error("job_notification_broadcast_forbidden");
         const effectiveMrkdwn=event_id?(mrkdwn??true):mrkdwn;
         const effectiveParse=event_id?"none" as const:parse;
         const safeText=event_id&&effectiveMrkdwn
@@ -515,7 +520,7 @@ export function createSlackMcpServer(
           channelId: channel_id,
           text: safeText,
           ...(thread_ts ? { threadTs: thread_ts } : {}),
-          replyBroadcast: reply_broadcast,
+          replyBroadcast: effectiveReplyBroadcast,
           ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
           ...(effectiveParse?{parse:effectiveParse}:{}),
           ...(event_id?{identityBlockId:`dona-job-${createHash("sha256").update(event_id).digest("hex").slice(0,32)}`}:{}),
@@ -534,7 +539,7 @@ export function createSlackMcpServer(
           channel_id: result.channelId,
           message_ts: result.messageTs,
           body_sha256,
-          reply_broadcast,
+          reply_broadcast: effectiveReplyBroadcast,
           ...(effectiveMrkdwn!==undefined?{mrkdwn:effectiveMrkdwn}:{}),
           ...(effectiveParse?{parse:effectiveParse}:{}),
           ...(event_id?{event_id}:{}),
