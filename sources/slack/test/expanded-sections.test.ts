@@ -19,3 +19,15 @@ test("a link at a split boundary stays in one section and malformed surrogate ad
   assert.ok(blocks.some((block) => block.text.text.includes("<https://example.com|PR>")));
   assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
 });
+
+test("long inline code and emphasis remain balanced across sections", () => {
+  for (const marker of ["`", "*", "_", "~"]) {
+    const blocks = expandedSections(`${marker}${"x".repeat(7_000)}${marker}`, "identity", true);
+    assert.ok(blocks.length > 1);
+    for (const block of blocks) {
+      assert.ok(block.text.text.length <= 3_000);
+      assert.ok(block.text.text.startsWith(marker));
+      assert.ok(block.text.text.endsWith(marker));
+    }
+  }
+});

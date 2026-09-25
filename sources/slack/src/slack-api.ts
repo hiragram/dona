@@ -40,6 +40,39 @@ export interface SlackPostResult {
   threadTs?: string;
 }
 
+type InlineMarker = "`" | "*" | "_" | "~";
+
+function advanceMrkdwnState(
+  text: string,
+  state: { fence: boolean; inline: InlineMarker[] },
+): void {
+  for (let index = 0; index < text.length; index++) {
+    if (text.startsWith("```", index)) {
+      state.fence = !state.fence;
+      index += 2;
+      continue;
+    }
+    if (state.fence) continue;
+    if (text[index] === "\\") {
+      index++;
+      continue;
+    }
+    if (text.startsWith("<http", index)) {
+      const close = text.indexOf(">", index + 5);
+      if (close !== -1) {
+        index = close;
+        continue;
+      }
+    }
+    const marker = text[index];
+    if (marker !== "`" && marker !== "*" && marker !== "_" && marker !== "~") continue;
+    if (state.inline.includes("`") && marker !== "`") continue;
+    const existing = state.inline.lastIndexOf(marker);
+    if (existing === -1) state.inline.push(marker);
+    else state.inline.splice(existing, 1);
+  }
+}
+
 export function expandedSections(text: string, blockId: string, mrkdwn: boolean) {
   const chunks: string[] = [];
   for (let offset = 0; offset < text.length;) {
@@ -62,12 +95,15 @@ export function expandedSections(text: string, blockId: string, mrkdwn: boolean)
     chunks.push(text.slice(offset, end));
     offset = end;
   }
-  let insideFence = false;
+  const state: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
   return chunks.map((rawChunk, index) => {
-    const startsInsideFence = insideFence;
-    if (mrkdwn && (rawChunk.match(/```/g) ?? []).length % 2 === 1) insideFence = !insideFence;
+    const startsInsideFence = state.fence;
+    const startsInsideInline = [...state.inline];
+    if (mrkdwn) advanceMrkdwnState(rawChunk, state);
+    const inlinePrefix = startsInsideInline.join("");
+    const inlineSuffix = [...state.inline].reverse().join("");
     const chunk = mrkdwn
-      ? `${startsInsideFence ? "```\n" : ""}${rawChunk}${insideFence ? "\n```" : ""}`
+      ? `${startsInsideFence ? "```\n" : ""}${inlinePrefix}${rawChunk}${inlineSuffix}${state.fence ? "\n```" : ""}`
       : rawChunk;
     return ({
     type: "section" as const,
