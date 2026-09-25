@@ -67,14 +67,15 @@ class FakeSlackClient implements SlackApiClient {
       ],
     };
   }
-  async getChannel(): Promise<SlackChannel> {
+  async getChannel(channelId: string): Promise<SlackChannel> {
     return {
-      id: "C123",
+      id: channelId,
       name: "general",
-      isPrivate: false,
+      isPrivate: channelId.startsWith("G"),
       isArchived: false,
       isMember: true,
       isShared: false,
+      isMpim: channelId === "GMPIM",
     };
   }
   async hasChannelMember(_channelId:string,userId:string):Promise<boolean> { return userId==="U1"; }
@@ -305,6 +306,16 @@ describe("Dona Slack MCP server", () => {
 
       await client.callTool({ name: "post_message", arguments: {
         workspace: "company", channel_id: "D123", text: "dm", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GPRIVATE", text: "private", thread_ts: "1.2",
+      } });
+      assert.equal(fake.posts.at(-1)?.replyBroadcast, true);
+
+      await client.callTool({ name: "post_message", arguments: {
+        workspace: "company", channel_id: "GMPIM", text: "group dm", thread_ts: "1.2",
       } });
       assert.equal(fake.posts.at(-1)?.replyBroadcast, false);
 
