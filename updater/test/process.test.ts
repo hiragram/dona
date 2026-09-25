@@ -236,8 +236,9 @@ test("process observation includes an orphan in the command process group", asyn
     diagnostic: { store, identity: { request_id: "upd_01m1es03xy5cf8d9pm5cwx4srv", attempt: 1, step: "dispatcher:npm-test" } },
   });
   assert.equal(result.timed_out, true);
-  assert.ok(records.some((record) => /phase=timeout.*process_tree=observed total=[1-9]/.test(record)), records.join("\n"));
-  assert.ok(records.some((record) => /phase=timeout.*pgid=/.test(record)));
+  assert.ok(records.some((record) => /phase=checkpoint_(25|75).*process_tree=observed total=[1-9]/.test(record)));
+  assert.ok(records.some((record) => /phase=checkpoint_(25|75).*ppid=1,pgid=/.test(record)));
+  assert.ok(records.some((record) => record.includes("phase=timeout")));
 });
 
 test("ProcessCheckpointTracker keeps the exact remaining concurrent case identity", () => {

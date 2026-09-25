@@ -187,26 +187,23 @@ export class ProcessRunner {
         poll();
       };
       let timer: NodeJS.Timeout | undefined;
-      let samplingTimeout = false;
-      const terminate = async (reason: "timeout" | "readiness_failed"): Promise<void> => {
+      const terminate = (reason: "timeout" | "readiness_failed"): void => {
         if (settled || timedOut || readinessFailed) return;
         if (reason === "timeout") {
           timedOut = true;
           checkpoints.freezeTimeout();
-          samplingTimeout = true;
-          await sample("timeout");
-          samplingTimeout = false;
         } else {
           readinessFailed = true;
         }
         termOutcome = signalGroup("SIGTERM");
+        if (reason === "timeout") void sample("timeout");
         hardKillTimer = setTimeout(() => {
           killOutcome = signalGroup("SIGKILL");
           hardKillTimer = undefined;
           finishAfterGroupCleanup();
         }, 1_000);
       };
-      const timeOut = (): void => { void terminate("timeout"); };
+      const timeOut = (): void => terminate("timeout");
       const armCommandTimeout = (timeoutMs: number): void => {
         if (settled || timedOut || readinessFailed) return;
         if (timer) clearTimeout(timer);
@@ -219,7 +216,7 @@ export class ProcessRunner {
         void options.timeoutStartAfter.then(() => {
           const remainingMs = Math.max(0, options.timeoutMs - (Date.now() - timeoutStartedAt));
           armCommandTimeout(Math.min(options.timeoutAfterReadyMs!, remainingMs));
-        }, () => { void terminate("readiness_failed"); });
+        }, () => terminate("readiness_failed"));
       }
       child.once("error", (error) => {
         if (timer) clearTimeout(timer);
@@ -243,7 +240,7 @@ export class ProcessRunner {
         if (timer) clearTimeout(timer);
         closedCode = code;
         exitSignal = signal;
-        if (!hardKillTimer && !cleanupPollTimer && !samplingTimeout) void finish();
+        if (!hardKillTimer && !cleanupPollTimer) void finish();
       });
     });
   }
