@@ -112,6 +112,13 @@ describe("job result publish contract", () => {
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "to\\u200bken": "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "to\\bken": "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ kty: "R\\u0053A", d: "PRIVATE_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    for (const artifact of [
+      { kty: "RSA", "k\\u0074y": "public", d: "PRIVATE_VALUE" },
+      { "%5C%75%30%30%37%34oken": "CANARY_VALUE" },
+    ]) assert.throws(() => validateJobResultPublish({ ...base, artifacts: [artifact] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    for (const summary of ["http://[ff02::1]/download/result", "Loaded .ssh/id_rsa", "Read .aws/credentials", "Read secrets/credential.json"]) {
+      assert.throws(() => validateJobResultPublish({ ...base, summary }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    }
     assert.throws(() => validateJobResultPublish({ ...base, summary: "\u001b[31m" }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     for (const value of ["//cdn.example.com/assets/report.json", "//[2606:4700:4700::1111]/dns-query", '{"kty":"RSA","n":"public"} {"d":"done"}', "成功/失敗の内訳", "実装/テスト完了", "GET /health returned 200", "POST /v1/job-result-publish", "Updated dispatcher/src/job.ts", "See docs/guide", "build/test passed", "Bearer authentication is enabled", "Bearer credentials were removed", 'payload={\\"status\\":\\"ok\\"}']) {
       assert.doesNotThrow(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), value);
@@ -323,6 +330,10 @@ describe("job result publish contract", () => {
     const multilineGrant = multiline.issue(row({ objective: "internal\nplan" }), "session-multiline");
     assert.throws(() => multiline.validate(multilineGrant.capability, "session-multiline", { ...base, summary: 'payload={"detail":"internal\\nplan"}' },
       () => row({ status: "running", objective: "internal\nplan" })), code("content_requires_redaction"));
+    const invisible = new JobResultPublishCapabilities(() => "session-invisible");
+    const invisibleGrant = invisible.issue(row({ objective: "secret\u200bplan" }), "session-invisible");
+    assert.throws(() => invisible.validate(invisibleGrant.capability, "session-invisible", { ...base, summary: "secretplan" },
+      () => row({ status: "running", objective: "secret\u200bplan" })), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "private%252520objective%252520text" }, () => current), code("content_requires_redaction"));
     const japanese = new JobResultPublishCapabilities(() => "session-ja");
     const jaGrant = japanese.issue(row({ objective: "秘密 計画" }), "session-ja");
@@ -546,6 +557,35 @@ describe("job result publish contract", () => {
       assert.ok(performance.now() - started < 1_000);
       active.destroy();
     } finally {
+      await stopServer(server);
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("chunkedのwire framingが1 MiBを超えても本文上限内なら受理する", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-many-chunks-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => "session-1");
+    const grant = grants.issue(row(), "session-1");
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 32);
+    let client: net.Socket | undefined;
+    try {
+      await startServer(server, socket);
+      client = net.createConnection(socket);
+      client.on("error", () => {});
+      await new Promise<void>(resolve => client!.once("connect", resolve));
+      const body = JSON.stringify({ ...base, summary: "x".repeat(60_000) });
+      const encoded = Buffer.from(body);
+      const chunks = Array.from(encoded, byte => {
+        return Buffer.concat([Buffer.from("0000000000000001\r\n"), Buffer.from([byte]), Buffer.from("\r\n")]);
+      });
+      assert.ok(chunks.reduce((size, chunk) => size + chunk.length, 0) > jobResultEnvelopeMaxBytes);
+      const response = new Promise<string>(resolve => client!.once("data", data => resolve(String(data))));
+      client.write(Buffer.concat([Buffer.from(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nTransfer-Encoding: chunked\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n`), ...chunks, Buffer.from("0\r\n\r\n")]));
+      assert.match(await Promise.race([response, new Promise<string>((_, reject) => setTimeout(() => reject(new Error("chunked response timeout")), 5_000))]), /^HTTP\/1\.1 202 /);
+    } finally {
+      client?.destroy();
       await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }

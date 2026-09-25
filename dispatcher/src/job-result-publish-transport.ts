@@ -143,7 +143,13 @@ export class JobResultPublishServer {
       if (socket.destroyed) return;
       if (rawBytes === 0) return;
       const active = this.activeMessages.get(socket);
-      if (active && !active.complete) return;
+      if (active && !active.complete) {
+        // HTTP's decoded request stream enforces the body limit. Discard wire
+        // framing while that request is active, including chunk-size lines.
+        rawChunks = [];
+        rawBytes = 0;
+        return;
+      }
       const raw = Buffer.concat(rawChunks, rawBytes);
       const end = requestEndOffset(raw);
       if (end !== null) {
@@ -174,8 +180,13 @@ export class JobResultPublishServer {
           return;
         }
         firstReplay = false;
+        if (this.activeMessages.get(socket)?.complete === false) {
+          rawChunks = [];
+          rawBytes = 0;
+          return;
+        }
         rawBytes += chunk.length;
-        if (rawBytes > jobResultEnvelopeMaxBytes + 16_384) { socket.destroy(); return; }
+        if (!this.activeMessages.has(socket) && rawBytes > 16_384) { socket.destroy(); return; }
         rawChunks.push(Buffer.from(chunk));
         // Observe the HTTP parser's state after it has handled this data event.
         queueMicrotask(inspectRaw);

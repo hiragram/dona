@@ -111,6 +111,7 @@ function hasPrivateJwkText(value: string): boolean {
 }
 const localPath = /(?:^|[\s"'<>`()[\]{},:=])\/(?!\/)[^\s"'<>`]+|(?<![A-Za-z0-9._~:/-])\/[A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+|(?<![A-Za-z0-9])~\/|[A-Za-z]:(?:\\|\/(?!\/))/iu;
 function hasLocalPath(value: string): boolean {
+  if (/(?:^|[\s"'<>`()[\]{},:=])(?:\.ssh|\.aws|\.env(?:\.[A-Za-z0-9_-]+)?|secrets|id_(?:rsa|ed25519))(?:[\\/]|\b)/i.test(value)) return true;
   if (/(?<![A-Za-z0-9/])\/(?:Users|home|root|workspace|var|tmp|etc|opt|private|run|proc|dev|sys)(?:\/|$)/i.test(value)) return true;
   const candidate = new RegExp(localPath.source, "giu");
   for (const match of value.matchAll(candidate)) {
@@ -184,7 +185,7 @@ function hasPrivateHttpHost(candidate: string): boolean {
   }
   if (isIP(host) === 6) {
     const first = Number.parseInt(host.split(":")[0] || "0", 16);
-    if (host === "::" || host === "::1" || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) return true;
+    if (host === "::" || host === "::1" || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00) return true;
     const mapped = host.match(/(?:^|:)ffff:(\d+\.\d+\.\d+\.\d+)$/i);
     if (mapped) return hasPrivateHttpHost(`http://${mapped[1]}/`);
     // Also cover compressed hexadecimal IPv4-mapped addresses.
@@ -263,17 +264,18 @@ function forbiddenKey(key: string): boolean {
 }
 function normalizedStructuredKey(key: string): string {
   let normalized = key.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
-  for (let depth = 0; depth < 3; depth++) {
+  for (let depth = 0; depth < 8; depth++) {
     const decoded = normalized.replace(/\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g, escaped => {
       if (escaped[1] === "u") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
       return ({ b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" } as Record<string, string>)[escaped[1]!] ?? escaped[1]!;
     });
-    if (decoded === normalized) break;
-    normalized = decoded.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
-  }
-  for (let depth = 0; depth < 3 && /%[0-9A-Fa-f]{2}/.test(normalized); depth++) {
-    try { normalized = decodeURIComponent(normalized).replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, ""); }
-    catch { break; }
+    let next = decoded;
+    if (/%[0-9A-Fa-f]{2}/.test(next)) {
+      try { next = decodeURIComponent(next); } catch { /* Invalid encodings remain literal. */ }
+    }
+    next = next.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "");
+    if (next === normalized) break;
+    normalized = next;
   }
   return normalized.normalize("NFC");
 }
@@ -283,8 +285,10 @@ class ForbiddenValueMatcher {
   private readonly exact = new Set<string>();
   private readonly substrings: string[] = [];
   constructor(values: readonly string[], substringShortValues: ReadonlySet<string> = new Set()) {
-    const normalizedShortValues = new Set([...substringShortValues].map(value => value.normalize("NFC")));
-    for (const value of new Set(values.map(item => item.normalize("NFC")))) {
+    const display = (value: string) => value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}]/gu, "").normalize("NFC");
+    const normalizedShortValues = new Set([...substringShortValues].flatMap(value => [value.normalize("NFC"), display(value)]));
+    for (const value of new Set(values.flatMap(item => [item.normalize("NFC"), display(item)]))) {
+      if (!value) continue;
       if (value.length < 8 && !normalizedShortValues.has(value)) { this.exact.add(value); continue; }
       this.substrings.push(value);
     }
@@ -370,8 +374,10 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth);
   } else if (value !== null && typeof value === "object") {
-    const normalizedObject = Object.fromEntries(Object.entries(value).map(([key, item]) =>
-      [normalizedStructuredKey(key), typeof item === "string" ? normalizedStructuredKey(item) : item]));
+    const normalizedEntries = Object.entries(value).map(([key, item]) =>
+      [normalizedStructuredKey(key), typeof item === "string" ? normalizedStructuredKey(item) : item] as const);
+    if (new Set(normalizedEntries.map(([key]) => key)).size !== normalizedEntries.length) throw new JobResultPublishError("content_requires_redaction");
+    const normalizedObject = Object.fromEntries(normalizedEntries);
     if (hasPrivateJwkFields(normalizedObject)) throw new JobResultPublishError("content_requires_redaction");
     for (const [key, item] of Object.entries(value)) {
       if (forbiddenKey(normalizedStructuredKey(key)) && !isPublicCountField(key, item)) throw new JobResultPublishError("content_requires_redaction");
