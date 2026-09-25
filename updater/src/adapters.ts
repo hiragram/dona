@@ -619,7 +619,11 @@ export class RealRuntime implements RuntimePort {
   }
 
   stopSlack(): Promise<CommandResult> {
-    return this.launchctl(["kill", "SIGTERM", this.domainTarget(this.policy.launchd.slack_label)]);
+    return this.launchctl(["bootout", this.domainTarget(this.policy.launchd.slack_label)]);
+  }
+
+  slackRegistered(): Promise<boolean> {
+    return this.serviceRegistered(this.policy.launchd.slack_label);
   }
 
   stopDispatcher(): Promise<CommandResult> {
@@ -627,13 +631,19 @@ export class RealRuntime implements RuntimePort {
   }
 
   async dispatcherRegistered(): Promise<boolean> {
-    const result = await this.launchctl(["print", this.domainTarget(this.policy.launchd.dispatcher_label)]);
+    return this.serviceRegistered(this.policy.launchd.dispatcher_label);
+  }
+
+  private async serviceRegistered(label: string): Promise<boolean> {
+    const errorCode = label === this.policy.launchd.dispatcher_label
+      ? "dispatcher_registration_unverified" : "slack_registration_unverified";
+    const result = await this.launchctl(["print", this.domainTarget(label)]);
     if (result.timed_out || result.output_truncated || result.exit_code === null) {
-      throw new Error("dispatcher_registration_unverified");
+      throw new Error(errorCode);
     }
     if (result.exit_code === 0) return true;
     if (/Could not find (?:specified )?service/i.test(result.stderr)) return false;
-    throw new Error("dispatcher_registration_unverified");
+    throw new Error(errorCode);
   }
 
   migrateAppSchema(_requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult> {
@@ -715,8 +725,14 @@ export class RealRuntime implements RuntimePort {
       path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")]);
   }
 
-  startSlack(): Promise<CommandResult> {
-    return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.slack_label)]);
+  async startSlack(): Promise<CommandResult> {
+    if (await this.slackRegistered()) {
+      return this.launchctl(["kickstart", "-k", this.domainTarget(this.policy.launchd.slack_label)]);
+    }
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("launchctl_requires_unix_uid");
+    return this.launchctl(["bootstrap", `gui/${uid}`,
+      path.join(os.homedir(), "Library/LaunchAgents/dev.dona.slack-adapter.plist")]);
   }
 
   async waitForMainAgentIdle(): Promise<MainAgentObservation> {

@@ -655,9 +655,15 @@ export class UpdateController {
           return;
         }
       }
-      if (!(await this.ensureServiceStopped(
-        row, "stop_slack", "slack_adapter", row.current_sha, () => this.runtime.stopSlack(),
-      ))) return;
+      try {
+        if (!(await this.ensureServiceStopped(
+          row, "stop_slack", "slack_adapter", row.current_sha, () => this.runtime.stopSlack(),
+        ))) return;
+      } catch {
+        this.assertLease(row);
+        await this.restoreQuiescedServices(row, "stop_slack_registration_unverified");
+        return;
+      }
       try {
         if (!(await this.ensureServiceStopped(
           row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
@@ -975,9 +981,15 @@ export class UpdateController {
             return;
           }
         }
-        if (!(await this.ensureServiceStopped(
-          row, "stop_target_slack", "slack_adapter", null, () => this.runtime.stopSlack(),
-        ))) return;
+        try {
+          if (!(await this.ensureServiceStopped(
+            row, "stop_target_slack", "slack_adapter", null, () => this.runtime.stopSlack(),
+          ))) return;
+        } catch {
+          this.assertLease(row);
+          await this.restoreTargetAfterDrain(row, "stop_target_slack_registration_unverified", true, true);
+          return;
+        }
         try {
           if (!(await this.ensureServiceStopped(
             row, "stop_target_dispatcher", "dispatcher", null, () => this.runtime.stopDispatcher(),
@@ -1559,12 +1571,13 @@ export class UpdateController {
       this.needsReview(row, `${kind}_rejected`, `The persisted ${kind} operation was definitively rejected`);
       return false;
     }
-    const dispatcherUnregistered = async (): Promise<boolean> =>
-      service !== "dispatcher" || !(await this.runtime.dispatcherRegistered());
+    const serviceUnregistered = async (): Promise<boolean> =>
+      service === "dispatcher" ? !(await this.runtime.dispatcherRegistered())
+        : !(await this.runtime.slackRegistered());
     if (existing) {
       const health = await this.waitForStopped(service);
       this.assertLease(row);
-      if (!health.live && await dispatcherUnregistered()) {
+      if (!health.live && await serviceUnregistered()) {
         this.assertLease(row);
         this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health }, this.clock.now());
         return true;
@@ -1575,7 +1588,7 @@ export class UpdateController {
 
     const before = service === "dispatcher" ? await this.runtime.dispatcherHealth() : await this.runtime.slackHealth();
     this.assertLease(row);
-    if (!before.live && await dispatcherUnregistered()) {
+    if (!before.live && await serviceUnregistered()) {
       this.assertLease(row);
       this.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, expectedSha, null, {}, this.clock.now());
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health: before }, this.clock.now());
@@ -1609,7 +1622,7 @@ export class UpdateController {
     }, this.clock.now());
     const health = await this.waitForStopped(service);
     this.assertLease(row);
-    if (!health.live && await dispatcherUnregistered()) {
+    if (!health.live && await serviceUnregistered()) {
       this.assertLease(row);
       this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, { health }, this.clock.now());
       return true;
@@ -1715,7 +1728,23 @@ export class UpdateController {
       return "started";
     }
     this.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, sha, null, {}, this.clock.now());
-    const result = await execute();
+    let result: CommandResult;
+    try { result = await execute(); }
+    catch {
+      this.assertLease(row);
+      this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "acceptance_unknown", null,
+        { error_code: "registration_or_launch_unverified" }, this.clock.now());
+      const health = await this.waitForHealth(service, sha, compatibility);
+      this.assertLease(row);
+      if (this.healthMatches(health, sha, service === "slack_adapter", compatibility)) {
+        this.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null,
+          { health }, this.clock.now());
+        return "started";
+      }
+      this.deferOrReview(row, `${kind}_acceptance_unknown`,
+        `The ${kind} launch acceptance is unknown and versioned health was not observed`);
+      return "deferred";
+    }
     this.assertLease(row);
     if (!resultSucceeded(result)) {
       const phase = result.timed_out || result.output_truncated || result.exit_code === null

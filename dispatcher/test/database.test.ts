@@ -1521,7 +1521,8 @@ describe("DispatcherDatabase", () => {
     const followUp=database.enqueue(eventEnvelope("Ev-steer-admission-bytes-follow-up")).row;
     database.appendQueuedJobInstruction(first.job_id,followUp.event_id,"b".repeat(50));
     const accepted = database.getJob(first.job_id)!;
-    assert.deepEqual(database.appendQueuedJobInstruction(first.job_id,followUp.event_id,"b".repeat(50)),accepted);
+    assert.deepEqual(database.appendQueuedJobInstruction(first.job_id,followUp.event_id,"b".repeat(50)),
+      { row: accepted, duplicate: true });
     const later = database.enqueue(eventEnvelope("Ev-steer-admission-bytes-later")).row;
     assert.throws(()=>database.appendQueuedJobInstruction(first.job_id,later.event_id,"c"),error=>error instanceof JobCreationError && error.code==="job_group_limit_exceeded");
     assert.deepEqual(database.getJob(first.job_id)!,accepted);

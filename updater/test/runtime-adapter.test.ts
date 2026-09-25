@@ -223,10 +223,11 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
     ]);
     const uid = process.getuid!();
     assert.deepEqual(recording.calls.map(({ executable, args }) => [executable, ...args]), [
-      [policy.executables.launchctl, "kill", "SIGTERM", `gui/${uid}/${policy.launchd.slack_label}`],
+      [policy.executables.launchctl, "bootout", `gui/${uid}/${policy.launchd.slack_label}`],
       [policy.executables.launchctl, "bootout", `gui/${uid}/${policy.launchd.dispatcher_label}`],
       [policy.executables.launchctl, "print", `gui/${uid}/${policy.launchd.dispatcher_label}`],
       [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.dispatcher_label}`],
+      [policy.executables.launchctl, "print", `gui/${uid}/${policy.launchd.slack_label}`],
       [policy.executables.launchctl, "kickstart", "-k", `gui/${uid}/${policy.launchd.slack_label}`],
     ]);
     assert.equal(Object.values(recording.calls[0]!.options.env ?? {}).some((value) => /token|secret/i.test(value)), false);

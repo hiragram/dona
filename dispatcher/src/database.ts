@@ -1812,14 +1812,14 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
-  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): JobRow {
+  appendQueuedJobInstruction(jobId: string, sourceEventId: string, instruction: string): { row: JobRow; duplicate: boolean } {
     return this.db.transaction(() => {
       this.assertJobSourceMatchesThread(jobId, sourceEventId);
       this.assertJobSteerAllowed(jobId);
       if (this.getRequired(sourceEventId).source !== "slack") throw new Error("Job control requires a Slack source event");
       const row = this.getJobRequired(jobId);
       if (this.db.prepare("SELECT 1 FROM job_queued_steer_receipts WHERE job_id=? AND source_event_id=?")
-        .get(jobId,sourceEventId)) return row;
+        .get(jobId,sourceEventId)) return { row, duplicate: true };
       if (!["queued", "retryable_failed"].includes(row.status)) throw new Error(`Job ${jobId} is not waiting to start`);
       const addition = `\n\n[DONA_FOLLOW_UP]\n${instruction}\n[/DONA_FOLLOW_UP]`;
       const objective = row.objective + addition;
@@ -1833,7 +1833,7 @@ export class DispatcherDatabase {
         .run(objective,sourceEventId,nowUtc(),jobId);
       this.db.prepare("INSERT INTO job_queued_steer_receipts(job_id,source_event_id) VALUES(?,?)")
         .run(jobId,sourceEventId);
-      return this.getJobRequired(jobId);
+      return { row: this.getJobRequired(jobId), duplicate: false };
     }).immediate();
   }
 

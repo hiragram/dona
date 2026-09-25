@@ -64,6 +64,7 @@ export interface RuntimePort {
   slackDrainStatus(): Promise<DrainSnapshot>;
   dispatcherDrainStatus(): Promise<DrainSnapshot>;
   stopSlack(): Promise<CommandResult>;
+  slackRegistered(): Promise<boolean>;
   stopDispatcher(): Promise<CommandResult>;
   dispatcherRegistered(): Promise<boolean>;
   migrateAppSchema(requestId: string, targetSha: string, previous: Compatibility, target: Compatibility): Promise<CommandResult>;

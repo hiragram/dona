@@ -995,6 +995,21 @@ describe("JobSupervisor", () => {
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
     database.close();
   });
+  test("queued follow-up receipt reports a duplicate after another follow-up", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const source = database.enqueue(eventEnvelope("Ev-queued-followup-source")).row;
+    const first = database.enqueue(eventEnvelope("Ev-queued-followup-first")).row;
+    const second = database.enqueue(eventEnvelope("Ev-queued-followup-second")).row;
+    const job = database.createJob({ source_event_id: source.event_id, objective: "調査",
+      workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+    assert.equal((await supervisor.steer(job.job_id, first.event_id, "A")).duplicate, false);
+    assert.equal((await supervisor.steer(job.job_id, second.event_id, "B")).duplicate, false);
+    assert.equal((await supervisor.steer(job.job_id, first.event_id, "A")).duplicate, true);
+    assert.equal(database.getJob(job.job_id)?.objective.split("[DONA_FOLLOW_UP]").length, 3);
+    database.close();
+  });
   test("definitive steer absence clears a terminal dispatching marker", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);

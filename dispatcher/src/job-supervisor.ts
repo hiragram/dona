@@ -257,9 +257,9 @@ export class JobSupervisor {
       const current = this.database.getJob(jobId);
       if (!current) throw new Error(`Job ${jobId} was not found`);
       if (["queued", "retryable_failed"].includes(current.status)) {
-        const row = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction);
+        const result = this.database.appendQueuedJobInstruction(jobId, sourceEventId, instruction);
         this.wake();
-        return { row, duplicate: current.steer_event_id === sourceEventId && current.steer_state === "accepted" };
+        return result;
       }
       const begun = this.database.beginJobSteer(jobId, sourceEventId);
       if (begun.duplicate) return begun;

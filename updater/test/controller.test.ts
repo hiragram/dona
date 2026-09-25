@@ -270,6 +270,8 @@ class FakeRuntime implements RuntimePort {
   dispatcherRegistrationOverride: boolean | undefined;
   dispatcherRegistrationAppearsOnCall: number | undefined;
   dispatcherRegistrationThrowsOnCall: number | undefined;
+  slackRegistrationThrowsOnCall: number | undefined;
+  private slackRegistrationCalls = 0;
   private dispatcherRegistrationCalls = 0;
   activeWorkerCount = 0;
   workerAppearsAfterForwardStop = false;
@@ -400,6 +402,13 @@ class FakeRuntime implements RuntimePort {
       drained: this.dispatcherQuiescing, in_flight: 0, unsafe_states: [] };
   }
   async stopSlack() { this.calls.push("stopSlack"); this.slackLive = false; return ok; }
+  async slackRegistered() {
+    this.slackRegistrationCalls += 1;
+    if (this.slackRegistrationThrowsOnCall === this.slackRegistrationCalls) {
+      throw new Error("slack_registration_unverified");
+    }
+    return this.slackLive;
+  }
   async stopDispatcher() {
     this.calls.push("stopDispatcher");
     this.dispatcherLive = false;
@@ -741,6 +750,21 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher")?.phase, "observed");
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
     assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
+  test("persists target Dispatcher start intent when registration lookup throws", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-target-start-read" });
+    f.dispatcher.terminal = true;
+    f.runtime.dispatcherStartThrows = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "restarting");
+    assert.equal(f.database.runtimeOperation(row.request_id, "start_target_dispatcher")?.phase, "acceptance_unknown");
+    assert.equal((await f.store.observe()).current_sha, targetSha);
     f.database.close();
   });
   test("restores old runtime when Dispatcher stop registration proof is unreadable", async () => {
