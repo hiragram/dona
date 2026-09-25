@@ -48,10 +48,15 @@ function isEscaped(text: string, index: number): boolean {
   return (index - start) % 2 === 1;
 }
 
+function insideAngleToken(text: string, index: number): boolean {
+  const open = text.lastIndexOf("<", index);
+  return open >= 0 && open > text.lastIndexOf(">", index) && text.indexOf(">", index + 1) !== -1;
+}
+
 function fenceOpenAt(text: string, end: number): boolean {
   let open = false;
   for (const match of text.slice(0, end).matchAll(/```/g)) {
-    if (!isEscaped(text, match.index)) open = !open;
+    if (!isEscaped(text, match.index) && !insideAngleToken(text, match.index)) open = !open;
   }
   return open;
 }
@@ -60,7 +65,7 @@ function inlineCodeOpenAt(text: string, end: number): boolean {
   let inFence = false;
   let inCode = false;
   for (let index = 0; index < end; index++) {
-    if (text.startsWith("```", index) && !isEscaped(text, index)) {
+    if (text.startsWith("```", index) && !isEscaped(text, index) && !insideAngleToken(text, index)) {
       inFence = !inFence;
       index += 2;
       continue;
@@ -74,7 +79,7 @@ function findMultiQuoteStart(text: string): number {
   let inFence = false;
   let inCode = false;
   for (let index = 0; index < text.length; index++) {
-    if (text.startsWith("```", index) && !isEscaped(text, index)) {
+    if (text.startsWith("```", index) && !isEscaped(text, index) && !insideAngleToken(text, index)) {
       inFence = !inFence;
       index += 2;
       continue;
@@ -125,7 +130,7 @@ function advanceMrkdwnState(
   offset: number,
 ): void {
   for (let index = 0; index < text.length; index++) {
-    if (text.startsWith("```", index) && !isEscaped(text, offset + index)) {
+    if (text.startsWith("```", index) && !isEscaped(fullText, offset + index) && !insideAngleToken(fullText, offset + index)) {
       state.fence = !state.fence;
       index += 2;
       continue;
@@ -173,7 +178,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     if (end < text.length) {
       const prefix = text.slice(offset, end);
       const newline = prefix.lastIndexOf("\n");
-      const fences = [...prefix.matchAll(/```/g)].map((match) => match.index).filter((index) => !isEscaped(text, offset + index));
+      const fences = [...prefix.matchAll(/```/g)].map((match) => match.index).filter((index) => !isEscaped(text, offset + index) && !insideAngleToken(text, offset + index));
       const fenceCount = fences.length;
       const startsInsideFence = mrkdwn && fenceOpenAt(text, offset);
       const endsInsideFence = startsInsideFence !== (fenceCount % 2 === 1);
@@ -200,7 +205,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
           else if (alias && alias[0].length <= 3_000) end = offset + lastColon + alias[0].length;
         }
         const partialFence = /`{1,2}$/.exec(prefix)?.index;
-        if (partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence) && !isEscaped(text, offset + partialFence)) {
+        if (end <= offset + maxRawLength && partialFence !== undefined && partialFence > 0 && text.startsWith("```", offset + partialFence) && !isEscaped(text, offset + partialFence) && !insideAngleToken(text, offset + partialFence)) {
           end = Math.min(end, offset + partialFence);
         }
         const lastFence = fences.at(-1) ?? -1;
@@ -249,7 +254,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     if (mrkdwn) {
       for (const match of rawChunk.matchAll(/```/g)) {
         const fenceAt = match.index;
-        if (isEscaped(text, rawOffset + fenceAt)) continue;
+        if (isEscaped(text, rawOffset + fenceAt) || insideAngleToken(text, rawOffset + fenceAt)) continue;
         const beforeFence = rawChunk.slice(cursor, fenceAt);
         advanceMrkdwnState(beforeFence, state, text, rawOffset + cursor);
         rendered += beforeFence;
@@ -268,6 +273,9 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       ? `${rendered}${!state.fence && index < chunks.length - 1 ? [...state.inline].reverse().join("") : ""}${state.fence ? "\n```" : ""}`
       : rawChunk;
     if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^<[^>]+>$/.test(rawChunk) && rawChunk.length <= 3_000) {
+      chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
+    }
+    if (chunk.length > 3_000 && !startsInsideFence && !startsInsideInline.includes("`") && /^:[a-z0-9_+-]+:$/i.test(rawChunk) && rawChunk.length <= 3_000) {
       chunk = quotePrefix && rawChunk.length <= 2_999 ? `>${rawChunk}` : rawChunk;
     }
     return ({

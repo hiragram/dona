@@ -245,3 +245,16 @@ test("an entity inside a long Slack link does not break the link", () => {
   const blocks = expandedSections(`${token}end`, "identity", true);
   assert.ok(blocks.some((block) => block.text.text.includes(token)));
 });
+
+test("a near-limit emoji alias inside emphasis is delivered", () => {
+  const alias = `:${"a".repeat(2_997)}:`;
+  const blocks = expandedSections(`*prefix\n${alias}tail*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text === alias));
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+});
+
+test("a fence-like sequence inside a Slack token does not split the token", () => {
+  const token = `<https://${"a".repeat(2_889)}\`\`\`tail|P>`;
+  const blocks = expandedSections(`${token}${"end".repeat(100)}`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(token)));
+});
