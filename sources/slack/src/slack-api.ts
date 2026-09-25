@@ -239,7 +239,11 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
         const lastCloseToken = prefix.lastIndexOf(">");
         if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken) && !inlineCodeOpenAt(text, offset + lastOpenToken, candidates)) {
           const close = angleTokenClose(text, offset + lastOpenToken);
-          if (close !== -1 && isEscaped(text, offset + lastOpenToken) && close + 1 - offset <= 3_000) end = close + 1;
+          if (close !== -1 && isEscaped(text, offset + lastOpenToken) && close + 1 - offset <= 3_000) {
+            let escapeStart = lastOpenToken;
+            while (escapeStart > 0 && prefix[escapeStart - 1] === "\\") escapeStart--;
+            end = escapeStart > 0 && close + 1 - offset > maxRawLength ? offset + escapeStart : close + 1;
+          }
           else if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
           else if (close !== -1 && close + 1 - offset <= 3_000) end = close + 1;
         }

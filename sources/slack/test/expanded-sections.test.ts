@@ -471,3 +471,11 @@ test("a maximum-length token followed by the final inline closer has no empty se
   assert.ok(blocks.some((block) => block.text.text === token));
   assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
 });
+
+test("a prefixed escaped near-limit link starts its own section", () => {
+  const token = `<https://${"a".repeat(2_985)}|P>`;
+  const escaped = `\\${token}`;
+  const blocks = expandedSections(`*x${escaped}*`, "identity", true);
+  assert.ok(blocks.some((block) => block.text.text.includes(escaped)));
+  assert.ok(blocks.every((block) => block.text.text.length > 0 && block.text.text.length <= 3_000));
+});
