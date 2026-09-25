@@ -508,6 +508,8 @@ export class RealRuntime implements RuntimePort {
         const stoppedLegacyClause = legacyTable ? `AND NOT (status='needs_review'
           AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l
             WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL))` : "";
+        const terminalStoppedLegacyClause = legacyTable ? `AND NOT EXISTS
+          (SELECT 1 FROM legacy_job_agents_to_stop l WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)` : "";
         let active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs
           WHERE (status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
@@ -519,6 +521,11 @@ export class RealRuntime implements RuntimePort {
               (herdr_workspace_id IS NOT NULL AND COALESCE(last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))
             OR steer_state='dispatching'
             OR (status IN ('completed','failed','cancelled') AND steer_state='accepted')
+            OR (status IN ('completed','failed','cancelled') AND herdr_workspace_id IS NOT NULL
+              AND COALESCE(last_error_code,'') NOT IN
+                ('agent_not_found','agent_not_running','invalid_result_agent_stopped',
+                 'workspace_cleanup_agent_stopped','cancel_worker_stopped','terminal_worker_stopped')
+              ${terminalStoppedLegacyClause})
             OR (status IN ('completed','failed','cancelled') AND last_error_code IN
               ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified'))`)
           .get() as { count: number }).count;

@@ -947,7 +947,10 @@ export class UpdateController {
         const targetDispatcherStoppedForRollback =
           this.database.runtimeOperation(row.request_id, "stop_target_dispatcher")?.phase === "observed";
         if (!dispatcherBeforeDrain.live && !targetDispatcherNeverStarted && !targetDispatcherStoppedForRollback) {
-          this.needsReview(row, "rollback_dispatcher_unavailable");
+          const recoveryScope = await this.rollbackQuiescedScope(row, dispatcherBeforeDrain, slackHealth);
+          this.assertLease(row);
+          await this.restoreTargetAfterDrain(row, "rollback_dispatcher_unavailable",
+            recoveryScope.dispatcherQuiesced, recoveryScope.slackQuiesced);
           return;
         }
         if (slackHealth.live) {
@@ -1018,6 +1021,18 @@ export class UpdateController {
         await this.restoreTargetAfterDrain(row,
           workerBeforeRollback.error_code ?? "rollback_active_worker_handoff_unavailable",
           recoveryScope.dispatcherQuiesced, recoveryScope.slackQuiesced);
+        return;
+      }
+      let dispatcherRegistered: boolean;
+      try { dispatcherRegistered = await this.runtime.dispatcherRegistered(); }
+      catch {
+        this.assertLease(row);
+        await this.restoreTargetAfterDrain(row, "rollback_dispatcher_registration_unverified", true, true);
+        return;
+      }
+      this.assertLease(row);
+      if (dispatcherRegistered) {
+        await this.restoreTargetAfterDrain(row, "rollback_dispatcher_registration_restored", false, true);
         return;
       }
       receipt = await this.releases.rollback(row);
@@ -1094,15 +1109,15 @@ export class UpdateController {
     dispatcherQuiesced: boolean; slackQuiesced: boolean;
   }> {
     const [dispatcherDrain, slackDrain] = await Promise.allSettled([
-      dispatcher.live ? this.runtime.dispatcherDrainStatus() : Promise.resolve(null),
-      slack.live ? this.runtime.slackDrainStatus() : Promise.resolve(null),
+      dispatcher.live || dispatcher.observed === true ? this.runtime.dispatcherDrainStatus() : Promise.resolve(null),
+      slack.live || slack.observed === true ? this.runtime.slackDrainStatus() : Promise.resolve(null),
     ]);
     return {
-      dispatcherQuiesced: (!dispatcher.live && (dispatcher.observed !== false ||
-        this.database.runtimeOperation(row.request_id, "stop_target_dispatcher")?.phase === "observed")) ||
+      dispatcherQuiesced: (!dispatcher.live && dispatcher.observed === undefined) ||
+        this.database.runtimeOperation(row.request_id, "stop_target_dispatcher")?.phase === "observed" ||
         (dispatcherDrain.status === "fulfilled" && dispatcherDrain.value?.quiescing === true),
-      slackQuiesced: (!slack.live && (slack.observed !== false ||
-        this.database.runtimeOperation(row.request_id, "stop_target_slack")?.phase === "observed")) ||
+      slackQuiesced: (!slack.live && slack.observed === undefined) ||
+        this.database.runtimeOperation(row.request_id, "stop_target_slack")?.phase === "observed" ||
         (slackDrain.status === "fulfilled" && slackDrain.value?.quiescing === true),
     };
   }

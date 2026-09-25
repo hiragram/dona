@@ -327,6 +327,14 @@ test("RealRuntime distinguishes unresolved steer from definite retryable agent a
     uncertain.prepare("UPDATE jobs SET last_error_code='stale_preparing'").run();
     uncertain.close();
     assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const terminalCancel = new Database(databasePath);
+    terminalCancel.prepare("UPDATE jobs SET status='completed',steer_state=NULL,last_error_code=NULL,herdr_workspace_id='recorded'").run();
+    terminalCancel.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE jobs SET last_error_code='agent_not_found'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
   } finally { await removeTree(root); }
 });
 
