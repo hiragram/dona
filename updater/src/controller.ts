@@ -848,7 +848,7 @@ export class UpdateController {
           const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
           this.assertLease(row);
           if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-            this.needsReview(row, "rollback_slack_drain_incomplete");
+            await this.restoreTargetAfterDrain(row, "rollback_slack_drain_incomplete");
             return;
           }
         }
@@ -856,7 +856,7 @@ export class UpdateController {
           const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
           this.assertLease(row);
           if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-            this.needsReview(row, "rollback_dispatcher_drain_incomplete");
+            await this.restoreTargetAfterDrain(row, "rollback_dispatcher_drain_incomplete");
             return;
           }
         }
@@ -944,6 +944,23 @@ export class UpdateController {
       activation_generation: observation.receipt!.generation,
       observed_active_sha: row.current_sha,
     }, this.clock.now());
+  }
+
+  private async restoreTargetAfterDrain(row: UpdateRow, causeCode: string): Promise<void> {
+    // Rollback has not switched the pointer or stopped the main agent. Restore
+    // the target services to collect the worker Result before operator review.
+    if (!(await this.restartQuiescedService(row, "restart_target_dispatcher_after_drain",
+      "dispatcher", causeCode, () => this.runtime.startDispatcher(), row.target_sha))) return;
+    if (!(await this.restartQuiescedService(row, "restart_target_slack_after_drain",
+      "slack_adapter", causeCode, () => this.runtime.startSlack(), row.target_sha))) return;
+    const pointer = await this.releases.observe();
+    this.assertLease(row);
+    if (pointer.current_sha !== row.target_sha) {
+      this.needsReview(row, "rollback_drain_recovery_pointer_changed");
+      return;
+    }
+    this.needsReview(row, causeCode,
+      "Rollback was deferred because worker drain was incomplete; target services were restored and verified");
   }
 
   private async waitForHealth(
@@ -1598,17 +1615,19 @@ export class UpdateController {
 
   private async restartQuiescedService(
     row: UpdateRow,
-    kind: Extract<RuntimeOperationKind, "restart_current_dispatcher" | "restart_current_slack">,
+    kind: Extract<RuntimeOperationKind, "restart_current_dispatcher" | "restart_current_slack" |
+      "restart_target_dispatcher_after_drain" | "restart_target_slack_after_drain">,
     service: HealthSnapshot["service"],
     causeCode: string,
     execute: () => Promise<CommandResult>,
+    releaseSha = row.current_sha,
   ): Promise<boolean> {
     const label = service === "dispatcher" ? "Dispatcher" : "Slack Adapter";
-    const codePrefix = service === "dispatcher"
-      ? "quiesce_recovery_dispatcher"
-      : "quiesce_recovery_slack";
+    const codePrefix = kind.startsWith("restart_target_")
+      ? `rollback_drain_recovery_${service}`
+      : service === "dispatcher" ? "quiesce_recovery_dispatcher" : "quiesce_recovery_slack";
     const existing = this.database.runtimeOperation(row.request_id, kind);
-    if (existing && (existing.target_ref !== service || existing.expected_sha !== row.current_sha)) {
+    if (existing && (existing.target_ref !== service || existing.expected_sha !== releaseSha)) {
       this.needsReview(
         row,
         `${codePrefix}_restart_intent_mismatch`,
@@ -1638,7 +1657,7 @@ export class UpdateController {
         row.fence,
         kind,
         service,
-        row.current_sha,
+        releaseSha,
         null,
         { cause_code: causeCode },
         this.clock.now(),
@@ -1669,7 +1688,7 @@ export class UpdateController {
         exit_code: result.exit_code,
       }, this.clock.now());
     }
-    const currentManifest = await this.releases.releaseManifest(row.current_sha);
+    const currentManifest = await this.releases.releaseManifest(releaseSha);
     this.assertLease(row);
     if (!currentManifest) {
       this.needsReview(
@@ -1679,9 +1698,9 @@ export class UpdateController {
       );
       return false;
     }
-    const health = await this.waitForHealth(service, row.current_sha, currentManifest.compatibility);
+    const health = await this.waitForHealth(service, releaseSha, currentManifest.compatibility);
     this.assertLease(row);
-    if (!this.healthMatches(health, row.current_sha, service === "slack_adapter", currentManifest.compatibility)) {
+    if (!this.healthMatches(health, releaseSha, service === "slack_adapter", currentManifest.compatibility)) {
       this.needsReview(
         row,
         `${codePrefix}_health_failed`,
