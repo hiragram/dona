@@ -149,7 +149,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<!date\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9-]+\.)+(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]{2,})(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/g;
+const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9._~%-]+(?::[^@\s/"'<>`]*)?@)?(?:(?:[A-Za-z0-9-]+\.)+(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]{2,})|(?:[A-Za-z0-9-]+\.)*localhost)(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/g;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
 const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
@@ -341,7 +341,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       let url: URL;
       try { url = new URL(`https://${candidate}`); }
       catch { throw new JobResultPublishError("content_requires_redaction"); }
-      if (hasSignedQueryKey(candidate) || hasForbiddenUrlParameters(url, forbiddenValues)) {
+      if (url.username || url.password || hasPrivateHttpHost(url.href) || hasSignedQueryKey(candidate) || hasForbiddenUrlParameters(url, forbiddenValues)) {
         throw new JobResultPublishError("content_requires_redaction");
       }
     }
