@@ -1593,12 +1593,20 @@ export class UpdateController {
         stoppedMainAgent.previous_session_id ?? undefined,
       ))) return;
     }
-    if (dispatcherQuiesced) {
-      if (!(await this.restartQuiescedService(
-        row, "restart_current_dispatcher", "dispatcher", causeCode,
-        () => this.runtime.startDispatcher(),
-      ))) return;
-    } else {
+    const failure: { code?: string; message?: string } = {};
+    const dispatcherRestored = !dispatcherQuiesced || await this.restartQuiescedService(
+      row, "restart_current_dispatcher", "dispatcher", causeCode,
+      () => this.runtime.startDispatcher(), row.current_sha, failure,
+    );
+    const slackRestored = await this.restartQuiescedService(
+      row, "restart_current_slack", "slack_adapter", causeCode,
+      () => this.runtime.startSlack(), row.current_sha, failure,
+    );
+    if (!dispatcherRestored || !slackRestored) {
+      this.needsReview(row, failure.code ?? "quiesce_recovery_unverified", failure.message);
+      return;
+    }
+    if (!dispatcherQuiesced) {
       const currentManifest = await this.releases.releaseManifest(row.current_sha);
       const health = await this.runtime.dispatcherHealth();
       this.assertLease(row);
@@ -1607,13 +1615,6 @@ export class UpdateController {
         return;
       }
     }
-    if (!(await this.restartQuiescedService(
-      row,
-      "restart_current_slack",
-      "slack_adapter",
-      causeCode,
-      () => this.runtime.startSlack(),
-    ))) return;
     let [pointer, initialMainAgent] = await Promise.all([
       this.releases.observe(),
       this.runtime.mainAgentStatus(path.join(this.policy.release_root, row.current_sha)),

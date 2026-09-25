@@ -506,8 +506,9 @@ export class RealRuntime implements RuntimePort {
       try {
         let active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs
           WHERE (status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
-            AND NOT (status='needs_review' AND last_error_code='result_path_exists'
-              AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL))
+            AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
+              AND herdr_workspace_id IS NULL AND dispatch_started_at IS NULL AND prompt_accepted_at IS NULL)
+            AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='invalid_result_agent_stopped'))
             OR (status='retryable_failed' AND (herdr_workspace_id IS NOT NULL OR last_error_code='stale_preparing'))`)
           .get() as { count: number }).count;
         const legacyTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get();

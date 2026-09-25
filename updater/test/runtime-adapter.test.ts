@@ -254,6 +254,10 @@ test("RealRuntime excludes only a proven pre-prepare result collision", async ()
     guarded.prepare("UPDATE jobs SET herdr_workspace_id='possible-worker'").run();
     guarded.close();
     assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+    const stopped = new Database(databasePath);
+    stopped.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped'").run();
+    stopped.close();
+    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
   } finally {
     await removeTree(root);
   }

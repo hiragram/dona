@@ -271,6 +271,7 @@ class FakeRuntime implements RuntimePort {
   rollbackDispatcherDrainIncomplete = false;
   targetRecoveryDispatcherStartUnknownOnce = false;
   targetRecoveryDispatcherStartRejectedOnce = false;
+  currentRecoveryDispatcherStartRejectedOnce = false;
   reviveDispatcherOnWorkerSafety = false;
   rollbackSlackDrainIncomplete = false;
   forwardSlackDrainIncomplete = false;
@@ -356,6 +357,10 @@ class FakeRuntime implements RuntimePort {
   async stopDispatcher() { this.calls.push("stopDispatcher"); this.dispatcherLive = false; return ok; }
   async startDispatcher() {
     this.calls.push("startDispatcher");
+    if (this.currentRecoveryDispatcherStartRejectedOnce && this.mainAgentSha === currentSha) {
+      this.currentRecoveryDispatcherStartRejectedOnce = false;
+      return { ...ok, exit_code: 1 };
+    }
     if (this.targetRecoveryDispatcherStartRejectedOnce && this.calls.filter(call => call === "quiesceDispatcher").length > 1) {
       this.targetRecoveryDispatcherStartRejectedOnce = false;
       return { ...ok, exit_code: 1 };
@@ -1491,7 +1496,7 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
-  test("does not retry or continue when quiesce recovery restart acceptance is unknown", async () => {
+  test("does not retry an unknown Dispatcher restart while restoring Slack", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
     const plan = planned.plan as { plan_id: string; plan_hash: string };
@@ -1512,13 +1517,31 @@ describe("UpdateController isolated end-to-end", () => {
     assert.match(row.last_error_message ?? "", /no blind retry/);
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.deepEqual(f.runtime.calls, [
-      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "startDispatcher",
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "startDispatcher", "startSlack",
     ]);
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher")?.phase, "acceptance_unknown");
     assert.equal(await f.controller.processNext(), false);
     assert.deepEqual(f.runtime.calls, [
-      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "startDispatcher",
+      "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "startDispatcher", "startSlack",
     ]);
+    f.database.close();
+  });
+
+  test("restores Slack after a definite forward Dispatcher restart rejection", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-forward-reject" });
+    f.dispatcher.terminal = true;
+    f.runtime.mainStopOutcome = "rejected";
+    f.runtime.currentRecoveryDispatcherStartRejectedOnce = true;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_dispatcher_restart_rejected");
+    assert.deepEqual(f.runtime.calls.slice(-2), ["startDispatcher", "startSlack"]);
+    assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
     f.database.close();
   });
 

@@ -1417,7 +1417,7 @@ describe("DispatcherDatabase", () => {
         workspace: {kind: "scratch"}}, config.jobsWorkspaceRoot, config.jobResultsDir).row };
     });
     const raw = new Database(config.databasePath);
-    for (const { status, row } of jobs) raw.prepare("UPDATE jobs SET status=? WHERE job_id=?").run(status, row.job_id);
+    for (const { status, row } of jobs) raw.prepare("UPDATE jobs SET status=?,last_error_code=NULL WHERE job_id=?").run(status, row.job_id);
     raw.prepare("UPDATE jobs SET last_error_code='stale_preparing',herdr_workspace_id=NULL WHERE job_id=?")
       .run(jobs.at(-1)!.row.job_id);
     raw.prepare("UPDATE jobs SET herdr_workspace_id='known-worker' WHERE job_id=?")
@@ -1448,6 +1448,10 @@ describe("DispatcherDatabase", () => {
     guarded.prepare("UPDATE jobs SET herdr_workspace_id='possible-worker' WHERE job_id=?").run(job.job_id);
     guarded.close();
     assert.equal(database.updateSafetyStatus().active_worker_count, 1);
+    const stopped = new Database(config.databasePath);
+    stopped.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped' WHERE job_id=?").run(job.job_id);
+    stopped.close();
+    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
     database.close();
   });
 
