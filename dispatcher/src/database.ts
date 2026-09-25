@@ -28,7 +28,7 @@ import type {
 import { eventStatuses, jobStatuses } from "./types.js";
 import { jobAgentName } from "./job-agent-name.js";
 import { createJobDisplayLabel } from "./job-display-label.js";
-import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding } from "./job-routing.js";
+import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEventJobBinding, type JobBinding } from "./job-routing.js";
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import {
   insertLiveSessionReceipt,
@@ -2213,7 +2213,12 @@ export class DispatcherDatabase {
     const binding=readEventJobBinding(this.db,sourceEventId);
     const owner=this.db.prepare("SELECT owner_json FROM job_owner_bindings WHERE job_id=?").get(jobId) as {owner_json:string}|undefined;
     const completion=this.db.prepare("SELECT owner_json FROM job_completion_results WHERE notification_event_id=?").get(sourceEventId) as {owner_json:string}|undefined;
-    if(!owner||(!binding&&completion?.owner_json!==owner.owner_json)||(binding&&stableStringify(binding.owner)!==owner.owner_json))
+    const sourceOwner=binding?.owner??(completion?JSON.parse(completion.owner_json) as JobBinding["owner"]:undefined);
+    const jobOwner=owner?JSON.parse(owner.owner_json) as JobBinding["owner"]:undefined;
+    const matches=sourceOwner?.kind==="slack_thread"&&jobOwner?.kind==="slack_thread"
+      ?sourceOwner.workspace_id===jobOwner.workspace_id&&sourceOwner.channel_id===jobOwner.channel_id
+      :owner!==undefined&&sourceOwner!==undefined&&stableStringify(sourceOwner)===owner.owner_json;
+    if(!matches)
       throw new Error(`Event ${sourceEventId} does not belong to job ${jobId}'s owner`);
   }
 

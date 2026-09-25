@@ -1457,9 +1457,8 @@ describe("DispatcherDatabase", () => {
     otherThreadEnvelope.reply_target!.thread_ts = "1756722031.000001";
     otherThreadEnvelope.subject.thread_ts = "1756722031.000001";
     const otherThread = database.enqueue(otherThreadEnvelope).row;
-    assert.throws(
-      () => database.appendQueuedJobInstruction(created.row.job_id, otherThread.event_id, "wrong thread"),
-      /does not belong/,
+    assert.doesNotThrow(
+      () => database.appendQueuedJobInstruction(created.row.job_id, otherThread.event_id, "別threadからの追加条件"),
     );
 
     database.beginJobPreparation(created.row.job_id);
@@ -1509,7 +1508,15 @@ describe("DispatcherDatabase", () => {
     assert.throws(()=>database.appendQueuedJobInstruction(first.row.job_id,followUp.event_id,"追".repeat(40)),error=>error instanceof JobCreationError && error.code==="job_group_limit_exceeded");
     database.beginJobPreparation(first.row.job_id);
     assert.deepEqual(database.listRunnableJobs().map(row=>row.job_id),[other.row.job_id,second.row.job_id]);
-    assert.throws(()=>database.assertJobSourceMatchesThread(first.row.job_id,secondEvent.event_id),/does not belong/);
+    assert.doesNotThrow(()=>database.assertJobSourceMatchesThread(first.row.job_id,secondEvent.event_id));
+    const otherChannelEnvelope=eventEnvelope("Ev-owner-aware-other-channel");
+    otherChannelEnvelope.subject.channel_id="C_OTHER";otherChannelEnvelope.reply_target!.channel_id="C_OTHER";
+    const otherChannel=database.enqueue(otherChannelEnvelope).row;
+    assert.throws(()=>database.assertJobSourceMatchesThread(first.row.job_id,otherChannel.event_id),/does not belong/);
+    const otherWorkspaceEnvelope=eventEnvelope("Ev-owner-aware-other-workspace");
+    otherWorkspaceEnvelope.subject.workspace_id="T_OTHER";otherWorkspaceEnvelope.reply_target!.workspace_id="T_OTHER";
+    const otherWorkspace=database.enqueue(otherWorkspaceEnvelope).row;
+    assert.throws(()=>database.assertJobSourceMatchesThread(first.row.job_id,otherWorkspace.event_id),/does not belong/);
     database.close();
   });
 
