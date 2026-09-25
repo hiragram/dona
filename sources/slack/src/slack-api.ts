@@ -61,7 +61,9 @@ function fenceOpenAt(text: string, end: number): boolean {
   return open;
 }
 
-function inlineCodeOpenAt(text: string, end: number): boolean {
+type CloseCandidates = Map<InlineMarker, number[]>;
+
+function inlineCodeOpenAt(text: string, end: number, candidates: CloseCandidates): boolean {
   let inFence = false;
   let inCode = false;
   for (let index = 0; index < end; index++) {
@@ -70,12 +72,12 @@ function inlineCodeOpenAt(text: string, end: number): boolean {
       index += 2;
       continue;
     }
-    if (!inFence && text[index] === "`" && !isEscaped(text, index) && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`"))) inCode = !inCode;
+    if (!inFence && text[index] === "`" && !isEscaped(text, index) && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`", candidates))) inCode = !inCode;
   }
   return inCode;
 }
 
-function findMultiQuoteStart(text: string): number {
+function findMultiQuoteStart(text: string, candidates: CloseCandidates): number {
   let inFence = false;
   let inCode = false;
   for (let index = 0; index < text.length; index++) {
@@ -85,13 +87,22 @@ function findMultiQuoteStart(text: string): number {
       continue;
     }
     if (inFence || isEscaped(text, index)) continue;
-    if (text[index] === "`" && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`"))) inCode = !inCode;
+    if (text[index] === "`" && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`", candidates))) inCode = !inCode;
     if (!inCode && (index === 0 || text[index - 1] === "\n") && text.startsWith(">>>", index)) return index;
   }
   return -1;
 }
 
-function hasMatchingClose(text: string, start: number, marker: InlineMarker): boolean {
+function hasMatchingClose(text: string, start: number, marker: InlineMarker, candidates: CloseCandidates): boolean {
+  const positions = candidates.get(marker) ?? [];
+  let low = 0;
+  let high = positions.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((positions[middle] ?? 0) <= start) low = middle + 1;
+    else high = middle;
+  }
+  if (low === positions.length) return false;
   let inFence = false;
   let inCode = false;
   for (let index = start + 1; index < text.length; index++) {
@@ -112,12 +123,12 @@ function hasMatchingClose(text: string, start: number, marker: InlineMarker): bo
         continue;
       }
     }
-    if (text[index] === "`" && marker !== "`" && !insideAngleToken(text, index)) {
+    if (text[index] === "`" && marker !== "`" && !insideAngleToken(text, index) && (inCode || hasMatchingClose(text, index, "`", candidates))) {
       inCode = !inCode;
       continue;
     }
     if (inCode || text[index] !== marker) continue;
-    if (marker === "_" && /[\w]/.test(text[index - 1] ?? "") && /[\w]/.test(text[index + 1] ?? "")) continue;
+    if (marker === "_" && /[\p{L}\p{N}_]/u.test(text[index - 1] ?? "") && /[\p{L}\p{N}_]/u.test(text[index + 1] ?? "")) continue;
     if (marker !== "`" && /\s/.test(text[index - 1] ?? "")) continue;
     return true;
   }
@@ -129,6 +140,7 @@ function advanceMrkdwnState(
   state: { fence: boolean; inline: InlineMarker[] },
   fullText: string,
   offset: number,
+  candidates: CloseCandidates,
 ): void {
   for (let index = 0; index < text.length; index++) {
     if (text.startsWith("```", index) && !isEscaped(fullText, offset + index) && !insideAngleToken(fullText, offset + index)) {
@@ -152,7 +164,7 @@ function advanceMrkdwnState(
     if (marker !== "`" && marker !== "*" && marker !== "_" && marker !== "~") continue;
     if (state.inline.includes("`") && marker !== "`") continue;
     const absoluteIndex = offset + index;
-    if (marker === "_" && /[\w]/.test(fullText[absoluteIndex - 1] ?? "") && /[\w]/.test(fullText[absoluteIndex + 1] ?? "")) continue;
+    if (marker === "_" && /[\p{L}\p{N}_]/u.test(fullText[absoluteIndex - 1] ?? "") && /[\p{L}\p{N}_]/u.test(fullText[absoluteIndex + 1] ?? "")) continue;
     const existing = state.inline.lastIndexOf(marker);
     if (existing !== -1) {
       if (marker !== "`" && /\s/.test(fullText[absoluteIndex - 1] ?? "")) continue;
@@ -160,7 +172,7 @@ function advanceMrkdwnState(
       continue;
     }
     if (marker !== "`" && /\s/.test(fullText[absoluteIndex + 1] ?? "")) continue;
-    if (hasMatchingClose(fullText, absoluteIndex, marker)) state.inline.push(marker);
+    if (hasMatchingClose(fullText, absoluteIndex, marker, candidates)) state.inline.push(marker);
   }
 }
 
@@ -173,6 +185,14 @@ type ExpandedSection = {
 
 function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, maxRawLength: number): ExpandedSection[] {
   const chunks: string[] = [];
+  const candidates: CloseCandidates = new Map<InlineMarker, number[]>([["`", []], ["*", []], ["_", []], ["~", []]]);
+  for (let index = 0; index < text.length; index++) {
+    const marker = text[index] as InlineMarker;
+    if (!candidates.has(marker) || isEscaped(text, index)) continue;
+    if (marker !== "`" && /\s/.test(text[index - 1] ?? "")) continue;
+    if (marker === "_" && /[\p{L}\p{N}_]/u.test(text[index - 1] ?? "") && /[\p{L}\p{N}_]/u.test(text[index + 1] ?? "")) continue;
+    candidates.get(marker)!.push(index);
+  }
   const graphemeBoundaries = [...new Intl.Segmenter("und", { granularity: "grapheme" }).segment(text)].map((part) => part.index);
   graphemeBoundaries.push(text.length);
   for (let offset = 0; offset < text.length;) {
@@ -190,7 +210,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       else if (mrkdwn) {
         const lastOpenToken = prefix.lastIndexOf("<");
         const lastCloseToken = prefix.lastIndexOf(">");
-        if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken) && !inlineCodeOpenAt(text, offset + lastOpenToken)) {
+        if (lastOpenToken > lastCloseToken && lastOpenToken >= 0 && !fenceOpenAt(text, offset + lastOpenToken) && !inlineCodeOpenAt(text, offset + lastOpenToken, candidates)) {
           const close = text.indexOf(">", offset + lastOpenToken + 1);
           if (close !== -1 && isEscaped(text, offset + lastOpenToken) && close + 1 - offset <= 3_000) end = close + 1;
           else if (close !== -1 && lastOpenToken > 0) end = offset + lastOpenToken;
@@ -203,7 +223,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
           else if (entity && offset + lastEntity + entity[0].length - offset <= 3_000) end = offset + lastEntity + entity[0].length;
         }
         const lastColon = prefix.lastIndexOf(":");
-        if (end <= offset + maxRawLength && lastColon >= 0 && !fenceOpenAt(text, offset + lastColon) && !inlineCodeOpenAt(text, offset + lastColon)) {
+        if (end <= offset + maxRawLength && lastColon >= 0 && !fenceOpenAt(text, offset + lastColon) && !inlineCodeOpenAt(text, offset + lastColon, candidates)) {
           const alias = /^:[a-z0-9_+-]+:/i.exec(text.slice(offset + lastColon));
           if (alias && lastColon > 0) end = Math.min(end, offset + lastColon);
           else if (alias && alias[0].length <= 3_000) end = offset + lastColon + alias[0].length;
@@ -243,7 +263,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
       const marker = text[end] as InlineMarker;
       if (marker === "*" || marker === "_" || marker === "~" || marker === "`") {
         const boundaryState: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
-        advanceMrkdwnState(text.slice(0, end), boundaryState, text, 0);
+        advanceMrkdwnState(text.slice(0, end), boundaryState, text, 0, candidates);
         if (boundaryState.inline.includes(marker) && !boundaryState.fence) {
           end++;
           continue;
@@ -256,13 +276,13 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
     offset = end;
   }
   const state: { fence: boolean; inline: InlineMarker[] } = { fence: false, inline: [] };
-  const multiQuoteStart = findMultiQuoteStart(text);
+  const multiQuoteStart = findMultiQuoteStart(text, candidates);
   let rawOffset = 0;
   const blocks = chunks.map((rawChunk, index) => {
     const startsInsideFence = state.fence;
     const startsInsideInline = [...state.inline];
     const lineStart = text.lastIndexOf("\n", rawOffset - 1) + 1;
-    const continuesQuote = rawOffset > lineStart && text[lineStart] === ">" && !fenceOpenAt(text, lineStart) && !inlineCodeOpenAt(text, lineStart);
+    const continuesQuote = rawOffset > lineStart && text[lineStart] === ">" && !fenceOpenAt(text, lineStart) && !inlineCodeOpenAt(text, lineStart, candidates);
     const quotePrefix = multiQuoteStart >= 0 && rawOffset > multiQuoteStart
       ? rawOffset === lineStart && rawChunk.startsWith(">>>") && !startsInsideFence && !startsInsideInline.includes("`") ? "" : ">>>"
       : continuesQuote ? ">" : "";
@@ -273,7 +293,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
         const fenceAt = match.index;
         if (isEscaped(text, rawOffset + fenceAt) || insideAngleToken(text, rawOffset + fenceAt)) continue;
         const beforeFence = rawChunk.slice(cursor, fenceAt);
-        advanceMrkdwnState(beforeFence, state, text, rawOffset + cursor);
+        advanceMrkdwnState(beforeFence, state, text, rawOffset + cursor, candidates);
         rendered += beforeFence;
         if (!state.fence) rendered += [...state.inline].reverse().join("");
         rendered += "```";
@@ -282,7 +302,7 @@ function splitExpandedSections(text: string, blockId: string, mrkdwn: boolean, m
         cursor = fenceAt + 3;
       }
       const rest = rawChunk.slice(cursor);
-      advanceMrkdwnState(rest, state, text, rawOffset + cursor);
+      advanceMrkdwnState(rest, state, text, rawOffset + cursor, candidates);
       rendered += rest;
     }
     rawOffset += rawChunk.length;

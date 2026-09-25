@@ -371,3 +371,21 @@ test("consecutive closing inline markers stay in the preceding section", () => {
   assert.ok(blocks[0]?.text.text.endsWith("_*"));
   assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("**")));
 });
+
+test("an unmatched backtick does not hide the end of emphasis", () => {
+  const blocks = expandedSections(`*bold \`typo ${"x".repeat(7_000)}*`, "identity", true);
+  assert.ok(blocks.slice(1).every((block) => block.text.text.startsWith("*")));
+});
+
+test("underscores inside Japanese words do not create inline formatting", () => {
+  const blocks = expandedSections(`日本_語${"x".repeat(7_000)}末_尾`, "identity", true);
+  assert.ok(blocks.slice(1).every((block) => !block.text.text.startsWith("_")));
+});
+
+test("dense unmatched markers do not stall section splitting", () => {
+  const input = "*_~` x ".repeat(1_500).slice(0, 12_000);
+  const start = performance.now();
+  const blocks = expandedSections(input, "identity", true);
+  assert.ok(blocks.every((block) => block.text.text.length <= 3_000));
+  assert.ok(performance.now() - start < 2_000);
+});
