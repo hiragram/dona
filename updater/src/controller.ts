@@ -564,7 +564,7 @@ export class UpdateController {
         const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
         this.assertLease(row);
         if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-          await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete");
+          await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false);
           return;
         }
       } else if (persistedSlackStop?.phase !== "observed") {
@@ -848,7 +848,7 @@ export class UpdateController {
           const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
           this.assertLease(row);
           if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-            await this.restoreTargetAfterDrain(row, "rollback_slack_drain_incomplete");
+            await this.restoreTargetAfterDrain(row, "rollback_slack_drain_incomplete", false, true);
             return;
           }
         }
@@ -856,7 +856,7 @@ export class UpdateController {
           const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
           this.assertLease(row);
           if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-            await this.restoreTargetAfterDrain(row, "rollback_dispatcher_drain_incomplete");
+            await this.restoreTargetAfterDrain(row, "rollback_dispatcher_drain_incomplete", true, slackHealth.live);
             return;
           }
         }
@@ -946,13 +946,33 @@ export class UpdateController {
     }, this.clock.now());
   }
 
-  private async restoreTargetAfterDrain(row: UpdateRow, causeCode: string): Promise<void> {
+  private async restoreTargetAfterDrain(
+    row: UpdateRow, causeCode: string, dispatcherQuiesced: boolean, slackQuiesced: boolean,
+  ): Promise<void> {
     // Rollback has not switched the pointer or stopped the main agent. Restore
-    // the target services to collect the worker Result before operator review.
-    if (!(await this.restartQuiescedService(row, "restart_target_dispatcher_after_drain",
+    // only services that entered quiesce. A live Dispatcher may own a worker.
+    if (dispatcherQuiesced && !(await this.restartQuiescedService(row, "restart_target_dispatcher_after_drain",
       "dispatcher", causeCode, () => this.runtime.startDispatcher(), row.target_sha))) return;
-    if (!(await this.restartQuiescedService(row, "restart_target_slack_after_drain",
+    if (!dispatcherQuiesced) {
+      const manifest = await this.releases.releaseManifest(row.target_sha);
+      const health = await this.runtime.dispatcherHealth();
+      this.assertLease(row);
+      if (!manifest || !this.healthMatches(health, row.target_sha, false, manifest.compatibility)) {
+        this.needsReview(row, "rollback_drain_dispatcher_health_unverified");
+        return;
+      }
+    }
+    if (slackQuiesced && !(await this.restartQuiescedService(row, "restart_target_slack_after_drain",
       "slack_adapter", causeCode, () => this.runtime.startSlack(), row.target_sha))) return;
+    if (!slackQuiesced) {
+      const manifest = await this.releases.releaseManifest(row.target_sha);
+      const health = await this.runtime.slackHealth();
+      this.assertLease(row);
+      if (!manifest || !this.healthMatches(health, row.target_sha, true, manifest.compatibility)) {
+        this.needsReview(row, "rollback_drain_slack_health_unverified");
+        return;
+      }
+    }
     const pointer = await this.releases.observe();
     this.assertLease(row);
     if (pointer.current_sha !== row.target_sha) {
@@ -1524,7 +1544,9 @@ export class UpdateController {
       (!requireWorkspaces || health.workspaces_ready === true);
   }
 
-  private async restoreQuiescedServices(row: UpdateRow, causeCode: string): Promise<void> {
+  private async restoreQuiescedServices(
+    row: UpdateRow, causeCode: string, dispatcherQuiesced = true,
+  ): Promise<void> {
     const stoppedMainAgent = this.database.runtimeOperation(row.request_id, "stop_main_agent");
     if (stoppedMainAgent?.phase === "observed") {
       if (!stoppedMainAgent.target_ref || !(await this.ensurePreviousMainAgentStarted(
@@ -1533,13 +1555,20 @@ export class UpdateController {
         stoppedMainAgent.previous_session_id ?? undefined,
       ))) return;
     }
-    if (!(await this.restartQuiescedService(
-      row,
-      "restart_current_dispatcher",
-      "dispatcher",
-      causeCode,
-      () => this.runtime.startDispatcher(),
-    ))) return;
+    if (dispatcherQuiesced) {
+      if (!(await this.restartQuiescedService(
+        row, "restart_current_dispatcher", "dispatcher", causeCode,
+        () => this.runtime.startDispatcher(),
+      ))) return;
+    } else {
+      const currentManifest = await this.releases.releaseManifest(row.current_sha);
+      const health = await this.runtime.dispatcherHealth();
+      this.assertLease(row);
+      if (!currentManifest || !this.healthMatches(health, row.current_sha, false, currentManifest.compatibility)) {
+        this.needsReview(row, "quiesce_recovery_dispatcher_health_failed");
+        return;
+      }
+    }
     if (!(await this.restartQuiescedService(
       row,
       "restart_current_slack",
