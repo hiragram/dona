@@ -35,7 +35,7 @@ export class JobResultPublishError extends Error {
 
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
-const sensitive = /(?:(?:^|\s)(?:-u\s*|--user(?:=|\s+))[^:\s]+:[^\s]+|\bmachine\s+[^\s]+\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
+const sensitive = /(?:(?:^|\s)(?:-[uU]\s*|--(?:proxy-)?user(?:=|\s+))[^:\s]+:[^\s]+|\bmachine\s+[^\s]+\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const pgpassCredential = /(?:^|\s)[^\s:]{1,255}:(?:\d{1,5}|\*):[^\s:]{1,255}:[^\s:]{1,255}:[^\s:]{1,255}(?=$|\s)/;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
@@ -183,7 +183,7 @@ function hasPrivateHttpHost(candidate: string): boolean {
   if (hostname === "localhost" || hostname.endsWith(".localhost") ||
     hostname === "files.slack.com" || hostname === "hooks.slack.com") return true;
   const host = hostname.replace(/^\[|\]$/g, "");
-  if (isIP(host) === 0 && (!host.includes(".") || /\.(?:internal|local|lan|home\.arpa|test|invalid|example)$/.test(host))) return true;
+  if (isIP(host) === 0) return host !== "github.com";
   if (isIP(host) === 4) {
     const [a, b] = host.split(".").map(Number) as [number, number];
     const c = Number(host.split(".")[2]);
@@ -687,9 +687,7 @@ export class JobResultPublishCapabilities {
       .flatMap(candidate => candidate.runtimeValues)
       .map(value => value.normalize("NFC"))
       .filter(value => value.length < 8));
-    for (const objective of [job.objective, ...[...this.grants.values()].map(candidate => candidate.objective)]) {
-      if (objective) shortRuntimeValues.add(objective.normalize("NFC"));
-    }
+    if (job.objective) shortRuntimeValues.add(job.objective.normalize("NFC"));
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);

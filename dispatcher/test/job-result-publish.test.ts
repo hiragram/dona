@@ -104,7 +104,7 @@ describe("job result publish contract", () => {
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "0x7f000001/private/result", "017700000001/download/file", "0x7f.1/private/result", "0177.0.0.1/download/file", "artifact.internal./private/result",
       "GET /run/secrets/db-password returned 200", "GET /proc/self/environ returned 200", "POST /dev/null", "GET /sys/kernel", "保存先は/home/worker/private.txt", "結果を/workspace/dona/privateへ保存", "report,[/root/.dona/result.json]", "report,/home/worker/private.txt",
-      "path:/root/.dona/result.json", "保存先:/home/worker/private.txt", "保存先は/mnt/private/result.json", "結果は/srv/dona/secretへ保存", "結果🔒/mnt/private/result.json", "сохранено/srv/dona/secret", "http://198.18.0.1/download/result", "http://192.88.99.1/download/result", "http://[fec0::1]/download/result", "http://[2001:db8::1]/download/result", "http://[64:ff9b:1::a00:1]/download/result", "repo/.ssh/id_rsa", "config/.aws/credentials", "build/secrets/token.json", `npm_${"A".repeat(36)}`, `hf_${"A".repeat(30)}`, `ya29.${"A".repeat(30)}`, "http://[100::1]/download/result", "http://[2001:2::1]/download/result", "localhost/download/result", "foo.localhost/download/result", "user:hunter2@example.com/download", "kty: RSA\nn: PUBLIC_VALUE\ne: AQAB\nd: PRIVATE_VALUE", "kty: RSA # signing key\nn: PUBLIC_VALUE\ne: AQAB\nd: PRIVATE_VALUE", "http://[::ffff:0:127.0.0.1]/download/result", "machine api.example.com login alice password hunter2", "d: PRIVATE_VALUE\nn: PUBLIC_VALUE\ne: AQAB\nkty: RSA", "http://api.test/download/result", "http://api.invalid/download/result", "http://api.example/download/result", "curl -u alice:hunter2 https://example.com", "curl --user alice:hunter2 https://example.com", "GET /download?%74oken=CANARY_VALUE returned 200", "db.example.com:5432:app:alice:hunter2", "http://[2001:20::1]/download/result"]) {
+      "path:/root/.dona/result.json", "保存先:/home/worker/private.txt", "保存先は/mnt/private/result.json", "結果は/srv/dona/secretへ保存", "結果🔒/mnt/private/result.json", "сохранено/srv/dona/secret", "http://198.18.0.1/download/result", "http://192.88.99.1/download/result", "http://[fec0::1]/download/result", "http://[2001:db8::1]/download/result", "http://[64:ff9b:1::a00:1]/download/result", "repo/.ssh/id_rsa", "config/.aws/credentials", "build/secrets/token.json", `npm_${"A".repeat(36)}`, `hf_${"A".repeat(30)}`, `ya29.${"A".repeat(30)}`, "http://[100::1]/download/result", "http://[2001:2::1]/download/result", "localhost/download/result", "foo.localhost/download/result", "user:hunter2@example.com/download", "kty: RSA\nn: PUBLIC_VALUE\ne: AQAB\nd: PRIVATE_VALUE", "kty: RSA # signing key\nn: PUBLIC_VALUE\ne: AQAB\nd: PRIVATE_VALUE", "http://[::ffff:0:127.0.0.1]/download/result", "machine api.example.com login alice password hunter2", "d: PRIVATE_VALUE\nn: PUBLIC_VALUE\ne: AQAB\nkty: RSA", "http://api.test/download/result", "http://api.invalid/download/result", "http://api.example/download/result", "curl -u alice:hunter2 https://example.com", "curl --user alice:hunter2 https://example.com", "GET /download?%74oken=CANARY_VALUE returned 200", "db.example.com:5432:app:alice:hunter2", "http://[2001:20::1]/download/result", "curl --proxy-user alice:hunter2 https://github.com", "curl --proxy-user=alice:hunter2 https://github.com", "https://download.corp.com/result"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "client-key-data": "BASE64_PRIVATE_KEY" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
@@ -125,7 +125,7 @@ describe("job result publish contract", () => {
     assert.throws(() => validateJobResultPublish({ ...base, summary: "\u001b[31m" }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, summary: "<https://example.com/| >" }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, summary: "ghp_abcd\u034fefghijklmnop" }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
-    for (const value of ["//cdn.example.com/assets/report.json", "//[2606:4700:4700::1111]/dns-query", '{"kty":"RSA","n":"public"} {"d":"done"}', "成功/失敗の内訳", "実装/テスト完了", "GET /health returned 200", "POST /v1/job-result-publish", "Updated dispatcher/src/job.ts", "See docs/guide", "build/test passed", "Bearer authentication is enabled", "Bearer credentials were removed", 'payload={\\"status\\":\\"ok\\"}']) {
+    for (const value of ["//github.com/hiragram/dona", "//[2606:4700:4700::1111]/dns-query", '{"kty":"RSA","n":"public"} {"d":"done"}', "成功/失敗の内訳", "実装/テスト完了", "GET /health returned 200", "POST /v1/job-result-publish", "Updated dispatcher/src/job.ts", "See docs/guide", "build/test passed", "Bearer authentication is enabled", "Bearer credentials were removed", 'payload={\\"status\\":\\"ok\\"}']) {
       assert.doesNotThrow(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), value);
     }
     assert.equal(validateJobResultPublish({ ...base, summary: "coverage 95% complete" }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
@@ -135,11 +135,11 @@ describe("job result publish contract", () => {
       assert.throws(() => validateJobResultPublish({ ...base, output: { format: "text", text: assignment } }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     assert.throws(() => validateJobResultPublish({ ...base, summary: `x://:${"a:".repeat(5000)}` }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
-    const repeatedUrls = "http://example.com?foo=".repeat(10_000);
+    const repeatedUrls = "http://github.com?foo=".repeat(10_000);
     const started = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: repeatedUrls }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.ok(performance.now() - started < 2_000, "署名URL検査は大きな本文でも線形時間で終わる");
-    const plusUrls = "https://example.com/?q=a+b ".repeat(500);
+    const plusUrls = "https://github.com/?q=a+b ".repeat(500);
     const plusStarted = performance.now();
     assert.equal(validateJobResultPublish({ ...base, summary: plusUrls }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
     assert.ok(performance.now() - plusStarted < 2_000, "plusを含む複数URLもboundedに検査する");
@@ -320,7 +320,9 @@ describe("job result publish contract", () => {
     const grant = grants.issue(row({ herdr_pane_id: "pane-one" }), "session-one");
     grants.issue(row({ job_id: "job_two", herdr_pane_id: "pane-two", agent_name: "agent-two", herdr_workspace_id: "herdr-two",
       objective: "private objective two", workspace_path: "/workspace/two", result_path: "/result/two" }), otherSession);
+    grants.issue(row({ job_id: "job_short", objective: "完了", workspace_path: "/workspace/short", result_path: "/result/short" }), otherSession);
     const current = row({ status: "running", herdr_pane_id: "pane-one", objective: "private objective text" });
+    assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "実装完了" }, () => current).envelope.summary, "実装完了");
     for (const privateValue of ["pane-two", "agent-two", "herdr-two", "workspace-two", "agent-session-two",
       "private objective two", "private objective text"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
