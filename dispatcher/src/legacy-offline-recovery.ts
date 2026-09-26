@@ -17,7 +17,8 @@ type LegacyJob = {
 
 export type LegacyResultObservation =
   | { state: "absent" }
-  | { state: "invalid" | "valid"; sha256: string; bytes: number; device: number; inode: number };
+  | { state: "invalid" | "valid"; sha256: string; bytes: number; device: number; inode: number }
+  | { state: "invalid"; reason: "oversize"; sha256: null; bytes: number; device: number; inode: number };
 
 export interface LegacyRecoveryCandidate {
   job_id: string;
@@ -74,7 +75,16 @@ async function resultObservation(job: LegacyJob): Promise<LegacyResultObservatio
   }
   try {
     const stat = await file.stat();
-    if (!stat.isFile() || stat.size > jobResultEnvelopeMaxBytes) throw new Error("legacy_result_file_invalid");
+    if (!stat.isFile()) throw new Error("legacy_result_file_invalid");
+    if (stat.size > jobResultEnvelopeMaxBytes) {
+      const after = await file.stat();
+      const named = await fs.lstat(job.result_path);
+      if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs ||
+          !named.isFile() || named.dev !== stat.dev || named.ino !== stat.ino)
+        throw new Error("legacy_result_changed_during_read");
+      return { state: "invalid", reason: "oversize", sha256: null, bytes: stat.size,
+        device: stat.dev, inode: stat.ino };
+    }
     const chunks: Buffer[] = [];
     let length = 0;
     while (true) {
@@ -110,6 +120,7 @@ export async function createLegacyRecoveryPreflight(sourcePath: string, backupPa
   const source = new Database(sourcePath, { readonly: true, fileMustExist: true });
   const temporary = `${backupPath}.tmp`;
   let backup: Database.Database | undefined;
+  let temporaryCreated = false;
   try {
     verify(source);
     const before = counts(source);
@@ -121,6 +132,7 @@ export async function createLegacyRecoveryPreflight(sourcePath: string, backupPa
       throw error;
     })) throw new Error("legacy_backup_already_exists");
     const tempHandle = await fs.open(temporary, "wx", 0o600);
+    temporaryCreated = true;
     await tempHandle.close();
     // better-sqlite3's online backup supplies one consistent SQLite snapshot.
     await source.backup(temporary);
@@ -160,11 +172,12 @@ export async function createLegacyRecoveryPreflight(sourcePath: string, backupPa
     // link is exclusive: unlike rename, it cannot replace a backup created during inspection.
     await fs.link(temporary, backupPath);
     await fs.unlink(temporary);
+    temporaryCreated = false;
     return { schema_version: 1, source_schema: sourceSchema, backup_sha256: backupSha256,
       backup_counts: backupCounts, candidates, maintenance_fence: "unavailable", recovery_allowed: false,
       blocker: "independent_complete_worker_stop_receipt_unavailable" };
   } catch (error) {
-    await fs.rm(temporary, { force: true });
+    if (temporaryCreated) await fs.rm(temporary, { force: true });
     throw error;
   } finally {
     backup?.close();
