@@ -99,7 +99,7 @@ describe("job result publish contract", () => {
       "pypi-AgEIcHlwaS5vcmcCAAAAAAAAAAAAAAAAAAAA", "dckr_pat_AAAAAAAAAAAAAAAAAAAAAAAA", "ghp_AAAA*BBBB*CCCCCCCCCCCCCCCCCCCCCCCCCCCC", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
       "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ", "xoxc-abcdefghijkl", "xoxd-abcdefghijkl", "xoxe-abcdefghijkl", "ASIA1234567890ABCDEF", `AIza${"A".repeat(35)}`,
       "https://example.com/?id=eyJhbGciOiJIUzI1NiJ9%2Ee30%2EdGVzdHNpZ25hdHVyZQ",
-      "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE", "Bearer abc123", "https:\\\\files.slack.com\\files-pri\\download", "http:\\\\127.0.0.1\\private",
+      "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE", "Bearer abc123", "Basic YTpi", "AUTH PLAIN AGFsaWNlAGh1bnRlcjI=", "https:\\\\files.slack.com\\files-pri\\download", "http:\\\\127.0.0.1\\private",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "0x7f000001/private/result", "017700000001/download/file", "0x7f.1/private/result", "0177.0.0.1/download/file", "artifact.internal./private/result",
@@ -351,6 +351,10 @@ describe("job result publish contract", () => {
     const entityCapability = numericEntityGrants.issue(row({ job_id: "job_entity", objective: "private & objective" }), "entity-session");
     assert.throws(() => numericEntityGrants.validate(entityCapability.capability, "entity-session", { ...base,
       summary: "private &#38; objective" }, () => row({ job_id: "job_entity", status: "running", objective: "private & objective" })), code("content_requires_redaction"));
+    const quoteGrants = new JobResultPublishCapabilities(() => "quote-session");
+    const quoteCapability = quoteGrants.issue(row({ job_id: "job_quote", objective: 'private "objective"' }), "quote-session");
+    assert.throws(() => quoteGrants.validate(quoteCapability.capability, "quote-session", { ...base,
+      summary: "private &quot;objective&quot;" }, () => row({ job_id: "job_quote", status: "running", objective: 'private "objective"' })), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: grant.capability.slice(0, 20), output: { format: "markdown", text: grant.capability.slice(20) } },
       () => current), code("content_requires_redaction"));
@@ -366,6 +370,12 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ parts: ["private objective ", "ok", "text"] }] },
       () => current), code("content_requires_redaction"));
+    const longArrayObjective = "private objective ".repeat(40);
+    const longArrayGrants = new JobResultPublishCapabilities(() => "long-array-session");
+    const longArrayCapability = longArrayGrants.issue(row({ job_id: "job_long_array", objective: longArrayObjective }), "long-array-session");
+    assert.throws(() => longArrayGrants.validate(longArrayCapability.capability, "long-array-session", { ...base,
+      artifacts: [{ parts: [longArrayObjective.slice(0, 300), "ok", longArrayObjective.slice(300)] }] },
+      () => row({ job_id: "job_long_array", status: "running", objective: longArrayObjective })), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: Array.from({ length: 3 }, () => ({ parts: Array.from({ length: 12 }, () => "____") })) },
       () => current), code("content_requires_redaction"));

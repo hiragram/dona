@@ -267,8 +267,8 @@ function displayProjection(value: string): string {
     .replace(/(?<![A-Za-z0-9])_([^_\r\n]+)_(?![A-Za-z0-9])/g, "$1")
     .replace(/(?<!\\)[*~`]/g, "")
     .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
-    .replace(/&(?:amp|lt|gt|#(?:\d{1,7}|[xX][0-9a-fA-F]{1,6}));/g, entity => {
-      if (entity[1] !== "#") return ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[entity]!;
+    .replace(/&(?:amp|lt|gt|quot|apos|#(?:\d{1,7}|[xX][0-9a-fA-F]{1,6}));/g, entity => {
+      if (entity[1] !== "#") return ({ "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&apos;": "'" })[entity]!;
       const numeric = entity[2]?.toLowerCase() === "x"
         ? Number.parseInt(entity.slice(3, -1), 16) : Number.parseInt(entity.slice(2, -1), 10);
       return numeric > 0 && numeric <= 0x10ffff && !(numeric >= 0xd800 && numeric <= 0xdfff)
@@ -334,12 +334,20 @@ function hasNetrcCredential(value: string): boolean {
   return false;
 }
 function hasBasicCredential(value: string): boolean {
-  for (const match of value.matchAll(/\bBasic\s+([A-Za-z0-9+/]{8,}={0,2})(?=$|[^A-Za-z0-9+/=])/gi)) {
+  for (const match of value.matchAll(/\bBasic\s+([A-Za-z0-9+/]{4,}={0,2})(?=$|[^A-Za-z0-9+/=])/gi)) {
     const encoded = match[1]!;
     const bytes = Buffer.from(encoded, "base64");
     if (bytes.toString("base64").replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
     const decoded = bytes.toString("utf8");
     if (decoded.includes(":")) return true;
+  }
+  return false;
+}
+function hasSaslPlainCredential(value: string): boolean {
+  for (const match of value.matchAll(/\bAUTH\s+PLAIN\s+([A-Za-z0-9+/]{4,}={0,2})(?=$|[^A-Za-z0-9+/=])/gi)) {
+    const encoded = match[1]!;
+    const bytes = Buffer.from(encoded, "base64");
+    if (bytes.toString("base64").replace(/=+$/, "") === encoded.replace(/=+$/, "") && bytes.includes(0)) return true;
   }
   return false;
 }
@@ -408,7 +416,7 @@ class ForbiddenValueMatcher {
   }
 }
 
-function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, decodeDepth: number, budget: { count: number; combinations: number }, digests?: ReadonlySet<string>, fingerprints?: ReadonlySet<number>): boolean {
+function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, decodeDepth: number, budget: { count: number; combinations: number; combinationBytes: number }, digests?: ReadonlySet<string>, fingerprints?: ReadonlySet<number>): boolean {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const inspect = (bytes: Buffer): boolean => {
     try {
@@ -463,7 +471,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
   return false;
 }
 
-function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0, budget: { count: number; combinations: number } = { count: 0, combinations: 0 }): void {
+function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0, budget: { count: number; combinations: number; combinationBytes: number } = { count: 0, combinations: 0, combinationBytes: 0 }): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
     const normalizedHttp = value.replace(/https?:[\\/]+[^\s"'<>`]+/gi, candidate =>
@@ -548,19 +556,21 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || hasCredentialXmlElement(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || ageSecretIdentity.test(value) || shortBearerCredential.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasSaslPlainCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || hasCredentialXmlElement(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || ageSecretIdentity.test(value) || shortBearerCredential.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     if (value.length === 2 && typeof value[0] === "string" && value[1] !== null && value[1] !== "" &&
       forbiddenKey(normalizedStructuredKey(value[0]))) throw new JobResultPublishError("content_requires_redaction");
     if (forbiddenValues || (forbiddenDigests && forbiddenFingerprints)) {
-      const pieces = value.filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 256);
+      const pieces = value.filter((item): item is string => typeof item === "string" && item.length > 0);
       if (pieces.length >= 2) {
         if (pieces.length > 12) throw new JobResultPublishError("content_requires_redaction");
         for (let mask = 1; mask < 1 << pieces.length; mask++) {
           if (++budget.combinations > 4_096) throw new JobResultPublishError("content_requires_redaction");
           let candidate = "";
           for (let index = 0; index < pieces.length; index++) if (mask & (1 << index)) candidate += pieces[index];
+          budget.combinationBytes += candidate.length;
+          if (budget.combinationBytes > jobResultEnvelopeMaxBytes) throw new JobResultPublishError("content_requires_redaction");
           if (forbiddenValues?.contains(candidate) || (forbiddenDigests && forbiddenFingerprints && candidate.length === 43 &&
             containsForbiddenCapability(candidate, forbiddenDigests, forbiddenFingerprints))) {
             throw new JobResultPublishError("content_requires_redaction");
@@ -654,7 +664,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     throw new JobResultPublishError("invalid_request");
   }
   const matcher = forbiddenValues ? new ForbiddenValueMatcher(forbiddenValues, shortRuntimeValues) : undefined;
-  const encodedBudget = { count: 0, combinations: 0 };
+  const encodedBudget = { count: 0, combinations: 0, combinationBytes: 0 };
   // Fixed schema keys are Dispatcher-owned; inspect only worker-provided fields.
   assertSafeJson(parsed.data.summary, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
   if (parsed.data.output !== undefined) assertSafeJson(parsed.data.output.text, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
