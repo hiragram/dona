@@ -137,6 +137,7 @@ function hasLocalPath(value: string): boolean {
   return false;
 }
 const windowsUncPath = /(?<![A-Za-z0-9:\\])\\\\[^\\\s]+\\/;
+const windowsRelativePath = /(?:^|[\s"'`=:({])(?:\.{1,2}\\)?(?:[A-Za-z0-9_. -]{1,128}\\){2,}[A-Za-z0-9_. -]{1,128}/;
 const slashAuthority = /(?<![A-Za-z0-9:/])\/\/([^/?#\s"'<>`]+)(?:[/?#][^\s"'<>`]*)?/g;
 function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValueMatcher): boolean {
   for (const match of value.matchAll(slashAuthority)) {
@@ -154,7 +155,7 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<!date\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9._~%-]+(?::[^@\s/"'<>`]*)?@)?(?:(?:[A-Za-z0-9-]+\.)+(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]{2,})|(?:[A-Za-z0-9-]+\.)*localhost)(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/g;
+const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9._~%-]+(?::[^@\s/"'<>`]*)?@)?(?:(?:[A-Za-z0-9-]+\.)+(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]{2,})|(?:[A-Za-z0-9-]+\.)*localhost)(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/gi;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
 const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa|test|invalid|example)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
@@ -268,7 +269,7 @@ function decodeBase32Token(encoded: string): string | undefined {
   let bits = 0;
   let value = 0;
   const bytes: number[] = [];
-  for (const char of encoded.replace(/=+$/, "")) {
+  for (const char of encoded.replace(/=+$/, "").toUpperCase()) {
     const digit = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".indexOf(char);
     if (digit < 0) return undefined;
     value = (value << 5) | digit;
@@ -284,7 +285,7 @@ function decodeBase32Token(encoded: string): string | undefined {
   catch { return undefined; }
 }
 function containsForbiddenCapability(value: string, digests: ReadonlySet<string>, fingerprints: ReadonlySet<number>): boolean {
-  for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{69}={0,3})(?=$|[^A-Z2-7=])/g)) {
+  for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{69}={0,3})(?=$|[^A-Z2-7=])/gi)) {
     const raw = decodeBase32Token(match[1]!);
     if (raw && raw.length === capabilityWindowLength && fingerprints.has(fingerprint(raw)) && digests.has(createHash("sha256").update(raw).digest("hex"))) return true;
   }
@@ -341,7 +342,7 @@ function isPublicCountField(key: string, value: unknown): boolean {
 function forbiddenKey(key: string): boolean {
   const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
   return /(?:^|_)(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|capability|cookie|session)(?:_|$)/.test(normalized) ||
-    /^(?:sig|signature|x_amz_signature|x_goog_signature)$/.test(normalized) ||
+    /^(?:sig|signature|x_amz_signature|x_goog_signature|oauth2_bearer)$/.test(normalized) ||
     /(?:token|secret|password|passwd|passphrase|pwd|credential|authorization|auth|apikey|accesskey|accountkey|privatekey|capability|cookie|sessionid)$/.test(normalized.replaceAll("_", "")) ||
     /(?:^|_)(?:api|access|account|private)_key(?:_|$)/.test(normalized) ||
     /^(?:api_key|access_key|private_key|client_key_data|tls_key|agent_session|pane_id|workspace_path|result_path|agent_name)$/.test(normalized) ||
@@ -414,8 +415,9 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     if (encoded.length % 2 !== 0) continue;
     if (++budget.count > 1_024 || inspect(Buffer.from(encoded, "hex"))) return true;
   }
-  for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{16,}={0,6})(?=$|[^A-Z2-7=])/g)) {
+  for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{16,}={0,6})(?=$|[^A-Z2-7=])/gi)) {
     const encoded = match[1]!;
+    if (encoded.length > 13_112) continue;
     const decoded = decodeBase32Token(encoded);
     if (!decoded) continue;
     if (++budget.count > 1_024) return true;
@@ -505,7 +507,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
@@ -618,7 +620,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     if (parsed.data.artifacts) collect(parsed.data.artifacts);
     if (parsed.data.actions) collect(parsed.data.actions);
     const combined = leaves.join("");
-    if (containsForbiddenCapability(combined, forbiddenDigests, forbiddenFingerprints) ||
+    if (matcher?.contains(combined) || containsForbiddenCapability(combined, forbiddenDigests, forbiddenFingerprints) ||
       containsForbiddenCapability(displayProjection(combined), forbiddenDigests, forbiddenFingerprints)) {
       throw new JobResultPublishError("content_requires_redaction");
     }

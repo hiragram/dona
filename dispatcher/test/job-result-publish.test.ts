@@ -125,7 +125,7 @@ describe("job result publish contract", () => {
     assert.throws(() => validateJobResultPublish({ ...base, summary: "\u001b[31m" }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, summary: "<https://example.com/| >" }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, summary: "ghp_abcd\u034fefghijklmnop" }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
-    for (const summary of ["machine api.example.com password hunter2 login alice", "curl --pass hunter2 --key client.key https://github.com", "curl --cert client.pem:hunter2 https://github.com"]) {
+    for (const summary of ["machine api.example.com password hunter2 login alice", "curl --pass hunter2 --key client.key https://github.com", "curl --cert client.pem:hunter2 https://github.com", "curl --oauth2-bearer opaque https://github.com", "LOCALHOST/download/result", "LocalHost/private", "..\\Users\\alice\\AppData\\Local\\Dona\\result.json"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const summary of ["Basic authentication is enabled", "HTTP Basic authentication succeeded", "<details>結果</details>", "<testsuite>ok</testsuite>"]) {
@@ -346,6 +346,9 @@ describe("job result publish contract", () => {
       artifacts: [{ part: grant.capability.slice(0, 20) }, { part: grant.capability.slice(20) }] },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ part: "private objective " }, { part: "text" }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from(grant.capability, "utf8").toString("base64url") }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from("private objective text", "utf8").toString("base64") }, () => current), code("content_requires_redaction"));
@@ -378,6 +381,8 @@ describe("job result publish contract", () => {
     if (base32Bits) base32Capability += base32Alphabet[(base32Value << (5 - base32Bits)) & 31];
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: base32Capability }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: base32Capability.toLowerCase() }, () => current), code("content_requires_redaction"));
     const privateBase32 = Buffer.from("private objective text", "utf8");
     let privateBits = 0, privateValue = 0, encodedPrivate = "";
     for (const byte of privateBase32) {
