@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -39,8 +40,9 @@ import {
   type LiveSessionReceiptRow,
 } from "./live-session.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
+import { jobResultEnvelopeMaxBytes } from "./job-result-publish.js";
 import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobCreationPayloadSha256FromWorkspace,
-  jobObjectiveCharacterMax, legacyJobKey, parseCreateJobRequest, parseJobWorkspace, serializeJobWorkspace, stableStringify } from "./validation.js";
+  jobObjectiveCharacterMax, legacyJobKey, parseCreateJobRequest, parseJobResultEnvelope, parseJobWorkspace, serializeJobWorkspace, stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
@@ -650,6 +652,19 @@ export class DispatcherDatabase {
       this.db.exec(`CREATE TABLE IF NOT EXISTS job_terminal_worker_stop_proofs(
         job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
         stopped_at TEXT NOT NULL)`);
+      this.db.exec(`CREATE TABLE IF NOT EXISTS job_late_result_reconciliations(
+        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+        expected_updated_at TEXT NOT NULL,
+        expected_cause TEXT NOT NULL,
+        result_sha256 TEXT NOT NULL,
+        stop_receipt_id TEXT NOT NULL REFERENCES live_session_query_receipts(receipt_id) ON DELETE RESTRICT,
+        side_effects_evidence_sha256 TEXT NOT NULL,
+        notification_evidence_sha256 TEXT NOT NULL,
+        accepted_at TEXT NOT NULL,
+        final_status TEXT NOT NULL,
+        final_updated_at TEXT NOT NULL)`);
+      this.db.exec(`CREATE TRIGGER IF NOT EXISTS job_late_result_reconciliations_no_update
+        BEFORE UPDATE ON job_late_result_reconciliations BEGIN SELECT RAISE(ABORT, 'late_result_reconciliation_append_only'); END`);
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
         const mayHaveLiveLegacyAgent=["retryable_failed","preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status);
@@ -1383,6 +1398,113 @@ export class DispatcherDatabase {
     return row ? projectLiveSessionReceipt(row) : undefined;
   }
 
+  private lateResultFile(job: JobRow): {result:JobResultEnvelope;sha256:string} {
+    const fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
+    try {
+      const stat=fs.fstatSync(fd);
+      if(!stat.isFile()||stat.size>jobResultEnvelopeMaxBytes) throw new Error("late_result_file_invalid");
+      const chunks:Buffer[]=[];
+      let length=0;
+      while(true) {
+        const chunk=Buffer.allocUnsafe(Math.min(64*1024,jobResultEnvelopeMaxBytes+1-length));
+        const read=fs.readSync(fd,chunk,0,chunk.length,null);
+        if(read===0) break;
+        length+=read;
+        if(length>jobResultEnvelopeMaxBytes) throw new Error("late_result_file_invalid");
+        chunks.push(chunk.subarray(0,read));
+      }
+      const bytes=Buffer.concat(chunks,length);
+      let parsed:unknown;
+      try {parsed=JSON.parse(bytes.toString("utf8"));}
+      catch {throw new Error("late_result_json_invalid");}
+      const result=parseJobResultEnvelope(parsed,job.job_id);
+      return {result,sha256:createHash("sha256").update(bytes).digest("hex")};
+    } finally {fs.closeSync(fd);}
+  }
+
+  private lateResultNotificationEvidence(job:JobRow):string {
+    const group=this.getJobGroup(job.source_event_id);
+    const ids=[job.completion_event_id,group?.attention_event_id,group?.all_terminal_event_id];
+    const events=[...new Set(ids.filter((id):id is string=>!!id))].map(id=>{
+      const event=this.getRequired(id);
+      return {id,status:event.status,result_json:event.result_json,last_error_code:event.last_error_code,
+        settled:this.attentionNotificationSettled(event)};
+    });
+    return createHash("sha256").update(stableStringify(events)).digest("hex");
+  }
+
+  private lateProgressNotificationSettled(event:EventRow,jobId:string):boolean {
+    if(event.source!=="dona_job"||event.status!=="completed"||!event.result_json) return false;
+    const payload=JSON.parse(event.payload_json) as {job_id?:string;group?:{transition?:string}};
+    const result=JSON.parse(event.result_json) as ResultEnvelope;
+    return payload.job_id===jobId&&payload.group?.transition==="progress"&&
+      result.event_id===event.event_id&&result.status==="completed"&&
+      Array.isArray(result.actions)&&result.actions.length===0;
+  }
+
+  inspectLateJobResult(jobId:string):{job_id:string;status:JobStatus;updated_at:string;cause:string|null;result_sha256:string;notification_evidence_sha256:string} {
+    const job=this.getJobRequired(jobId);
+    const file=this.lateResultFile(job);
+    return {job_id:jobId,status:job.status,updated_at:job.updated_at,cause:job.last_error_code,
+      result_sha256:file.sha256,notification_evidence_sha256:this.lateResultNotificationEvidence(job)};
+  }
+
+  acceptLateJobResult(jobId:string, expectedUpdatedAt:string, expectedCause:string, expectedDigest:string,
+    stopReceiptId:string, sideEffectsEvidenceSha256:string, notificationEvidenceSha256:string, at=new Date()):JobRow {
+    for(const digest of [expectedDigest,sideEffectsEvidenceSha256,notificationEvidenceSha256])
+      if(!/^[0-9a-f]{64}$/.test(digest)) throw new Error("late_result_evidence_digest_invalid");
+    return this.db.transaction(()=>{
+      const job=this.getJobRequired(jobId);
+      const prior=this.db.prepare("SELECT * FROM job_late_result_reconciliations WHERE job_id=?").get(jobId) as
+        {expected_updated_at:string;expected_cause:string;result_sha256:string;stop_receipt_id:string;
+          side_effects_evidence_sha256:string;notification_evidence_sha256:string;final_status:string;final_updated_at:string}|undefined;
+      if(prior) {
+        if(prior.expected_updated_at!==expectedUpdatedAt||prior.expected_cause!==expectedCause||
+          prior.result_sha256!==expectedDigest||prior.stop_receipt_id!==stopReceiptId||
+          prior.side_effects_evidence_sha256!==sideEffectsEvidenceSha256||
+          prior.notification_evidence_sha256!==notificationEvidenceSha256||
+          prior.final_status!==job.status||prior.final_updated_at!==job.updated_at)
+          throw new Error("late_result_reconciliation_conflict");
+        return job;
+      }
+      if(readEventJobBinding(this.db,job.source_event_id)?.owner.kind!=="slack_thread" ||
+        job.status!=="needs_review"||!["result_missing","invalid_result","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
+        job.updated_at!==expectedUpdatedAt||job.last_error_code!==expectedCause||job.result_json!==null)
+        throw new Error("late_result_job_changed");
+      const receipt=this.getLiveSessionReceipt(jobId,stopReceiptId);
+      const latest=this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
+        .get(jobId) as {receipt_id:string}|undefined;
+      if(!receipt||latest?.receipt_id!==stopReceiptId||receipt.durable_status_after!=="needs_review"||
+        receipt.result_present_after||Date.parse(receipt.observed_at)<Date.parse(job.updated_at)||
+        receipt.live_session.query_status!=="agent_not_found"||
+        receipt.reconciliation.state!=="session_absent"||
+        !this.getJobLiveSessionIdentity(jobId)) throw new Error("late_result_worker_stop_unproven");
+      if(this.lateResultNotificationEvidence(job)!==notificationEvidenceSha256)
+        throw new Error("late_result_notification_drift");
+      const group=this.getJobGroup(job.source_event_id);
+      if(group?.all_terminal_event_id) throw new Error("late_result_notification_requires_reconciliation");
+      for(const id of new Set([job.completion_event_id,group?.attention_event_id])) {
+        if(!id) continue;
+        const event=this.getRequired(id);
+        if(!["queued","retryable_failed"].includes(event.status)&&
+          !this.attentionNotificationSettled(event)&&
+          !(id===job.completion_event_id&&this.lateProgressNotificationSettled(event,jobId)))
+          throw new Error("late_result_notification_requires_reconciliation");
+      }
+      const file=this.lateResultFile(job);
+      if(file.sha256!==expectedDigest) throw new Error("late_result_digest_drift");
+      this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
+      if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
+      this.markTerminalWorkerStopProof(jobId);
+      this.enqueueJobNotification(jobId,at);
+      const accepted=this.getJobRequired(jobId);
+      this.db.prepare(`INSERT INTO job_late_result_reconciliations VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        .run(jobId,expectedUpdatedAt,expectedCause,expectedDigest,stopReceiptId,sideEffectsEvidenceSha256,
+          notificationEvidenceSha256,at.toISOString(),accepted.status,accepted.updated_at);
+      return accepted;
+    }).immediate();
+  }
+
   resolveInvalidJobResult(jobId: string, receiptId: string, expectedUpdatedAt: string, at = new Date()): JobRow {
     return this.db.transaction(() => {
       const job = this.getJobRequired(jobId);
@@ -1631,14 +1753,16 @@ export class DispatcherDatabase {
   }
 
   liveSessionRetentionPlan(cutoff: string): { receipt_rows: number } {
-    const receipt_rows=(this.db.prepare("SELECT count(*) AS count FROM live_session_query_receipts WHERE created_at<=?")
+    const receipt_rows=(this.db.prepare(`SELECT count(*) AS count FROM live_session_query_receipts r WHERE r.created_at<=?
+      AND NOT EXISTS (SELECT 1 FROM job_late_result_reconciliations l WHERE l.stop_receipt_id=r.receipt_id)`)
       .get(cutoff) as {count:number}).count;
     return {receipt_rows};
   }
 
   purgeLiveSessionReceipts(cutoff: string): { receipt_rows: number } {
     const plan=this.liveSessionRetentionPlan(cutoff);
-    this.db.prepare("DELETE FROM live_session_query_receipts WHERE created_at<=?").run(cutoff);
+    this.db.prepare(`DELETE FROM live_session_query_receipts WHERE created_at<=?
+      AND NOT EXISTS (SELECT 1 FROM job_late_result_reconciliations l WHERE l.stop_receipt_id=live_session_query_receipts.receipt_id)`).run(cutoff);
     return plan;
   }
 
@@ -1753,6 +1877,10 @@ export class DispatcherDatabase {
   }
 
   saveJobResult(jobId: string, result: JobResultEnvelope, resultPath: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): void {
+    this.saveJobResultInternal(jobId,result,resultPath,at,notificationHook,false);
+  }
+
+  private saveJobResultInternal(jobId: string, result: JobResultEnvelope, resultPath: string, at: Date, notificationHook: JobNotificationHook, operatorLate: boolean): void {
     this.db.transaction(() => {
       const job=this.getJobRequired(jobId);
       this.assertJobCompletionBinding(job);
@@ -1774,7 +1902,7 @@ export class DispatcherDatabase {
       const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
       if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
         throw new Error("scheduled_work_result_deadline_exceeded");
-      const recoverAmbiguous=job.status==="needs_review"&&(["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
+      const recoverAmbiguous=job.status==="needs_review"&&((operatorLate&&["result_missing","invalid_result","invalid_result_agent_stopped"].includes(job.last_error_code??""))||["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
         (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
       if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
         throw new Error("completed_at_precedes_prompt_dispatch");
@@ -1787,6 +1915,9 @@ export class DispatcherDatabase {
           }
           const prior=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(job.completion_event_id) as {notification_state:string}|undefined;
           if(prior&&prior.notification_state!=="pending") throw new Error("prior_notification_requires_reconciliation");
+          if(operatorLate&&priorEvent.status==="completed"&&!this.attentionNotificationSettled(priorEvent)&&
+            !this.lateProgressNotificationSettled(priorEvent,jobId))
+            throw new Error("prior_notification_requires_reconciliation");
           this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')").run(completedAt.toISOString(),completedAt.toISOString(),job.completion_event_id);
           if(binding?.owner.kind === "slack_thread" && ["queued", "retryable_failed"].includes(priorEvent.status)) {
             this.db.prepare("UPDATE job_groups SET attention_event_id=NULL WHERE source_event_id=? AND attention_event_id=?")
