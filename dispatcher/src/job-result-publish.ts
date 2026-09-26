@@ -127,6 +127,9 @@ function hasLocalPath(value: string): boolean {
     const route = match[0].trimStart();
     if (/^<\/[A-Za-z][A-Za-z0-9:._-]*$/.test(route) && value[match.index! + match[0].length] === ">") continue;
     const prefix = value.slice(0, match.index);
+    const publicRoute = route.replace(/^\(/, "").replace(/\)$/, "");
+    if (/^\/(?:v\d+|api|docs|health|status)(?:\/[A-Za-z0-9._-]+)*$/i.test(publicRoute) &&
+      (/\bendpoint\s*$/i.test(prefix) || (route.startsWith("(") && /\]$/.test(prefix)))) continue;
     const slashPosition = match.index + match[0].indexOf("/");
     if (/\/\/\[[0-9a-f:.]+\]$/i.test(value.slice(0, slashPosition))) continue;
     if (route.startsWith("/") && /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(prefix.trimEnd()) &&
@@ -280,7 +283,7 @@ function decodeBase32Token(encoded: string): string | undefined {
       value &= (1 << bits) - 1;
     }
   }
-  if (value !== 0 || bytes.length < 4 || bytes.length > jobResultEnvelopeMaxBytes) return undefined;
+  if (value !== 0 || bytes.length < 1 || bytes.length > jobResultEnvelopeMaxBytes) return undefined;
   try { return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(bytes)); }
   catch { return undefined; }
 }
@@ -316,7 +319,7 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
 const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_.-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
 const cliCredentialCandidate = /--([A-Za-z][A-Za-z0-9-]*)\s+[^\s]+/g;
 function hasNetrcCredential(value: string): boolean {
-  for (const match of value.matchAll(/(?:^|\s)(?:machine\s+\S+|default)\b([^\r\n]*)/gi)) {
+  for (const match of value.matchAll(/(?:^|\s)(?:machine\s+\S+|default)\b((?:(?!\b(?:machine|default)\s+)[\s\S]){0,1024})/gi)) {
     const fields = match[1]!.trim().split(/\s+/);
     if (fields.some((field, index) => /^(?:password|account)$/i.test(field) && index + 1 < fields.length)) return true;
   }
@@ -335,6 +338,12 @@ function hasBasicCredential(value: string): boolean {
 function hasCurlPrivateKeyCredential(value: string): boolean {
   return /(?:^|\s)--pass(?:=|\s+)\S+/i.test(value) ||
     /(?:^|\s)--cert(?:=|\s+)(?:"[^"]+"|'[^']+'|\S+):[^\s"']+/i.test(value);
+}
+function hasCredentialXmlElement(value: string): boolean {
+  for (const match of value.matchAll(/<([A-Za-z][A-Za-z0-9:._-]*)\b[^>]*>([^<]{1,8192})<\/\1\s*>/gi)) {
+    if (forbiddenKey(normalizedStructuredKey(match[1]!)) && match[2]!.trim()) return true;
+  }
+  return false;
 }
 function isPublicCountField(key: string, value: unknown): boolean {
   return /_count$/i.test(key.replace(/([a-z0-9])([A-Z])/g, "$1_$2")) &&
@@ -364,7 +373,7 @@ function normalizedStructuredKey(key: string): string {
     if (next === normalized) break;
     normalized = next;
   }
-  return normalized.normalize("NFC");
+  return normalized.normalize("NFKC");
 }
 const hasInvalidUnicode = (value: string): boolean => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
 
@@ -416,7 +425,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     if (encoded.length % 2 !== 0) continue;
     if (++budget.count > 1_024 || inspect(Buffer.from(encoded, "hex"))) return true;
   }
-  for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{16,}={0,6})(?=$|[^A-Z2-7=])/gi)) {
+  for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{4,}={0,6})(?=$|[^A-Z2-7=])/gi)) {
     const encoded = match[1]!;
     if (encoded.length > jobResultEnvelopeMaxBytes) return true;
     const decoded = decodeBase32Token(encoded);
@@ -511,7 +520,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || hasCredentialXmlElement(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
@@ -616,18 +625,29 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     const leaves: string[] = [];
     const keys: string[] = [];
     const ordered: string[] = [];
+    const fieldValues = new Map<string, string[]>();
     const collect = (value: unknown): void => {
       if (typeof value === "string") { leaves.push(value); ordered.push(value); }
       else if (Array.isArray(value)) value.forEach(collect);
       else if (value !== null && typeof value === "object") {
-        for (const [key, item] of Object.entries(value)) { keys.push(key); ordered.push(key); collect(item); }
+        for (const [key, item] of Object.entries(value)) {
+          keys.push(key);
+          ordered.push(key);
+          if (typeof item === "string") {
+            const group = fieldValues.get(key) ?? [];
+            group.push(item);
+            fieldValues.set(key, group);
+          }
+          collect(item);
+        }
       }
     };
     collect(parsed.data.summary);
     if (parsed.data.output) collect(parsed.data.output.text);
     if (parsed.data.artifacts) collect(parsed.data.artifacts);
     if (parsed.data.actions) collect(parsed.data.actions);
-    for (const combined of [leaves.join(""), keys.join(""), ordered.join("")]) {
+    for (const combined of [leaves.join(""), keys.join(""), ordered.join(""),
+      ...[...fieldValues.values()].filter(values => values.length > 1).map(values => values.join(""))]) {
       if (matcher?.contains(combined) || (matcher && hasEncodedPrivateValue(combined, matcher, 0, encodedBudget, forbiddenDigests, forbiddenFingerprints)) ||
         containsForbiddenCapability(combined, forbiddenDigests, forbiddenFingerprints) ||
         containsForbiddenCapability(displayProjection(combined), forbiddenDigests, forbiddenFingerprints)) {
