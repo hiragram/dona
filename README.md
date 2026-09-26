@@ -34,7 +34,7 @@ npm run dev
 
 開発ランチャーはDispatcherを先に起動し、readyを確認してからSlack Adapterを起動します。`Ctrl+C`、またはどちらか一方の終了時には両方を停止します。プロセス自体は分離されたままです。
 
-Herdrの`dona`セッション内には、事前に`dona-main`という名前のCodexエージェントを起動してください。詳細な設定、疎通方法、復旧コマンドは各ディレクトリのREADMEにあります。
+Herdrの`dona`セッション内には、事前に`dona-main`という名前のCodexエージェントを起動してください。Codexへ渡す引数（Herdrの`--`以降）に`--model gpt-6-sol -c 'model_reasoning_effort="medium"'`を明示します。[モデル設定と検証](docs/operations/codex-model-settings.md)を参照してください。詳細な設定、疎通方法、復旧コマンドは各ディレクトリのREADMEにあります。
 
 `npm run dev`が起動するのはDispatcherとAdapterだけです。Slack MCPとDispatcher MCPのstdioプロセスは[`.codex/config.toml`](./.codex/config.toml)を読んだCodexが必要に応じて起動します。
 
