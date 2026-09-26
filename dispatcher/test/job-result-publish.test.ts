@@ -99,7 +99,7 @@ describe("job result publish contract", () => {
       "pypi-AgEIcHlwaS5vcmcCAAAAAAAAAAAAAAAAAAAA", "dckr_pat_AAAAAAAAAAAAAAAAAAAAAAAA", "ghp_AAAA*BBBB*CCCCCCCCCCCCCCCCCCCCCCCCCCCC", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGVzdHNpZ25hdHVyZQ",
       "eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyJhbGciOiJIUzI1NiJ9.e30.dGVzdHNpZ25hdHVyZQ", "jwt_eyAiYWxnIjoiSFMyNTYifQ.e30.dGVzdHNpZ25hdHVyZQ", "xoxc-abcdefghijkl", "xoxd-abcdefghijkl", "xoxe-abcdefghijkl", "ASIA1234567890ABCDEF", `AIza${"A".repeat(35)}`,
       "https://example.com/?id=eyJhbGciOiJIUzI1NiJ9%2Ee30%2EdGVzdHNpZ25hdHVyZQ",
-      "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE",
+      "curl --token CANARY_VALUE", "tool --client-secret CANARY_VALUE", "tool --sig CANARY_VALUE", "sv=2024-11-04&sig=CANARY_VALUE", "Bearer abc123", "https:\\\\files.slack.com\\files-pri\\download", "http:\\\\127.0.0.1\\private",
       "//user:CANARY_VALUE@cdn.example.com/private", "//cdn.example.com/file?sig=CANARY_VALUE",
       "//user:CANARY_VALUE@cdn.example.com", "//cdn.example.com?sig=CANARY_VALUE",
       "10.0.0.5:8080/download/OPAQUE_VALUE", "artifact.internal:8443/results/private.json", "localhost:8080/download/OPAQUE_VALUE", "service:3000/private/result", "[::1]:8080/download/OPAQUE_VALUE", "[fd00::1]:8443/private/result", "127.1/private/result", "2130706433/download/file", "0x7f000001/private/result", "017700000001/download/file", "0x7f.1/private/result", "0177.0.0.1/download/file", "artifact.internal./private/result",
@@ -357,6 +357,9 @@ describe("job result publish contract", () => {
       artifacts: [{ part: grant.capability.slice(0, 20) }, { note: "ok" }, { part: grant.capability.slice(20) }] },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ parts: [grant.capability.slice(0, 20), "ok", grant.capability.slice(20)] }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: grant.capability.match(/.{1,7}/g)!.map((part, index) => ({ [`part${index + 1}`]: part })).flatMap((part, index) => index === 0 ? [part, { note: "ok" }] : [part]) },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
@@ -434,6 +437,8 @@ describe("job result publish contract", () => {
     const shortCapability = shortGrant.issue(row({ job_id: "job_short_base32" }), "s1");
     assert.throws(() => shortGrant.validate(shortCapability.capability, "s1", { ...base,
       summary: "OMYQ====" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
+    assert.throws(() => shortGrant.validate(shortCapability.capability, "s1", { ...base,
+      summary: "7331" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
     const longBase32Source = Buffer.from("private objective text".repeat(500), "utf8");
     let longBits = 0, longValue = 0, longBase32 = "";
     for (const byte of longBase32Source) {

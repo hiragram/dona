@@ -38,6 +38,7 @@ export class JobResultPublishError extends Error {
 const sensitive = /(?:(?:^|\s)(?:-[uU]\s*|--(?:proxy-)?user(?:=|\s+))[^:\s]+:[^\s]+|(?:\bmachine\s+[^\s]+|\bdefault)\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~-]+:[^@\s/]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?\/[^\s"'<>`]+/i;
 const ageSecretIdentity = /AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{20,}\b/i;
+const shortBearerCredential = /\bBearer\s+(?=[A-Za-z0-9._~-]{1,7}(?:\b|$))(?=[A-Za-z0-9._~-]*[0-9._~-])[A-Za-z0-9._~-]{1,7}\b/i;
 const pgpassCredential = /(?:^|\s)(?:\\.|[^\s:\\]){1,255}:(?:\d{1,5}|\*):(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}(?=$|\s)/;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
@@ -434,10 +435,14 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const bytes = Buffer.from(encoded, format);
     if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
   }
-  for (const match of value.matchAll(/[0-9a-f]{8,}/gi)) {
+  for (const match of value.matchAll(/[0-9a-f]{4,}/gi)) {
     const encoded = match[0];
     if (encoded.length % 2 !== 0) continue;
-    if (inspect(Buffer.from(encoded, "hex"))) return true;
+    const bytes = Buffer.from(encoded, "hex");
+    if (encoded.length < 8) {
+      try { if (matcher.contains(decoder.decode(bytes))) return true; }
+      catch { /* Non-UTF-8 short values cannot reveal a text identity. */ }
+    } else if (inspect(bytes)) return true;
   }
   for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{4,}={0,6})(?=$|[^A-Z2-7=])/gi)) {
     const encoded = match[1]!;
@@ -455,6 +460,9 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
 function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0, budget: { count: number } = { count: 0 }): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
+    const normalizedHttp = value.replace(/https?:[\\/]+[^\s"'<>`]+/gi, candidate =>
+      candidate.replace(/^https?:[\\/]+/i, prefix => prefix.slice(0, prefix.indexOf(":" )).toLowerCase() + "://").replaceAll("\\", "/"));
+    if (normalizedHttp !== value) assertSafeJson(normalizedHttp, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     for (const match of value.matchAll(networkUrlCandidate)) {
       let url: URL;
       try { url = new URL(match[0]); } catch { throw new JobResultPublishError("content_requires_redaction"); }
@@ -534,11 +542,24 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || hasCredentialXmlElement(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || ageSecretIdentity.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || hasCredentialXmlElement(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || ageSecretIdentity.test(value) || shortBearerCredential.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     if (value.length === 2 && typeof value[0] === "string" && value[1] !== null && value[1] !== "" &&
       forbiddenKey(normalizedStructuredKey(value[0]))) throw new JobResultPublishError("content_requires_redaction");
+    if (forbiddenDigests && forbiddenFingerprints) {
+      const pieces = value.filter((item): item is string => typeof item === "string" && /^[A-Za-z0-9_-]{2,42}$/.test(item));
+      if (pieces.length >= 2 && pieces.reduce((length, piece) => length + piece.length, 0) >= 43) {
+        if (pieces.length > 12) throw new JobResultPublishError("content_requires_redaction");
+        for (let mask = 1; mask < 1 << pieces.length; mask++) {
+          let candidate = "";
+          for (let index = 0; index < pieces.length; index++) if (mask & (1 << index)) candidate += pieces[index];
+          if (candidate.length === 43 && containsForbiddenCapability(candidate, forbiddenDigests, forbiddenFingerprints)) {
+            throw new JobResultPublishError("content_requires_redaction");
+          }
+        }
+      }
+    }
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
   } else if (value !== null && typeof value === "object") {
     const normalizedEntries = Object.entries(value).map(([key, item]) =>
