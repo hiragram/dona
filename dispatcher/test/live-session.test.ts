@@ -210,6 +210,26 @@ describe("read-only live session reconciliation",()=>{
     assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,resolved.updated_at),/job_invalid_result_reconciliation_unavailable/);
     state.database.close();
   });
+  test("停止receipt後のidentity世代差し替えをoperator解決で拒否する",async()=>{
+    const state=await addressableJob("needs_review","identity-generation-drift");
+    state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
+    state.database.sealJobGroup(state.source.event_id);
+    const attention=state.database.enqueueJobNotification(state.job.job_id).row;
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
+    assert.ok(receipt.identity_generation_sha256);
+    const current=state.database.getJob(state.job.job_id)!;
+    const raw=new Database(state.config.databasePath);
+    raw.prepare("UPDATE job_live_session_identities SET generation_nonce=? WHERE job_id=?")
+      .run("replacement-generation",state.job.job_id);
+    raw.close();
+    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,current.updated_at),
+      /late_result_worker_stop_unproven/);
+    assert.throws(()=>state.database.resolveNeedsReviewAttention(state.source.event_id,current.job_id,
+      attention.event_id,receipt.receipt_id,current.updated_at),/late_result_worker_stop_unproven/);
+    assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
+    state.database.close();
+  });
   test("別jobのattentionではinvalid Resultを解消済みと記録しない",async()=>{
     const state=await addressableJob("needs_review","attention-owner");
     const sibling=state.database.createJob({source_event_id:state.source.event_id,job_key:"invalid-sibling",

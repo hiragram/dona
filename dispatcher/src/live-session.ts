@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type Database from "better-sqlite3";
 
@@ -37,6 +37,7 @@ export interface LiveSessionIdentityRow {
   agent_name: string | null;
   max_state_change_seq: number | null;
   recorded_at: string;
+  generation_nonce: string | null;
 }
 
 export interface LiveSessionReceiptProjection {
@@ -45,6 +46,7 @@ export interface LiveSessionReceiptProjection {
   job_id: string;
   observed_at: string;
   boot_id: string;
+  identity_generation_sha256?: string | null;
   durable_status_before: JobStatus;
   durable_status_after: JobStatus;
   result_present_before: boolean;
@@ -84,6 +86,7 @@ interface LiveSessionReceiptRow {
   reason_codes_json: string;
   safe_next_action: "review_existing_session" | "review_durable_result" | "do_not_retry";
   duration_ms: number;
+  identity_generation_sha256: string | null;
 }
 
 export interface LiveSessionObservationInput {
@@ -118,7 +121,8 @@ export function migrateLiveSession(db: Database.Database): void {
       herdr_pane_id TEXT,
       agent_name TEXT,
       max_state_change_seq INTEGER CHECK (max_state_change_seq >= 0 OR max_state_change_seq IS NULL),
-      recorded_at TEXT NOT NULL
+      recorded_at TEXT NOT NULL,
+      generation_nonce TEXT
     );
     CREATE TABLE IF NOT EXISTS live_session_query_receipts (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,6 +145,7 @@ export function migrateLiveSession(db: Database.Database): void {
       reason_codes_json TEXT NOT NULL,
       safe_next_action TEXT NOT NULL,
       duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+      identity_generation_sha256 TEXT,
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS live_session_receipts_job_idx
@@ -155,9 +160,24 @@ export function migrateLiveSession(db: Database.Database): void {
     if (!identityColumns.has(column)) db.exec(`ALTER TABLE job_live_session_identities ADD COLUMN ${column} TEXT`);
   }
   if (!identityColumns.has("max_state_change_seq")) db.exec("ALTER TABLE job_live_session_identities ADD COLUMN max_state_change_seq INTEGER CHECK (max_state_change_seq >= 0 OR max_state_change_seq IS NULL)");
+  if (!identityColumns.has("generation_nonce")) db.exec("ALTER TABLE job_live_session_identities ADD COLUMN generation_nonce TEXT");
+  const receiptColumns = new Set((db.prepare("PRAGMA table_info(live_session_query_receipts)").all() as Array<{name:string}>).map(row=>row.name));
+  if (!receiptColumns.has("identity_generation_sha256")) db.exec("ALTER TABLE live_session_query_receipts ADD COLUMN identity_generation_sha256 TEXT");
 }
 
-export function expectedLiveSessionIdentity(job: JobRow, identity: LiveSessionIdentityRow | undefined): string | undefined {
+export function liveSessionIdentityGenerationSha256(
+  job: Pick<JobRow,"herdr_workspace_id"|"herdr_pane_id"|"agent_name">,
+  identity: LiveSessionIdentityRow | undefined,
+): string | undefined {
+  if (!identity?.generation_nonce || !expectedLiveSessionIdentity(job, identity)) return undefined;
+  return createHash("sha256").update(JSON.stringify([
+    identity.identity_version, identity.generation_nonce, identity.herdr_agent_session_id,
+    identity.herdr_workspace_id, identity.herdr_pane_id, identity.agent_name, identity.recorded_at,
+    job.herdr_workspace_id, job.herdr_pane_id, job.agent_name,
+  ])).digest("hex");
+}
+
+export function expectedLiveSessionIdentity(job: Pick<JobRow,"herdr_workspace_id"|"herdr_pane_id"|"agent_name">, identity: LiveSessionIdentityRow | undefined): string | undefined {
   if (!job.herdr_workspace_id || !job.herdr_pane_id || !identity?.herdr_agent_session_id) return undefined;
   if (identity.herdr_workspace_id !== job.herdr_workspace_id || identity.herdr_pane_id !== job.herdr_pane_id || identity.agent_name !== job.agent_name) return undefined;
   return JSON.stringify([job.herdr_workspace_id, job.herdr_pane_id, job.agent_name, identity.herdr_agent_session_id]);
@@ -280,13 +300,14 @@ export function insertLiveSessionReceipt(db: Database.Database, sourceEventId: s
   db.prepare(`INSERT INTO live_session_query_receipts(
     receipt_id,job_id,source_event_id,boot_id,started_at,completed_at,durable_status_before,durable_status_after,
     result_present_before,result_present_after,query_status,session_state,identity_match,state_change_seq,
-    reconciliation_state,confidence,reason_codes_json,safe_next_action,duration_ms,created_at
-  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    reconciliation_state,confidence,reason_codes_json,safe_next_action,duration_ms,identity_generation_sha256,created_at
+  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     receipt.receipt_id, receipt.job_id, sourceEventId ?? null, receipt.boot_id, startedAt, receipt.observed_at,
     receipt.durable_status_before, receipt.durable_status_after, Number(receipt.result_present_before), Number(receipt.result_present_after),
     receipt.live_session.query_status, receipt.live_session.session_state, receipt.live_session.identity_match === null ? null : Number(receipt.live_session.identity_match),
     receipt.live_session.state_change_seq, receipt.reconciliation.state, receipt.reconciliation.confidence,
-    JSON.stringify(receipt.reconciliation.reason_codes), receipt.reconciliation.safe_next_action, receipt.live_session.freshness_ms, receipt.observed_at,
+    JSON.stringify(receipt.reconciliation.reason_codes), receipt.reconciliation.safe_next_action, receipt.live_session.freshness_ms,
+    receipt.identity_generation_sha256 ?? null, receipt.observed_at,
   );
 }
 
@@ -297,6 +318,7 @@ export function projectLiveSessionReceipt(row: LiveSessionReceiptRow): LiveSessi
     job_id: row.job_id,
     observed_at: row.completed_at,
     boot_id: row.boot_id,
+    identity_generation_sha256: row.identity_generation_sha256,
     durable_status_before: row.durable_status_before,
     durable_status_after: row.durable_status_after,
     result_present_before: row.result_present_before === 1,
