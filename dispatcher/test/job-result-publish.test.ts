@@ -377,6 +377,9 @@ describe("job result publish contract", () => {
       artifacts: [{ prefix: "private objective ", note: "ok", suffix: "text" }] },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ prefix: "private objective " }, { note: "ok" }, { suffix: "text" }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ prefix: "ghp_", note: "ok", suffix: "abcdefghijklmnop" }] },
       () => current), code("content_requires_redaction"));
     const longArrayObjective = "private objective ".repeat(40);
@@ -463,6 +466,8 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: encodedPrivate.match(/.{1,8}/g)!.join(" \n") }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: encodedPrivate.match(/.{1,16}/g)!.join(" ") }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from("private objective text", "utf8").toString("base64").match(/.{1,8}/g)!.join(" ") }, () => current), code("content_requires_redaction"));
     const spacedObjective = "private objective text".repeat(100);
     const spacedGrants = new JobResultPublishCapabilities(() => "spaced-session");
@@ -479,6 +484,8 @@ describe("job result publish contract", () => {
       summary: "OMYQ====" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
     assert.throws(() => shortGrant.validate(shortCapability.capability, "s1", { ...base,
       summary: "7331" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
+    assert.throws(() => shortGrant.validate(shortCapability.capability, "s1", { ...base,
+      summary: "czE" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
     const longBase32Source = Buffer.from("private objective text".repeat(500), "utf8");
     let longBits = 0, longValue = 0, longBase32 = "";
     for (const byte of longBase32Source) {

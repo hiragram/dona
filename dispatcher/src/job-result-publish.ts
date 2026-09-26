@@ -437,6 +437,14 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
     if (inspect(bytes)) return true;
   }
+  for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{2,7})(?=$|[^A-Za-z0-9+/_-])/g)) {
+    const encoded = match[1]!;
+    const format = /[+/]/.test(encoded) ? "base64" : "base64url";
+    const bytes = Buffer.from(encoded, format);
+    if (bytes.toString(format) !== encoded) continue;
+    try { if (matcher.contains(decoder.decode(bytes))) return true; }
+    catch { /* Non-UTF-8 short values cannot reveal a text identity. */ }
+  }
   const grouped: string[] = [];
   let previousEnd = -1;
   const inspectGroup = (): boolean => {
@@ -444,7 +452,16 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const encoded = grouped.join("");
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
-    return bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes);
+    if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
+    if (/^[A-Z2-7]+=*$/i.test(encoded)) {
+      const decoded = decodeBase32Token(encoded);
+      if (decoded) {
+        if (++budget.count > 1_024 || matcher.contains(decoded)) return true;
+        try { assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget); }
+        catch (error) { if (error instanceof JobResultPublishError) return true; }
+      }
+    }
+    return false;
   };
   for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]+={0,2})(?=$|[^A-Za-z0-9+/_-])/g)) {
     const encoded = match[1]!;
@@ -473,15 +490,6 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     if (!decoded) continue;
     if (++budget.count > 1_024) return true;
     if (matcher.contains(decoded)) return true;
-    try { assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget); }
-    catch (error) { if (error instanceof JobResultPublishError) return true; }
-  }
-  for (const match of value.matchAll(/(?:^|[^A-Z2-7])((?:[A-Z2-7]{1,8}\s+){2,}[A-Z2-7]{1,8}={0,6})(?=$|[^A-Z2-7=])/gi)) {
-    const encoded = match[1]!.replace(/\s+/g, "");
-    if (encoded.length > jobResultEnvelopeMaxBytes) return true;
-    const decoded = decodeBase32Token(encoded);
-    if (!decoded) continue;
-    if (++budget.count > 1_024 || matcher.contains(decoded)) return true;
     try { assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget); }
     catch (error) { if (error instanceof JobResultPublishError) return true; }
   }
@@ -727,6 +735,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     if (parsed.data.output) collect(parsed.data.output.text);
     if (parsed.data.artifacts) collect(parsed.data.artifacts);
     if (parsed.data.actions) collect(parsed.data.actions);
+    assertSafeFragmentCombinations(leaves, forbiddenDigests, matcher, forbiddenFingerprints, encodedBudget);
     for (const combined of new Set([leaves.join(""), keys.join(""), ordered.join(""),
       ...[...fieldValues.values()].filter(values => values.length > 1).map(values => values.join("")),
       ...[...numberedValues.values()].filter(values => values.length > 1).map(values =>
