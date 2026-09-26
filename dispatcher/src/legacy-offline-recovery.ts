@@ -65,6 +65,28 @@ function counts(db: Database.Database): Record<string, number> {
   return result;
 }
 
+async function pathIdentities(filePath: string): Promise<Set<string>> {
+  const absolute = path.resolve(filePath);
+  const identities = new Set([absolute]);
+  try { identities.add(path.join(await fs.realpath(path.dirname(absolute)), path.basename(absolute))); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return identities;
+}
+
+async function assertBackupPathsUnreserved(db: Database.Database, sourcePath: string, backupPath: string): Promise<void> {
+  const reserved = [sourcePath, `${sourcePath}-wal`, `${sourcePath}-shm`, `${sourcePath}-journal`];
+  for (const row of db.prepare("SELECT result_path FROM jobs UNION ALL SELECT result_path FROM events WHERE result_path IS NOT NULL")
+    .all() as Array<{ result_path: string }>) reserved.push(row.result_path);
+  const destination = new Set([...(await pathIdentities(backupPath)), ...(await pathIdentities(`${backupPath}.tmp`))]);
+  for (const candidate of reserved) {
+    for (const identity of await pathIdentities(candidate)) {
+      if (destination.has(identity)) throw new Error("legacy_backup_path_reserved");
+    }
+  }
+}
+
 async function resultObservation(job: LegacyJob): Promise<LegacyResultObservation> {
   let file: fs.FileHandle;
   try {
@@ -124,6 +146,7 @@ export async function createLegacyRecoveryPreflight(sourcePath: string, backupPa
   try {
     verify(source);
     const before = counts(source);
+    await assertBackupPathsUnreserved(source, sourcePath, backupPath);
     const parent = await fs.realpath(path.dirname(backupPath));
     const parentStat = await fs.stat(parent);
     if ((parentStat.mode & 0o077) !== 0) throw new Error("legacy_backup_directory_not_private");
@@ -141,6 +164,7 @@ export async function createLegacyRecoveryPreflight(sourcePath: string, backupPa
     const sourceSchema = verify(backup);
     const backupCounts = counts(backup);
     if (JSON.stringify(before) !== JSON.stringify(backupCounts)) throw new Error("legacy_backup_counts_drift");
+    await assertBackupPathsUnreserved(backup, sourcePath, backupPath);
     const rows = backup.prepare("SELECT * FROM jobs WHERE status='needs_review' ORDER BY job_id").all() as LegacyJob[];
     const candidates: LegacyRecoveryCandidate[] = [];
     for (const job of rows) {
@@ -169,6 +193,7 @@ export async function createLegacyRecoveryPreflight(sourcePath: string, backupPa
     const backupHash = createHash("sha256");
     for await (const chunk of createReadStream(temporary)) backupHash.update(chunk);
     const backupSha256 = backupHash.digest("hex");
+    await assertBackupPathsUnreserved(source, sourcePath, backupPath);
     // link is exclusive: unlike rename, it cannot replace a backup created during inspection.
     await fs.link(temporary, backupPath);
     await fs.unlink(temporary);

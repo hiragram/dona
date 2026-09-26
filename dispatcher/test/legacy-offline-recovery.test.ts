@@ -70,10 +70,31 @@ test("offline preflight never deletes a source database whose name matches its t
   const sourcePath = path.join(root, "source.tmp");
   const dispatcher = new DispatcherDatabase(sourcePath);
   dispatcher.close();
-  await assert.rejects(createLegacyRecoveryPreflight(sourcePath, path.join(root, "source")), /EEXIST/);
+  await assert.rejects(createLegacyRecoveryPreflight(sourcePath, path.join(root, "source")), /legacy_backup_path_reserved/);
   const source = new Database(sourcePath, { readonly: true, fileMustExist: true });
   assert.equal(source.pragma("user_version", { simple: true }), 3);
   source.close();
+});
+
+test("offline preflight rejects backup destinations reserved by missing Results", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const dispatcher = new DispatcherDatabase(config.databasePath);
+  const event = dispatcher.enqueue(eventEnvelope("legacy-offline-destination-collision")).row;
+  const job = dispatcher.createJob({ source_event_id: event.event_id, objective: "fixture",
+    workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
+  dispatcher.close();
+  await fs.mkdir(path.dirname(job.result_path), { recursive: true, mode: 0o700 });
+  await assert.rejects(createLegacyRecoveryPreflight(config.databasePath, job.result_path),
+    /legacy_backup_path_reserved/);
+  await assert.rejects(fs.stat(job.result_path), { code: "ENOENT" });
+  const privateDir = path.join(root, "private"); await fs.mkdir(privateDir, { mode: 0o700 });
+  const sourceResult = path.join(privateDir, "candidate.tmp");
+  const writer = new Database(config.databasePath);
+  writer.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(sourceResult, job.job_id);
+  writer.close();
+  await assert.rejects(createLegacyRecoveryPreflight(config.databasePath, path.join(privateDir, "candidate")),
+    /legacy_backup_path_reserved/);
+  await assert.rejects(fs.stat(sourceResult), { code: "ENOENT" });
 });
 
 test("offline preflight inventories missing, invalid, and oversized finals", async () => {
