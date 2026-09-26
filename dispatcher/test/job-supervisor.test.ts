@@ -110,7 +110,7 @@ afterEach(async () => {
 
 describe("JobSupervisor", () => {
   for (const agentPresent of [true, false]) {
-    test(`cancel of stale preparation ${agentPresent ? "retains unknown agent" : "confirms agent absent"}`, async () => {
+    test(`cancel of stale preparation ${agentPresent ? "retains unknown agent" : "records name-based agent absence"}`, async () => {
       const { root, config } = await tempConfig();
       roots.push(root);
       const database = new DispatcherDatabase(config.databasePath);
@@ -126,7 +126,7 @@ describe("JobSupervisor", () => {
       else await supervisor.cancel(job.job_id, job.source_event_id);
       assert.equal(cancelCalls, 0);
       assert.equal(database.getJob(job.job_id)?.status, agentPresent ? "needs_review" : "cancelled");
-      assert.equal(database.updateSafetyStatus().active_worker_count, agentPresent ? 1 : 0);
+      assert.equal(database.updateSafetyStatus().active_worker_count, 1);
       database.close();
     });
   }
@@ -190,7 +190,7 @@ describe("JobSupervisor", () => {
     database.close();
   });
 
-  test("accepts definitive agent absence when cancelling a stale preparation review", async () => {
+  test("name-based absence after stale preparation keeps the drain gate", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const job = createScratchJob(database, config, "Ev-stale-preparing-reviewed-cancel");
@@ -202,7 +202,7 @@ describe("JobSupervisor", () => {
     }), config, logger, () => undefined);
     await supervisor.cancel(job.job_id, job.source_event_id);
     assert.equal(database.getJob(job.job_id)?.status, "cancelled");
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.close();
   });
 
