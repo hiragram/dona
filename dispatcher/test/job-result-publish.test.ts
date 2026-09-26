@@ -270,9 +270,12 @@ describe("job result publish contract", () => {
     const candidate = grants.validate(grant.capability, "session-one", base, () => current);
     wall -= 60 * 60_000;
     monotonic += jobResultPublishTtlMs / 2;
-    assert.ok(grants.renew(grant.capability, "session-one", () => current).capability);
+    const renewed = grants.renew(grant.capability, "session-one", () => current);
+    wall += 60 * 60_000;
+    assert.equal(grants.validate(renewed.capability, "session-one", base, () => current).envelope.status, "completed");
     monotonic += jobResultPublishTtlMs / 2;
     assert.throws(() => candidate.assertCurrentGrant(), code("capability_expired"));
+    assert.equal(grants.validate(renewed.capability, "session-one", base, () => current).envelope.status, "completed");
   });
 
   test("pruneしたgrantのcandidateは時計が戻っても復活しない", () => {
@@ -372,6 +375,9 @@ describe("job result publish contract", () => {
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ prefix: "private objective ", note: "ok", suffix: "text" }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ prefix: "ghp_", note: "ok", suffix: "abcdefghijklmnop" }] },
       () => current), code("content_requires_redaction"));
     const longArrayObjective = "private objective ".repeat(40);
     const longArrayGrants = new JobResultPublishCapabilities(() => "long-array-session");

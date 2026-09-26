@@ -159,8 +159,8 @@ function hasPrivateSlashAuthority(value: string, forbiddenValues?: ForbiddenValu
   return false;
 }
 const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>|<!date\^[^>]+>|<@[A-Z0-9]+(?:\|[^>]*)?>/i;
-const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
-const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9._~%-]+(?::[^@\s/"'<>`]*)?@)?(?:(?:[A-Za-z0-9-]+\.)+(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]{2,})|(?:[A-Za-z0-9-]+\.)*localhost)(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/gi;
+const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]{0,63}:\/\/[^\s"'<>`]+/gi;
+const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9._~%-]{1,256}(?::[^@\s/"'<>`]{0,256})?@)?(?:(?:[A-Za-z0-9-]{1,63}\.)+(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{2,59})|(?:[A-Za-z0-9-]{1,63}\.)*localhost)(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/gi;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
 const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa|test|invalid|example)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
@@ -490,7 +490,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
 
 function assertSafeFragmentCombinations(values: readonly unknown[], forbiddenDigests: ReadonlySet<string> | undefined,
   forbiddenValues: ForbiddenValueMatcher | undefined, forbiddenFingerprints: ReadonlySet<number> | undefined,
-  budget: { combinations: number; combinationBytes: number }): void {
+  budget: { count: number; combinations: number; combinationBytes: number }): void {
   if (!forbiddenValues && !(forbiddenDigests && forbiddenFingerprints)) return;
   const pieces = values.filter((item): item is string => typeof item === "string" && item.length > 0);
   if (pieces.length < 2) return;
@@ -501,10 +501,7 @@ function assertSafeFragmentCombinations(values: readonly unknown[], forbiddenDig
     for (let index = 0; index < pieces.length; index++) if (mask & (1 << index)) candidate += pieces[index];
     budget.combinationBytes += candidate.length;
     if (budget.combinationBytes > jobResultEnvelopeMaxBytes) throw new JobResultPublishError("content_requires_redaction");
-    if (forbiddenValues?.contains(candidate) || (forbiddenDigests && forbiddenFingerprints && candidate.length === 43 &&
-      containsForbiddenCapability(candidate, forbiddenDigests, forbiddenFingerprints))) {
-      throw new JobResultPublishError("content_requires_redaction");
-    }
+    assertSafeJson(candidate, 0, forbiddenDigests, forbiddenValues, forbiddenFingerprints, 0, budget);
   }
 }
 
@@ -730,15 +727,12 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     if (parsed.data.output) collect(parsed.data.output.text);
     if (parsed.data.artifacts) collect(parsed.data.artifacts);
     if (parsed.data.actions) collect(parsed.data.actions);
-    for (const combined of [leaves.join(""), keys.join(""), ordered.join(""),
+    for (const combined of new Set([leaves.join(""), keys.join(""), ordered.join(""),
       ...[...fieldValues.values()].filter(values => values.length > 1).map(values => values.join("")),
       ...[...numberedValues.values()].filter(values => values.length > 1).map(values =>
-        values.sort((left, right) => left.index - right.index).map(item => item.value).join(""))]) {
-      if (matcher?.contains(combined) || (matcher && hasEncodedPrivateValue(combined, matcher, 0, encodedBudget, forbiddenDigests, forbiddenFingerprints)) ||
-        containsForbiddenCapability(combined, forbiddenDigests, forbiddenFingerprints) ||
-        containsForbiddenCapability(displayProjection(combined), forbiddenDigests, forbiddenFingerprints)) {
-        throw new JobResultPublishError("content_requires_redaction");
-      }
+        values.sort((left, right) => left.index - right.index).map(item => item.value).join(""))])) {
+      if (!combined || combined === parsed.data.summary || combined === parsed.data.output?.text) continue;
+      assertSafeJson(combined, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
     }
   }
   const envelope: JobResultEnvelope = {
@@ -838,7 +832,8 @@ export class JobResultPublishCapabilities {
     // safely repeat the same renewal and recover the same successor token.
     const predecessor = this.grants.get(createHash("sha256").update(capability).digest("hex"));
     if (!predecessor || this.monotonicNow() < predecessor.monotonicRenewableAt) throw new JobResultPublishError("renewal_not_due");
-    const expiresAt = this.now() + jobResultPublishTtlMs;
+    const remaining = Math.max(0, predecessor.monotonicDeadline - this.monotonicNow());
+    const expiresAt = Math.max(this.now(), predecessor.expiresAt - remaining) + jobResultPublishTtlMs;
     this.grants.set(key, { jobId: job.job_id, generation: predecessor.generation, session, attemptCount: job.attempt_count,
       paneId: job.herdr_pane_id, agentName: job.agent_name, herdrWorkspaceId: job.herdr_workspace_id,
       privateValues: grantPrivateValues(job, session),
