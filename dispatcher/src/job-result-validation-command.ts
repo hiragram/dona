@@ -8,16 +8,21 @@ function nodeLibraryDirectories(): readonly string[] {
   if (!libraryDirectories) {
     // report本文は出力・保存しない。ロード済みnative libraryの実体ディレクトリだけを使う。
     const report = process.report.getReport() as { sharedObjects?: string[] };
-    libraryDirectories = Object.freeze([...new Set((report.sharedObjects ?? [])
-      .filter(value => value.startsWith("/") && /(?:\.dylib|\.so(?:\.\d+)*)$/.test(value)
-        && !value.startsWith("/usr/lib/") && !value.startsWith("/System/") && !value.startsWith("/lib/"))
-      .map(value => {
-        const directory = path.dirname(realpathSync(value));
-        if (!/^lib(?:32|64)?$/.test(path.basename(directory))) throw new Error("Scheduled Node library directory is unsupported");
-        return directory;
-      }))]);
+    libraryDirectories = Object.freeze(nodeLibraryDirectoriesFromLoadedObjects(report.sharedObjects ?? []));
   }
   return libraryDirectories;
+}
+
+export function nodeLibraryDirectoriesFromLoadedObjects(objects: readonly string[]): string[] {
+  const systemRoots = ["/usr/lib/", "/usr/lib64/", "/lib/", "/lib64/", "/System/"];
+  return [...new Set(objects
+    .filter(value => value.startsWith("/") && /(?:\.dylib|\.so(?:\.\d+)*)$/.test(value)
+      && !systemRoots.some(root => value.startsWith(root)))
+    .map(value => {
+      const directory = path.dirname(realpathSync(value));
+      if (!/^lib(?:32|64)?$/.test(path.basename(directory))) throw new Error("Scheduled Node library directory is unsupported");
+      return directory;
+    }))];
 }
 
 export function jobResultValidationCommand(scheduled: boolean): string[] {

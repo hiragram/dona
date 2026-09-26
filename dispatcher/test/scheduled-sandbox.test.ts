@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { jobResultValidationCommand, jobResultValidationReadPaths } from "../src/job-result-validation-command.js";
+import { jobResultValidationCommand, jobResultValidationReadPaths, nodeLibraryDirectoriesFromLoadedObjects } from "../src/job-result-validation-command.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -74,4 +74,21 @@ test("isolation未確認ではHerdr workspaceやworkerを開始しない",async(
     await assert.rejects(runtime.prepare({...job,source:"dona_schedule"}),/workspace must be a real directory/);
     assert.deepEqual(await fs.readdir(outside),[]);
   }finally{database.close();await fs.rm(root,{recursive:true,force:true});}
+});
+
+
+test("system loaderのlib64 aliasを追加grantへ広げずnative libraryだけを扱う", async () => {
+  assert.deepEqual(nodeLibraryDirectoriesFromLoadedObjects([
+    "/lib64/ld-linux-x86-64.so.2", "/usr/lib64/libc.so.6", "/lib/x86_64-linux-gnu/libm.so.6",
+    "/usr/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/libSystem.B.dylib", "/System/Library/libfixture.dylib",
+    "linux-vdso.so.1", "/unrelated/addon.node",
+  ]), []);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-node-libraries-"));
+  try {
+    const lib = path.join(root, "lib"); await fs.mkdir(lib);
+    const library = path.join(lib, "libfixture.dylib"); await fs.writeFile(library, "fixture");
+    assert.deepEqual(nodeLibraryDirectoriesFromLoadedObjects([library, library]), [await fs.realpath(lib)]);
+    const unsupported = path.join(root, "libfixture.so"); await fs.writeFile(unsupported, "fixture");
+    assert.throws(() => nodeLibraryDirectoriesFromLoadedObjects([unsupported]), /unsupported/);
+  } finally { await fs.rm(root, {recursive:true, force:true}); }
 });
