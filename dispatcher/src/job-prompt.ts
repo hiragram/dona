@@ -1,5 +1,5 @@
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { jobResultValidationCommand } from "./job-result-validation-command.js";
 import type { JobRow, JobWorkspace } from "./types.js";
 import { parseJobWorkspace } from "./validation.js";
 import { jobResultPublishTtlMs } from "./job-result-publish.js";
@@ -20,9 +20,7 @@ export function buildJobResultPublishInstructions(): string {
 export function buildJobPrompt(row: JobRow, progressEnabled = true): string {
   progressEnabled = progressEnabled && row.source !== "dona_schedule";
   const progressPath = jobProgressPath(row);
-  const sourceMode = import.meta.url.endsWith(".ts");
-  const validatorPath = fileURLToPath(new URL(sourceMode ? "./job-result-validate.ts" : "./job-result-validate.js", import.meta.url));
-  const validatorCommand = ["node", ...(sourceMode ? ["--import", fileURLToPath(import.meta.resolve("tsx"))] : []), validatorPath]
+  const validatorCommand = jobResultValidationCommand(row.source === "dona_schedule")
     .map((arg) => "'" + arg.replaceAll("'", "'\"'\"'") + "'").join(" ");
   const jobJson = JSON.stringify({
     schema_version: 1,

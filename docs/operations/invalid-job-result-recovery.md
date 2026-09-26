@@ -36,3 +36,5 @@ file有無、共通schemaの検証結果、DBのstatus・last_error_code・resul
 - invalid finalは`invalid_result` / `needs_review`とResult未保存を維持する。診断や正しい生成例だけでcompletedへ進めない。
 
 公開済みfile/DBを修正せず、旧jobを再投入せず、needs_reviewを自動解除しない。operator解決は上記の別途承認されたworker停止・副作用照合・receipt/CAS gateを引き続き必要とする。この検証コマンドは新publish API、migration gate、recovery protocolを置き換えない。
+
+schedule workerでは固定PATHに依存せず、稼働Nodeの絶対パスとbuild時に同じreader/schemaから生成した単一bundleを使う。sandboxにはその2つとNodeのロード済み共有ライブラリの実体ディレクトリだけをread許可し、releaseディレクトリやnode_modules全体は許可しない。macOSでは検証コマンド内だけの`DYLD_LIBRARY_PATH`をその実体ディレクトリへ固定し、許可外のHomebrew opt symlink走査を避ける。OpenSSL設定は`--openssl-config=/dev/null`へ固定し、ホスト設定のread許可は追加しない。共有ライブラリの実体が`lib`/`lib32`/`lib64`以外に置かれている環境ではfail-closedとする。既存のroot deny・network無効・workspace read-onlyを維持する。起動前probeは同じsandboxで正常fixtureの受理と不正fixtureの拒否も確認し、検証経路が利用不能ならworkerを開始しない。開発時もschedule利用前には`npm run build`が必要である。
