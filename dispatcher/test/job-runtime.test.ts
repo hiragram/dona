@@ -58,6 +58,12 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     const prompt = buildJobPrompt(job, false);
     assert.equal(prompt.includes("progress_path"), false);
     assert.equal(prompt.includes("工程が変わるたび"), false);
+    assert.match(prompt, /new Date\(\)\.toISOString\(\)/);
+    assert.match(prompt, /isoformat\(\)\.replace/);
+    assert.match(prompt, /末尾Zが必須/);
+    assert.match(prompt, /job-result-validate\.ts/);
+    assert.match(prompt, /exit code 0の場合だけrename/);
+    assert.match(prompt, /既存final Resultがある場合も新規公開を停止/);
     database.close();
   });
 

@@ -15,10 +15,19 @@ import type {
 import { jobDisplayMetadataKey } from "./job-display-label.js";
 
 const jsonObject = z.record(z.string(), z.unknown());
-const utcRfc3339 = z
-  .string()
-  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/, "must be UTC RFC 3339")
-  .refine((value) => !Number.isNaN(Date.parse(value)), "must be a valid timestamp");
+// Date.parse normalizes invalid calendar dates; validate components without rounding fractions.
+const utcTimestampPattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
+const utcRfc3339 = z.string()
+  .refine((value) => utcTimestampPattern.exec(value)?.[0] === value, "must be UTC RFC 3339 with trailing Z")
+  .refine((value) => {
+    const match = utcTimestampPattern.exec(value);
+    if (!match) return true; // The format validator supplies the bounded reason.
+    const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
+    const leap = year! % 4 === 0 && (year! % 100 !== 0 || year! % 400 === 0);
+    const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    return month! >= 1 && month! <= 12 && day! >= 1 && day! <= days[month! - 1]!
+      && hour! <= 23 && minute! <= 59 && second! <= 59;
+  }, "must be a valid calendar date and time");
 
 export const jobKeyPattern = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
 export const legacyJobKey = "legacy-default";
