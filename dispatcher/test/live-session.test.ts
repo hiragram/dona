@@ -230,6 +230,31 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
     state.database.close();
   });
+  test("receipt保存直前のidentity差し替えをunknownとして監査する",async()=>{
+    const state=await addressableJob();
+    const identity=state.database.getJobLiveSessionIdentity(state.job.job_id)!;
+    const job=state.database.getJob(state.job.job_id)!;
+    const startedAt="2026-09-26T00:00:00.000Z",completedAt="2026-09-26T00:00:01.000Z";
+    const expectedIdentity=JSON.stringify(["workspace-private","pane-private",job.agent_name,"session-private"]);
+    const absent=buildLiveSessionReceipt({before:job,after:job,bootId:"boot",startedAt,completedAt,
+      expectedIdentity,result:{ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}});
+    const observed=buildLiveSessionReceipt({before:job,after:job,bootId:"boot",startedAt,completedAt,
+      expectedIdentity,result:{ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,
+        agentStatus:"working",agentIdentity:expectedIdentity,stateChangeSeq:99}});
+    const raw=new Database(state.config.databasePath);
+    raw.prepare("UPDATE job_live_session_identities SET generation_nonce=? WHERE job_id=?")
+      .run("replacement-generation",job.job_id);
+    raw.close();
+    for(const candidate of [absent,observed]) {
+      const saved=state.database.appendLiveSessionReceipt(state.source.event_id,candidate,startedAt,identity);
+      assert.equal(saved.reconciliation.state,"unknown");
+      assert.equal(saved.identity_generation_sha256,null);
+      assert.ok(saved.reconciliation.reason_codes.includes("identity_generation_changed_during_query"));
+      assert.equal(state.database.getLiveSessionReceipt(job.job_id,saved.receipt_id)?.reconciliation.state,"unknown");
+    }
+    assert.equal(state.database.getJobLiveSessionIdentity(job.job_id)?.max_state_change_seq,null);
+    state.database.close();
+  });
   test("別jobのattentionではinvalid Resultを解消済みと記録しない",async()=>{
     const state=await addressableJob("needs_review","attention-owner");
     const sibling=state.database.createJob({source_event_id:state.source.event_id,job_key:"invalid-sibling",

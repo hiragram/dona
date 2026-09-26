@@ -1374,10 +1374,17 @@ export class DispatcherDatabase {
       const currentIdentity=this.getJobLiveSessionIdentity(receipt.job_id);
       const observedGeneration=liveSessionIdentityGenerationSha256(job,identity);
       const currentGeneration=liveSessionIdentityGenerationSha256(job,currentIdentity);
+      const generationMismatch=(identity!==undefined||receipt.reconciliation.state==="session_absent")&&
+        (!observedGeneration||observedGeneration!==currentGeneration);
       let auditedReceipt={...receipt,identity_generation_sha256:
-        observedGeneration && observedGeneration===currentGeneration ? observedGeneration : null};
+        !generationMismatch&&observedGeneration ? observedGeneration : null,
+        reconciliation:generationMismatch?{
+          state:"unknown" as const,confidence:"fail_closed" as const,
+          reason_codes:[...new Set([...receipt.reconciliation.reason_codes,"identity_generation_changed_during_query"])],
+          safe_next_action:"do_not_retry" as const,
+        }:receipt.reconciliation};
       const sequence=receipt.live_session.state_change_seq;
-      if(identity&&receipt.live_session.query_status==="observed"&&receipt.live_session.identity_match===true&&sequence!==null){
+      if(!generationMismatch&&identity&&receipt.live_session.query_status==="observed"&&receipt.live_session.identity_match===true&&sequence!==null){
         const currentSequence=this.latestLiveSessionStateChangeSeq(receipt.job_id,identity);
         if(currentSequence!==undefined&&sequence<currentSequence){
           auditedReceipt={...auditedReceipt,reconciliation:{state:"unknown",confidence:"fail_closed",
@@ -1386,7 +1393,7 @@ export class DispatcherDatabase {
         }
       }
       insertLiveSessionReceipt(this.db,sourceEventId,auditedReceipt,startedAt);
-      if(identity&&auditedReceipt.live_session.query_status==="observed"&&auditedReceipt.live_session.identity_match===true&&sequence!==null){
+      if(!generationMismatch&&identity&&auditedReceipt.live_session.query_status==="observed"&&auditedReceipt.live_session.identity_match===true&&sequence!==null){
         const changed=this.db.prepare(`UPDATE job_live_session_identities SET max_state_change_seq=CASE
           WHEN max_state_change_seq IS NULL OR max_state_change_seq<? THEN ? ELSE max_state_change_seq END
           WHERE job_id=? AND recorded_at=? AND herdr_agent_session_id=? AND herdr_workspace_id=? AND herdr_pane_id=? AND agent_name=?`)
