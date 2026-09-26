@@ -370,6 +370,9 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ parts: ["private objective ", "ok", "text"] }] },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ prefix: "private objective ", note: "ok", suffix: "text" }] },
+      () => current), code("content_requires_redaction"));
     const longArrayObjective = "private objective ".repeat(40);
     const longArrayGrants = new JobResultPublishCapabilities(() => "long-array-session");
     const longArrayCapability = longArrayGrants.issue(row({ job_id: "job_long_array", objective: longArrayObjective }), "long-array-session");
@@ -460,6 +463,9 @@ describe("job result publish contract", () => {
     const spacedCapability = spacedGrants.issue(row({ job_id: "job_spaced", objective: spacedObjective }), "spaced-session");
     assert.throws(() => spacedGrants.validate(spacedCapability.capability, "spaced-session", { ...base,
       summary: Buffer.from(spacedObjective, "utf8").toString("base64").match(/.{1,12}/g)!.join(" ") },
+      () => row({ job_id: "job_spaced", status: "running", objective: spacedObjective })), code("content_requires_redaction"));
+    assert.throws(() => spacedGrants.validate(spacedCapability.capability, "spaced-session", { ...base,
+      summary: Buffer.from(spacedObjective, "utf8").toString("base64").match(/.{1,2}/g)!.join(" ") },
       () => row({ job_id: "job_spaced", status: "running", objective: spacedObjective })), code("content_requires_redaction"));
     const shortGrant = new JobResultPublishCapabilities(() => "s1");
     const shortCapability = shortGrant.issue(row({ job_id: "job_short_base32" }), "s1");

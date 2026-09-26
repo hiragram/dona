@@ -446,7 +446,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const bytes = Buffer.from(encoded, format);
     return bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes);
   };
-  for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{4,}={0,2})(?=$|[^A-Za-z0-9+/_-])/g)) {
+  for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]+={0,2})(?=$|[^A-Za-z0-9+/_-])/g)) {
     const encoded = match[1]!;
     const start = match.index! + match[0].lastIndexOf(encoded);
     if (previousEnd >= 0 && !/^\s+$/.test(value.slice(previousEnd, start))) {
@@ -476,7 +476,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     try { assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget); }
     catch (error) { if (error instanceof JobResultPublishError) return true; }
   }
-  for (const match of value.matchAll(/(?:^|[^A-Z2-7])((?:[A-Z2-7]{2,8}\s+){2,}[A-Z2-7]{2,8}={0,6})(?=$|[^A-Z2-7=])/gi)) {
+  for (const match of value.matchAll(/(?:^|[^A-Z2-7])((?:[A-Z2-7]{1,8}\s+){2,}[A-Z2-7]{1,8}={0,6})(?=$|[^A-Z2-7=])/gi)) {
     const encoded = match[1]!.replace(/\s+/g, "");
     if (encoded.length > jobResultEnvelopeMaxBytes) return true;
     const decoded = decodeBase32Token(encoded);
@@ -486,6 +486,26 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     catch (error) { if (error instanceof JobResultPublishError) return true; }
   }
   return false;
+}
+
+function assertSafeFragmentCombinations(values: readonly unknown[], forbiddenDigests: ReadonlySet<string> | undefined,
+  forbiddenValues: ForbiddenValueMatcher | undefined, forbiddenFingerprints: ReadonlySet<number> | undefined,
+  budget: { combinations: number; combinationBytes: number }): void {
+  if (!forbiddenValues && !(forbiddenDigests && forbiddenFingerprints)) return;
+  const pieces = values.filter((item): item is string => typeof item === "string" && item.length > 0);
+  if (pieces.length < 2) return;
+  if (pieces.length > 12) throw new JobResultPublishError("content_requires_redaction");
+  for (let mask = 1; mask < 1 << pieces.length; mask++) {
+    if (++budget.combinations > 4_096) throw new JobResultPublishError("content_requires_redaction");
+    let candidate = "";
+    for (let index = 0; index < pieces.length; index++) if (mask & (1 << index)) candidate += pieces[index];
+    budget.combinationBytes += candidate.length;
+    if (budget.combinationBytes > jobResultEnvelopeMaxBytes) throw new JobResultPublishError("content_requires_redaction");
+    if (forbiddenValues?.contains(candidate) || (forbiddenDigests && forbiddenFingerprints && candidate.length === 43 &&
+      containsForbiddenCapability(candidate, forbiddenDigests, forbiddenFingerprints))) {
+      throw new JobResultPublishError("content_requires_redaction");
+    }
+  }
 }
 
 function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0, budget: { count: number; combinations: number; combinationBytes: number } = { count: 0, combinations: 0, combinationBytes: 0 }): void {
@@ -578,25 +598,10 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   } else if (Array.isArray(value)) {
     if (value.length === 2 && typeof value[0] === "string" && value[1] !== null && value[1] !== "" &&
       forbiddenKey(normalizedStructuredKey(value[0]))) throw new JobResultPublishError("content_requires_redaction");
-    if (forbiddenValues || (forbiddenDigests && forbiddenFingerprints)) {
-      const pieces = value.filter((item): item is string => typeof item === "string" && item.length > 0);
-      if (pieces.length >= 2) {
-        if (pieces.length > 12) throw new JobResultPublishError("content_requires_redaction");
-        for (let mask = 1; mask < 1 << pieces.length; mask++) {
-          if (++budget.combinations > 4_096) throw new JobResultPublishError("content_requires_redaction");
-          let candidate = "";
-          for (let index = 0; index < pieces.length; index++) if (mask & (1 << index)) candidate += pieces[index];
-          budget.combinationBytes += candidate.length;
-          if (budget.combinationBytes > jobResultEnvelopeMaxBytes) throw new JobResultPublishError("content_requires_redaction");
-          if (forbiddenValues?.contains(candidate) || (forbiddenDigests && forbiddenFingerprints && candidate.length === 43 &&
-            containsForbiddenCapability(candidate, forbiddenDigests, forbiddenFingerprints))) {
-            throw new JobResultPublishError("content_requires_redaction");
-          }
-        }
-      }
-    }
+    assertSafeFragmentCombinations(value, forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
   } else if (value !== null && typeof value === "object") {
+    assertSafeFragmentCombinations(Object.values(value), forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
     const normalizedEntries = Object.entries(value).map(([key, item]) =>
       [normalizedStructuredKey(key), typeof item === "string" ? normalizedStructuredKey(item) : item] as const);
     if (new Set(normalizedEntries.map(([key]) => key)).size !== normalizedEntries.length) throw new JobResultPublishError("content_requires_redaction");
