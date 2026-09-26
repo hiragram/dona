@@ -1936,6 +1936,50 @@ describe("JobSupervisor", () => {
     await new Promise(resolve=>setTimeout(resolve,30));
     assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
   });
+  test("terminal cleanup retries a transient pre-send observation failure", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-read-timeout");
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    const identity=JSON.stringify(["w1","w1:p1",job.agent_name,"session-1"]);
+    let transient=true,sends=0;
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){return transient?failed("timeout",true):sends?failed("agent_not_found"):{...ok("idle"),agentIdentity:identity};},
+      async cancel(){sends++;return ok("idle");},
+      async listAgents(){return {...ok("idle"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
+    }),{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();const raw=new Database(config.databasePath);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    assert.equal((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome,"pending");
+    assert.equal(sends,0);
+    transient=false;
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
+    assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
+  });
+  test("terminal cleanup observation does not delay notification publishing", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const job=createScratchJob(database,config,"Ev-terminal-cleanup-nonblocking");
+    database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
+    database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
+    const identity=JSON.stringify(["w1","w1:p1",job.agent_name,"session-1"]);
+    let releaseRead:((result:HerdrCommandResult)=>void)|undefined,reads=0,sends=0;
+    const blockedRead=new Promise<HerdrCommandResult>(resolve=>{releaseRead=resolve;});
+    const supervisor=new JobSupervisor(database,fakeRuntime({
+      async get(){reads++;return reads===1?blockedRead:sends?failed("agent_not_found"):{...ok("idle"),agentIdentity:identity};},
+      async cancel(){sends++;return ok("idle");},
+      async listAgents(){return {...ok("idle"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
+    }),{...config,queuePollMs:5},logger,()=>undefined);
+    supervisor.start();
+    await waitFor(()=>typeof database.getJob(job.job_id)?.completion_event_id==="string");
+    assert.equal(sends,0);
+    releaseRead!({...ok("idle"),agentIdentity:identity});
+    await waitFor(()=>sends===1);
+    await supervisor.stop();database.close();
+  });
   test("terminal cleanup waits for the same worker to become idle", async () => {
     const {root,config}=await tempConfig();roots.push(root);
     const database=new DispatcherDatabase(config.databasePath);

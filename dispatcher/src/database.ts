@@ -472,6 +472,8 @@ export function migrateDispatcherDatabase(
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
+    const hasTerminalCleanups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_terminal_worker_cleanups'").get() !== undefined;
+    if (hasTerminalCleanups) db.exec("CREATE TEMP TABLE preserved_terminal_cleanups_v3 AS SELECT * FROM job_terminal_worker_cleanups");
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -533,6 +535,9 @@ export function migrateDispatcherDatabase(
     `);
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
       SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);`);
+    if (hasTerminalCleanups) db.exec(`INSERT INTO job_terminal_worker_cleanups(job_id,outcome,identity_json,updated_at)
+      SELECT c.job_id,c.outcome,c.identity_json,c.updated_at FROM preserved_terminal_cleanups_v3 c JOIN jobs USING(job_id);
+      DROP TABLE preserved_terminal_cleanups_v3;`);
     db.exec("DROP TABLE legacy_job_stop_markers_v3");
     migrationHook("indexes_recreated");
 

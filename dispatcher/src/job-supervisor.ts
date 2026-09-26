@@ -126,6 +126,7 @@ export class JobSupervisor {
   private staleJobsRecovered = false;
   private terminalStopProofCursor = "";
   private terminalCleanupCursor = "";
+  private terminalCleanupOperation:Promise<void>|undefined;
 
   private async reconcileTerminalCleanup(job:JobRow,outcome:"pending"|"attempting",claimedIdentity:string|null):Promise<void> {
     const identity=this.database.getJobLiveSessionIdentity(job.job_id);
@@ -139,8 +140,10 @@ export class JobSupervisor {
       if(!byName.ok) {
         const absent=!byName.timedOut&&!byName.aborted&&
           ["agent_not_found","agent_not_running"].includes(byName.errorCode??"");
+        if(!absent) return;
         const listed=absent?await this.runtime.listAgents(this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs)):undefined;
-        this.database.finishTerminalWorkerCleanup(job.job_id,"pending",listed&&terminalAgentAbsentFromList(listed,job.agent_name)?"stopped":"unknown");
+        if(listed&&terminalAgentAbsentFromList(listed,job.agent_name))
+          this.database.finishTerminalWorkerCleanup(job.job_id,"pending","stopped");
         return;
       }
       if(byName.agentIdentity!==expected||
@@ -303,6 +306,7 @@ export class JobSupervisor {
     this.wake();
     this.cancelledCleanupWake.wake();
     await this.loopPromise;
+    await this.terminalCleanupOperation;
     await this.progressLoopPromise;
     await progressStop;
     await Promise.allSettled([...this.controls.values()]);
@@ -487,22 +491,30 @@ export class JobSupervisor {
     }
   }
 
+  private launchTerminalCleanup():void {
+    if(this.terminalCleanupOperation||this.stopping)return;
+    let candidates=this.database.listTerminalWorkerCleanupCandidates(this.terminalCleanupCursor,1);
+    if(candidates.length===0&&this.terminalCleanupCursor) {
+      this.terminalCleanupCursor="";
+      candidates=this.database.listTerminalWorkerCleanupCandidates("",1);
+    }
+    const candidate=candidates[0];
+    if(!candidate)return;
+    this.terminalCleanupCursor=candidate.job.job_id;
+    const operation=this.reconcileTerminalCleanup(candidate.job,candidate.outcome,candidate.identity_json)
+      .catch((error:unknown)=>{
+        // Before a send, pending remains retryable. After a durable claim,
+        // attempting is recovered by observation without another send.
+        this.logger.warn("Terminal worker cleanup observation failed",{job_id:candidate.job.job_id,
+          error_message:error instanceof Error?error.message:String(error)});
+      })
+      .finally(()=>{if(this.terminalCleanupOperation===operation)this.terminalCleanupOperation=undefined;});
+    this.terminalCleanupOperation=operation;
+  }
+
   private async loop(): Promise<void> {
     while (!this.stopping) {
-      let cleanupCandidates=this.database.listTerminalWorkerCleanupCandidates(this.terminalCleanupCursor);
-      if(cleanupCandidates.length===0&&this.terminalCleanupCursor) {
-        this.terminalCleanupCursor="";
-        cleanupCandidates=this.database.listTerminalWorkerCleanupCandidates();
-      }
-      for(const candidate of cleanupCandidates) {
-        this.terminalCleanupCursor=candidate.job.job_id;
-        try { await this.reconcileTerminalCleanup(candidate.job,candidate.outcome,candidate.identity_json); }
-        catch(error) {
-          if(!this.stopping) this.database.finishTerminalWorkerCleanup(candidate.job.job_id,candidate.outcome,"unknown");
-          this.logger.warn("Terminal worker cleanup observation failed",{job_id:candidate.job.job_id,
-            error_message:error instanceof Error?error.message:String(error)});
-        }
-      }
+      this.launchTerminalCleanup();
       for(const job of this.database.listAmbiguousScheduledJobs()) try {
         if(await this.reconcileAmbiguousScheduledJob(job)) continue;
         if(!["cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance"].includes(job.last_error_code??"")) continue;

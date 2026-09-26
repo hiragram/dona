@@ -147,6 +147,23 @@ afterEach(async () => {
 });
 
 describe("DispatcherDatabase", () => {
+  test("preserves bridge cleanup claims while rebuilding schema v3 jobs", async () => {
+    const {root,config}=await tempConfig();roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const raw=new Database(config.databasePath);
+    raw.pragma("foreign_keys = ON");
+    raw.exec(`CREATE TABLE job_terminal_worker_cleanups(
+      job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+      outcome TEXT NOT NULL,identity_json TEXT,updated_at TEXT NOT NULL)`);
+    raw.prepare("INSERT INTO job_terminal_worker_cleanups VALUES(?,?,?,?)")
+      .run("job-running","attempting","saved-identity","2026-09-03T00:04:00.000Z");
+    migrateDispatcherDatabase(raw,()=>{},false,3);
+    assert.deepEqual(raw.prepare("SELECT * FROM job_terminal_worker_cleanups").all(),[{
+      job_id:"job-running",outcome:"attempting",identity_json:"saved-identity",updated_at:"2026-09-03T00:04:00.000Z",
+    }]);
+    assert.deepEqual(raw.pragma("foreign_key_check"),[]);
+    raw.close();
+  });
   test("transactionally migrates a real schema v2 fixture to v3 without losing job state", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
