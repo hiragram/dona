@@ -1517,6 +1517,8 @@ export class DispatcherDatabase {
       const receipt = this.getLiveSessionReceipt(jobId, receiptId);
       if (!receipt || receipt.durable_status_after !== "needs_review" || receipt.result_present_after ||
           receipt.reconciliation.safe_next_action !== "do_not_retry") throw new Error("live_session_receipt_mismatch");
+      if (receipt.reconciliation.state !== "session_absent" || !this.getJobLiveSessionIdentity(jobId))
+        throw new Error("late_result_worker_stop_unproven");
       if (Date.parse(receipt.observed_at) < Date.parse(job.updated_at)) throw new Error("live_session_receipt_precedes_job_state");
       const latest = this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
         .get(jobId) as {receipt_id:string}|undefined;
@@ -1600,6 +1602,8 @@ export class DispatcherDatabase {
           Date.parse(receipt.observed_at) < Date.parse(job.updated_at)) {
         throw new Error("live_session_receipt_mismatch");
       }
+      if (receipt.reconciliation.state !== "session_absent" || !this.getJobLiveSessionIdentity(jobId))
+        throw new Error("late_result_worker_stop_unproven");
       const latest = this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
         .get(jobId) as {receipt_id:string}|undefined;
       if (latest?.receipt_id !== receiptId) throw new Error("newer_live_session_receipt_exists");

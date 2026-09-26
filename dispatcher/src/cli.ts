@@ -10,6 +10,7 @@ import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { liveSessionReceiptRetentionSeconds } from "./live-session.js";
+import { createLegacyRecoveryPreflight } from "./legacy-offline-recovery.js";
 
 function projectLiveJob(row: Record<string, unknown>): Record<string, unknown> {
   const safeKeys = [
@@ -31,6 +32,7 @@ function usage(): never {
   dona-dispatcher event reconcile-notification <event_id> not_sent [--resume]
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
+  dona-dispatcher job legacy-offline-preflight <new_private_backup_path>
   dona-dispatcher job show <job_id> [--live-session | --live-session-receipt <receipt_id>]
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
@@ -65,6 +67,11 @@ async function main(): Promise<void> {
   }
   if (!["event", "job", "scheduler"].includes(args[0]!)) usage();
   const command = args[1];
+  if (args[0] === "job" && command === "legacy-offline-preflight") {
+    if (args.length !== 3) usage();
+    console.log(JSON.stringify(await createLegacyRecoveryPreflight(config.databasePath, eventIdAt(args, 2)), null, 2));
+    return;
+  }
   const database = new DispatcherDatabase(config.databasePath, {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,

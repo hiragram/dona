@@ -314,11 +314,23 @@ describe("read-only live session reconciliation",()=>{
   test("legacy identity欠落ではHerdrを探索せずnot_addressableを監査する",async()=>{
     const {root,config}=await tempConfig();roots.push(root);const database=new DispatcherDatabase(config.databasePath);
     const source=database.enqueue(eventEnvelope("Ev-live-legacy")).row;
-    const job=database.createJob({source_event_id:source.event_id,objective:"legacy",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const job=database.createJob({source_event_id:source.event_id,job_key:"legacy-identity",objective:"legacy",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
     const calls:string[]=[];const supervisor=new JobSupervisor(database,runtimeWith(()=>{throw new Error("must not run");},calls),config,logger,()=>{});
     const receipt=await supervisor.observeLiveSession(job.job_id,source.event_id);
     assert.equal(receipt.live_session.query_status,"not_addressable");
     assert.equal(receipt.reconciliation.state,"not_addressable");
+    database.markJobNeedsReview(job.job_id,"invalid_result","malformed Result");
+    const after=await supervisor.observeLiveSession(job.job_id,source.event_id);
+    const current=database.getJob(job.job_id)!;
+    assert.throws(()=>database.resolveInvalidJobResult(job.job_id,after.receipt_id,current.updated_at),
+      /late_result_worker_stop_unproven/);
+    database.sealJobGroup(source.event_id);
+    const attention=database.enqueueJobNotification(job.job_id).row;
+    const refreshed=database.getJob(job.job_id)!;
+    const latest=await supervisor.observeLiveSession(job.job_id,source.event_id);
+    assert.throws(()=>database.resolveNeedsReviewAttention(source.event_id,job.job_id,attention.event_id,
+      latest.receipt_id,refreshed.updated_at),/late_result_worker_stop_unproven/);
+    assert.equal(database.getJob(job.job_id)?.status,"needs_review");
     assert.deepEqual(calls,[]);database.close();
   });
 
