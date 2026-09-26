@@ -863,6 +863,7 @@ export class RealRuntime implements RuntimePort {
         "--timeout", String(this.policy.timeouts.agent_start_ms),
         "--", "-C", canonicalRelease, "-c", projectTrust,
         "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
+        "--model", "gpt-6-sol", "-c", 'model_reasoning_effort="medium"',
         "-c", "check_for_update_on_startup=false", mainAgentStartupPrompt,
       ], this.policy.timeouts.agent_start_ms + 5_000);
       if (result.exit_code === 0 && !result.timed_out && !result.output_truncated) break;

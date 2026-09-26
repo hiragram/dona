@@ -487,6 +487,7 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
         "--pane", "w1:p1", "--timeout", "100", "--", "-C", canonicalTargetRelease, "-c",
         `projects = { ${JSON.stringify(canonicalTargetRelease)} = { trust_level = "trusted" } }`,
         "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
+        "--model", "gpt-6-sol", "-c", 'model_reasoning_effort="medium"',
         "-c", "check_for_update_on_startup=false",
         "起動確認です。外部操作、ファイル変更、プロセス操作は行わず、READYとだけ返してください。",
       ],

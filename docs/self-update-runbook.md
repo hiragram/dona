@@ -72,6 +72,8 @@ reconcileはpointer、receipt、DB fence/checkpoint、保存済みruntime intent
 
 ## Stable control-plane更新と既存インシデント補正
 
+`dona-main`の`gpt-6-sol`／`medium`設定もstable Updaterの起動実装です。既存installへ適用するには、この変更を含むexact SHAの`--upgrade-control`と新Updaterのversion health確認を先に完了し、その後同じ新releaseの通常plan/applyを行います。runtimeだけの更新成功ではmain設定の反映を保証しません。[モデル設定の適用条件](operations/codex-model-settings.md#既存installへの適用条件)を確認してください。
+
 セルフアップデート通知の重複防止は、Slack Appのcustom message metadata schemaに依存しません。通知本文を表示するsection blockの`block_id`へ決定論的な`notification_id`を埋め、同じBotの投稿だけをthread全pageから照合します。このfieldは通常のmessage read/write権限で永続化・再読できるため、manifest変更、`metadata.message:read`、App再認可、外部状態のattestationは不要です。
 
 maintenance windowを確保し、cleanな最新main checkoutで次を実行します。`needs_review`はterminalなので存在してもよいですが、未承認planを含む非terminal requestが1件でもあれば拒否します。
