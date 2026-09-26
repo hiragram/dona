@@ -75,14 +75,27 @@ async function pathIdentities(filePath: string): Promise<Set<string>> {
   return identities;
 }
 
-async function assertBackupPathsUnreserved(db: Database.Database, sourcePath: string, backupPath: string): Promise<void> {
+async function assertBackupPathsUnreserved(
+  db: Database.Database, sourcePath: string, backupPath: string, requireSidecarsAbsent = true,
+): Promise<void> {
   const reserved = [sourcePath, `${sourcePath}-wal`, `${sourcePath}-shm`, `${sourcePath}-journal`];
   for (const row of db.prepare("SELECT result_path FROM jobs UNION ALL SELECT result_path FROM events WHERE result_path IS NOT NULL")
     .all() as Array<{ result_path: string }>) reserved.push(row.result_path);
-  const destination = new Set([...(await pathIdentities(backupPath)), ...(await pathIdentities(`${backupPath}.tmp`))]);
+  const temporary = `${backupPath}.tmp`;
+  const destinations = [backupPath, temporary, `${temporary}-journal`, `${temporary}-wal`, `${temporary}-shm`];
+  const destination = new Set<string>();
+  for (const candidate of destinations) {
+    for (const identity of await pathIdentities(candidate)) destination.add(identity);
+  }
   for (const candidate of reserved) {
     for (const identity of await pathIdentities(candidate)) {
       if (destination.has(identity)) throw new Error("legacy_backup_path_reserved");
+    }
+  }
+  for (const candidate of requireSidecarsAbsent ? destinations.slice(2) : []) {
+    try { await fs.lstat(candidate); throw new Error("legacy_backup_sidecar_exists"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
 }
@@ -145,7 +158,6 @@ export async function createLegacyRecoveryPreflight(sourcePath: string, backupPa
   let temporaryCreated = false;
   try {
     verify(source);
-    const before = counts(source);
     await assertBackupPathsUnreserved(source, sourcePath, backupPath);
     const parent = await fs.realpath(path.dirname(backupPath));
     const parentStat = await fs.stat(parent);
@@ -160,11 +172,14 @@ export async function createLegacyRecoveryPreflight(sourcePath: string, backupPa
     // better-sqlite3's online backup supplies one consistent SQLite snapshot.
     await source.backup(temporary);
     await fs.chmod(temporary, 0o600);
-    backup = new Database(temporary, { readonly: true, fileMustExist: true });
+    backup = new Database(temporary, { fileMustExist: true });
+    // The online backup inherits WAL mode. Checkpoint this private copy and
+    // switch it to DELETE so no SQLite sidecars remain beside the published file.
+    if (backup.pragma("journal_mode = DELETE", { simple: true }) !== "delete")
+      throw new Error("legacy_backup_journal_mode_failed");
     const sourceSchema = verify(backup);
     const backupCounts = counts(backup);
-    if (JSON.stringify(before) !== JSON.stringify(backupCounts)) throw new Error("legacy_backup_counts_drift");
-    await assertBackupPathsUnreserved(backup, sourcePath, backupPath);
+    await assertBackupPathsUnreserved(backup, sourcePath, backupPath, false);
     const rows = backup.prepare("SELECT * FROM jobs WHERE status='needs_review' ORDER BY job_id").all() as LegacyJob[];
     const candidates: LegacyRecoveryCandidate[] = [];
     for (const job of rows) {

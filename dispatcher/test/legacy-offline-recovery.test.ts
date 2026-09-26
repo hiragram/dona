@@ -35,6 +35,10 @@ test("offline preflight copies a consistent database and leaves legacy recovery 
   assert.equal(report.candidates[0]?.result.state, "valid");
   assert.equal(report.candidates[0]?.provisional_decision, "accept_valid_result");
   assert.equal((await fs.stat(backupPath)).mode & 0o777, 0o600);
+  assert.deepEqual(await fs.readdir(privateDir), ["backup.sqlite3"]);
+  const backup = new Database(backupPath, { readonly: true });
+  assert.equal(backup.pragma("journal_mode", { simple: true }), "delete");
+  backup.close();
   const after = new Database(config.databasePath, { readonly: true });
   assert.equal((after.prepare("SELECT status FROM jobs WHERE job_id=?").get(job.job_id) as {status:string}).status, "needs_review");
   after.close();
@@ -95,6 +99,33 @@ test("offline preflight rejects backup destinations reserved by missing Results"
   await assert.rejects(createLegacyRecoveryPreflight(config.databasePath, path.join(privateDir, "candidate")),
     /legacy_backup_path_reserved/);
   await assert.rejects(fs.stat(sourceResult), { code: "ENOENT" });
+  const sidecarResult = path.join(privateDir, "other.tmp-journal");
+  const sidecarWriter = new Database(config.databasePath);
+  sidecarWriter.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(sidecarResult, job.job_id);
+  sidecarWriter.close();
+  await assert.rejects(createLegacyRecoveryPreflight(config.databasePath, path.join(privateDir, "other")),
+    /legacy_backup_path_reserved/);
+  await assert.rejects(fs.stat(sidecarResult), { code: "ENOENT" });
+});
+
+test("offline preflight preserves a source DB or unrelated file at a SQLite backup sidecar", async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const sidecarSource = path.join(root, "backup.tmp-journal");
+  const dispatcher = new DispatcherDatabase(sidecarSource);
+  dispatcher.close();
+  await assert.rejects(createLegacyRecoveryPreflight(sidecarSource, path.join(root, "backup")),
+    /legacy_backup_path_reserved/);
+  const stillPresent = new Database(sidecarSource, { readonly: true, fileMustExist: true });
+  assert.equal(stillPresent.pragma("user_version", { simple: true }), 3);
+  stillPresent.close();
+  const normal = new DispatcherDatabase(config.databasePath);
+  normal.close();
+  const privateDir = path.join(root, "private"); await fs.mkdir(privateDir, { mode: 0o700 });
+  const backupPath = path.join(privateDir, "other");
+  await fs.writeFile(`${backupPath}.tmp-journal`, "owned elsewhere");
+  await assert.rejects(createLegacyRecoveryPreflight(config.databasePath, backupPath),
+    /legacy_backup_sidecar_exists/);
+  assert.equal(await fs.readFile(`${backupPath}.tmp-journal`, "utf8"), "owned elsewhere");
 });
 
 test("offline preflight inventories missing, invalid, and oversized finals", async () => {
