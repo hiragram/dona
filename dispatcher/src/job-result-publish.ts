@@ -36,7 +36,7 @@ export class JobResultPublishError extends Error {
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
 const sensitive = /(?:(?:^|\s)(?:-[uU]\s*|--(?:proxy-)?user(?:=|\s+))[^:\s]+:[^\s]+|(?:\bmachine\s+[^\s]+|\bdefault)\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
-const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~-]+:[^@\s/<>`]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?(?:[/?#][^\s"'<>`]*|(?=$|[\s"'<>`]))/i;
+const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~%\-]+:[^@\s/<>`]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?(?:[/?#][^\s"'<>`]*|(?=$|[\s"'<>`]))/i;
 const ageSecretIdentity = /AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{20,}\b/i;
 const shortBearerCredential = /\bBearer\s+(?!(?:authentication|credentials)\b)[A-Za-z0-9._~-]+\b/i;
 const pgpassCredential = /(?:^|[\s"'([{])(?:\\.|[^\s:\\]){1,255}:(?:\d{1,5}|\*):(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}(?=$|[\s"')\]}])/;
@@ -208,6 +208,11 @@ function hasPrivateHttpHost(candidate: string): boolean {
       const bits = (Number.parseInt(groups[1] || "0", 16) << 16) | Number.parseInt(groups[2] || "0", 16);
       if (hasPrivateHttpHost(`http://${[(bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255].join(".")}/`)) return true;
     }
+    const nat64 = host.match(/^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (nat64) {
+      const bits = (Number.parseInt(nat64[1]!, 16) << 16) | Number.parseInt(nat64[2]!, 16);
+      if (hasPrivateHttpHost(`http://${[(bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255].join(".")}/`)) return true;
+    }
     if (host === "::" || host === "::1" || first === 0 || first === 0x100 || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
       (first & 0xffc0) === 0xfec0 || (first & 0xff00) === 0xff00) return true;
     if (first === 0x2001 && [0x10, 0x20].includes(Number.parseInt(host.split(":")[1] || "0", 16) & 0xfff0)) return true;
@@ -348,6 +353,7 @@ function hasBasicCredential(value: string): boolean {
   return false;
 }
 function hasSaslPlainCredential(value: string): boolean {
+  if (/\bAUTH\s+LOGIN\s+[A-Za-z0-9+/]{4,}={0,2}\s+[A-Za-z0-9+/]{4,}={0,2}\b/i.test(value)) return true;
   for (const match of value.matchAll(/\bAUTH\s+PLAIN\s+([A-Za-z0-9+/]{4,}={0,2})(?=$|[^A-Za-z0-9+/=])/gi)) {
     const encoded = match[1]!;
     const bytes = Buffer.from(encoded, "base64");
@@ -509,7 +515,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
 
 function assertSafeFragmentCombinations(values: readonly unknown[], forbiddenDigests: ReadonlySet<string> | undefined,
   forbiddenValues: ForbiddenValueMatcher | undefined, forbiddenFingerprints: ReadonlySet<number> | undefined,
-  budget: { count: number; combinations: number; combinationBytes: number }): void {
+  budget: { count: number; combinations: number; combinationBytes: number }, decodedPieces = false): void {
   if (!forbiddenValues && !(forbiddenDigests && forbiddenFingerprints)) return;
   const pieces = values.filter((item): item is string => typeof item === "string" && item.length > 0);
   if (pieces.length < 2) return;
@@ -521,6 +527,17 @@ function assertSafeFragmentCombinations(values: readonly unknown[], forbiddenDig
     budget.combinationBytes += candidate.length;
     if (budget.combinationBytes > jobResultEnvelopeMaxBytes) throw new JobResultPublishError("content_requires_redaction");
     assertSafeJson(candidate, 0, forbiddenDigests, forbiddenValues, forbiddenFingerprints, 0, budget);
+  }
+  if (!decodedPieces) {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const decoded = pieces.map(piece => {
+      if (!/^[A-Za-z0-9+/_-]{4,}={0,2}$/.test(piece)) return piece;
+      try { return decoder.decode(Buffer.from(piece, /[+/]/.test(piece) ? "base64" : "base64url")); }
+      catch { return piece; }
+    });
+    if (decoded.some((piece, index) => piece !== pieces[index])) {
+      assertSafeFragmentCombinations(decoded, forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget, true);
+    }
   }
 }
 
@@ -697,6 +714,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
         else if (item !== null && typeof item === "object") {
           siblingObjects.push(item as Record<string, unknown>);
           if (siblingObjects.length > 4_096) throw new JobResultPublishError("content_requires_redaction");
+          collectSiblingObjects(Object.values(item));
         }
       }
     };
@@ -1026,10 +1044,10 @@ export class JobResultPublishCapabilities {
       .filter(candidate => candidate.expiresAt > this.now())
       .map(candidate => candidate.fingerprint));
     const grantIdentities = [...this.grants.values()]
-      .filter(candidate => candidate.expiresAt > this.now())
+      .filter(candidate => candidate.jobId === job.job_id && candidate.expiresAt > this.now())
       .flatMap(candidate => candidate.privateValues);
     const shortRuntimeValues = new Set([...this.grants.values()]
-      .filter(candidate => candidate.expiresAt > this.now())
+      .filter(candidate => candidate.jobId === job.job_id && candidate.expiresAt > this.now())
       .flatMap(candidate => [...candidate.runtimeValues, candidate.objective])
       .filter((value): value is string => typeof value === "string" && value.length > 0)
       .map(value => value.normalize("NFC"))

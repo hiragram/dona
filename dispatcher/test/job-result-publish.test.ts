@@ -333,7 +333,7 @@ describe("job result publish contract", () => {
     }
   });
 
-  test("他jobの期限内runtime identityと自jobのobjectiveを本文から除外する", () => {
+  test("自jobのruntime identityとobjectiveを本文から除外し、他jobの低entropy値をoracleにしない", () => {
     const otherSession = JSON.stringify(["workspace-two", "pane-two", "agent-two", "agent-session-two"]);
     const grants = new JobResultPublishCapabilities(id => id === "job_one" ? "session-one" : otherSession);
     const grant = grants.issue(row({ herdr_pane_id: "pane-one" }), "session-one");
@@ -341,11 +341,11 @@ describe("job result publish contract", () => {
       objective: "private objective two", workspace_path: "/workspace/two", result_path: "/result/two" }), otherSession);
     grants.issue(row({ job_id: "job_short", objective: "完了", workspace_path: "/workspace/short", result_path: "/result/short" }), otherSession);
     const current = row({ status: "running", herdr_pane_id: "pane-one", objective: "private objective text" });
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "実装完了" }, () => current), code("content_requires_redaction"));
-    for (const privateValue of ["pane-two", "agent-two", "herdr-two", "workspace-two", "agent-session-two",
-      "private objective two", "private objective text"]) {
+    assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "実装完了" }, () => current).envelope.status, "completed");
+    for (const privateValue of ["pane-one", "session-one", "private objective text"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
     }
+    assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "private objective two" }, () => current).envelope.status, "completed");
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: "private *objective* text" } },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: "private _objective_ text" } },
@@ -433,8 +433,18 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       actions: [{ kty: "oct" }, { k: "c29tZXByaXZhdGVrZXk" }, { kty: "public" }] },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: [{ left: { kty: "oct" }, right: { k: "c29tZXByaXZhdGVrZXk" } }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: ["cHJpdmF0ZQ==", "IG9iamVjdGl2ZSB0ZXh0"] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: "AUTH LOGIN\r\nYWxpY2U=\r\naHVudGVyMg==" },
+      () => current), code("content_requires_redaction"));
     for (const summary of ["Basic YWxpY2U6aHVudGVyMh==", '保存値 "db.example.com:5432:app:alice:hunter2"',
-      "10.0.0.5./private", "127.0.0.1./result", '<password value="hunter2"/>', '<api-key secret="CANARY"/>']) {
+      "10.0.0.5./private", "127.0.0.1./result", '<password value="hunter2"/>', '<api-key secret="CANARY"/>',
+      "http://[64:ff9b::a00:5]/download", "alice%40corp:hunter2@10.0.0.5/download"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary },
         () => current), code("content_requires_redaction"));
     }
@@ -588,16 +598,16 @@ describe("job result publish contract", () => {
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: `${grant.capability.slice(0, 20)}<!date^0^${grant.capability.slice(20)}|x>` } },
       () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?private+objective+two" }, () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com/status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "参照example.com?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.xn--p1ai?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?detail=private+objective+text" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "https://example.com/?private+objective+text" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com/status?detail=private+objective+text" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.com?detail=private+objective+text" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "参照example.com?detail=private+objective+text" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "example.xn--p1ai?detail=private+objective+text" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?detail=private+objective+text" }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "//cdn.example.com/?private+objective+text=x" }, () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "GET /status?detail=private+objective+two" }, () => current), code("content_requires_redaction"));
-    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: 'payload={"detail":"private\\u0020objective\\u0020two"}' }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "GET /status?detail=private+objective+text" }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: 'payload={"detail":"private\\u0020objective\\u0020text"}' }, () => current), code("content_requires_redaction"));
     const multiline = new JobResultPublishCapabilities(() => "session-multiline");
     const multilineGrant = multiline.issue(row({ objective: "internal\nplan" }), "session-multiline");
     assert.throws(() => multiline.validate(multilineGrant.capability, "session-multiline", { ...base, summary: 'payload={"detail":"internal\\nplan"}' },
@@ -651,7 +661,7 @@ describe("job result publish contract", () => {
     const own = grants.issue(row({ job_id: "job_one" }), "job_one");
     const current = row({ status: "running" });
     assert.equal(grants.validate(own.capability, "job_one", base, () => current).envelope.status, "completed");
-    assert.throws(() => grants.validate(own.capability, "job_one", { ...base, artifacts: [{ summary: "public" }] }, () => current), code("content_requires_redaction"));
+    assert.equal(grants.validate(own.capability, "job_one", { ...base, artifacts: [{ summary: "public" }] }, () => current).envelope.status, "completed");
   });
 
   test("多数grantの非公開値を大きい本文で一度だけ走査する", () => {
