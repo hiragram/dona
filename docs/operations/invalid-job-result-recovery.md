@@ -1,5 +1,16 @@
 # 無効なJob Resultのoperator解決
 
+## 遅れて公開された正常なfinal Resultの単一job照合
+
+`needs_review`の原因が`result_missing`、`invalid_result`、`invalid_result_agent_stopped`で、DBにResultが未受理の場合だけ使用する。schedule所有jobや過去のjob群を一括処理しない。
+
+1. `job inspect-late-result <job_id>`で現在の`updated_at`、原因、final ResultのSHA-256、通知証跡のSHA-256を読む。invalid final、欠落、symlink、1 MiB超過は受理対象にしない。
+2. workerの停止を別途確認し、`job show <job_id> --live-session`で同一jobの最新receiptを保存する。受理時には識別済みagentに対する`session_absent`の最新receiptが必要となる。`not_addressable`、timeout、稼働中、古いreceiptは停止証明にならない。
+3. branch、PR、Issue、外部操作の副作用を確認し、その証跡文書のSHA-256を`side_effects_evidence_sha256`として保管する。通知についても既存eventの配送有無と曖昧なwriteがないことを確認する。`inspect-late-result`の通知digestは現在のDB投影へのCASであり、operatorの確認を代替しない。
+4. 確認済みの値だけで`job accept-late-result <job_id> <expected_updated_at> <expected_cause> <result_sha256> <stop_receipt_id> <side_effects_evidence_sha256> <notification_evidence_sha256> --worker-stopped-reviewed --side-effects-reviewed --notification-reviewed`を一度呼ぶ。応答喪失時は`job show`と`inspect-late-result`で状態を再読し、同一引数以外のwriteを行わない。
+
+受理は単一DB transactionでjobの状態・原因・更新時刻、最新停止receipt、Result bytesのdigest、通知状態を照合する。未配送通知だけを抑止し、配送済みのattentionは確認済みの場合だけ保持して解決記録を追加する。曖昧な通知や既存のall-terminal通知がある場合は拒否する。元のResult fileと通知event IDを書き換えず、確定状態の通知を作る。受理記録はappend-onlyで、参照された停止receiptはretentionから除外する。旧jobの自動受理、Result修復、worker再実行、Project担当変更は行わない。
+
 通常jobのResultが検証に失敗した場合、Dispatcherは`needs_review`へ隔離する。実作業や外部操作が済んでいる可能性があるため、同じjobを再投入しない。
 
 1. `job show <job_id> --live-session`で最新のreceiptを取得する。`not_addressable`はworker停止の証明ではない。利用できる運用手段でworkerの終了を別途確認する。

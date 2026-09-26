@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { afterEach, describe, test } from "node:test";
 
@@ -41,6 +42,88 @@ async function addressableJob(status:"dispatching"|"needs_review"="needs_review"
 }
 
 describe("read-only live session reconciliation",()=>{
+  test("operatorだけが停止receiptと固定digestで遅延Resultを受理し再起動後も同一要求を再読できる",async()=>{
+    const state=await addressableJob("needs_review","late-result");
+    state.database.markJobNeedsReview(state.job.job_id,"result_missing","missing at terminal observation");
+    state.database.sealJobGroup(state.source.event_id);
+    state.database.enqueueJobNotification(state.job.job_id);
+    const current=state.database.getJob(state.job.job_id)!;
+    const result={schema_version:1,job_id:current.job_id,status:"completed",summary:"作業完了",completed_at:new Date().toISOString()} as const;
+    await fs.mkdir(current.result_path.slice(0,current.result_path.lastIndexOf("/")),{recursive:true});
+    await fs.writeFile(current.result_path,JSON.stringify(result));
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(current.job_id,state.source.event_id);
+    const preview=state.database.inspectLateJobResult(current.job_id);
+    const sideEffects=createHash("sha256").update("reviewed side effects").digest("hex");
+    assert.throws(()=>state.database.saveJobResult(current.job_id,result,current.result_path),/Invalid status transition/);
+    const args=[current.job_id,current.updated_at,"result_missing",preview.result_sha256,receipt.receipt_id,sideEffects,preview.notification_evidence_sha256] as const;
+    assert.throws(()=>state.database.acceptLateJobResult(current.job_id,current.updated_at,"result_missing",preview.result_sha256,"wrong",sideEffects,preview.notification_evidence_sha256),/worker_stop_unproven/);
+    const accepted=state.database.acceptLateJobResult(...args);
+    assert.equal(accepted.status,"completed");
+    assert.equal(JSON.parse(accepted.result_json!).summary,"作業完了");
+    assert.ok(accepted.completion_event_id);
+    state.database.close();
+    const reopened=new DispatcherDatabase(state.config.databasePath);
+    assert.equal(reopened.acceptLateJobResult(...args).updated_at,accepted.updated_at);
+    assert.equal(reopened.liveSessionRetentionPlan("9999-01-01T00:00:00.000Z").receipt_rows,0);
+    reopened.purgeLiveSessionReceipts("9999-01-01T00:00:00.000Z");
+    assert.ok(reopened.getLiveSessionReceipt(current.job_id,receipt.receipt_id));
+    assert.throws(()=>reopened.acceptLateJobResult(current.job_id,current.updated_at,"invalid_result",preview.result_sha256,receipt.receipt_id,sideEffects,preview.notification_evidence_sha256),/reconciliation_conflict/);
+    reopened.close();
+  });
+
+  test("遅延Resultはdigest drift、CAS、停止証跡欠落、通知曖昧を拒否する",async()=>{
+    const state=await addressableJob("needs_review","late-rejections");
+    state.database.markJobNeedsReview(state.job.job_id,"invalid_result","invalid at terminal observation");
+    state.database.sealJobGroup(state.source.event_id);
+    const current=state.database.getJob(state.job.job_id)!;
+    await fs.mkdir(current.result_path.slice(0,current.result_path.lastIndexOf("/")),{recursive:true});
+    await fs.writeFile(current.result_path,JSON.stringify({schema_version:1,job_id:current.job_id,status:"failed",summary:"失敗",completed_at:new Date().toISOString()}));
+    const preview=state.database.inspectLateJobResult(current.job_id);
+    const digest=createHash("sha256").update("reviewed").digest("hex");
+    assert.throws(()=>state.database.acceptLateJobResult(current.job_id,current.updated_at,"invalid_result",preview.result_sha256,"missing",digest,preview.notification_evidence_sha256),/worker_stop_unproven/);
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(current.job_id,state.source.event_id);
+    const args=[current.job_id,current.updated_at,"invalid_result",preview.result_sha256,receipt.receipt_id,digest,preview.notification_evidence_sha256] as const;
+    assert.throws(()=>state.database.acceptLateJobResult(current.job_id,"stale","invalid_result",preview.result_sha256,receipt.receipt_id,digest,preview.notification_evidence_sha256),/job_changed/);
+    await fs.appendFile(current.result_path," ");
+    assert.throws(()=>state.database.acceptLateJobResult(...args),/digest_drift/);
+    assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
+    await fs.writeFile(current.result_path,JSON.stringify({schema_version:1,job_id:current.job_id,status:"failed",summary:"失敗",completed_at:new Date().toISOString()}));
+    const refreshed=state.database.inspectLateJobResult(current.job_id);
+    const prior=state.database.enqueueJobNotification(current.job_id).row;
+    state.database.beginDispatch(prior.event_id,`${state.config.resultsDir}/ambiguous.json`);
+    const latestJob=state.database.getJob(current.job_id)!;
+    const latestReceipt=await supervisor.observeLiveSession(current.job_id,state.source.event_id);
+    assert.throws(()=>state.database.acceptLateJobResult(current.job_id,latestJob.updated_at,"invalid_result",refreshed.result_sha256,latestReceipt.receipt_id,digest,state.database.inspectLateJobResult(current.job_id).notification_evidence_sha256),/notification_requires_reconciliation/);
+    state.database.close();
+  });
+  test("配送済みattentionのidentityを保持し、確定Resultの通知を作る",async()=>{
+    const state=await addressableJob("needs_review","late-delivered");
+    state.database.markJobNeedsReview(state.job.job_id,"result_missing","missing");
+    state.database.sealJobGroup(state.source.event_id);
+    const attention=state.database.enqueueJobNotification(state.job.job_id).row;
+    state.database.beginDispatch(attention.event_id,`${state.config.resultsDir}/attention.json`);
+    state.database.markWaiting(attention.event_id);
+    state.database.saveCompleted(attention.event_id,{schema_version:1,event_id:attention.event_id,status:"completed",
+      summary:"attention delivered",completed_at:new Date().toISOString(),actions:[
+        {tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${state.config.resultsDir}/attention.json`);
+    const current=state.database.getJob(state.job.job_id)!;
+    await fs.mkdir(current.result_path.slice(0,current.result_path.lastIndexOf("/")),{recursive:true});
+    await fs.writeFile(current.result_path,JSON.stringify({schema_version:1,job_id:current.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(current.job_id,state.source.event_id);
+    const preview=state.database.inspectLateJobResult(current.job_id);
+    const digest=createHash("sha256").update("reviewed").digest("hex");
+    const accepted=state.database.acceptLateJobResult(current.job_id,current.updated_at,"result_missing",preview.result_sha256,
+      receipt.receipt_id,digest,preview.notification_evidence_sha256);
+    assert.equal(state.database.get(attention.event_id)?.status,"completed");
+    assert.equal(state.database.getJobGroup(state.source.event_id)?.attention_event_id,attention.event_id);
+    assert.notEqual(accepted.completion_event_id,attention.event_id);
+    state.database.close();
+  });
   test("needs_reviewのattentionは最新のlive receiptとoperator確認でのみ解消する",async()=>{
     const state=await addressableJob("needs_review","review-attention");
     state.database.sealJobGroup(state.source.event_id);

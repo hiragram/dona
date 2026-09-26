@@ -37,6 +37,8 @@ function usage(): never {
   dona-dispatcher job legacy-notification <job_id>
   dona-dispatcher job reconcile-legacy-notification <job_id> <expected_job_updated_at> <expected_classified_at> <evidence_sha256> --notification-reviewed --no-post-confirmed
   dona-dispatcher job resolve-invalid-result <job_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
+  dona-dispatcher job inspect-late-result <job_id>
+  dona-dispatcher job accept-late-result <job_id> <expected_updated_at> <expected_cause> <result_sha256> <stop_receipt_id> <side_effects_evidence_sha256> <notification_evidence_sha256> --worker-stopped-reviewed --side-effects-reviewed --notification-reviewed
   dona-dispatcher job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher job attention-recovery <source_event_id>
@@ -140,6 +142,18 @@ async function main(): Promise<void> {
         const jobId=eventIdAt(args,2),receiptId=eventIdAt(args,3),expectedUpdatedAt=eventIdAt(args,4);
         const row=database.resolveInvalidJobResult(jobId,receiptId,expectedUpdatedAt);
         console.log(JSON.stringify({job_id:row.job_id,status:row.status,updated_at:row.updated_at,last_error_code:row.last_error_code},null,2));return;
+      }
+      if(command==="inspect-late-result") {
+        if(args.length!==3)usage();
+        console.log(JSON.stringify(database.inspectLateJobResult(eventIdAt(args,2)),null,2));return;
+      }
+      if(command==="accept-late-result") {
+        if(args.length!==12||args[9]!=="--worker-stopped-reviewed"||
+          args[10]!=="--side-effects-reviewed"||args[11]!=="--notification-reviewed")usage();
+        const row=database.acceptLateJobResult(eventIdAt(args,2),eventIdAt(args,3),eventIdAt(args,4),
+          eventIdAt(args,5),eventIdAt(args,6),eventIdAt(args,7),eventIdAt(args,8));
+        console.log(JSON.stringify({job_id:row.job_id,status:row.status,updated_at:row.updated_at,
+          completion_event_id:row.completion_event_id},null,2));return;
       }
       if(command==="resolve-failed-attention") {
         if(args.length!==8 || args[6]!=="--notification-reviewed" || args[7]!=="--side-effects-reviewed") usage();
