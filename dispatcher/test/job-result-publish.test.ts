@@ -427,6 +427,16 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ kty: "oct" }, { k: "c29tZXByaXZhdGVrZXk" }] },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: [[{ kty: "oct" }], [{ k: "c29tZXByaXZhdGVrZXk" }]] },
+      () => current), code("content_requires_redaction"));
+    for (const summary of ["Basic YWxpY2U6aHVudGVyMh==", '保存値 "db.example.com:5432:app:alice:hunter2"',
+      "10.0.0.5./private", "127.0.0.1./result", '<password value="hunter2"/>', '<api-key secret="CANARY"/>']) {
+      assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary },
+        () => current), code("content_requires_redaction"));
+    }
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: [{ "\\x74oken": "abc" }] }, () => current), code("content_requires_redaction"));
     const tinyGrants = new JobResultPublishCapabilities(() => "tiny-session");
     const tinyCapability = tinyGrants.issue(row({ job_id: "job_tiny", herdr_pane_id: "s1" }), "tiny-session");
     assert.throws(() => tinyGrants.validate(tinyCapability.capability, "tiny-session", { ...base,

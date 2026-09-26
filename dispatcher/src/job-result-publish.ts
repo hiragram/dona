@@ -39,7 +39,7 @@ const sensitive = /(?:(?:^|\s)(?:-[uU]\s*|--(?:proxy-)?user(?:=|\s+))[^:\s]+:[^\
 const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~-]+:[^@\s/<>`]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?(?:[/?#][^\s"'<>`]*|(?=$|[\s"'<>`]))/i;
 const ageSecretIdentity = /AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{20,}\b/i;
 const shortBearerCredential = /\bBearer\s+(?!(?:authentication|credentials)\b)[A-Za-z0-9._~-]+\b/i;
-const pgpassCredential = /(?:^|\s)(?:\\.|[^\s:\\]){1,255}:(?:\d{1,5}|\*):(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}(?=$|\s)/;
+const pgpassCredential = /(?:^|[\s"'([{])(?:\\.|[^\s:\\]){1,255}:(?:\d{1,5}|\*):(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}(?=$|[\s"')\]}])/;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
 function hasPrivateJwkFields(value: Record<string, unknown>): boolean {
@@ -162,7 +162,7 @@ const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]{0,63}:\/\/[^\s"'<>`]+/gi;
 const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9._~%-]{1,256}(?::[^@\s/"'<>`]{0,256})?@)?(?:(?:[A-Za-z0-9-]{1,63}\.)+(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{2,59})|(?:[A-Za-z0-9-]{1,63}\.)*localhost)(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/gi;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
-const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa|test|invalid|example)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})(?:[/?#][^\s"'<>`]*|(?=$|[\s"'<>`])))/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}\.?|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa|test|invalid|example)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})(?:[/?#][^\s"'<>`]*|(?=$|[\s"'<>`])))/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -342,7 +342,6 @@ function hasBasicCredential(value: string): boolean {
   for (const match of value.matchAll(/\bBasic\s+([A-Za-z0-9+/]{4,}={0,2})(?=$|[^A-Za-z0-9+/=])/gi)) {
     const encoded = match[1]!;
     const bytes = Buffer.from(encoded, "base64");
-    if (bytes.toString("base64").replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
     const decoded = bytes.toString("utf8");
     if (decoded.includes(":")) return true;
   }
@@ -352,7 +351,7 @@ function hasSaslPlainCredential(value: string): boolean {
   for (const match of value.matchAll(/\bAUTH\s+PLAIN\s+([A-Za-z0-9+/]{4,}={0,2})(?=$|[^A-Za-z0-9+/=])/gi)) {
     const encoded = match[1]!;
     const bytes = Buffer.from(encoded, "base64");
-    if (bytes.toString("base64").replace(/=+$/, "") === encoded.replace(/=+$/, "") && bytes.includes(0)) return true;
+    if (bytes.includes(0)) return true;
   }
   return false;
 }
@@ -361,6 +360,10 @@ function hasCurlPrivateKeyCredential(value: string): boolean {
     /(?:^|\s)--cert(?:=|\s+)(?:"[^"]+"|'[^']+'|\S+):[^\s"']+/i.test(value);
 }
 function hasCredentialXmlElement(value: string): boolean {
+  for (const match of value.matchAll(/<([A-Za-z][A-Za-z0-9:._-]*)\b([^><]{0,8192})\/?\s*>/gi)) {
+    if (forbiddenKey(normalizedStructuredKey(match[1]!)) &&
+      /\b[A-Za-z_:][A-Za-z0-9:._-]*\s*=\s*(?:"[^"]+"|'[^']+'|[^\s"'=<>`/]+)/.test(match[2]!)) return true;
+  }
   for (const match of value.matchAll(/<([A-Za-z][A-Za-z0-9:._-]*)\b[^><]{0,8192}>([^<]{1,8192})<\/\1\s*>/gi)) {
     if (forbiddenKey(normalizedStructuredKey(match[1]!)) && match[2]!.trim()) return true;
   }
@@ -382,8 +385,8 @@ function forbiddenKey(key: string): boolean {
 function normalizedStructuredKey(key: string): string {
   let normalized = key.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
   for (let depth = 0; depth < 8; depth++) {
-    const decoded = normalized.replace(/\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g, escaped => {
-      if (escaped[1] === "u") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
+    const decoded = normalized.replace(/\\(?:u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|["\\/bfnrt])/g, escaped => {
+      if (escaped[1] === "u" || escaped[1] === "x") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
       return ({ b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" } as Record<string, string>)[escaped[1]!] ?? escaped[1]!;
     });
     let next = decoded;
@@ -687,7 +690,17 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       }
     }
     assertSafeNumericFragments(value, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
-    const siblingObjects = value.filter((item): item is Record<string, unknown> => item !== null && !Array.isArray(item) && typeof item === "object");
+    const siblingObjects: Record<string, unknown>[] = [];
+    const collectSiblingObjects = (items: readonly unknown[]): void => {
+      for (const item of items) {
+        if (Array.isArray(item)) collectSiblingObjects(item);
+        else if (item !== null && typeof item === "object") {
+          siblingObjects.push(item as Record<string, unknown>);
+          if (siblingObjects.length > 4_096) throw new JobResultPublishError("content_requires_redaction");
+        }
+      }
+    };
+    collectSiblingObjects(value);
     if (siblingObjects.length > 1 && hasPrivateJwkFields(Object.assign({}, ...siblingObjects))) {
       throw new JobResultPublishError("content_requires_redaction");
     }
