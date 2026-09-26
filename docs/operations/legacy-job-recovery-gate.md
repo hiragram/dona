@@ -4,7 +4,17 @@
 
 保存済みlive session identityを持たない旧jobでは、個別のHerdr照会が`not_addressable`となる。これはworker停止の証明ではない。`resolve-invalid-result`、`resolve-review-attention`、`accept-late-result`は、保存済みidentityの同一generationに対して取得した最新の`session_absent` receiptだけでも進めない。DB内のnonce、identity、receiptはbackupから一緒に巻き戻せるため、独立したhost/supervisorのmaintenance fence receiptがない間は`maintenance_fence_receipt_required`で拒否する。identity generation digestは照会中の差し替え検出にだけ用い、停止証明とはみなさない。
 
-現行のHerdr連携は個別agentの`get` / `prompt` / `wait`であり、全worker/process treeの完全inventory、admission freeze、再生成防止、host/supervisor generationを束ねた停止receiptを提供しない。したがって旧11件を解除するwrite経路は実装していない。`updateSafetyStatus()`とUpdaterの`workerSafety()`の危険判定も緩めない。
+現行のHerdr連携は個別agentの`get` / `prompt` / `wait`であり、全worker/process treeの完全inventory、admission freeze、再生成防止、host/supervisor generationを束ねた停止receiptを提供しない。したがって旧job群を解除するwrite経路は実装していない。対象件数は毎回durable stateから再取得する。`updateSafetyStatus()`とUpdaterの`workerSafety()`の危険判定も緩めない。
+
+## 利用者の手動停止申告を扱う場合
+
+利用者が待機中のCodexプロセスを手動終了し、残る異常状態jobを停止済みと扱う判断を明示した場合、その判断は`operator_assertion`として記録する。これは停止に関する運用上の受容判断であり、`session_absent`、`job_terminal_worker_stop_proofs`、独立したmaintenance fence receiptへ変換しない。申告だけで既存の`maintenance_fence_receipt_required`を通過させたり、Dispatcher・Updaterの安全判定を変更したりしない。
+
+監査記録には、申告元event ID、保存済みactor ID、申告受信時刻、申告本文のdigest、実際の停止時刻が不明ならその事実、候補job IDと各`updated_at`、申告を候補へ適用した判断時刻、証拠クラス、残余リスクを含める。候補はその時点のdurable stateから再取得し、過去の件数を固定しない。申告後に作成・再開したworkerは申告の対象と推定しない。記録は元のResultやDBの停止proofを上書きせず、追記とread-backができる別の監査成果物にする。
+
+申告を使って旧jobを解決する経路を実装する場合は、machine proof経路と異なる明示的なoperator decisionとして設計する。対象job・actor・申告時点・Result file identity・DB状態・通知・group・副作用の証跡をwrite直前に再照合し、どの不確実性をoperatorが受容したかをjob単位で記録する。妥当なfinalだけを共有validatorと正規の受理経路へ渡し、無効・欠落finalから成功Resultを生成しない。配送済み・未送信・応答不明の通知を別々に扱い、曖昧な送信を自動再試行しない。旧jobを解決しても、残るrunning workerやUpdater自身の`needs_review`を解決済みとみなさず、双方の安全判定を再読する。
+
+現時点のCLIはこのoperator decisionを監査付きで実行する経路を持たない。既存の`--worker-stopped-reviewed`は申告の監査記録や個別の停止証明を作らない。個別の副作用・通知確認とwrite経路の実装前にproductionのDB、Result、worker、Updaterを直接変更しない。
 
 `dispatcher/src/maintenance-fence.ts`には署名済みreceiptのDona側検証契約を実装した。これはsynthetic receiptを使う契約テスト用であり、現在のoperator復旧CLIには接続していない。現行Herdr 0.8.2の`agent list` / `workspace list`は表示用一覧で、全session・pane・process treeの完全性watermarkや、一覧から停止まで同一世代で再生成を禁止するatomic操作を返さない。`agent get`の`idle` / `done` / `agent_not_found`も停止の証明ではない。従って現行APIだけでproviderを構成してreceiptを発行してはならない。
 
@@ -27,4 +37,4 @@ Herdrまたはhost supervisorが次を同一generationへ束縛した検証可�
 
 jobごとに外部副作用、通知の配送・曖昧性、正常finalの受理可否をoperatorが判断する。routing owner/destinationとgroup、attention receipt/claimを厳密に照合する。復旧transactionはjob状態、`updated_at`、Result bytesとfile identity、通知/group、fence generationをCASで再確認し、append-only ledgerへ記録する。正常finalだけを共有validatorとterminal保存経路で受理し、無効・欠落finalは元fileを修復せず`failed`へ確定する。曖昧な通知は再送しない。commit後は同じgenerationでDispatcher/Updater双方の安全判定を再読する。
 
-この手順の実行にはmaintenance windowと個別operator判断が必要であり、現在の依頼ではservice停止、production DB/Result変更、self-updateを行わない。旧11件の解決、通知、self-updateは未実施である。
+この手順の実行にはmaintenance windowと個別operator判断が必要であり、現在の依頼ではservice停止、production DB/Result変更、self-updateを行わない。旧job群の解決、通知、self-updateは未実施である。
