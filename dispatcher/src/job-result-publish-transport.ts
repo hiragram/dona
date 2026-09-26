@@ -49,7 +49,8 @@ function rejectOversize(request: IncomingMessage, response: ServerResponse, requ
 
 class WireRequestBoundary {
   private state: "header" | "fixed" | "size" | "data" | "data_crlf" | "trailer" = "header";
-  private pending = Buffer.alloc(0);
+  private readonly pending = Buffer.alloc(16_384);
+  private pendingLength = 0;
   private remaining = 0;
   private crlfIndex = 0;
   private completed = false;
@@ -74,19 +75,21 @@ class WireRequestBoundary {
         continue;
       }
       const marker = this.state === "header" ? "\r\n\r\n" : "\r\n";
-      const limit = (this.state === "size" ? 256 : 16_384) - this.pending.length;
+      const limit = (this.state === "size" ? 256 : 16_384) - this.pendingLength;
       if (limit <= 0) throw new Error("oversize_wire_header");
-      const window = Buffer.concat([this.pending, chunk.subarray(offset, Math.min(chunk.length, offset + limit))]);
-      const end = window.indexOf(marker);
+      const before = this.pendingLength;
+      const copied = Math.min(chunk.length - offset, limit);
+      chunk.copy(this.pending, before, offset, offset + copied);
+      this.pendingLength += copied;
+      const end = this.pending.subarray(0, this.pendingLength).indexOf(marker);
       if (end < 0) {
-        if (offset + limit < chunk.length) throw new Error("oversize_wire_header");
-        this.pending = window;
-        offset = chunk.length;
+        if (copied < chunk.length - offset) throw new Error("oversize_wire_header");
+        offset += copied;
         break;
       }
-      offset += end + marker.length - this.pending.length;
-      const line = window.subarray(0, end).toString("latin1");
-      this.pending = Buffer.alloc(0);
+      offset += end + marker.length - before;
+      const line = this.pending.subarray(0, end).toString("latin1");
+      this.pendingLength = 0;
       if (this.state === "header") {
         if (!/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP\/1\.[01]\r\n/.test(line)) throw new Error("invalid_wire_header");
         if (/\r\ntransfer-encoding:\s*chunked\s*(?:\r\n|$)/i.test(line)) this.state = "size";
@@ -105,13 +108,13 @@ class WireRequestBoundary {
         this.state = this.remaining === 0 ? "trailer" : "data";
       } else if (line === "") this.finish();
     }
-    return this.completed && this.state === "header" && this.pending.length > 0;
+    return this.completed && this.state === "header" && this.pendingLength > 0;
   }
 
   private finish(): void {
     this.completed = true;
     this.state = "header";
-    this.pending = Buffer.alloc(0);
+    this.pendingLength = 0;
   }
 }
 

@@ -108,6 +108,7 @@ describe("job result publish contract", () => {
       assert.throws(() => validateJobResultPublish({ ...base, summary: value }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "client-key-data": "BASE64_PRIVATE_KEY" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
+    assert.throws(() => validateJobResultPublish({ ...base, actions: [["password", "hunter2"]] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "tls.key": "BASE64_PRIVATE_KEY" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "to\u200bken": "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     assert.throws(() => validateJobResultPublish({ ...base, artifacts: [{ "to\u034fken": "CANARY_VALUE" }] }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
@@ -337,7 +338,7 @@ describe("job result publish contract", () => {
       objective: "private objective two", workspace_path: "/workspace/two", result_path: "/result/two" }), otherSession);
     grants.issue(row({ job_id: "job_short", objective: "完了", workspace_path: "/workspace/short", result_path: "/result/short" }), otherSession);
     const current = row({ status: "running", herdr_pane_id: "pane-one", objective: "private objective text" });
-    assert.equal(grants.validate(grant.capability, "session-one", { ...base, summary: "実装完了" }, () => current).envelope.summary, "実装完了");
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: "実装完了" }, () => current), code("content_requires_redaction"));
     for (const privateValue of ["pane-two", "agent-two", "herdr-two", "workspace-two", "agent-session-two",
       "private objective two", "private objective text"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: privateValue }, () => current), code("content_requires_redaction"));
@@ -354,6 +355,9 @@ describe("job result publish contract", () => {
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ part: grant.capability.slice(0, 20) }, { note: "ok" }, { part: grant.capability.slice(20) }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: grant.capability.match(/.{1,7}/g)!.map((part, index) => ({ [`part${index + 1}`]: part })).flatMap((part, index) => index === 0 ? [part, { note: "ok" }] : [part]) },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ [grant.capability.slice(0, 20)]: "ok" }, { [grant.capability.slice(20)]: "ok" }] },

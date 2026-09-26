@@ -428,8 +428,8 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const bytes = Buffer.from(encoded, format);
     if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
   }
-  for (const match of value.matchAll(/(?:[A-Za-z0-9+/_-]{4,}\r?\n)+[A-Za-z0-9+/_-]{2,}={0,2}/g)) {
-    const encoded = match[0].replace(/\r?\n/g, "");
+  for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])((?:[A-Za-z0-9+/_-]{4,}\r?\n)+[A-Za-z0-9+/_-]{2,}={0,2})/gm)) {
+    const encoded = match[1]!.replace(/\r?\n/g, "");
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
     if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
@@ -537,6 +537,8 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || hasCredentialXmlElement(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || ageSecretIdentity.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
+    if (value.length === 2 && typeof value[0] === "string" && value[1] !== null && value[1] !== "" &&
+      forbiddenKey(normalizedStructuredKey(value[0]))) throw new JobResultPublishError("content_requires_redaction");
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
   } else if (value !== null && typeof value === "object") {
     const normalizedEntries = Object.entries(value).map(([key, item]) =>
@@ -640,6 +642,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     const keys: string[] = [];
     const ordered: string[] = [];
     const fieldValues = new Map<string, string[]>();
+    const numberedValues = new Map<string, { index: number; value: string }[]>();
     const collect = (value: unknown): void => {
       if (typeof value === "string") { leaves.push(value); ordered.push(value); }
       else if (Array.isArray(value)) value.forEach(collect);
@@ -651,6 +654,12 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
             const group = fieldValues.get(key) ?? [];
             group.push(item);
             fieldValues.set(key, group);
+            const numbered = /^(.*?)(\d+)$/.exec(key);
+            if (numbered) {
+              const family = numberedValues.get(numbered[1]!) ?? [];
+              family.push({ index: Number(numbered[2]), value: item });
+              numberedValues.set(numbered[1]!, family);
+            }
           }
           collect(item);
         }
@@ -661,7 +670,9 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     if (parsed.data.artifacts) collect(parsed.data.artifacts);
     if (parsed.data.actions) collect(parsed.data.actions);
     for (const combined of [leaves.join(""), keys.join(""), ordered.join(""),
-      ...[...fieldValues.values()].filter(values => values.length > 1).map(values => values.join(""))]) {
+      ...[...fieldValues.values()].filter(values => values.length > 1).map(values => values.join("")),
+      ...[...numberedValues.values()].filter(values => values.length > 1).map(values =>
+        values.sort((left, right) => left.index - right.index).map(item => item.value).join(""))]) {
       if (matcher?.contains(combined) || (matcher && hasEncodedPrivateValue(combined, matcher, 0, encodedBudget, forbiddenDigests, forbiddenFingerprints)) ||
         containsForbiddenCapability(combined, forbiddenDigests, forbiddenFingerprints) ||
         containsForbiddenCapability(displayProjection(combined), forbiddenDigests, forbiddenFingerprints)) {
@@ -847,7 +858,8 @@ export class JobResultPublishCapabilities {
       .flatMap(candidate => candidate.privateValues);
     const shortRuntimeValues = new Set([...this.grants.values()]
       .filter(candidate => candidate.expiresAt > this.now())
-      .flatMap(candidate => candidate.runtimeValues)
+      .flatMap(candidate => [...candidate.runtimeValues, candidate.objective])
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
       .map(value => value.normalize("NFC"))
       .filter(value => value.length < 8));
     if (job.objective) shortRuntimeValues.add(job.objective.normalize("NFC"));
