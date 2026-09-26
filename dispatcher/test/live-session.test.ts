@@ -43,7 +43,7 @@ async function addressableJob(status:"dispatching"|"needs_review"="needs_review"
 }
 
 describe("read-only live session reconciliation",()=>{
-  test("operatorだけが停止receiptと固定digestで遅延Resultを受理し再起動後も同一要求を再読できる",async()=>{
+  test("遅延ResultはDB内receiptだけでは再起動後も受理しない",async()=>{
     const state=await addressableJob("needs_review","late-result");
     state.database.markJobNeedsReview(state.job.job_id,"result_missing","missing at terminal observation");
     state.database.sealJobGroup(state.source.event_id);
@@ -59,23 +59,16 @@ describe("read-only live session reconciliation",()=>{
     assert.throws(()=>state.database.saveJobResult(current.job_id,result,current.result_path),/Invalid status transition/);
     const args=[current.job_id,current.updated_at,"result_missing",preview.result_sha256,receipt.receipt_id,sideEffects,preview.notification_evidence_sha256] as const;
     assert.throws(()=>state.database.acceptLateJobResult(current.job_id,current.updated_at,"result_missing",preview.result_sha256,"wrong",sideEffects,preview.notification_evidence_sha256),/worker_stop_unproven/);
-    const accepted=state.database.acceptLateJobResult(...args);
-    assert.equal(accepted.status,"completed");
-    assert.equal(JSON.parse(accepted.result_json!).summary,"作業完了");
-    assert.ok(accepted.completion_event_id);
+    assert.throws(()=>state.database.acceptLateJobResult(...args),/maintenance_fence_receipt_required/);
+    assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
     const stopProofDb=new Database(state.config.databasePath);
-    assert.ok(stopProofDb.prepare("SELECT 1 FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(current.job_id));
+    assert.equal(stopProofDb.prepare("SELECT 1 FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(current.job_id),undefined);
     stopProofDb.close();
     state.database.close();
     const reopened=new DispatcherDatabase(state.config.databasePath);
-    assert.equal(reopened.acceptLateJobResult(...args).updated_at,accepted.updated_at);
-    assert.equal(reopened.liveSessionRetentionPlan("9999-01-01T00:00:00.000Z").receipt_rows,0);
-    reopened.purgeLiveSessionReceipts("9999-01-01T00:00:00.000Z");
+    assert.throws(()=>reopened.acceptLateJobResult(...args),/maintenance_fence_receipt_required/);
     assert.ok(reopened.getLiveSessionReceipt(current.job_id,receipt.receipt_id));
-    const raw=new Database(state.config.databasePath);
-    assert.throws(()=>raw.prepare("DELETE FROM live_session_query_receipts WHERE receipt_id=?").run(receipt.receipt_id),/FOREIGN KEY/);
-    raw.close();
-    assert.throws(()=>reopened.acceptLateJobResult(current.job_id,current.updated_at,"invalid_result",preview.result_sha256,receipt.receipt_id,sideEffects,preview.notification_evidence_sha256),/reconciliation_conflict/);
+    assert.equal(reopened.getJob(current.job_id)?.status,"needs_review");
     reopened.close();
   });
 
@@ -105,7 +98,7 @@ describe("read-only live session reconciliation",()=>{
     assert.throws(()=>state.database.acceptLateJobResult(current.job_id,latestJob.updated_at,"invalid_result",refreshed.result_sha256,latestReceipt.receipt_id,digest,state.database.inspectLateJobResult(current.job_id).notification_evidence_sha256),/notification_requires_reconciliation/);
     state.database.close();
   });
-  test("配送済みattentionのidentityを保持し、確定Resultの通知を作る",async()=>{
+  test("フェンスなしでは配送済みattentionを保持してResult受理を拒否する",async()=>{
     const state=await addressableJob("needs_review","late-delivered");
     state.database.markJobNeedsReview(state.job.job_id,"result_missing","missing");
     state.database.sealJobGroup(state.source.event_id);
@@ -124,11 +117,11 @@ describe("read-only live session reconciliation",()=>{
     const receipt=await supervisor.observeLiveSession(current.job_id,state.source.event_id);
     const preview=state.database.inspectLateJobResult(current.job_id);
     const digest=createHash("sha256").update("reviewed").digest("hex");
-    const accepted=state.database.acceptLateJobResult(current.job_id,current.updated_at,"result_missing",preview.result_sha256,
-      receipt.receipt_id,digest,preview.notification_evidence_sha256);
+    assert.throws(()=>state.database.acceptLateJobResult(current.job_id,current.updated_at,"result_missing",preview.result_sha256,
+      receipt.receipt_id,digest,preview.notification_evidence_sha256),/maintenance_fence_receipt_required/);
     assert.equal(state.database.get(attention.event_id)?.status,"completed");
     assert.equal(state.database.getJobGroup(state.source.event_id)?.attention_event_id,attention.event_id);
-    assert.notEqual(accepted.completion_event_id,attention.event_id);
+    assert.equal(state.database.getJob(current.job_id)?.completion_event_id,attention.event_id);
     state.database.close();
   });
   test("FIFOのfinal Resultを待たずに拒否する",async()=>{
@@ -138,7 +131,7 @@ describe("read-only live session reconciliation",()=>{
     assert.throws(()=>state.database.inspectLateJobResult(state.job.job_id),/late_result_file_invalid/);
     state.database.close();
   });
-  test("同groupの完了済みprogress通知は外部操作なしの場合に受理する",async()=>{
+  test("同groupの完了済みprogress通知があってもフェンスなしでは受理しない",async()=>{
     const state=await addressableJob("needs_review","late-progress");
     state.database.markJobNeedsReview(state.job.job_id,"result_missing","missing");
     const sibling=state.database.createJob({source_event_id:state.source.event_id,job_key:"attention-owner",
@@ -162,14 +155,14 @@ describe("read-only live session reconciliation",()=>{
     const receipt=await supervisor.observeLiveSession(current.job_id,state.source.event_id);
     const preview=state.database.inspectLateJobResult(current.job_id);
     const digest=createHash("sha256").update("reviewed").digest("hex");
-    const accepted=state.database.acceptLateJobResult(current.job_id,current.updated_at,"result_missing",preview.result_sha256,
-      receipt.receipt_id,digest,preview.notification_evidence_sha256);
-    assert.equal(accepted.status,"completed");
+    assert.throws(()=>state.database.acceptLateJobResult(current.job_id,current.updated_at,"result_missing",preview.result_sha256,
+      receipt.receipt_id,digest,preview.notification_evidence_sha256),/maintenance_fence_receipt_required/);
+    assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
     assert.equal(state.database.get(progress.event_id)?.status,"completed");
     assert.equal(state.database.getJobGroup(state.source.event_id)?.attention_event_id,attention.event_id);
     state.database.close();
   });
-  test("needs_reviewのattentionは最新のlive receiptとoperator確認でのみ解消する",async()=>{
+  test("needs_reviewのattentionは最新receiptだけでは解消しない",async()=>{
     const state=await addressableJob("needs_review","review-attention");
     state.database.sealJobGroup(state.source.event_id);
     const attention=state.database.enqueueJobNotification(state.job.job_id).row;
@@ -180,14 +173,13 @@ describe("read-only live session reconciliation",()=>{
       receipt.receipt_id,current.updated_at),/binding_mismatch/);
     assert.throws(()=>state.database.resolveNeedsReviewAttention(state.source.event_id,current.job_id,attention.event_id,
       "wrong-receipt",current.updated_at),/receipt_mismatch/);
-    const resolved=state.database.resolveNeedsReviewAttention(state.source.event_id,current.job_id,attention.event_id,
-      receipt.receipt_id,current.updated_at);
-    assert.equal(resolved.status,"failed");
-    assert.equal(state.database.get(attention.event_id)?.last_error_code,"job_result_superseded");
-    assert.ok(state.database.getJobGroup(state.source.event_id)?.all_terminal_event_id);
+    assert.throws(()=>state.database.resolveNeedsReviewAttention(state.source.event_id,current.job_id,attention.event_id,
+      receipt.receipt_id,current.updated_at),/maintenance_fence_receipt_required/);
+    assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
+    assert.equal(state.database.getJobGroup(state.source.event_id)?.attention_event_id,attention.event_id);
     state.database.close();
   });
-  test("invalid Resultのoperator解決は最新receiptと状態の一致を要求する",async()=>{
+  test("invalid Resultのoperator解決は最新receiptでもフェンスなしでは拒否する",async()=>{
     const state=await addressableJob("needs_review","invalid-result-first");
     state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
     state.database.sealJobGroup(state.source.event_id);
@@ -199,15 +191,10 @@ describe("read-only live session reconciliation",()=>{
     assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,"stale"),/job_changed_since_review/);
     const newer=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
     assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,current.updated_at),/newer_live_session_receipt_exists/);
-    const resolved=state.database.resolveInvalidJobResult(current.job_id,newer.receipt_id,current.updated_at);
-    assert.equal(resolved.status,"failed");
-    assert.equal(resolved.last_error_code,"invalid_result_operator_resolved");
-    assert.equal(resolved.result_json,null);
-    assert.equal(state.database.get(prior.event_id)?.last_error_code,"job_result_superseded");
-    assert.notEqual(resolved.completion_event_id,prior.event_id);
-    assert.equal(state.database.get(resolved.completion_event_id!)?.event_type,"job_failed");
-    assert.ok(state.database.getJobGroup(state.source.event_id)?.all_terminal_event_id);
-    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,resolved.updated_at),/job_invalid_result_reconciliation_unavailable/);
+    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,newer.receipt_id,current.updated_at),
+      /maintenance_fence_receipt_required/);
+    assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
+    assert.equal(state.database.get(prior.event_id)?.status,"queued");
     state.database.close();
   });
   test("停止receipt後のidentity世代差し替えをoperator解決で拒否する",async()=>{
@@ -253,6 +240,7 @@ describe("read-only live session reconciliation",()=>{
       assert.equal(state.database.getLiveSessionReceipt(job.job_id,saved.receipt_id)?.reconciliation.state,"unknown");
     }
     assert.equal(state.database.getJobLiveSessionIdentity(job.job_id)?.max_state_change_seq,null);
+    assert.equal(state.database.latestLiveSessionStateChangeSeq(job.job_id,state.database.getJobLiveSessionIdentity(job.job_id)!),undefined);
     state.database.close();
   });
   test("別jobのattentionではinvalid Resultを解消済みと記録しない",async()=>{
@@ -276,8 +264,9 @@ describe("read-only live session reconciliation",()=>{
     const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
     const receipt=await supervisor.observeLiveSession(sibling.job_id,state.source.event_id);
     const current=state.database.getJob(sibling.job_id)!;
-    const resolved=state.database.resolveInvalidJobResult(sibling.job_id,receipt.receipt_id,current.updated_at);
-    assert.equal(resolved.status,"failed");
+    assert.throws(()=>state.database.resolveInvalidJobResult(sibling.job_id,receipt.receipt_id,current.updated_at),
+      /maintenance_fence_receipt_required/);
+    assert.equal(state.database.getJob(sibling.job_id)?.status,"needs_review");
     const raw=new Database(state.config.databasePath);
     assert.equal(raw.prepare("SELECT 1 FROM job_attention_resolutions WHERE job_id=?").get(sibling.job_id),undefined);
     raw.close();
@@ -296,7 +285,7 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
     state.database.close();
   });
-  test("配達済みの旧通知を保持し確定状態の通知を追加する",async()=>{
+  test("フェンスなしでは配達済み旧通知を維持して新通知を作らない",async()=>{
     const state=await addressableJob("needs_review","invalid-result-delivered");
     state.database.markJobNeedsReview(state.job.job_id,"invalid_result","malformed Result");
     state.database.sealJobGroup(state.source.event_id);
@@ -311,11 +300,11 @@ describe("read-only live session reconciliation",()=>{
     const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
     const receipt=await supervisor.observeLiveSession(state.job.job_id,state.source.event_id);
     const current=state.database.getJob(state.job.job_id)!;
-    const resolved=state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,current.updated_at);
+    assert.throws(()=>state.database.resolveInvalidJobResult(current.job_id,receipt.receipt_id,current.updated_at),
+      /maintenance_fence_receipt_required/);
     assert.equal(state.database.get(prior.event_id)?.status,"completed");
-    assert.notEqual(resolved.completion_event_id,prior.event_id);
-    assert.equal(state.database.get(resolved.completion_event_id!)?.event_type,"job_failed");
-    assert.ok(state.database.getJobGroup(state.source.event_id)?.all_terminal_event_id);
+    assert.equal(state.database.getJob(current.job_id)?.status,"needs_review");
+    assert.equal(state.database.getJob(current.job_id)?.completion_event_id,prior.event_id);
     state.database.close();
   });
   test("exact identityのworkingを永続receiptへ記録しcontrol commandを呼ばない",async()=>{

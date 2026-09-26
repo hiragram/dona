@@ -2,7 +2,7 @@
 
 ## 現在の境界
 
-保存済みlive session identityを持たない旧jobでは、個別のHerdr照会が`not_addressable`となる。これはworker停止の証明ではない。`resolve-invalid-result`、`resolve-review-attention`、`accept-late-result`は、保存済みidentityの同一generationに対して取得した最新の`session_absent` receiptがなければ進めない。古いreceiptやrollbackで再作成されたidentityは拒否する。
+保存済みlive session identityを持たない旧jobでは、個別のHerdr照会が`not_addressable`となる。これはworker停止の証明ではない。`resolve-invalid-result`、`resolve-review-attention`、`accept-late-result`は、保存済みidentityの同一generationに対して取得した最新の`session_absent` receiptだけでも進めない。DB内のnonce、identity、receiptはbackupから一緒に巻き戻せるため、独立したhost/supervisorのmaintenance fence receiptがない間は`maintenance_fence_receipt_required`で拒否する。identity generation digestは照会中の差し替え検出にだけ用い、停止証明とはみなさない。
 
 現行のHerdr連携は個別agentの`get` / `prompt` / `wait`であり、全worker/process treeの完全inventory、admission freeze、再生成防止、host/supervisor generationを束ねた停止receiptを提供しない。したがって旧11件を解除するwrite経路は実装していない。`updateSafetyStatus()`とUpdaterの`workerSafety()`の危険判定も緩めない。
 

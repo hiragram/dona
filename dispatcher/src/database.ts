@@ -1417,6 +1417,12 @@ export class DispatcherDatabase {
         receipt.identity_generation_sha256 !== current) throw new Error("late_result_worker_stop_unproven");
   }
 
+  private assertMaintenanceFenceReceipt(): void {
+    // A database restore can roll back both the nonce and the observation receipt.
+    // No independently durable host/supervisor fence can currently be verified.
+    throw new Error("maintenance_fence_receipt_required");
+  }
+
   private lateResultFile(job: JobRow): {result:JobResultEnvelope;sha256:string} {
     const fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
     try {
@@ -1512,6 +1518,7 @@ export class DispatcherDatabase {
       }
       const file=this.lateResultFile(job);
       if(file.sha256!==expectedDigest) throw new Error("late_result_digest_drift");
+      this.assertMaintenanceFenceReceipt();
       this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
       if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.markTerminalWorkerStopProof(jobId);
@@ -1541,6 +1548,7 @@ export class DispatcherDatabase {
       const latest = this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
         .get(jobId) as {receipt_id:string}|undefined;
       if (latest?.receipt_id !== receiptId) throw new Error("newer_live_session_receipt_exists");
+      this.assertMaintenanceFenceReceipt();
       const group = this.getJobGroup(job.source_event_id);
       for (const eventId of new Set([job.completion_event_id, group?.attention_event_id, group?.all_terminal_event_id])) {
         if (!eventId) continue;
@@ -1621,6 +1629,7 @@ export class DispatcherDatabase {
         throw new Error("live_session_receipt_mismatch");
       }
       this.assertLiveSessionStopProof(job,receipt);
+      this.assertMaintenanceFenceReceipt();
       const latest = this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
         .get(jobId) as {receipt_id:string}|undefined;
       if (latest?.receipt_id !== receiptId) throw new Error("newer_live_session_receipt_exists");
@@ -1766,9 +1775,12 @@ export class DispatcherDatabase {
     const current=this.db.prepare(`SELECT max_state_change_seq FROM job_live_session_identities
       WHERE job_id=? AND recorded_at=? AND herdr_agent_session_id=? AND herdr_workspace_id=? AND herdr_pane_id=? AND agent_name=?`)
       .get(jobId,identity.recorded_at,identity.herdr_agent_session_id,identity.herdr_workspace_id,identity.herdr_pane_id,identity.agent_name) as {max_state_change_seq:number|null}|undefined;
+    const job=this.getJobRequired(jobId);
+    const generation=liveSessionIdentityGenerationSha256(job,identity);
     const receipt=this.db.prepare(`SELECT MAX(state_change_seq) AS state_change_seq FROM live_session_query_receipts
-      WHERE job_id=? AND completed_at>=? AND query_status='observed' AND identity_match=1 AND state_change_seq IS NOT NULL`)
-      .get(jobId,identity.recorded_at) as {state_change_seq:number|null}|undefined;
+      WHERE job_id=? AND completed_at>=? AND query_status='observed' AND identity_match=1
+        AND state_change_seq IS NOT NULL AND reconciliation_state!='unknown' AND identity_generation_sha256=?`)
+      .get(jobId,identity.recorded_at,generation??"") as {state_change_seq:number|null}|undefined;
     const values=[current?.max_state_change_seq,receipt?.state_change_seq].filter((value):value is number=>value!==null&&value!==undefined);
     return values.length>0?Math.max(...values):undefined;
   }

@@ -1,11 +1,13 @@
 # 無効なJob Resultのoperator解決
 
+現在、以下のoperator解決コマンドは、独立したhost/supervisorのmaintenance fence receiptを検証する経路が未実装のため、`maintenance_fence_receipt_required`で停止する。DB内のidentity generationと`session_absent` receiptはrollback可能で、worker停止の十分な証明にはならない。以下の手順は外部フェンス実装後の照合要件として維持する。必要な契約は[旧job復旧gate](legacy-job-recovery-gate.md)を参照する。
+
 ## 遅れて公開された正常なfinal Resultの単一job照合
 
 `needs_review`の原因が`result_missing`、`invalid_result`、`invalid_result_agent_stopped`で、DBにResultが未受理の場合だけ使用する。schedule所有jobや過去のjob群を一括処理しない。
 
 1. `job inspect-late-result <job_id>`で現在の`updated_at`、原因、final ResultのSHA-256、通知証跡のSHA-256を読む。invalid final、欠落、symlink、1 MiB超過は受理対象にしない。
-2. workerの停止を別途確認し、`job show <job_id> --live-session`で同一jobの最新receiptを保存する。受理時には識別済みagentの現在のidentity generationに束縛された`session_absent`の最新receiptが必要となる。`not_addressable`、timeout、稼働中、古いreceipt、rollback前のidentityに対するreceiptは停止証明にならない。
+2. 独立したmaintenance fence receiptでworkerの停止を確認し、`job show <job_id> --live-session`で同一jobの最新receiptを保存する。受理時には識別済みagentの現在のidentity generationに束縛された`session_absent`の最新receiptも必要となる。`not_addressable`、timeout、稼働中、古いreceipt、rollback前のidentityに対するreceiptは停止証明にならない。
 3. branch、PR、Issue、外部操作の副作用を確認し、その証跡文書のSHA-256を`side_effects_evidence_sha256`として保管する。通知についても既存eventの配送有無と曖昧なwriteがないことを確認する。`inspect-late-result`の通知digestは現在のDB投影へのCASであり、operatorの確認を代替しない。
 4. 確認済みの値だけで`job accept-late-result <job_id> <expected_updated_at> <expected_cause> <result_sha256> <stop_receipt_id> <side_effects_evidence_sha256> <notification_evidence_sha256> --worker-stopped-reviewed --side-effects-reviewed --notification-reviewed`を一度呼ぶ。応答喪失時は`job show`と`inspect-late-result`で状態を再読し、同一引数以外のwriteを行わない。
 
