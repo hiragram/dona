@@ -125,7 +125,7 @@ describe("job result publish contract", () => {
     assert.throws(() => validateJobResultPublish({ ...base, summary: "\u001b[31m" }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, summary: "<https://example.com/| >" }, row(), "2026-09-24T00:00:00Z"), code("invalid_request"));
     assert.throws(() => validateJobResultPublish({ ...base, summary: "ghp_abcd\u034fefghijklmnop" }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
-    for (const summary of ["machine api.example.com password hunter2 login alice", "curl --pass hunter2 --key client.key https://github.com", "curl --cert client.pem:hunter2 https://github.com", "curl --oauth2-bearer opaque https://github.com", "LOCALHOST/download/result", "LocalHost/private", "..\\Users\\alice\\AppData\\Local\\Dona\\result.json"]) {
+    for (const summary of ["machine api.example.com password hunter2 login alice", "curl --pass hunter2 --key client.key https://github.com", "curl --cert client.pem:hunter2 https://github.com", "curl --oauth2-bearer opaque https://github.com", "pass = hunter2", "cert = client.pem:hunter2", "user = alice:hunter2", "LOCALHOST/download/result", "LocalHost/private", "alice:hunter2@2130706433/download", "alice:hunter2@0x7f000001/private", "..\\Users\\alice\\AppData\\Local\\Dona\\result.json"]) {
       assert.throws(() => validateJobResultPublish({ ...base, summary }, row(), "2026-09-24T00:00:00Z"), code("content_requires_redaction"));
     }
     for (const summary of ["Basic authentication is enabled", "HTTP Basic authentication succeeded", "<details>結果</details>", "<testsuite>ok</testsuite>"]) {
@@ -346,8 +346,25 @@ describe("job result publish contract", () => {
       artifacts: [{ part: grant.capability.slice(0, 20) }, { part: grant.capability.slice(20) }] },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ [grant.capability.slice(0, 20)]: "ok" }, { [grant.capability.slice(20)]: "ok" }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ part: "private objective " }, { part: "text" }] },
       () => current), code("content_requires_redaction"));
+    const encodedObjective = Buffer.from("private objective text", "utf8").toString("base64");
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ part: encodedObjective.slice(0, 12) }, { part: encodedObjective.slice(12) }] },
+      () => current), code("content_requires_redaction"));
+    let deepObjective = "private objective text";
+    for (let depth = 0; depth < 4; depth++) deepObjective = Buffer.from(deepObjective, "utf8").toString("base64");
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: deepObjective }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: `${grant.capability.slice(0, 20)} ${grant.capability.slice(20)}` },
+      () => current), code("content_requires_redaction"));
+    const fullwidthCapability = grant.capability.replace(/[A-Za-z0-9_-]/g, character => String.fromCharCode(character.charCodeAt(0) + 0xfee0));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: fullwidthCapability }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from(grant.capability, "utf8").toString("base64url") }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
@@ -397,6 +414,20 @@ describe("job result publish contract", () => {
     if (privateBits) encodedPrivate += base32Alphabet[(privateValue << (5 - privateBits)) & 31];
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: encodedPrivate }, () => current), code("content_requires_redaction"));
+    const longBase32Source = Buffer.from("private objective text".repeat(500), "utf8");
+    let longBits = 0, longValue = 0, longBase32 = "";
+    for (const byte of longBase32Source) {
+      longValue = (longValue << 8) | byte;
+      longBits += 8;
+      while (longBits >= 5) {
+        longBits -= 5;
+        longBase32 += base32Alphabet[(longValue >>> longBits) & 31];
+        longValue &= (1 << longBits) - 1;
+      }
+    }
+    if (longBits) longBase32 += base32Alphabet[(longValue << (5 - longBits)) & 31];
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: longBase32 }, () => current), code("content_requires_redaction"));
     const longObjective = "private-long-objective-".repeat(500);
     const longGrant = new JobResultPublishCapabilities(() => "session-long-base64");
     const longIssued = longGrant.issue(row({ objective: longObjective }), "session-long-base64");
