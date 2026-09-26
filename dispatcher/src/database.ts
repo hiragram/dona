@@ -657,7 +657,7 @@ export class DispatcherDatabase {
         expected_updated_at TEXT NOT NULL,
         expected_cause TEXT NOT NULL,
         result_sha256 TEXT NOT NULL,
-        stop_receipt_id TEXT NOT NULL,
+        stop_receipt_id TEXT NOT NULL REFERENCES live_session_query_receipts(receipt_id) ON DELETE RESTRICT,
         side_effects_evidence_sha256 TEXT NOT NULL,
         notification_evidence_sha256 TEXT NOT NULL,
         accepted_at TEXT NOT NULL,
@@ -1399,12 +1399,21 @@ export class DispatcherDatabase {
   }
 
   private lateResultFile(job: JobRow): {result:JobResultEnvelope;sha256:string} {
-    const fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW);
+    const fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);
     try {
       const stat=fs.fstatSync(fd);
       if(!stat.isFile()||stat.size>jobResultEnvelopeMaxBytes) throw new Error("late_result_file_invalid");
-      const bytes=fs.readFileSync(fd);
-      if(bytes.length>jobResultEnvelopeMaxBytes) throw new Error("late_result_file_invalid");
+      const chunks:Buffer[]=[];
+      let length=0;
+      while(true) {
+        const chunk=Buffer.allocUnsafe(Math.min(64*1024,jobResultEnvelopeMaxBytes+1-length));
+        const read=fs.readSync(fd,chunk,0,chunk.length,null);
+        if(read===0) break;
+        length+=read;
+        if(length>jobResultEnvelopeMaxBytes) throw new Error("late_result_file_invalid");
+        chunks.push(chunk.subarray(0,read));
+      }
+      const bytes=Buffer.concat(chunks,length);
       let parsed:unknown;
       try {parsed=JSON.parse(bytes.toString("utf8"));}
       catch {throw new Error("late_result_json_invalid");}
@@ -1422,6 +1431,15 @@ export class DispatcherDatabase {
         settled:this.attentionNotificationSettled(event)};
     });
     return createHash("sha256").update(stableStringify(events)).digest("hex");
+  }
+
+  private lateProgressNotificationSettled(event:EventRow,jobId:string):boolean {
+    if(event.source!=="dona_job"||event.status!=="completed"||!event.result_json) return false;
+    const payload=JSON.parse(event.payload_json) as {job_id?:string;group?:{transition?:string}};
+    const result=JSON.parse(event.result_json) as ResultEnvelope;
+    return payload.job_id===jobId&&payload.group?.transition==="progress"&&
+      result.event_id===event.event_id&&result.status==="completed"&&
+      Array.isArray(result.actions)&&result.actions.length===0;
   }
 
   inspectLateJobResult(jobId:string):{job_id:string;status:JobStatus;updated_at:string;cause:string|null;result_sha256:string;notification_evidence_sha256:string} {
@@ -1468,13 +1486,16 @@ export class DispatcherDatabase {
       for(const id of new Set([job.completion_event_id,group?.attention_event_id])) {
         if(!id) continue;
         const event=this.getRequired(id);
-        if(!["queued","retryable_failed"].includes(event.status)&&!this.attentionNotificationSettled(event))
+        if(!["queued","retryable_failed"].includes(event.status)&&
+          !this.attentionNotificationSettled(event)&&
+          !(id===job.completion_event_id&&this.lateProgressNotificationSettled(event,jobId)))
           throw new Error("late_result_notification_requires_reconciliation");
       }
       const file=this.lateResultFile(job);
       if(file.sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
       if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
+      this.markTerminalWorkerStopProof(jobId);
       this.enqueueJobNotification(jobId,at);
       const accepted=this.getJobRequired(jobId);
       this.db.prepare(`INSERT INTO job_late_result_reconciliations VALUES(?,?,?,?,?,?,?,?,?,?)`)
@@ -1894,7 +1915,8 @@ export class DispatcherDatabase {
           }
           const prior=this.db.prepare("SELECT notification_state FROM job_completion_results WHERE notification_event_id=?").get(job.completion_event_id) as {notification_state:string}|undefined;
           if(prior&&prior.notification_state!=="pending") throw new Error("prior_notification_requires_reconciliation");
-          if(operatorLate&&priorEvent.status==="completed"&&!this.attentionNotificationSettled(priorEvent))
+          if(operatorLate&&priorEvent.status==="completed"&&!this.attentionNotificationSettled(priorEvent)&&
+            !this.lateProgressNotificationSettled(priorEvent,jobId))
             throw new Error("prior_notification_requires_reconciliation");
           this.db.prepare("UPDATE events SET status='completed',completed_at=?,updated_at=?,last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')").run(completedAt.toISOString(),completedAt.toISOString(),job.completion_event_id);
           if(binding?.owner.kind === "slack_thread" && ["queued", "retryable_failed"].includes(priorEvent.status)) {

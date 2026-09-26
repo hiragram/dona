@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import { afterEach, describe, test } from "node:test";
 
@@ -62,12 +63,18 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(accepted.status,"completed");
     assert.equal(JSON.parse(accepted.result_json!).summary,"作業完了");
     assert.ok(accepted.completion_event_id);
+    const stopProofDb=new Database(state.config.databasePath);
+    assert.ok(stopProofDb.prepare("SELECT 1 FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(current.job_id));
+    stopProofDb.close();
     state.database.close();
     const reopened=new DispatcherDatabase(state.config.databasePath);
     assert.equal(reopened.acceptLateJobResult(...args).updated_at,accepted.updated_at);
     assert.equal(reopened.liveSessionRetentionPlan("9999-01-01T00:00:00.000Z").receipt_rows,0);
     reopened.purgeLiveSessionReceipts("9999-01-01T00:00:00.000Z");
     assert.ok(reopened.getLiveSessionReceipt(current.job_id,receipt.receipt_id));
+    const raw=new Database(state.config.databasePath);
+    assert.throws(()=>raw.prepare("DELETE FROM live_session_query_receipts WHERE receipt_id=?").run(receipt.receipt_id),/FOREIGN KEY/);
+    raw.close();
     assert.throws(()=>reopened.acceptLateJobResult(current.job_id,current.updated_at,"invalid_result",preview.result_sha256,receipt.receipt_id,sideEffects,preview.notification_evidence_sha256),/reconciliation_conflict/);
     reopened.close();
   });
@@ -122,6 +129,44 @@ describe("read-only live session reconciliation",()=>{
     assert.equal(state.database.get(attention.event_id)?.status,"completed");
     assert.equal(state.database.getJobGroup(state.source.event_id)?.attention_event_id,attention.event_id);
     assert.notEqual(accepted.completion_event_id,attention.event_id);
+    state.database.close();
+  });
+  test("FIFOのfinal Resultを待たずに拒否する",async()=>{
+    const state=await addressableJob();
+    await fs.mkdir(state.job.result_path.slice(0,state.job.result_path.lastIndexOf("/")),{recursive:true});
+    execFileSync("mkfifo",[state.job.result_path]);
+    assert.throws(()=>state.database.inspectLateJobResult(state.job.job_id),/late_result_file_invalid/);
+    state.database.close();
+  });
+  test("同groupの完了済みprogress通知は外部操作なしの場合に受理する",async()=>{
+    const state=await addressableJob("needs_review","late-progress");
+    state.database.markJobNeedsReview(state.job.job_id,"result_missing","missing");
+    const sibling=state.database.createJob({source_event_id:state.source.event_id,job_key:"attention-owner",
+      objective:"別作業",workspace:{kind:"scratch"}},state.config.jobsWorkspaceRoot,state.config.jobResultsDir).row;
+    state.database.beginJobPreparation(sibling.job_id);
+    state.database.setJobRuntime(sibling.job_id,"other-workspace","other-pane","other-session");
+    state.database.beginJobDispatch(sibling.job_id);
+    state.database.markJobNeedsReview(sibling.job_id,"prompt_acceptance_unknown","unknown");
+    state.database.sealJobGroup(state.source.event_id);
+    const attention=state.database.enqueueJobNotification(sibling.job_id).row;
+    const progress=state.database.enqueueJobNotification(state.job.job_id).row;
+    assert.equal((JSON.parse(progress.payload_json) as {group:{transition:string}}).group.transition,"progress");
+    state.database.beginDispatch(progress.event_id,`${state.config.resultsDir}/progress.json`);
+    state.database.markWaiting(progress.event_id);
+    state.database.saveCompleted(progress.event_id,{schema_version:1,event_id:progress.event_id,status:"completed",
+      summary:"progress",actions:[],completed_at:new Date().toISOString()},`${state.config.resultsDir}/progress.json`);
+    const current=state.database.getJob(state.job.job_id)!;
+    await fs.mkdir(current.result_path.slice(0,current.result_path.lastIndexOf("/")),{recursive:true});
+    await fs.writeFile(current.result_path,JSON.stringify({schema_version:1,job_id:current.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+    const supervisor=new JobSupervisor(state.database,runtimeWith(()=>({ok:false,stdout:"",stderr:"",exitCode:1,timedOut:false,aborted:false,errorCode:"agent_not_found"}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(current.job_id,state.source.event_id);
+    const preview=state.database.inspectLateJobResult(current.job_id);
+    const digest=createHash("sha256").update("reviewed").digest("hex");
+    const accepted=state.database.acceptLateJobResult(current.job_id,current.updated_at,"result_missing",preview.result_sha256,
+      receipt.receipt_id,digest,preview.notification_evidence_sha256);
+    assert.equal(accepted.status,"completed");
+    assert.equal(state.database.get(progress.event_id)?.status,"completed");
+    assert.equal(state.database.getJobGroup(state.source.event_id)?.attention_event_id,attention.event_id);
     state.database.close();
   });
   test("needs_reviewのattentionは最新のlive receiptとoperator確認でのみ解消する",async()=>{
