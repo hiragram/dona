@@ -437,18 +437,26 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
     if (inspect(bytes)) return true;
   }
-  for (const match of value.matchAll(/(?:[A-Za-z0-9+/_-]{4,8}\s+){2,}[A-Za-z0-9+/_-]{4,8}={0,2}/g)) {
-    const encoded = match[0].replace(/\s+/g, "");
+  const grouped: string[] = [];
+  let previousEnd = -1;
+  const inspectGroup = (): boolean => {
+    if (grouped.length < 2) return false;
+    const encoded = grouped.join("");
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
-    if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
+    return bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes);
+  };
+  for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{4,}={0,2})(?=$|[^A-Za-z0-9+/_-])/g)) {
+    const encoded = match[1]!;
+    const start = match.index! + match[0].lastIndexOf(encoded);
+    if (previousEnd >= 0 && !/^\s+$/.test(value.slice(previousEnd, start))) {
+      if (inspectGroup()) return true;
+      grouped.length = 0;
+    }
+    grouped.push(encoded);
+    previousEnd = start + encoded.length;
   }
-  for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])((?:[A-Za-z0-9+/_-]{4,}\r?\n)+[A-Za-z0-9+/_-]{2,}={0,2})/gm)) {
-    const encoded = match[1]!.replace(/\r?\n/g, "");
-    const format = /[+/]/.test(encoded) ? "base64" : "base64url";
-    const bytes = Buffer.from(encoded, format);
-    if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
-  }
+  if (inspectGroup()) return true;
   for (const match of value.matchAll(/[0-9a-f]{4,}/gi)) {
     const encoded = match[0];
     if (encoded.length % 2 !== 0) continue;
