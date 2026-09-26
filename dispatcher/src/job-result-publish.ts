@@ -407,7 +407,15 @@ function normalizedStructuredKey(key: string): string {
     if (next === normalized) break;
     normalized = next;
   }
-  return normalized.normalize("NFKC");
+  normalized = normalized.normalize("NFKC");
+  if (/^[A-Za-z0-9+/_-]{4,}={0,2}$/.test(normalized)) {
+    try {
+      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(
+        Buffer.from(normalized, /[+/]/.test(normalized) ? "base64" : "base64url"));
+      if (forbiddenKey(decoded)) return decoded;
+    } catch { /* Non-text encodings do not create a structured key. */ }
+  }
+  return normalized;
 }
 const hasInvalidUnicode = (value: string): boolean => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
 
@@ -601,6 +609,17 @@ function assertSafeNumericFragments(values: readonly unknown[], depth: number, f
     } catch (error) {
       if (error instanceof JobResultPublishError) throw error;
     }
+    if (points.length >= 4 && points.length % 2 === 0) {
+      for (const encoding of ["utf-16le", "utf-16be"] as const) {
+        try {
+          const decoded = new TextDecoder(encoding, { fatal: true }).decode(Buffer.from(points));
+          if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
+          assertSafeJson(decoded, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
+        } catch (error) {
+          if (error instanceof JobResultPublishError) throw error;
+        }
+      }
+    }
   }
 }
 
@@ -729,8 +748,10 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     };
     collectSiblingObjects(value);
     if (siblingObjects.length > 1 &&
-      siblingObjects.some(item => typeof item.kty === "string" && ["RSA", "EC", "OKP", "oct"].includes(item.kty)) &&
-      siblingObjects.some(item => Object.keys(item).some(key => privateJwkParameter.has(key)))) {
+      siblingObjects.some(item => Object.entries(item).some(([key, field]) =>
+        normalizedStructuredKey(key) === "kty" && typeof field === "string" &&
+        ["RSA", "EC", "OKP", "oct"].includes(normalizedStructuredKey(field)))) &&
+      siblingObjects.some(item => Object.keys(item).some(key => privateJwkParameter.has(normalizedStructuredKey(key))))) {
       throw new JobResultPublishError("content_requires_redaction");
     }
     assertSafeMixedFragments(value, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);

@@ -445,6 +445,18 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       actions: [{ "to&#x6b;en": "abc" }] },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ "dG9rZW4=": "abc" }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: [{ "k\\x74y": "oct" }, { k: "c29tZXByaXZhdGVrZXk" }] },
+      () => current), code("content_requires_redaction"));
+    const utf16Objective = "秘密";
+    const utf16Grants = new JobResultPublishCapabilities(() => "utf16-session");
+    const utf16Capability = utf16Grants.issue(row({ job_id: "job_utf16", objective: utf16Objective }), "utf16-session");
+    assert.throws(() => utf16Grants.validate(utf16Capability.capability, "utf16-session", { ...base,
+      actions: [...Buffer.from(utf16Objective, "utf16le")] },
+      () => row({ job_id: "job_utf16", status: "running", objective: utf16Objective })), code("content_requires_redaction"));
     const emojiObjective = "private 🔒 objective";
     const emojiGrants = new JobResultPublishCapabilities(() => "emoji-session");
     const emojiCapability = emojiGrants.issue(row({ job_id: "job_emoji", objective: emojiObjective }), "emoji-session");
