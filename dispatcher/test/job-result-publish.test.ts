@@ -452,6 +452,8 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: encodedPrivate }, () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: encodedPrivate.match(/.{1,8}/g)!.join(" \n") }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from("private objective text", "utf8").toString("base64").match(/.{1,8}/g)!.join(" ") }, () => current), code("content_requires_redaction"));
     const shortGrant = new JobResultPublishCapabilities(() => "s1");
     const shortCapability = shortGrant.issue(row({ job_id: "job_short_base32" }), "s1");
@@ -579,6 +581,14 @@ describe("job result publish contract", () => {
     assert.ok(performance.now() - started < 2_000, "grant数に比例して本文を再走査しない");
   });
 
+  test("未完了markupを大量に含む本文もboundedに検査する", () => {
+    for (const prefix of ["<a:", "<a "]) {
+      const started = performance.now();
+      assert.equal(validateJobResultPublish({ ...base, summary: prefix.repeat(32_000) }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+      assert.ok(performance.now() - started < 2_000);
+    }
+  });
+
   test("長いprivate objectiveが多数あってもpublishの検査を完了する", () => {
     const grants = new JobResultPublishCapabilities(id => id);
     let own = "";
@@ -595,10 +605,13 @@ describe("job result publish contract", () => {
     let session: string | undefined = "session-1";
     const grants = new JobResultPublishCapabilities(() => session);
     const grant = grants.issue(row(), "session-1");
+    grants.issue(row({ job_id: "job_other", objective: "private guess" }), "session-1");
     session = undefined;
     const terminal = row({ status: "completed", herdr_pane_id: null, result_json: "{}" });
     const candidate = grants.validate(grant.capability, "session-1", base, () => terminal);
     assert.equal(candidate.reconcileOnly, true);
+    const guessed = grants.validate(grant.capability, "session-1", { ...base, summary: "private guess" }, () => terminal);
+    assert.equal(guessed.reconcileOnly, true);
     assert.deepEqual(candidate.fence, { jobId: "job_one", publishableStatuses: ["dispatching", "running"], grantGeneration: 1,
       attemptCount: 1, paneId: "pane-1", session: "session-1" });
     assert.throws(() => grants.validate(grant.capability, "other-session", base, () => terminal), code("worker_session_stale"));

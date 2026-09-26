@@ -263,7 +263,7 @@ function fingerprint(value: string): number {
   return hash;
 }
 function displayProjection(value: string): string {
-  return value.replace(/<[A-Za-z][A-Za-z0-9+.-]*:[^|>\s]+\|([^>]+)>/g, "$1")
+  return value.replace(/<[A-Za-z][A-Za-z0-9+.-]*:[^|<>\s]+\|([^<>]+)>/g, "$1")
     .replace(/(?<![A-Za-z0-9])_([^_\r\n]+)_(?![A-Za-z0-9])/g, "$1")
     .replace(/(?<!\\)[*~`]/g, "")
     .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
@@ -356,7 +356,7 @@ function hasCurlPrivateKeyCredential(value: string): boolean {
     /(?:^|\s)--cert(?:=|\s+)(?:"[^"]+"|'[^']+'|\S+):[^\s"']+/i.test(value);
 }
 function hasCredentialXmlElement(value: string): boolean {
-  for (const match of value.matchAll(/<([A-Za-z][A-Za-z0-9:._-]*)\b[^>]*>([^<]{1,8192})<\/\1\s*>/gi)) {
+  for (const match of value.matchAll(/<([A-Za-z][A-Za-z0-9:._-]*)\b[^><]{0,8192}>([^<]{1,8192})<\/\1\s*>/gi)) {
     if (forbiddenKey(normalizedStructuredKey(match[1]!)) && match[2]!.trim()) return true;
   }
   return false;
@@ -465,6 +465,15 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     if (!decoded) continue;
     if (++budget.count > 1_024) return true;
     if (matcher.contains(decoded)) return true;
+    try { assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget); }
+    catch (error) { if (error instanceof JobResultPublishError) return true; }
+  }
+  for (const match of value.matchAll(/(?:^|[^A-Z2-7])((?:[A-Z2-7]{2,8}\s+){2,}[A-Z2-7]{2,8}={0,6})(?=$|[^A-Z2-7=])/gi)) {
+    const encoded = match[1]!.replace(/\s+/g, "");
+    if (encoded.length > jobResultEnvelopeMaxBytes) return true;
+    const decoded = decodeBase32Token(encoded);
+    if (!decoded) continue;
+    if (++budget.count > 1_024 || matcher.contains(decoded)) return true;
     try { assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget); }
     catch (error) { if (error instanceof JobResultPublishError) return true; }
   }
@@ -905,7 +914,14 @@ export class JobResultPublishCapabilities {
     const forbiddenValues = [grant.paneId, job.herdr_pane_id, job.herdr_workspace_id, job.workspace_path,
       job.result_path, job.agent_name, job.objective, grant.session, ...grantIdentities]
       .filter((value): value is string => typeof value === "string" && value.length > 0);
-    return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(), forbiddenDigests, forbiddenValues, forbiddenFingerprints, shortRuntimeValues),
+    // Terminal reconciliation is read-only. Excluding live private values here
+    // prevents a conflict/redaction response from becoming a membership oracle.
+    const terminalReconcile = (job.status === "completed" || job.status === "failed") && typeof job.result_json === "string";
+    return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(),
+      terminalReconcile ? undefined : forbiddenDigests,
+      terminalReconcile ? undefined : forbiddenValues,
+      terminalReconcile ? undefined : forbiddenFingerprints,
+      terminalReconcile ? undefined : shortRuntimeValues),
       fence: { jobId: job.job_id, publishableStatuses: ["dispatching", "running"], grantGeneration: grant.generation,
         attemptCount: grant.attemptCount, paneId: grant.paneId, session: grant.session },
       assertCurrentGrant: () => {
