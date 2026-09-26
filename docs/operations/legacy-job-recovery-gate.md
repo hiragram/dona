@@ -6,6 +6,8 @@
 
 現行のHerdr連携は個別agentの`get` / `prompt` / `wait`であり、全worker/process treeの完全inventory、admission freeze、再生成防止、host/supervisor generationを束ねた停止receiptを提供しない。したがって旧11件を解除するwrite経路は実装していない。`updateSafetyStatus()`とUpdaterの`workerSafety()`の危険判定も緩めない。
 
+新規jobについても、Result受理後の`idle` / `done`やagent名による`agent_not_found`を停止証拠へ変換しない。取消・steer競合で得た同じ名前ベースの観測も停止証拠には使わない。旧版が保存した`job_terminal_worker_stop_proofs`と`legacy_job_agents_to_stop.stopped_at`も出所を証明できないため、DispatcherとUpdaterのdrain判定では無効とする。準備を開始したjobは、後のworkspace cleanupがHerdr workspace IDを消しても`attempt_count`でdrain gateに残す。Resultの受理と通知生成はworker停止より先に進み得る。現行Herdr APIには保存済みagent session identityを条件にしたatomicなstop/closeがなく、`pane.close`はpane IDのみを対象とするため、照会とcloseの間にagentが入れ替わる可能性を排除できない。Codex CLIの`resume <SESSION_ID>`は対話sessionを再開する入口だが、Dispatcherの同一job所有権、Resultの重複受理防止、通知、Herdr再接続を束ねた復旧契約ではない。自動停止・自動resumeはこの契約が揃うまで行わない。
+
 `dispatcher/src/maintenance-fence.ts`には署名済みreceiptのDona側検証契約を実装した。これはsynthetic receiptを使う契約テスト用であり、現在のoperator復旧CLIには接続していない。現行Herdr 0.8.2の`agent list` / `workspace list`は表示用一覧で、全session・pane・process treeの完全性watermarkや、一覧から停止まで同一世代で再生成を禁止するatomic操作を返さない。`agent get`の`idle` / `done` / `agent_not_found`も停止の証明ではない。従って現行APIだけでproviderを構成してreceiptを発行してはならない。
 
 ## 外部componentに必要な契約

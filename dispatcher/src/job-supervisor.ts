@@ -113,7 +113,6 @@ export class JobSupervisor {
   private running = false;
   private stopping = false;
   private staleJobsRecovered = false;
-  private terminalStopProofCursor = "";
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -279,8 +278,7 @@ export class JobSupervisor {
         const current = this.database.getJob(jobId);
         if (current && ["completed", "failed", "cancelled"].includes(current.status) &&
           current.last_error_code === "terminal_steer_worker_unverified") {
-          this.database.markTerminalJobWorkerStopped(jobId, "terminal_steer_worker_unverified");
-          this.database.markTerminalWorkerStopProof(jobId);
+          // The name may have been rebound. Keep the terminal stop fence.
         } else {
           this.database.markJobNeedsReview(jobId, prompted.errorCode!, commandMessage(prompted));
         }
@@ -342,9 +340,7 @@ export class JobSupervisor {
       }
       if (!cancelled.ok && !cancelled.timedOut &&
           ["agent_not_found","agent_not_running"].includes(cancelled.errorCode??"")) {
-        this.database.markJobCancellationWorkerStopped(jobId);
         if (await this.tryComplete(cancelling,false)) {
-          this.database.markTerminalWorkerStopProof(jobId);
           return { row: this.database.getJob(jobId)!, duplicate:false };
         }
         this.database.markJobCancelled(jobId,reason); this.wake();
@@ -372,9 +368,7 @@ export class JobSupervisor {
         this.database.markJobNeedsReview(jobId,"cancel_exit_unknown","Agent exit was not observed after cancellation acceptance");
         this.wake(); throw new Error(`Job ${cancelling.job_id} cancellation requires review`);
       }
-      this.database.markJobCancellationWorkerStopped(jobId);
       if(await this.tryComplete(cancelling,false)) {
-        this.database.markTerminalWorkerStopProof(jobId);
         return {row:this.database.getJob(jobId)!,duplicate:false};
       }
       this.database.markJobCancelled(jobId, reason);
@@ -473,35 +467,9 @@ export class JobSupervisor {
           });
         }
       }
-      let terminalProofJobs = this.database.listTerminalJobsNeedingWorkerStopProof(this.terminalStopProofCursor,8);
-      if (terminalProofJobs.length === 0 && this.terminalStopProofCursor) {
-        this.terminalStopProofCursor = "";
-        terminalProofJobs = this.database.listTerminalJobsNeedingWorkerStopProof("",8);
-      }
-      for (const job of terminalProofJobs) {
-        this.terminalStopProofCursor = job.job_id;
-        try {
-          const observed = await this.runtime.get(job.agent_name, this.abortController.signal,
-            Math.min(2_000,this.config.jobCommandTimeoutMs));
-          const expectedIdentity = expectedLiveSessionIdentity(job,this.database.getJobLiveSessionIdentity(job.job_id));
-          const absent = !observed.ok && !observed.timedOut &&
-            ["agent_not_found","agent_not_running"].includes(observed.errorCode??"");
-          const stopped = observed.ok && ["idle","done"].includes(observed.agentStatus??"") &&
-            (!expectedIdentity || observed.agentIdentity === expectedIdentity);
-          if (absent || stopped) {
-            if (job.last_error_code && ["terminal_steer_worker_unverified", "cancel_worker_unverified",
-              "schedule_reconcile_worker_unverified"].includes(job.last_error_code)) {
-              this.database.markTerminalJobWorkerStopped(job.job_id, job.last_error_code);
-            }
-            if (job.steer_state === "accepted") this.database.markTerminalAcceptedSteerStopped(job.job_id);
-            this.database.markTerminalWorkerStopProof(job.job_id);
-          }
-        } catch (error) {
-          this.logger.warn("Terminal job worker stop proof is still unavailable", {
-            job_id: job.job_id, error_message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
+      // A name-based Herdr read, including idle/done or agent_not_found, does not
+      // prove that the saved agent session was stopped. Keep terminal workers in
+      // the update drain gate until an exact-identity stop receipt is available.
       this.publishNotifications();
       try {
         this.scheduleRunnableJobs();

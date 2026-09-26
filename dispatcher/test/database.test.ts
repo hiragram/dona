@@ -1703,7 +1703,7 @@ describe("DispatcherDatabase", () => {
     reopened.close();
   });
 
-  test("keeps terminal legacy agents unsafe until a durable stop is recorded", async () => {
+  test("keeps terminal legacy agents unsafe after legacy name-based stop markers", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const jobs = ["completed","failed","cancelled"].map((status,index) => {
@@ -1723,7 +1723,11 @@ describe("DispatcherDatabase", () => {
     for(const {status,job} of jobs) assert.equal(reopened.getJob(job.job_id)?.status,status);
     assert.equal(reopened.updateSafetyStatus().safe,false);
     assert.equal(reopened.updateSafetyStatus().active_worker_count,3);
-    assert.ok(reopened.updateSafetyStatus().unsafe_states.includes("jobs.legacy_shared_grant:3"));
+    assert.ok(reopened.updateSafetyStatus().unsafe_states.includes("jobs.completed:1"));
+    const marked = new Database(config.databasePath);
+    marked.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at=?").run(new Date().toISOString());
+    marked.close();
+    assert.equal(reopened.updateSafetyStatus().active_worker_count, 3);
     reopened.close();
   });
 
@@ -1821,21 +1825,21 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
-  test("successful workspace cleanup leaves a durable worker stop diagnosis", async () => {
+  test("workspace cleanup does not clear a prepared worker from the drain gate", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-schedule-cleanup-stop-proof")).row;
     const job = database.createJob({ source_event_id: source.event_id, objective: "cleanup照合",
       workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
     const raw = new Database(config.databasePath);
-    raw.prepare("UPDATE jobs SET status='needs_review',last_error_code='workspace_cleanup_failed',herdr_workspace_id='workspace' WHERE job_id=?")
+    raw.prepare("UPDATE jobs SET status='needs_review',last_error_code='workspace_cleanup_failed',herdr_workspace_id='workspace',attempt_count=1 WHERE job_id=?")
       .run(job.job_id);
     raw.close();
     assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.markJobRuntimeCleaned(job.job_id);
     assert.equal(database.getJob(job.job_id)?.last_error_code, "workspace_cleanup_agent_stopped");
     assert.equal(database.getJob(job.job_id)?.herdr_workspace_id, null);
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.close();
   });
 
@@ -1856,14 +1860,14 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
-  test("a result raced with cancellation stays unsafe until the worker exit is observed", async () => {
+  test("a result raced with cancellation stays unsafe after a legacy stop marker", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-terminal-cancel-race")).row;
     const job = database.createJob({ source_event_id: source.event_id, objective: "取消競合",
       workspace: { kind: "scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
     const raw = new Database(config.databasePath);
-    raw.prepare("UPDATE jobs SET status='cancelling',last_error_code='cancel_worker_unverified' WHERE job_id=?")
+    raw.prepare("UPDATE jobs SET status='cancelling',last_error_code='cancel_worker_unverified',herdr_workspace_id='legacy-workspace' WHERE job_id=?")
       .run(job.job_id);
     raw.close();
     database.saveJobResult(job.job_id, { schema_version: 1, job_id: job.job_id,
@@ -1871,13 +1875,13 @@ describe("DispatcherDatabase", () => {
       completed_at: new Date().toISOString() }, job.result_path);
     assert.equal(database.getJob(job.job_id)?.last_error_code, "cancel_worker_unverified");
     assert.equal(database.updateSafetyStatus().active_worker_count, 1);
-    database.markJobCancellationWorkerStopped(job.job_id);
-    assert.equal(database.getJob(job.job_id)?.last_error_code, null);
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    database.markTerminalWorkerStopProof(job.job_id);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "cancel_worker_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.close();
   });
 
-  test("update safety excludes only definite absence for retryable workers", async () => {
+  test("update safety keeps allocated retryable workers unsafe after name-based absence", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-retryable-worker-absence")).row;
@@ -1886,7 +1890,7 @@ describe("DispatcherDatabase", () => {
     const raw = new Database(config.databasePath);
     raw.prepare("UPDATE jobs SET status='retryable_failed',herdr_workspace_id='recorded',last_error_code='agent_not_found' WHERE job_id=?")
       .run(job.job_id);
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     raw.prepare("UPDATE jobs SET last_error_code='stale_preparing' WHERE job_id=?").run(job.job_id);
     assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     raw.close();
@@ -1918,24 +1922,23 @@ describe("DispatcherDatabase", () => {
     const stopped = new Database(config.databasePath);
     stopped.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped' WHERE job_id=?").run(job.job_id);
     stopped.close();
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     for (const code of ["agent_not_found", "agent_not_running", "steer_acceptance_unknown"]) {
       const state = new Database(config.databasePath);
       state.prepare("UPDATE jobs SET last_error_code=? WHERE job_id=?").run(code, job.job_id);
       state.close();
-      assert.equal(database.updateSafetyStatus().active_worker_count,
-        code === "steer_acceptance_unknown" ? 1 : 0);
+      assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     }
     const legacy = new Database(config.databasePath);
     legacy.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown' WHERE job_id=?").run(job.job_id);
     legacy.prepare("INSERT INTO legacy_job_agents_to_stop(job_id,stopped_at) VALUES(?,?)")
       .run(job.job_id, new Date().toISOString());
     legacy.close();
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     const invalid = new Database(config.databasePath);
     invalid.prepare("UPDATE jobs SET last_error_code='invalid_result' WHERE job_id=?").run(job.job_id);
     invalid.close();
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.close();
   });
 
