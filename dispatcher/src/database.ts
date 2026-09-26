@@ -653,6 +653,12 @@ export class DispatcherDatabase {
       this.db.exec(`CREATE TABLE IF NOT EXISTS job_terminal_worker_stop_proofs(
         job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
         stopped_at TEXT NOT NULL)`);
+      // Only jobs created by a release with this table receive a row. Legacy jobs are never stopped here.
+      this.db.exec(`CREATE TABLE IF NOT EXISTS job_terminal_worker_cleanups(
+        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+        outcome TEXT NOT NULL CHECK(outcome IN ('pending','attempting','stopped','unknown','rejected')),
+        identity_json TEXT,
+        updated_at TEXT NOT NULL)`);
       this.db.exec(`CREATE TABLE IF NOT EXISTS job_late_result_reconciliations(
         job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
         expected_updated_at TEXT NOT NULL,
@@ -973,6 +979,8 @@ export class DispatcherDatabase {
         timestamp,
         timestamp,
       );
+      this.db.prepare("INSERT INTO job_terminal_worker_cleanups(job_id,outcome,updated_at) VALUES(?,'pending',?)")
+        .run(jobId,timestamp);
       this.db.prepare(`INSERT INTO job_owner_bindings(job_id,source_event_id,owner_json,destination_json)
         SELECT ?,event_id,owner_json,destination_json FROM event_job_bindings WHERE event_id=?`).run(jobId,sourceEvent.event_id);
       if (binding.owner.kind === "schedule") {
@@ -1139,6 +1147,28 @@ export class DispatcherDatabase {
           (SELECT 1 FROM job_terminal_worker_stop_proofs p WHERE p.job_id=jobs.job_id)))
       AND COALESCE(steer_state,'') <> 'dispatching'
       ORDER BY job_id LIMIT ?`).all(afterJobId,limit) as JobRow[];
+  }
+
+  listTerminalWorkerCleanupCandidates(limit = 8): Array<{job:JobRow;outcome:"pending"|"attempting";identity_json:string|null}> {
+    return this.db.prepare(`SELECT j.*, c.outcome AS cleanup_outcome, c.identity_json AS cleanup_identity_json
+      FROM job_terminal_worker_cleanups c JOIN jobs j USING(job_id)
+      WHERE c.outcome IN ('pending','attempting') AND j.status IN ('completed','failed')
+        AND j.result_json IS NOT NULL
+      ORDER BY j.completed_at,j.job_id LIMIT ?`).all(limit).map((row) => {
+        const record=row as JobRow & {cleanup_outcome:"pending"|"attempting";cleanup_identity_json:string|null};
+        return {job:record,outcome:record.cleanup_outcome,identity_json:record.cleanup_identity_json};
+      });
+  }
+
+  claimTerminalWorkerCleanup(jobId:string,identityJson:string):boolean {
+    return this.db.prepare(`UPDATE job_terminal_worker_cleanups SET outcome='attempting',identity_json=?,updated_at=?
+      WHERE job_id=? AND outcome='pending' AND EXISTS(SELECT 1 FROM jobs WHERE job_id=?
+        AND status IN ('completed','failed') AND result_json IS NOT NULL)`).run(identityJson,nowUtc(),jobId,jobId).changes===1;
+  }
+
+  finishTerminalWorkerCleanup(jobId:string,expected:"pending"|"attempting",outcome:"stopped"|"unknown"|"rejected"):void {
+    this.db.prepare(`UPDATE job_terminal_worker_cleanups SET outcome=?,updated_at=? WHERE job_id=? AND outcome=?`)
+      .run(outcome,nowUtc(),jobId,expected);
   }
 
   markTerminalJobWorkerStopped(jobId: string, expectedCode: string): void {

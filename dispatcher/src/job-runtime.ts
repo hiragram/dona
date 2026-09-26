@@ -24,6 +24,8 @@ export interface JobAgentRuntime {
   disableProgress?(): void;
   prepare(row: JobRow, signal?: AbortSignal): Promise<PreparedJobRuntime>;
   get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
+  listAgents?(signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
+  stopTerminalPane?(paneId: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult>;
   wait(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
   cancel(agentName: string, signal?: AbortSignal): Promise<HerdrCommandResult>;
@@ -406,6 +408,14 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
 
   get(agentName: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
     return this.herdr(["agent", "get", agentName], timeoutMs ?? this.config.jobCommandTimeoutMs, signal, true);
+  }
+
+  listAgents(signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "list"],timeoutMs ?? this.config.jobCommandTimeoutMs,signal,true);
+  }
+
+  stopTerminalPane(paneId: string, signal?: AbortSignal): Promise<HerdrCommandResult> {
+    return this.herdr(["agent", "send-keys", paneId, "ctrl+c"], this.config.jobCommandTimeoutMs, signal);
   }
 
   prompt(agentName: string, text: string, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrCommandResult> {
