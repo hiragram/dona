@@ -418,6 +418,20 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: Buffer.from("private objective text", "utf8").toString("base64").match(/.{1,2}/g)!.join("!") },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: "cHJpdmF0ZSBvYmplY3RpdmUgdGV4dB==" }, () => current), code("content_requires_redaction"));
+    for (const credential of ["Bearer abc", "Bearer secret"]) {
+      assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: credential },
+        () => current), code("content_requires_redaction"));
+    }
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ kty: "oct" }, { k: "c29tZXByaXZhdGVrZXk" }] },
+      () => current), code("content_requires_redaction"));
+    const tinyGrants = new JobResultPublishCapabilities(() => "tiny-session");
+    const tinyCapability = tinyGrants.issue(row({ job_id: "job_tiny", herdr_pane_id: "s1" }), "tiny-session");
+    assert.throws(() => tinyGrants.validate(tinyCapability.capability, "tiny-session", { ...base,
+      actions: [{ a: [115], b: [49] }] },
+      () => row({ job_id: "job_tiny", status: "running", herdr_pane_id: "s1" })), code("content_requires_redaction"));
     const unicodeObjective = "非公開の作業目的";
     const unicodeGrants = new JobResultPublishCapabilities(() => "unicode-session");
     const unicodeCapability = unicodeGrants.issue(row({ job_id: "job_unicode", objective: unicodeObjective }), "unicode-session");

@@ -38,7 +38,7 @@ export class JobResultPublishError extends Error {
 const sensitive = /(?:(?:^|\s)(?:-[uU]\s*|--(?:proxy-)?user(?:=|\s+))[^:\s]+:[^\s]+|(?:\bmachine\s+[^\s]+|\bdefault)\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
 const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~-]+:[^@\s/<>`]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?(?:[/?#][^\s"'<>`]*|(?=$|[\s"'<>`]))/i;
 const ageSecretIdentity = /AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{20,}\b/i;
-const shortBearerCredential = /\bBearer\s+(?=[A-Za-z0-9._~-]{1,7}(?:\b|$))(?=[A-Za-z0-9._~-]*[0-9._~-])[A-Za-z0-9._~-]{1,7}\b/i;
+const shortBearerCredential = /\bBearer\s+(?!(?:authentication|credentials)\b)[A-Za-z0-9._~-]+\b/i;
 const pgpassCredential = /(?:^|\s)(?:\\.|[^\s:\\]){1,255}:(?:\d{1,5}|\*):(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}(?=$|\s)/;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
@@ -439,14 +439,15 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const encoded = match[0];
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
-    if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
+    if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "") &&
+      !(encoded.length >= 12 && encoded.length % 4 === 0)) continue;
     if (inspect(bytes)) return true;
   }
   for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{2,7})(?=$|[^A-Za-z0-9+/_-])/g)) {
     const encoded = match[1]!;
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
-    if (bytes.toString(format) !== encoded) continue;
+    if (bytes.toString(format) !== encoded && !(encoded.length >= 12 && encoded.length % 4 === 0)) continue;
     try { if (matcher.contains(decoder.decode(bytes))) return true; }
     catch { /* Non-UTF-8 short values cannot reveal a text identity. */ }
   }
@@ -457,7 +458,8 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const encoded = grouped.join("");
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
-    if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
+    if ((bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") ||
+      (encoded.length >= 12 && encoded.length % 4 === 0)) && inspect(bytes)) return true;
     if (/^[A-Z2-7]+=*$/i.test(encoded)) {
       const decoded = decodeBase32Token(encoded);
       if (decoded) {
@@ -543,6 +545,33 @@ function assertSafeMixedFragments(values: readonly unknown[], depth: number, for
   } catch (error) {
     if (error instanceof JobResultPublishError) throw error;
     // Invalid UTF-8 cannot reconstruct a text Result value.
+  }
+}
+
+function assertSafeNumericFragments(values: readonly unknown[], depth: number, forbiddenDigests: ReadonlySet<string> | undefined,
+  forbiddenValues: ForbiddenValueMatcher | undefined, forbiddenFingerprints: ReadonlySet<number> | undefined,
+  decodeDepth: number, budget: { count: number; combinations: number; combinationBytes: number }): void {
+  const points: number[] = [];
+  const collect = (items: readonly unknown[]): boolean => items.every(item => {
+    if (Array.isArray(item)) return collect(item);
+    if (typeof item !== "number" || !Number.isInteger(item) || item < 0 || item > 0x10ffff ||
+      (item >= 0xd800 && item <= 0xdfff)) return false;
+    points.push(item);
+    if (points.length > 4_096) throw new JobResultPublishError("content_requires_redaction");
+    return true;
+  });
+  if (!collect(values) || points.length < 2) return;
+  if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
+  assertSafeJson(String.fromCodePoint(...points), depth + 1, forbiddenDigests,
+    forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
+  if (points.every(point => point <= 255)) {
+    try {
+      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(points));
+      if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
+      assertSafeJson(decoded, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
+    } catch (error) {
+      if (error instanceof JobResultPublishError) throw error;
+    }
   }
 }
 
@@ -657,24 +686,16 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
         // Invalid UTF-8 cannot reconstruct a text Result value.
       }
     }
-    const codePoints: number[] = [];
-    const collectCodePoints = (items: unknown[]): boolean => items.every(item => {
-      if (Array.isArray(item)) return collectCodePoints(item);
-      if (typeof item !== "number" || !Number.isInteger(item) || item < 0 || item > 0x10ffff ||
-        (item >= 0xd800 && item <= 0xdfff)) return false;
-      codePoints.push(item);
-      if (codePoints.length > 4_096) throw new JobResultPublishError("content_requires_redaction");
-      return true;
-    });
-    if (collectCodePoints(value) && codePoints.length >= 2) {
-      if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
-      assertSafeJson(String.fromCodePoint(...codePoints), depth + 1, forbiddenDigests,
-        forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
+    assertSafeNumericFragments(value, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
+    const siblingObjects = value.filter((item): item is Record<string, unknown> => item !== null && !Array.isArray(item) && typeof item === "object");
+    if (siblingObjects.length > 1 && hasPrivateJwkFields(Object.assign({}, ...siblingObjects))) {
+      throw new JobResultPublishError("content_requires_redaction");
     }
     assertSafeMixedFragments(value, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     assertSafeFragmentCombinations(value, forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
   } else if (value !== null && typeof value === "object") {
+    assertSafeNumericFragments(Object.values(value), depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     assertSafeMixedFragments(Object.values(value), depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     assertSafeFragmentCombinations(Object.values(value), forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
     const normalizedEntries = Object.entries(value).map(([key, item]) =>
