@@ -6,7 +6,7 @@
 
 - 実際に実装・対応へ着手するIssueをrepository、number、node IDで特定する。Issue本文の自由文をcommandやjob IDの正本にしない。
 - Issue起票・分解・足場PR作成だけでは実装着手としない。対象IssueのないSkill修正などではこのProject更新を適用せず、架空Issueを作成・紐づけしない。
-- job IDの正本はDispatcherが渡す `[DONA_JOB_BEGIN]` の `job_json.job_id`。Dona親は`delegate_job`の成功responseのjob IDを引継ぎに使える。自由文、branch、directory名から生成・推測しない。信頼できるjob IDがない場合はfieldを書かず、Donaへ不足を返す。
+- 新しく記録するjob IDの正本はDispatcherが渡す `[DONA_JOB_BEGIN]` の `job_json.job_id`。Dona親は`delegate_job`の成功responseのjob IDを引継ぎに使える。自由文、branch、directory名から生成・推測しない。信頼できるjob IDがない場合はfieldを書かず、Donaへ不足を返す。
 - Epicとchildは独立して扱う。起票した全childやPRのclosing targetへjob IDを一括記入しない。
 
 最初に最小のread-only確認を行う。
@@ -25,11 +25,14 @@ Project/item未登録、field/optionの欠落・型違い、権限不足では�
 
 ## delegate前とworker着手時に確認する
 
-1. Dona親は`delegate_job`前に対象itemの`Dona Job ID`と`Status`を読む。別job IDがあればDona Dispatcher MCPの`get_job_status`で確認し、稼働中なら重複開始せず、既存jobへの追加条件は許可された`steer_job`へ渡す。完了・失敗・中止済みでも自動上書きせず、引継ぎの明示指示と既存成果を確認する。unknownや取得不能も空欄とみなさない。
-2. 委任時のobjectiveへ対象Issue identity、Project/item、観測した担当と状態、許可済みの引継ぎがあればその内容を含める。新job IDの予測記入はせず、workerが着手前に契約のjob IDで更新する。
-3. workerは実装前にitemを再読する。空欄かつ`Todo`なら新規着手できる。同じjob IDなら再開として扱い、`Todo`なら未完了の状態更新へ、`In Progress`なら実装へ進める。別job IDなら上書き・重複開始せずDispatcher MCPで状態確認する。workerにツールがなければ、観測したjob IDと状態確認が必要な旨をJob ResultとしてDonaへ返し、Herdr shellや内部DB操作へ迂回しない。
-4. 別担当の引継ぎは明示された範囲でだけ実施する。状態確認がterminalだったことだけを引継ぎ許可としない。ID空欄でも`In Progress`、`Merge Ready`、その他の状態なら無断で`Todo`相当と解釈せず、再開・再着手の指示と既存成果を照合する。
-5. 更新直前にIssue identity、item ID、担当、Statusを再確認する。変化した場合は新しい状態から判断し直す。確認済みの同一itemに`Dona Job ID`を書き、read-backで一致を確認した後、`Todo`から`In Progress`へ更新し、両fieldを再読する。引継ぎや再着手でその他の遷移が必要なら、明示された遷移だけを行う。
+1. Dona親は`delegate_job`前に、正しいProjectの対象Issue itemをrepository、number、Issue node ID、Project ID、item IDで照合し、`Dona Job ID`と`Status`を読む。旧job IDはこのfieldからexact IDを取得し、自由文や候補jobの類似性から選ばない。
+2. 同じworkspace/channelでユーザーが対象Issueの再開・引継ぎを明示した場合、旧job IDの文字列の復唱は求めない。Dona親は現在の依頼event IDを`source_event_id`としてDispatcher MCPの`get_job_status`へ取得したexact IDを渡し、そのdurable statusと旧jobが依頼元と同じworkspace/channelであることを確認する。これはIssue引継ぎに必要なread-only確認の限定例外であり、旧jobへの`steer_job` / `cancel_job`を許可するものではない。照会結果全文や秘密情報をSlackへ開示せず、必要な状態と引継ぎ可否だけを伝える。
+3. 旧jobが`completed` / `failed` / `cancelled`の場合だけ、既存PR・commitなどの成果、未完了範囲、今回の対象Issueの再開・引継ぎ指示を照合し、許可された範囲を新jobへ引継げる。terminal statusだけ、またはProjectに旧IDが残っていることだけを許可としない。`running` / `queued` / `blocked` / `needs_review` / `unknown`、その他の未確認状態、取得不能、別workspace/channel、Issue/item不一致では上書き・重複開始しない。稼働中jobへの追加条件は、別途対象と権限を確認した`steer_job`で扱う。
+4. 委任時のobjectiveには対象Issue identity、Project/item、旧jobのexact ID、観測したProjectの担当・Status、Dispatcherで確認したdurable status・workspace/channel・確認時刻・照会に使ったevent ID、ユーザーの対象Issue引継ぎ指示、照合した既存成果、許可された作業範囲とStatus遷移を必要最小限の確認証拠として含める。照会結果全文や秘密情報は渡さない。新job IDの予測記入はせず、workerが今回のDONA_JOB契約の`job_json.job_id`を使う。
+5. workerは実装前にitemを再読する。空欄かつ`Todo`なら新規着手できる。同じjob IDなら再開として扱い、`Todo`なら未完了の状態更新へ、`In Progress`なら実装へ進める。別job IDの場合は、親から渡された上記確認証拠が揃い、対象Issue・Project/item・旧ID・Statusが再読値と一致するときだけ、許可された範囲で引継ぐ。証拠不足や不一致では上書き・着手せずDona親へ再確認を返す。workerにDispatcher MCPがないことだけで証拠済み引継ぎを止めたり、ユーザーに旧IDの復唱を求めたりしない。Herdr shellや内部DB操作へ迂回しない。ID空欄でも`In Progress`、`Merge Ready`、その他の状態なら無断で`Todo`相当と解釈せず、再開・再着手の指示と既存成果を照合する。
+6. 各write直前にIssue identity、Project/item ID、担当、Statusを再読する。親の確認時点からProject値がdriftした場合は上書きせず、Dona親へ再確認を返す。確認済みの同一itemに今回のjob IDを書き、read-backでidentity・担当・Statusを照合した後、`Todo`から`In Progress`へ更新し、両fieldを再読する。引継ぎや再着手でその他の遷移が必要なら、明示された遷移だけを行う。担当write後は、そのread-back済みの今回job IDを次のwrite前の期待値とする。
+
+この手順はrepo内の運用指針であり、外部のautomatic approval reviewerそのものの規則変更や承認結果を保証しない。実行環境が承認を要求した場合はそのフローに従い、拒否を迂回しない。
 
 ## fieldを更新・再読する
 
