@@ -514,9 +514,40 @@ function assertSafeFragmentCombinations(values: readonly unknown[], forbiddenDig
   }
 }
 
+function assertSafeMixedFragments(values: readonly unknown[], depth: number, forbiddenDigests: ReadonlySet<string> | undefined,
+  forbiddenValues: ForbiddenValueMatcher | undefined, forbiddenFingerprints: ReadonlySet<number> | undefined,
+  decodeDepth: number, budget: { count: number; combinations: number; combinationBytes: number }): void {
+  const mixed: (string | number)[] = [];
+  const collectMixed = (items: readonly unknown[]): boolean => items.every(item => {
+    if (Array.isArray(item)) return collectMixed(item);
+    if (typeof item === "string") { mixed.push(item); return true; }
+    if (typeof item === "number" && Number.isInteger(item) && item >= 0 && item <= 255) {
+      mixed.push(item); return true;
+    }
+    return false;
+  });
+  if (!collectMixed(values) || !mixed.some(item => typeof item === "string") || !mixed.some(item => typeof item === "number")) return;
+  if (mixed.length > 12) throw new JobResultPublishError("content_requires_redaction");
+  assertSafeFragmentCombinations(mixed.map(item => typeof item === "number" ? String.fromCharCode(item) : item),
+    forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
+  const byteParts = mixed.map(item => typeof item === "number" ? Buffer.from([item]) : Buffer.from(item, "utf8"));
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(byteParts));
+    if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
+    assertSafeJson(decoded, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
+  } catch (error) {
+    if (error instanceof JobResultPublishError) throw error;
+    // Invalid UTF-8 cannot reconstruct a text Result value.
+  }
+}
+
 function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySet<string>, forbiddenValues?: ForbiddenValueMatcher, forbiddenFingerprints?: ReadonlySet<number>, decodeDepth = 0, budget: { count: number; combinations: number; combinationBytes: number } = { count: 0, combinations: 0, combinationBytes: 0 }): void {
   if (depth > 64) throw new JobResultPublishError("invalid_request");
   if (typeof value === "string") {
+    if (/[。．｡]/u.test(value)) {
+      assertSafeJson(value.replace(/[。．｡]/gu, "."), depth, forbiddenDigests, forbiddenValues,
+        forbiddenFingerprints, decodeDepth + 1, budget);
+    }
     const normalizedHttp = value.replace(/https?:[\\/]+[^\s"'<>`]+/gi, candidate =>
       candidate.replace(/^https?:[\\/]+/i, prefix => prefix.slice(0, prefix.indexOf(":" )).toLowerCase() + "://").replaceAll("\\", "/"));
     if (normalizedHttp !== value) assertSafeJson(normalizedHttp, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
@@ -621,32 +652,11 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
         // Invalid UTF-8 cannot reconstruct a text Result value.
       }
     }
-    const mixed: (string | number)[] = [];
-    const collectMixed = (items: unknown[]): boolean => items.every(item => {
-      if (Array.isArray(item)) return collectMixed(item);
-      if (typeof item === "string") { mixed.push(item); return true; }
-      if (typeof item === "number" && Number.isInteger(item) && item >= 0 && item <= 255) {
-        mixed.push(item); return true;
-      }
-      return false;
-    });
-    if (collectMixed(value) && mixed.some(item => typeof item === "string") && mixed.some(item => typeof item === "number")) {
-      if (mixed.length > 12) throw new JobResultPublishError("content_requires_redaction");
-      assertSafeFragmentCombinations(mixed.map(item => typeof item === "number" ? String.fromCharCode(item) : item),
-        forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
-      const byteParts = mixed.map(item => typeof item === "number" ? Buffer.from([item]) : Buffer.from(item, "utf8"));
-      try {
-        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(byteParts));
-        if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
-        assertSafeJson(decoded, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
-      } catch (error) {
-        if (error instanceof JobResultPublishError) throw error;
-        // Invalid UTF-8 cannot reconstruct a text Result value.
-      }
-    }
+    assertSafeMixedFragments(value, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     assertSafeFragmentCombinations(value, forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
   } else if (value !== null && typeof value === "object") {
+    assertSafeMixedFragments(Object.values(value), depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     assertSafeFragmentCombinations(Object.values(value), forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
     const normalizedEntries = Object.entries(value).map(([key, item]) =>
       [normalizedStructuredKey(key), typeof item === "string" ? normalizedStructuredKey(item) : item] as const);
