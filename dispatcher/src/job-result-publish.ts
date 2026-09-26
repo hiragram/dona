@@ -405,6 +405,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
   const inspect = (bytes: Buffer): boolean => {
     try {
       const decoded = decoder.decode(bytes);
+      if (++budget.count > 1_024) return true;
       if (matcher.contains(decoded)) return true;
       assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget);
     } catch (error) {
@@ -418,12 +419,18 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const format = /[+/]/.test(encoded) ? "base64" : "base64url";
     const bytes = Buffer.from(encoded, format);
     if (bytes.toString(format).replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
-    if (++budget.count > 1_024 || inspect(bytes)) return true;
+    if (inspect(bytes)) return true;
+  }
+  for (const match of value.matchAll(/(?:[A-Za-z0-9+/_-]{4,8}\s+){2,}[A-Za-z0-9+/_-]{4,8}={0,2}/g)) {
+    const encoded = match[0].replace(/\s+/g, "");
+    const format = /[+/]/.test(encoded) ? "base64" : "base64url";
+    const bytes = Buffer.from(encoded, format);
+    if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
   }
   for (const match of value.matchAll(/[0-9a-f]{8,}/gi)) {
     const encoded = match[0];
     if (encoded.length % 2 !== 0) continue;
-    if (++budget.count > 1_024 || inspect(Buffer.from(encoded, "hex"))) return true;
+    if (inspect(Buffer.from(encoded, "hex"))) return true;
   }
   for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{4,}={0,6})(?=$|[^A-Z2-7=])/gi)) {
     const encoded = match[1]!;

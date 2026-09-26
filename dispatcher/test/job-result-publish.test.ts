@@ -424,6 +424,8 @@ describe("job result publish contract", () => {
     if (privateBits) encodedPrivate += base32Alphabet[(privateValue << (5 - privateBits)) & 31];
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: encodedPrivate }, () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: Buffer.from("private objective text", "utf8").toString("base64").match(/.{1,8}/g)!.join(" ") }, () => current), code("content_requires_redaction"));
     const shortGrant = new JobResultPublishCapabilities(() => "s1");
     const shortCapability = shortGrant.issue(row({ job_id: "job_short_base32" }), "s1");
     assert.throws(() => shortGrant.validate(shortCapability.capability, "s1", { ...base,
@@ -442,6 +444,8 @@ describe("job result publish contract", () => {
     if (longBits) longBase32 += base32Alphabet[(longValue << (5 - longBits)) & 31];
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: longBase32 }, () => current), code("content_requires_redaction"));
+    assert.equal(grants.validate(grant.capability, "session-one", { ...base,
+      summary: "deadbeef ".repeat(513) }, () => current).envelope.status, "completed");
     const longObjective = "private-long-objective-".repeat(500);
     const longGrant = new JobResultPublishCapabilities(() => "session-long-base64");
     const longIssued = longGrant.issue(row({ objective: longObjective }), "session-long-base64");
@@ -753,6 +757,44 @@ describe("job result publish contract", () => {
       } finally { if (responseDeadline) clearTimeout(responseDeadline); }
     } finally {
       client?.destroy();
+      await stopServer(server);
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("本文上限超過は残りを無制限に受信せず接続を閉じる", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dona-result-oversize-"));
+    const socket = path.join(directory, "p.sock");
+    const grants = new JobResultPublishCapabilities(() => "session-1");
+    const grant = grants.issue(row(), "session-1");
+    const server = new JobResultPublishServer(grants, () => row({ status: "running" }),
+      { commit: async () => ({ outcome: "created" }), reconcile: async () => ({ outcome: "reused" }) }, 32);
+    try {
+      await startServer(server, socket);
+      const client = net.createConnection(socket);
+      client.on("error", () => {});
+      await new Promise<void>(resolve => client.once("connect", resolve));
+      const response = new Promise<string>((resolve, reject) => {
+        const deadline = setTimeout(() => reject(new Error("oversize response timeout")), 2_000);
+        client.once("data", data => { clearTimeout(deadline); resolve(String(data)); });
+      });
+      const closed = new Promise<void>(resolve => client.once("close", resolve));
+      client.write(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nContent-Length: ${jobResultEnvelopeMaxBytes + 65_537}\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n`);
+      assert.match(await response, /^HTTP\/1\.1 413 /);
+      await Promise.race([closed, new Promise<void>((_, reject) => setTimeout(() => reject(new Error("oversize connection stayed open")), 2_000))]);
+      const chunked = net.createConnection(socket);
+      chunked.on("error", () => {});
+      await new Promise<void>(resolve => chunked.once("connect", resolve));
+      const chunkedClosed = new Promise<void>(resolve => chunked.once("close", resolve));
+      let chunkedResponse = "";
+      chunked.on("data", data => { chunkedResponse += String(data); });
+      const hugeChunk = Buffer.alloc(jobResultEnvelopeMaxBytes + 65_537, 0x20);
+      chunked.end(Buffer.concat([
+        Buffer.from(`POST /v1/job-result-publish HTTP/1.1\r\nHost: worker\r\nTransfer-Encoding: chunked\r\nx-dona-job-result-capability: ${grant.capability}\r\nx-dona-worker-session: ${Buffer.from(JSON.stringify("session-1")).toString("base64url")}\r\n\r\n${hugeChunk.length.toString(16)}\r\n`),
+        hugeChunk, Buffer.from("\r\n0\r\n\r\n"),
+      ]));
+      await Promise.race([chunkedClosed, new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`oversize chunked connection stayed open: ${chunkedResponse.slice(0, 40)}`)), 2_000))]);
+    } finally {
       await stopServer(server);
       await fs.rm(directory, { recursive: true, force: true });
     }

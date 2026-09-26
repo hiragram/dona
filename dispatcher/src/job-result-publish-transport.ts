@@ -11,6 +11,7 @@ export interface JobResultPublishSink {
   /** Must compare the durable digest and may never mutate a terminal Result. */
   reconcile(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "reused" | "conflict" }>;
 }
+const oversizedBodyDrainBytes = 65_536;
 
 function reply(response: ServerResponse, status: number, code: string): void {
   const encoded = Buffer.from(JSON.stringify({ schema_version: 1, code }));
@@ -32,6 +33,18 @@ function reject(request: IncomingMessage, response: ServerResponse, status: numb
     }
   });
   reply(response, status, code);
+}
+
+function rejectOversize(request: IncomingMessage, response: ServerResponse, requestSocket: net.Socket): void {
+  // A peer controlling an oversized body must not keep the receiver busy by
+  // streaming indefinitely after the limit has already been crossed.
+  request.pause();
+  response.setHeader("connection", "close");
+  response.shouldKeepAlive = false;
+  response.once("finish", () => requestSocket.destroy());
+  const deadline = setTimeout(() => requestSocket.destroy(), 200);
+  deadline.unref();
+  reply(response, 413, "payload_too_large");
 }
 
 class WireRequestBoundary {
@@ -218,6 +231,7 @@ export class JobResultPublishServer {
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const requestSocket = request.socket;
     if (this.activeRequests.has(request.socket)) { request.socket.destroy(); return; }
     this.activeRequests.add(request.socket);
     this.activeMessages.set(request.socket, request);
@@ -263,13 +277,21 @@ export class JobResultPublishServer {
       // Authenticate before consuming the body. A generic UDS connection has no grant.
       this.grants.authorize(capability, session, this.getJob);
       authenticated = true;
+      const contentLength = request.headers["content-length"];
+      if (typeof contentLength === "string" && Number(contentLength) > jobResultEnvelopeMaxBytes + oversizedBodyDrainBytes) {
+        rejectOversize(request, response, requestSocket);
+        return;
+      }
       const body = Buffer.allocUnsafe(jobResultEnvelopeMaxBytes);
       let bytes = 0;
+      let received = 0;
       let tooLarge = false;
       const deadline = setTimeout(() => request.destroy(), this.bodyTimeoutMs);
       deadline.unref();
       try {
         for await (const chunk of request) {
+          received += chunk.length;
+          if (received > jobResultEnvelopeMaxBytes + oversizedBodyDrainBytes) throw new JobResultPublishError("payload_too_large");
           if (bytes + chunk.length > jobResultEnvelopeMaxBytes) { tooLarge = true; continue; }
           chunk.copy(body, bytes);
           bytes += chunk.length;
@@ -310,7 +332,8 @@ export class JobResultPublishServer {
     } catch (error) {
       if (error instanceof JobResultPublishError) {
         const status = error.code === "payload_too_large" ? 413 : error.code === "invalid_request" || error.code === "content_requires_redaction" ? 400 : error.code === "renewal_not_due" ? 425 : 403;
-        if (error.code === "renewal_not_due") reply(response, status, error.code);
+        if (error.code === "payload_too_large") rejectOversize(request, response, requestSocket);
+        else if (error.code === "renewal_not_due") reply(response, status, error.code);
         else if (authenticated && ["invalid_request", "content_requires_redaction", "payload_too_large"].includes(error.code)) {
           recoverableReject(request, response, status, error.code, this.bodyTimeoutMs);
         }
