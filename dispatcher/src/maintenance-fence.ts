@@ -79,22 +79,24 @@ export function verifyMaintenanceFenceReceipt(
   }
   const issued = Date.parse(body.issued_at);
   const expires = Date.parse(body.expires_at);
-  if (!Number.isFinite(issued) || !Number.isFinite(expires) ||
+  const currentTime = now.getTime();
+  if (!Number.isFinite(currentTime) || !Number.isFinite(issued) || !Number.isFinite(expires) ||
       new Date(issued).toISOString() !== body.issued_at ||
       new Date(expires).toISOString() !== body.expires_at ||
-      issued > now.getTime() || expires <= now.getTime() || expires <= issued ||
+      issued > currentTime || expires <= currentTime || expires <= issued ||
       expires - issued > 300_000) throw new Error("maintenance_fence_receipt_expired");
-  if (typeof receipt.signature_base64 !== "string" ||
+  if (publicKey.type !== "public" || publicKey.asymmetricKeyType !== "ed25519" ||
+      typeof receipt.signature_base64 !== "string" ||
       !/^[A-Za-z0-9+/]{86}==$/.test(receipt.signature_base64) ||
       !verify(null, maintenanceFencePayload(body), publicKey, Buffer.from(receipt.signature_base64, "base64"))) {
     throw new Error("maintenance_fence_signature_invalid");
   }
   if (current.host_boot_id !== body.host_boot_id ||
       current.supervisor_generation !== body.supervisor_generation ||
-      current.fence_generation !== body.fence_generation || !current.active ||
-      !current.ingress_frozen || !current.dispatcher_admission_frozen ||
-      !current.updater_activation_frozen || !current.worker_creation_frozen ||
-      !current.no_recreation_guard_active) {
+      current.fence_generation !== body.fence_generation || current.active !== true ||
+      current.ingress_frozen !== true || current.dispatcher_admission_frozen !== true ||
+      current.updater_activation_frozen !== true || current.worker_creation_frozen !== true ||
+      current.no_recreation_guard_active !== true) {
     throw new Error("maintenance_fence_generation_changed");
   }
 }

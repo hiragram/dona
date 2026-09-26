@@ -33,8 +33,18 @@ test("署名、対象job、現在のhost世代と継続中のfreezeが一致し�
   assert.throws(() => verifyMaintenanceFenceReceipt(receipt, current, "job-c", "host-supervisor", publicKey, now), /receipt_invalid/);
   assert.throws(() => verifyMaintenanceFenceReceipt(receipt, { ...current, fence_generation: 4 }, "job-a", "host-supervisor", publicKey, now), /generation_changed/);
   assert.throws(() => verifyMaintenanceFenceReceipt(receipt, { ...current, no_recreation_guard_active: false }, "job-a", "host-supervisor", publicKey, now), /generation_changed/);
+  assert.throws(() => verifyMaintenanceFenceReceipt(receipt,
+    { ...current, worker_creation_frozen: "false" } as unknown as MaintenanceFenceCurrentState,
+    "job-a", "host-supervisor", publicKey, now), /generation_changed/);
+  assert.throws(() => verifyMaintenanceFenceReceipt(receipt,
+    { ...current, active: "false" } as unknown as MaintenanceFenceCurrentState,
+    "job-a", "host-supervisor", publicKey, now), /generation_changed/);
   assert.throws(() => verifyMaintenanceFenceReceipt(receipt, current, "job-a", "host-supervisor", publicKey,
     new Date("2026-09-26T00:01:00.000Z")), /receipt_expired/);
+  assert.throws(() => verifyMaintenanceFenceReceipt(receipt, current, "job-a", "host-supervisor", publicKey,
+    new Date("invalid")), /receipt_expired/);
+  const ecKey = generateKeyPairSync("ec", { namedCurve: "secp256k1" }).publicKey;
+  assert.throws(() => verifyMaintenanceFenceReceipt(receipt, current, "job-a", "host-supervisor", ecKey, now), /signature_invalid/);
 });
 
 test("不完全inventory、停止未証明、署名改変、重複scopeを拒否する", () => {
