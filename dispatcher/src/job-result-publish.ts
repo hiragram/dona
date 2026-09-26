@@ -203,6 +203,11 @@ function hasPrivateHttpHost(candidate: string): boolean {
   }
   if (isIP(host) === 6) {
     const first = Number.parseInt(host.split(":")[0] || "0", 16);
+    if (first === 0x2002) {
+      const groups = host.split(":");
+      const bits = (Number.parseInt(groups[1] || "0", 16) << 16) | Number.parseInt(groups[2] || "0", 16);
+      if (hasPrivateHttpHost(`http://${[(bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255].join(".")}/`)) return true;
+    }
     if (host === "::" || host === "::1" || first === 0 || first === 0x100 || (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
       (first & 0xffc0) === 0xfec0 || (first & 0xff00) === 0xff00) return true;
     if (first === 0x2001 && [0x10, 0x20].includes(Number.parseInt(host.split(":")[1] || "0", 16) & 0xfff0)) return true;
@@ -467,7 +472,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
   for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]+={0,2})(?=$|[^A-Za-z0-9+/_-])/g)) {
     const encoded = match[1]!;
     const start = match.index! + match[0].lastIndexOf(encoded);
-    if (previousEnd >= 0 && !/^\s+$/.test(value.slice(previousEnd, start))) {
+    if (previousEnd >= 0 && !/^[^A-Za-z0-9+/_=-]+$/.test(value.slice(previousEnd, start))) {
       if (inspectGroup()) return true;
       grouped.length = 0;
     }
@@ -651,6 +656,20 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
         if (error instanceof JobResultPublishError) throw error;
         // Invalid UTF-8 cannot reconstruct a text Result value.
       }
+    }
+    const codePoints: number[] = [];
+    const collectCodePoints = (items: unknown[]): boolean => items.every(item => {
+      if (Array.isArray(item)) return collectCodePoints(item);
+      if (typeof item !== "number" || !Number.isInteger(item) || item < 0 || item > 0x10ffff ||
+        (item >= 0xd800 && item <= 0xdfff)) return false;
+      codePoints.push(item);
+      if (codePoints.length > 4_096) throw new JobResultPublishError("content_requires_redaction");
+      return true;
+    });
+    if (collectCodePoints(value) && codePoints.length >= 2) {
+      if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
+      assertSafeJson(String.fromCodePoint(...codePoints), depth + 1, forbiddenDigests,
+        forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
     assertSafeMixedFragments(value, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     assertSafeFragmentCombinations(value, forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);

@@ -416,12 +416,21 @@ describe("job result publish contract", () => {
       artifacts: [{ prefix: grant.capability.slice(0, 20), byte: grant.capability.charCodeAt(20), suffix: grant.capability.slice(21) }] },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: Buffer.from("private objective text", "utf8").toString("base64").match(/.{1,2}/g)!.join("!") },
+      () => current), code("content_requires_redaction"));
+    const unicodeObjective = "非公開の作業目的";
+    const unicodeGrants = new JobResultPublishCapabilities(() => "unicode-session");
+    const unicodeCapability = unicodeGrants.issue(row({ job_id: "job_unicode", objective: unicodeObjective }), "unicode-session");
+    assert.throws(() => unicodeGrants.validate(unicodeCapability.capability, "unicode-session", { ...base,
+      actions: Array.from(unicodeObjective, character => character.codePointAt(0)) },
+      () => row({ job_id: "job_unicode", status: "running", objective: unicodeObjective })), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       actions: ["private objective ", [116, 101], "xt"] },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: [...Buffer.from(grant.capability)].map(byte => `\\x${byte.toString(16).padStart(2, "0")}`).join("") },
       () => current), code("content_requires_redaction"));
-    for (const endpoint of ["10.0.0.5:8080?download=1", "[::1]#result", "10.0.0.5:8080", "10。0。0。5/private"]) {
+    for (const endpoint of ["10.0.0.5:8080?download=1", "[::1]#result", "10.0.0.5:8080", "10。0。0。5/private", "http://[2002:0a00:0005::]/private"]) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: endpoint },
         () => current), code("content_requires_redaction"));
     }
