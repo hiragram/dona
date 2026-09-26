@@ -77,6 +77,39 @@ const jobsRunnableFairIndexSql = `
     ON jobs(source_event_id, created_at, job_id, available_at)
     WHERE status = 'queued'
 `;
+const operatorAssertionRecoverySchemaSql = `
+  CREATE TABLE IF NOT EXISTS job_operator_assertion_recoveries(
+    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+    assertion_event_id TEXT NOT NULL REFERENCES events(event_id),
+    assertion_actor_id TEXT NOT NULL,
+    assertion_tenant_id TEXT NOT NULL,
+    assertion_workspace_id TEXT NOT NULL,
+    assertion_channel_id TEXT NOT NULL,
+    assertion_occurred_at TEXT NOT NULL,
+    assertion_payload_sha256 TEXT NOT NULL,
+    authorization_principal TEXT NOT NULL,
+    operator_principal TEXT NOT NULL,
+    operator_role TEXT NOT NULL CHECK(operator_role='job_owner'),
+    prior_status TEXT NOT NULL,
+    prior_cause TEXT NOT NULL,
+    prior_updated_at TEXT NOT NULL,
+    result_class TEXT NOT NULL CHECK(result_class IN ('valid','invalid','missing')),
+    result_sha256 TEXT,
+    side_effects_evidence_sha256 TEXT NOT NULL,
+    notification_evidence_sha256 TEXT NOT NULL,
+    final_status TEXT NOT NULL CHECK(final_status IN ('completed','failed')),
+    final_updated_at TEXT NOT NULL,
+    evidence_class TEXT NOT NULL CHECK(evidence_class='operator_assertion'),
+    stop_time_status TEXT NOT NULL CHECK(stop_time_status='unknown'),
+    residual_risk_codes_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL);
+  CREATE TRIGGER IF NOT EXISTS job_operator_assertion_recoveries_no_update
+    BEFORE UPDATE ON job_operator_assertion_recoveries
+    BEGIN SELECT RAISE(ABORT,'operator_assertion_recovery_append_only'); END;
+  CREATE TRIGGER IF NOT EXISTS job_operator_assertion_recoveries_no_delete
+    BEFORE DELETE ON job_operator_assertion_recoveries
+    BEGIN SELECT RAISE(ABORT,'operator_assertion_recovery_append_only'); END;
+`;
 
 export interface JobAdmissionLimits { jobsPerEventMax: number; jobObjectiveTotalMaxBytes: number; }
 export class JobCreationError extends Error {
@@ -470,6 +503,10 @@ export function migrateDispatcherDatabase(
     const hasLegacyStopMarkers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get() !== undefined;
     db.exec("CREATE TEMP TABLE legacy_job_stop_markers_v3(job_id TEXT PRIMARY KEY, stopped_at TEXT)");
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
+    const hasOperatorRecoveries = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_operator_assertion_recoveries'").get() !== undefined;
+    if (hasOperatorRecoveries) db.exec(`CREATE TEMP TABLE preserved_operator_recoveries_v3 AS
+      SELECT * FROM job_operator_assertion_recoveries;
+      DROP TABLE job_operator_assertion_recoveries;`);
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
     const hasTerminalCleanups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_terminal_worker_cleanups'").get() !== undefined;
@@ -533,6 +570,9 @@ export function migrateDispatcherDatabase(
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
       ${jobsRunnableFairIndexSql};
     `);
+    if (hasOperatorRecoveries) db.exec(`${operatorAssertionRecoverySchemaSql}
+      INSERT INTO job_operator_assertion_recoveries SELECT * FROM preserved_operator_recoveries_v3;
+      DROP TABLE preserved_operator_recoveries_v3;`);
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
       SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);`);
     if (hasTerminalCleanups) db.exec(`INSERT INTO job_terminal_worker_cleanups(job_id,outcome,identity_json,updated_at)
@@ -682,13 +722,15 @@ export class DispatcherDatabase {
         final_updated_at TEXT NOT NULL)`);
       this.db.exec(`CREATE TRIGGER IF NOT EXISTS job_late_result_reconciliations_no_update
         BEFORE UPDATE ON job_late_result_reconciliations BEGIN SELECT RAISE(ABORT, 'late_result_reconciliation_append_only'); END`);
+      this.db.exec(operatorAssertionRecoverySchemaSql);
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
         const mayHaveLiveLegacyAgent=["retryable_failed","preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status);
         if(mayHaveLiveLegacyAgent) this.db.prepare("INSERT OR IGNORE INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(row.job_id);
         if(mayHaveLiveLegacyAgent) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
           last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?
-          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop marker WHERE marker.job_id=jobs.job_id AND marker.stopped_at IS NULL)`)
+          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop marker WHERE marker.job_id=jobs.job_id AND marker.stopped_at IS NULL)
+          AND NOT (status='needs_review' AND last_error_code='legacy_agent_sandbox_unknown')`)
           .run(new Date().toISOString(),row.job_id);
         else if(row.status==="queued") this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
       }
@@ -826,6 +868,8 @@ export class DispatcherDatabase {
           ('terminal_steer_worker_unverified','cancel_worker_unverified'))
         OR (status IN ('completed','failed','cancelled') AND herdr_workspace_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM job_terminal_worker_stop_proofs p WHERE p.job_id=jobs.job_id)
+          AND NOT EXISTS (SELECT 1 FROM job_operator_assertion_recoveries a WHERE a.job_id=jobs.job_id
+            AND a.final_status=jobs.status AND a.final_updated_at=jobs.updated_at)
           AND COALESCE(last_error_code,'') NOT IN
             ('agent_not_found','agent_not_running','invalid_result_agent_stopped',
              'workspace_cleanup_agent_stopped','cancel_worker_stopped'))
@@ -838,6 +882,8 @@ export class DispatcherDatabase {
     // while any such worker may exist, including legacy agents marked for stop.
     const legacy = this.db.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
       JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM job_operator_assertion_recoveries a WHERE a.job_id=j.job_id
+          AND a.final_status=j.status AND a.final_updated_at=j.updated_at)
         AND COALESCE(j.steer_state,'') NOT IN ('dispatching','accepted')
         AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
         AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
@@ -1494,10 +1540,145 @@ export class DispatcherDatabase {
     const ids=[job.completion_event_id,group?.attention_event_id,group?.all_terminal_event_id];
     const events=[...new Set(ids.filter((id):id is string=>!!id))].map(id=>{
       const event=this.getRequired(id);
-      return {id,status:event.status,result_json:event.result_json,last_error_code:event.last_error_code,
+      return {id,status:event.status,updated_at:event.updated_at,result_json:event.result_json,
+        payload_json:event.payload_json,reply_target_json:event.reply_target_json,last_error_code:event.last_error_code,
+        completion:this.db.prepare("SELECT * FROM job_completion_results WHERE notification_event_id=?").get(id)??null,
+        delivery:this.db.prepare("SELECT * FROM job_attention_delivery_receipts WHERE attention_event_id=?").get(id)??null,
+        claim:this.db.prepare("SELECT * FROM job_attention_delivery_claims WHERE attention_event_id=?").get(id)??null,
         settled:this.attentionNotificationSettled(event)};
     });
-    return createHash("sha256").update(stableStringify(events)).digest("hex");
+    const migration=this.db.prepare("SELECT * FROM job_legacy_notification_migration WHERE job_id=?").get(job.job_id)??null;
+    const resolution=this.db.prepare("SELECT * FROM job_attention_resolutions WHERE job_id=?").get(job.job_id)??null;
+    return createHash("sha256").update(stableStringify({group,events,migration,resolution})).digest("hex");
+  }
+
+  private operatorResultFile(job:JobRow):{kind:"valid"|"invalid"|"missing";sha256:string|null;result?:JobResultEnvelope} {
+    let fd:number;
+    try {fd=fs.openSync(job.result_path,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);}
+    catch(error) {
+      if((error as NodeJS.ErrnoException).code==="ENOENT") return {kind:"missing",sha256:null};
+      throw new Error("operator_result_file_unreadable");
+    }
+    try {
+      const stat=fs.fstatSync(fd);
+      if(!stat.isFile()||stat.size>jobResultEnvelopeMaxBytes) throw new Error("operator_result_file_unreadable");
+      const bytes=fs.readFileSync(fd);
+      if(bytes.length>jobResultEnvelopeMaxBytes) throw new Error("operator_result_file_unreadable");
+      const sha256=createHash("sha256").update(bytes).digest("hex");
+      try {return {kind:"valid",sha256,result:parseJobResultEnvelope(JSON.parse(bytes.toString("utf8")),job.job_id)};}
+      catch {return {kind:"invalid",sha256};}
+    } finally {fs.closeSync(fd);}
+  }
+
+  inspectOperatorAssertionRecovery(jobId:string):{
+    job_id:string;status:JobStatus;cause:string|null;updated_at:string;
+    result_class:"valid"|"invalid"|"missing";result_sha256:string|null;notification_evidence_sha256:string;
+  } {
+    const job=this.getJobRequired(jobId),file=this.operatorResultFile(job);
+    return {job_id:jobId,status:job.status,cause:job.last_error_code,updated_at:job.updated_at,
+      result_class:file.kind,result_sha256:file.sha256,notification_evidence_sha256:this.lateResultNotificationEvidence(job)};
+  }
+
+  operatorAssertionRecoveryRecord(jobId:string):Record<string,unknown>|undefined {
+    return this.db.prepare(`SELECT job_id,assertion_event_id,assertion_actor_id,assertion_tenant_id,
+      assertion_workspace_id,assertion_channel_id,assertion_occurred_at,assertion_payload_sha256,
+      authorization_principal,
+      operator_principal,operator_role,prior_status,prior_cause,prior_updated_at,result_class,result_sha256,
+      side_effects_evidence_sha256,notification_evidence_sha256,final_status,final_updated_at,recorded_at
+      ,evidence_class,stop_time_status,residual_risk_codes_json
+      FROM job_operator_assertion_recoveries WHERE job_id=?`).get(jobId) as Record<string,unknown>|undefined;
+  }
+
+  recoverWithOperatorAssertion(input:{jobId:string;assertionEventId:string;operatorPrincipal:string;
+    expectedUpdatedAt:string;expectedCause:string;expectedResultClass:"valid"|"invalid"|"missing";
+    expectedResultSha256:string|null;sideEffectsEvidenceSha256:string;notificationEvidenceSha256:string;
+    residualRisksAccepted:boolean},at=new Date()):JobRow {
+    for(const digest of [input.sideEffectsEvidenceSha256,input.notificationEvidenceSha256,
+      ...(input.expectedResultSha256?[input.expectedResultSha256]:[])])
+      if(!/^[0-9a-f]{64}$/.test(digest)) throw new Error("operator_evidence_digest_invalid");
+    if(!input.operatorPrincipal||input.operatorPrincipal.length>256) throw new Error("operator_principal_invalid");
+    if(input.residualRisksAccepted!==true) throw new Error("operator_residual_risks_not_accepted");
+    return this.db.transaction(()=>{
+      const job=this.getJobRequired(input.jobId);
+      if(this.db.prepare("SELECT 1 FROM job_operator_assertion_recoveries WHERE job_id=?").get(job.job_id))
+        throw new Error("operator_recovery_already_recorded");
+      if(readEventJobBinding(this.db,job.source_event_id)?.owner.kind!=="slack_thread"||
+        job.status!=="needs_review"||!job.last_error_code||job.last_error_code!==input.expectedCause||
+        job.updated_at!==input.expectedUpdatedAt||job.result_json!==null||job.steer_state!==null)
+        throw new Error("operator_recovery_job_changed");
+      if(job.last_error_code==="result_path_exists"||
+        (job.attempt_count===0&&job.dispatch_started_at===null&&job.prompt_accepted_at===null&&job.herdr_workspace_id===null))
+        throw new Error("operator_recovery_pre_dispatch_unavailable");
+      const assertion=this.getRequired(input.assertionEventId);
+      const subject=JSON.parse(assertion.subject_json) as Record<string,unknown>;
+      const actor=subject.actor_id,workspace=subject.workspace_id,channel=subject.channel_id;
+      const tenant=subject.tenant_id??workspace;
+      const assertionPayload=JSON.parse(assertion.payload_json) as Record<string,unknown>;
+      if(assertion.source!=="slack"||!["app_mention","message"].includes(assertion.event_type)||
+        assertion.status!=="completed"||typeof assertionPayload.text!=="string"||!assertionPayload.text.trim()||
+        typeof actor!=="string"||!actor||actor!==job.actor_id||
+        typeof tenant!=="string"||tenant!==job.workspace_id||
+        typeof workspace!=="string"||workspace!==job.workspace_id||
+        typeof channel!=="string"||channel!==job.channel_id||
+        !Number.isFinite(Date.parse(assertion.occurred_at))||
+        Date.parse(job.created_at)>Date.parse(assertion.occurred_at)||
+        Date.parse(job.updated_at)>Date.parse(assertion.occurred_at)||
+        Date.parse(assertion.occurred_at)>at.getTime())
+        throw new Error("operator_assertion_scope_or_time_mismatch");
+      const group=this.getJobGroupRequired(job.source_event_id);
+      if(group.all_terminal_event_id) throw new Error("operator_notification_requires_reconciliation");
+      if(this.lateResultNotificationEvidence(job)!==input.notificationEvidenceSha256)
+        throw new Error("operator_notification_drift");
+      for(const id of new Set([job.completion_event_id,group.attention_event_id])) {
+        if(!id) continue;
+        const event=this.getRequired(id);
+        if(!["queued","retryable_failed"].includes(event.status)&&
+          !this.attentionNotificationSettled(event)&&
+          !(id===job.completion_event_id&&this.lateProgressNotificationSettled(event,job.job_id)))
+          throw new Error("operator_notification_requires_reconciliation");
+      }
+      const file=this.operatorResultFile(job);
+      if(file.kind!==input.expectedResultClass||file.sha256!==input.expectedResultSha256)
+        throw new Error("operator_result_drift");
+      if(file.kind==="valid") {
+        this.saveJobResultInternal(job.job_id,file.result!,job.result_path,at,()=>{},true);
+      } else {
+        for(const id of new Set([job.completion_event_id,group.attention_event_id])) {
+          if(!id) continue;
+          const event=this.getRequired(id);
+          if(["queued","retryable_failed"].includes(event.status)) {
+            const changed=this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+              last_error_code='job_result_superseded',last_error_message=NULL
+              WHERE event_id=? AND status IN ('queued','retryable_failed')`).run(at.toISOString(),at.toISOString(),id).changes;
+            if(changed!==1) throw new Error("operator_notification_drift");
+            this.db.prepare("UPDATE job_groups SET attention_event_id=NULL WHERE source_event_id=? AND attention_event_id=?")
+              .run(job.source_event_id,id);
+          }
+        }
+        const changed=this.db.prepare(`UPDATE jobs SET status='failed',completed_at=?,updated_at=?,completion_event_id=NULL,
+          last_error_code='operator_assertion_result_unaccepted',last_error_message=NULL
+          WHERE job_id=? AND status='needs_review' AND updated_at=? AND last_error_code=? AND result_json IS NULL`)
+          .run(at.toISOString(),at.toISOString(),job.job_id,input.expectedUpdatedAt,input.expectedCause).changes;
+        if(changed!==1) throw new Error("operator_recovery_job_changed");
+        if(group.attention_event_id) {
+          const event=this.getRequired(group.attention_event_id);
+          if((JSON.parse(event.payload_json) as {job_id?:string}).job_id===job.job_id)
+            this.recordAttentionResolution(job.job_id,event.event_id,"failed","operator_reconcile",null,at);
+        }
+      }
+      if(this.operatorResultFile(job).sha256!==input.expectedResultSha256)
+        throw new Error("operator_result_drift");
+      this.enqueueJobNotification(job.job_id,at);
+      const settled=this.getJobRequired(job.job_id);
+      this.db.prepare(`INSERT INTO job_operator_assertion_recoveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(job.job_id,assertion.event_id,actor,tenant,workspace,channel,assertion.occurred_at,
+          createHash("sha256").update(assertion.payload_json).digest("hex"),`slack:${actor}`,
+          input.operatorPrincipal,"job_owner",
+          job.status,job.last_error_code,job.updated_at,file.kind,file.sha256,input.sideEffectsEvidenceSha256,
+          input.notificationEvidenceSha256,settled.status,settled.updated_at,"operator_assertion","unknown",
+          stableStringify(["worker_stop_not_machine_observed","out_of_band_worker_recreation_unverified"]),at.toISOString());
+      return settled;
+    }).immediate();
   }
 
   private lateProgressNotificationSettled(event:EventRow,jobId:string):boolean {
@@ -1977,7 +2158,7 @@ export class DispatcherDatabase {
       const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
       if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
         throw new Error("scheduled_work_result_deadline_exceeded");
-      const recoverAmbiguous=job.status==="needs_review"&&((operatorLate&&["result_missing","invalid_result","invalid_result_agent_stopped"].includes(job.last_error_code??""))||["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
+      const recoverAmbiguous=job.status==="needs_review"&&(operatorLate||["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
         (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
       if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
         throw new Error("completed_at_precedes_prompt_dispatch");

@@ -284,6 +284,35 @@ test("RealRuntime counts terminal legacy agents until durable stop", async () =>
   } finally { await removeTree(root); }
 });
 
+test("RealRuntime treats a matching operator assertion ledger as separate terminal evidence", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec(`CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, updated_at TEXT,
+    steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT,
+    last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT);
+    CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT);
+    CREATE TABLE job_operator_assertion_recoveries (job_id TEXT, final_status TEXT, final_updated_at TEXT)`);
+  database.prepare("INSERT INTO jobs (job_id,status,updated_at,herdr_workspace_id) VALUES ('legacy','failed','t1','agent')").run();
+  database.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('legacy',NULL)").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).safe, false);
+    const recorded = new Database(databasePath);
+    recorded.prepare("INSERT INTO job_operator_assertion_recoveries VALUES ('legacy','failed','t1')").run();
+    recorded.close();
+    assert.equal((await runtime.workerSafety()).safe, true);
+    const changed = new Database(databasePath);
+    changed.prepare("UPDATE jobs SET updated_at='t2' WHERE job_id='legacy'").run();
+    changed.close();
+    assert.equal((await runtime.workerSafety()).safe, false);
+  } finally { await removeTree(root); }
+});
+
 test("RealRuntime counts a reconciled terminal schedule worker without stop proof", async () => {
   const { root, policy } = await tempPolicy();
   await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });

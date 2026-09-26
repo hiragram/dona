@@ -513,6 +513,10 @@ export class RealRuntime implements RuntimePort {
         const terminalProofTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_terminal_worker_stop_proofs'").get();
         const terminalStopProofClause = terminalProofTable ? `AND NOT EXISTS
           (SELECT 1 FROM job_terminal_worker_stop_proofs p WHERE p.job_id=jobs.job_id)` : "";
+        const operatorAssertionTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_operator_assertion_recoveries'").get();
+        const operatorAssertionClause = operatorAssertionTable ? `AND NOT EXISTS
+          (SELECT 1 FROM job_operator_assertion_recoveries a WHERE a.job_id=jobs.job_id
+            AND a.final_status=jobs.status AND a.final_updated_at=jobs.updated_at)` : "";
         let active = (database.prepare(`SELECT COUNT(*) AS count FROM jobs
           WHERE (status IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
             AND NOT (status='needs_review' AND COALESCE(last_error_code,'')='result_path_exists'
@@ -529,12 +533,15 @@ export class RealRuntime implements RuntimePort {
                 ('agent_not_found','agent_not_running','invalid_result_agent_stopped',
                  'workspace_cleanup_agent_stopped','cancel_worker_stopped')
               ${terminalStopProofClause}
+              ${operatorAssertionClause}
               ${terminalStoppedLegacyClause})
             OR (status IN ('completed','failed','cancelled') AND last_error_code IN
               ('schedule_reconcile_worker_unverified','terminal_steer_worker_unverified','cancel_worker_unverified'))`)
           .get() as { count: number }).count;
         if (legacyTable) active += (database.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
           JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
+            ${operatorAssertionTable ? `AND NOT EXISTS (SELECT 1 FROM job_operator_assertion_recoveries a
+              WHERE a.job_id=j.job_id AND a.final_status=j.status AND a.final_updated_at=j.updated_at)` : ""}
             AND COALESCE(j.steer_state,'') NOT IN ('dispatching','accepted')
             AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
             AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
