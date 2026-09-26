@@ -36,7 +36,8 @@ export class JobResultPublishError extends Error {
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
 const sensitive = /(?:(?:^|\s)(?:-[uU]\s*|--(?:proxy-)?user(?:=|\s+))[^:\s]+:[^\s]+|(?:\bmachine\s+[^\s]+|\bdefault)\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
-const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~-]+:[^@\s/]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])\/[^\s"'<>`]+/i;
+const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~-]+:[^@\s/]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?\/[^\s"'<>`]+/i;
+const ageSecretIdentity = /AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{20,}\b/i;
 const pgpassCredential = /(?:^|\s)(?:\\.|[^\s:\\]){1,255}:(?:\d{1,5}|\*):(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}(?=$|\s)/;
 const ansiEscape = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const privateJwkParameter = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
@@ -427,6 +428,12 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const bytes = Buffer.from(encoded, format);
     if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
   }
+  for (const match of value.matchAll(/(?:[A-Za-z0-9+/_-]{4,}\r?\n)+[A-Za-z0-9+/_-]{2,}={0,2}/g)) {
+    const encoded = match[0].replace(/\r?\n/g, "");
+    const format = /[+/]/.test(encoded) ? "base64" : "base64url";
+    const bytes = Buffer.from(encoded, format);
+    if (bytes.toString(format).replace(/=+$/, "") === encoded.replace(/=+$/, "") && inspect(bytes)) return true;
+  }
   for (const match of value.matchAll(/[0-9a-f]{8,}/gi)) {
     const encoded = match[0];
     if (encoded.length % 2 !== 0) continue;
@@ -527,7 +534,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || hasCredentialXmlElement(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || hasCredentialXmlElement(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || ageSecretIdentity.test(value) || (decodeDepth < 8 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || (decodeDepth >= 8 && /[A-Za-z0-9+/_-]{16,}={0,2}|[0-9a-f]{16,}/i.test(value)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || windowsRelativePath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
