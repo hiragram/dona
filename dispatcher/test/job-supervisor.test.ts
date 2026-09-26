@@ -1806,7 +1806,7 @@ describe("JobSupervisor", () => {
     assert.deepEqual(calls,["cancel","close","get"]); assert.equal(marked,true);
     database.close();
   });
-  test("terminal jobのworker停止を読み取りで確認して安全markerを解除する",async()=>{
+  test("terminal jobのidle観測だけでは停止証拠を作らない",async()=>{
     const {root,config}=await tempConfig(); roots.push(root);
     const database=new DispatcherDatabase(config.databasePath);
     const job=createScratchJob(database,config,"Ev-terminal-stop-proof");
@@ -1815,15 +1815,16 @@ describe("JobSupervisor", () => {
       .run(job.job_id);
     raw.close();
     let reads=0;
-    const runtime=fakeRuntime({async get(){reads+=1;return ok(reads===1?"working":"idle");}});
+    const runtime=fakeRuntime({async get(){reads+=1;return ok("idle");}});
     const supervisor=new JobSupervisor(database,runtime,{...config,queuePollMs:5},logger,()=>undefined);
     supervisor.start();
-    await waitFor(()=>database.getJob(job.job_id)?.last_error_code===null);
-    assert.ok(reads>=2);
-    assert.equal(database.updateSafetyStatus().active_worker_count,0);
+    await waitFor(()=>database.getJob(job.job_id)?.completion_event_id!==null);
+    assert.equal(database.getJob(job.job_id)?.last_error_code,"terminal_steer_worker_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count,1);
+    assert.equal(reads,0);
     await supervisor.stop();database.close();
   });
-  test("legacy terminal accepted steer is counted until a bounded stop proof", async () => {
+  test("legacy terminal accepted steer stays unsafe after name-based absence", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const job = createScratchJob(database, config, "Ev-legacy-terminal-accepted-steer");
@@ -1834,11 +1835,12 @@ describe("JobSupervisor", () => {
     const supervisor = new JobSupervisor(database, fakeRuntime({ async get() { return failed("agent_not_found"); } }),
       { ...config, queuePollMs: 5 }, logger, () => undefined);
     supervisor.start();
-    await waitFor(() => database.getJob(job.job_id)?.steer_state === null);
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    await waitFor(() => database.getJob(job.job_id)?.completion_event_id !== null);
+    assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     await supervisor.stop(); database.close();
   });
-  test("normal terminal worker is excluded after a durable bounded stop proof", async () => {
+  test("normal terminal worker remains in drain gate after name-based absence", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const job = createScratchJob(database, config, "Ev-normal-terminal-stop-proof");
@@ -1849,9 +1851,10 @@ describe("JobSupervisor", () => {
     const supervisor = new JobSupervisor(database, fakeRuntime({ async get() { return failed("agent_not_found"); } }),
       { ...config, queuePollMs: 5 }, logger, () => undefined);
     supervisor.start();
-    await waitFor(() => database.updateSafetyStatus().active_worker_count === 0);
+    await waitFor(() => database.getJob(job.job_id)?.completion_event_id !== null);
     const raw = new Database(config.databasePath);
-    assert.ok(raw.prepare("SELECT stopped_at FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(job.job_id));
+    assert.equal(raw.prepare("SELECT stopped_at FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(job.job_id), undefined);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     raw.close();
     await supervisor.stop(); database.close();
   });
