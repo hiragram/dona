@@ -386,6 +386,9 @@ describe("job result publish contract", () => {
       actions: [Array.from(Buffer.from(grant.capability, "utf8"))] },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: Array.from(Buffer.from(grant.capability, "utf8"), byte => [byte]) },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ prefix: "ghp_", note: "ok", suffix: "abcdefghijklmnop" }] },
       () => current), code("content_requires_redaction"));
     const longArrayObjective = "private objective ".repeat(40);
@@ -490,6 +493,8 @@ describe("job result publish contract", () => {
       summary: "OMYQ====" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
     assert.throws(() => shortGrant.validate(shortCapability.capability, "s1", { ...base,
       summary: "7331" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
+    assert.throws(() => shortGrant.validate(shortCapability.capability, "s1", { ...base,
+      summary: "73 31" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
     assert.throws(() => shortGrant.validate(shortCapability.capability, "s1", { ...base,
       summary: "czE" }, () => row({ job_id: "job_short_base32", status: "running" })), code("content_requires_redaction"));
     const longBase32Source = Buffer.from("private objective text".repeat(500), "utf8");
@@ -618,6 +623,12 @@ describe("job result publish contract", () => {
       assert.equal(validateJobResultPublish({ ...base, summary: prefix.repeat(32_000) }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
       assert.ok(performance.now() - started < 2_000);
     }
+  });
+
+  test("公開routeの大量反復もboundedに検査する", () => {
+    const started = performance.now();
+    assert.equal(validateJobResultPublish({ ...base, summary: "endpoint /api/x ".repeat(40_000) }, row(), "2026-09-24T00:00:00Z").envelope.status, "completed");
+    assert.ok(performance.now() - started < 2_000);
   });
 
   test("長いprivate objectiveが多数あってもpublishの検査を完了する", () => {

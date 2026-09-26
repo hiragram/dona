@@ -128,7 +128,7 @@ function hasLocalPath(value: string): boolean {
   for (const match of value.matchAll(candidate)) {
     const route = match[0].trimStart();
     if (/^<\/[A-Za-z][A-Za-z0-9:._-]*$/.test(route) && value[match.index! + match[0].length] === ">") continue;
-    const prefix = value.slice(0, match.index);
+    const prefix = value.slice(Math.max(0, match.index! - 32), match.index);
     const publicRoute = route.replace(/^\(/, "").replace(/\)$/, "");
     if (/^\/(?:v\d+|api|docs|health|status)(?:\/[A-Za-z0-9._-]+)*$/i.test(publicRoute) &&
       (/\bendpoint\s*$/i.test(prefix) || (route.startsWith("(") && /\]$/.test(prefix)))) continue;
@@ -461,6 +461,7 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
         catch (error) { if (error instanceof JobResultPublishError) return true; }
       }
     }
+    if (/^(?:[0-9a-f]{2})+$/i.test(encoded) && inspect(Buffer.from(encoded, "hex"))) return true;
     return false;
   };
   for (const match of value.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]+={0,2})(?=$|[^A-Za-z0-9+/_-])/g)) {
@@ -603,9 +604,16 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   } else if (Array.isArray(value)) {
     if (value.length === 2 && typeof value[0] === "string" && value[1] !== null && value[1] !== "" &&
       forbiddenKey(normalizedStructuredKey(value[0]))) throw new JobResultPublishError("content_requires_redaction");
-    if (value.length >= 2 && value.every(item => typeof item === "number" && Number.isInteger(item) && item >= 0 && item <= 255)) {
+    const bytes: number[] = [];
+    const collectBytes = (items: unknown[]): boolean => items.every(item => {
+      if (Array.isArray(item)) return collectBytes(item);
+      if (typeof item !== "number" || !Number.isInteger(item) || item < 0 || item > 255) return false;
+      bytes.push(item);
+      return true;
+    });
+    if (collectBytes(value) && bytes.length >= 2) {
       try {
-        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(value));
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(bytes));
         if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
         assertSafeJson(decoded, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
       } catch (error) {
