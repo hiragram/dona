@@ -440,6 +440,18 @@ describe("job result publish contract", () => {
       actions: ["cHJpdmF0ZQ==", "IG9iamVjdGl2ZSB0ZXh0"] },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: grant.capability.match(/.{1,2}/g)!.join("!") },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: [{ "to&#x6b;en": "abc" }] },
+      () => current), code("content_requires_redaction"));
+    const emojiObjective = "private 🔒 objective";
+    const emojiGrants = new JobResultPublishCapabilities(() => "emoji-session");
+    const emojiCapability = emojiGrants.issue(row({ job_id: "job_emoji", objective: emojiObjective }), "emoji-session");
+    assert.throws(() => emojiGrants.validate(emojiCapability.capability, "emoji-session", { ...base,
+      actions: emojiObjective.split("").map(character => character.charCodeAt(0)) },
+      () => row({ job_id: "job_emoji", status: "running", objective: emojiObjective })), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: "AUTH LOGIN\r\nYWxpY2U=\r\naHVudGVyMg==" },
       () => current), code("content_requires_redaction"));
     for (const summary of ["Basic YWxpY2U6aHVudGVyMh==", '保存値 "db.example.com:5432:app:alice:hunter2"',

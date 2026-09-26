@@ -332,6 +332,9 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
       }
     }
   }
+  const punctuationStripped = value.replace(/[^A-Za-z0-9_-]/g, "");
+  if (punctuationStripped !== value && punctuationStripped.length >= capabilityWindowLength &&
+    containsForbiddenCapability(punctuationStripped, digests, fingerprints)) return true;
   return false;
 }
 const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_.-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
@@ -399,7 +402,8 @@ function normalizedStructuredKey(key: string): string {
     if (/%[0-9A-Fa-f]{2}/.test(next)) {
       try { next = decodeURIComponent(next); } catch { /* Invalid encodings remain literal. */ }
     }
-    next = next.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
+    next = displayProjection(next).replace(ansiEscape, "")
+      .replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
     if (next === normalized) break;
     normalized = next;
   }
@@ -574,14 +578,19 @@ function assertSafeNumericFragments(values: readonly unknown[], depth: number, f
   const points: number[] = [];
   const collect = (items: readonly unknown[]): boolean => items.every(item => {
     if (Array.isArray(item)) return collect(item);
-    if (typeof item !== "number" || !Number.isInteger(item) || item < 0 || item > 0x10ffff ||
-      (item >= 0xd800 && item <= 0xdfff)) return false;
+    if (typeof item !== "number" || !Number.isInteger(item) || item < 0 || item > 0x10ffff) return false;
     points.push(item);
     if (points.length > 4_096) throw new JobResultPublishError("content_requires_redaction");
     return true;
   });
   if (!collect(values) || points.length < 2) return;
   if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
+  if (points.some(point => point >= 0xd800 && point <= 0xdfff)) {
+    if (points.some(point => point > 0xffff)) throw new JobResultPublishError("content_requires_redaction");
+    assertSafeJson(String.fromCharCode(...points), depth + 1, forbiddenDigests,
+      forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
+    return;
+  }
   assertSafeJson(String.fromCodePoint(...points), depth + 1, forbiddenDigests,
     forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
   if (points.every(point => point <= 255)) {
