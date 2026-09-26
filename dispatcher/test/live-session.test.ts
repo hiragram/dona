@@ -428,7 +428,30 @@ describe("read-only live session reconciliation",()=>{
     assert.doesNotThrow(()=>raw.prepare(`INSERT INTO job_live_session_identities(
       job_id,identity_version,herdr_agent_session_id,recorded_at) VALUES(?,1,?,?)`).run("job_old","session-old","2026-09-21T00:00:00Z"));
     const row=raw.prepare("SELECT herdr_workspace_id,herdr_pane_id,agent_name,max_state_change_seq FROM job_live_session_identities").get() as Record<string,unknown>;
-    assert.deepEqual(row,{herdr_workspace_id:null,herdr_pane_id:null,agent_name:null,max_state_change_seq:null});raw.close();
+    assert.deepEqual(row,{herdr_workspace_id:null,herdr_pane_id:null,agent_name:null,max_state_change_seq:null});
+    migrateLiveSession(raw);
+    const nonce=raw.prepare("SELECT generation_nonce FROM job_live_session_identities WHERE job_id='job_old'").pluck().get();
+    assert.equal(typeof nonce,"string");
+    migrateLiveSession(raw);
+    assert.equal(raw.prepare("SELECT generation_nonce FROM job_live_session_identities WHERE job_id='job_old'").pluck().get(),nonce);
+    raw.close();
+  });
+
+  test("更新前から稼働中のidentityを再起動時に世代付けして照会を維持する",async()=>{
+    const state=await addressableJob("dispatching","legacy-running");
+    const jobId=state.job.job_id;
+    const raw=new Database(state.config.databasePath);
+    raw.prepare("UPDATE job_live_session_identities SET generation_nonce=NULL WHERE job_id=?").run(jobId);
+    raw.close();state.database.close();
+    const reopened=new DispatcherDatabase(state.config.databasePath);
+    const nonce=reopened.getJobLiveSessionIdentity(jobId)?.generation_nonce;
+    assert.equal(typeof nonce,"string");
+    const supervisor=new JobSupervisor(reopened,runtimeWith(agentName=>({ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false,
+      agentStatus:"working",agentIdentity:JSON.stringify(["workspace-private","pane-private",agentName,"session-private"]),stateChangeSeq:5}),[]),state.config,logger,()=>{});
+    const receipt=await supervisor.observeLiveSession(jobId,state.source.event_id);
+    assert.equal(receipt.reconciliation.state,"prompt_acceptance_possible_running");
+    assert.ok(receipt.identity_generation_sha256);
+    reopened.close();
   });
 
   test("並行queryは独立したappend-only receiptを作る",async()=>{

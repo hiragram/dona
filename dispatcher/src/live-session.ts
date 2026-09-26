@@ -161,6 +161,11 @@ export function migrateLiveSession(db: Database.Database): void {
   }
   if (!identityColumns.has("max_state_change_seq")) db.exec("ALTER TABLE job_live_session_identities ADD COLUMN max_state_change_seq INTEGER CHECK (max_state_change_seq >= 0 OR max_state_change_seq IS NULL)");
   if (!identityColumns.has("generation_nonce")) db.exec("ALTER TABLE job_live_session_identities ADD COLUMN generation_nonce TEXT");
+  db.transaction(() => {
+    const legacy = db.prepare("SELECT job_id FROM job_live_session_identities WHERE generation_nonce IS NULL").all() as Array<{job_id:string}>;
+    const assign = db.prepare("UPDATE job_live_session_identities SET generation_nonce=? WHERE job_id=? AND generation_nonce IS NULL");
+    for (const row of legacy) assign.run(randomUUID(),row.job_id);
+  })();
   const receiptColumns = new Set((db.prepare("PRAGMA table_info(live_session_query_receipts)").all() as Array<{name:string}>).map(row=>row.name));
   if (!receiptColumns.has("identity_generation_sha256")) db.exec("ALTER TABLE live_session_query_receipts ADD COLUMN identity_generation_sha256 TEXT");
 }
