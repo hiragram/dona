@@ -162,7 +162,7 @@ const slackMention = /<!(?:channel|here|everyone)(?:\|[^>]*)?>|<!subteam\^[^>]+>
 const networkUrlCandidate = /[A-Za-z][A-Za-z0-9+.-]{0,63}:\/\/[^\s"'<>`]+/gi;
 const schemelessUrlCandidate = /(?:^|[^A-Za-z0-9_.@/:-])((?:[A-Za-z0-9._~%-]{1,256}(?::[^@\s/"'<>`]{0,256})?@)?(?:(?:[A-Za-z0-9-]{1,63}\.)+(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{2,59})|(?:[A-Za-z0-9-]{1,63}\.)*localhost)(?::\d{1,5})?(?:\/|[?#])[^\s"'<>`]+)/gi;
 const rootRelativeUrlCandidate = /(?:^|[\s"'`(])\/(?!\/)[^\s"'<>`]+/g;
-const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa|test|invalid|example)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})\/[^\s"'<>`]+)/gi;
+const privateHostPathCandidate = /(?:^|[^A-Za-z0-9.@:/])((?:(?:0x[0-9a-f]+|0[0-7]{8,}|\d{9,10}|(?:0x[0-9a-f]+|0[0-7]+|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]+|\d+)){1,3}|[A-Za-z0-9.-]+\.(?:internal|local|lan|home\.arpa|test|invalid|example)\.?|(?:files|hooks)\.slack\.com\.?|\[[0-9a-f:.]+\])(?::\d{1,5})?|[A-Za-z][A-Za-z0-9-]*:\d{1,5})(?:[/?#][^\s"'<>`]*|(?=$|[\s"'<>`])))/gi;
 const jwtCandidate = /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]*)\.([A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])/g;
 function hasJwt(value: string): boolean {
   for (const match of value.matchAll(jwtCandidate)) {
@@ -573,16 +573,16 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       const stripped = value.replace(ansiEscape, "").replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
       if (stripped !== value) assertSafeJson(stripped, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
     }
-    const jsonEscape = /\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g;
+    const jsonEscape = /\\(?:u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|["\\/bfnrt])/g;
     if (decodeDepth < 2 && jsonEscape.test(value)) {
       jsonEscape.lastIndex = 0;
       const decodedJson = value.replace(jsonEscape, escaped => {
-        if (escaped[1] === "u") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
+        if (escaped[1] === "u" || escaped[1] === "x") return String.fromCharCode(Number.parseInt(escaped.slice(2), 16));
         return ({ b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" } as Record<string, string>)[escaped[1]!] ?? escaped[1]!;
       });
       assertSafeJson(decodedJson, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if (decodeDepth >= 2 && /\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/.test(value)) throw new JobResultPublishError("content_requires_redaction");
+    if (decodeDepth >= 2 && /\\(?:u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|["\\/bfnrt])/.test(value)) throw new JobResultPublishError("content_requires_redaction");
     if (decodeDepth < 2 && value.includes("%")) {
       const decoded = value.replace(/(?:%[0-9A-Fa-f]{2})+/g, encoded => {
         try { return decodeURIComponent(encoded); }
@@ -614,6 +614,29 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
     if (collectBytes(value) && bytes.length >= 2) {
       try {
         const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(bytes));
+        if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
+        assertSafeJson(decoded, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
+      } catch (error) {
+        if (error instanceof JobResultPublishError) throw error;
+        // Invalid UTF-8 cannot reconstruct a text Result value.
+      }
+    }
+    const mixed: (string | number)[] = [];
+    const collectMixed = (items: unknown[]): boolean => items.every(item => {
+      if (Array.isArray(item)) return collectMixed(item);
+      if (typeof item === "string") { mixed.push(item); return true; }
+      if (typeof item === "number" && Number.isInteger(item) && item >= 0 && item <= 255) {
+        mixed.push(item); return true;
+      }
+      return false;
+    });
+    if (collectMixed(value) && mixed.some(item => typeof item === "string") && mixed.some(item => typeof item === "number")) {
+      if (mixed.length > 12) throw new JobResultPublishError("content_requires_redaction");
+      assertSafeFragmentCombinations(mixed.map(item => typeof item === "number" ? String.fromCharCode(item) : item),
+        forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
+      const byteParts = mixed.map(item => typeof item === "number" ? Buffer.from([item]) : Buffer.from(item, "utf8"));
+      try {
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(byteParts));
         if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
         assertSafeJson(decoded, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
       } catch (error) {

@@ -409,6 +409,19 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ part: "private objective " }, { part: "text" }] },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: [grant.capability.slice(0, 20), grant.capability.charCodeAt(20), grant.capability.slice(21)] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: ["private objective ", [116, 101], "xt"] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      summary: [...Buffer.from(grant.capability)].map(byte => `\\x${byte.toString(16).padStart(2, "0")}`).join("") },
+      () => current), code("content_requires_redaction"));
+    for (const endpoint of ["10.0.0.5:8080?download=1", "[::1]#result", "10.0.0.5:8080"]) {
+      assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary: endpoint },
+        () => current), code("content_requires_redaction"));
+    }
     const encodedObjective = Buffer.from("private objective text", "utf8").toString("base64");
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ part: encodedObjective.slice(0, 12) }, { part: encodedObjective.slice(12) }] },
