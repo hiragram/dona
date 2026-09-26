@@ -1,4 +1,5 @@
 import path from "node:path";
+import { jobResultValidationCommand } from "./job-result-validation-command.js";
 import type { JobRow, JobWorkspace } from "./types.js";
 import { parseJobWorkspace } from "./validation.js";
 import { jobResultPublishTtlMs } from "./job-result-publish.js";
@@ -19,6 +20,8 @@ export function buildJobResultPublishInstructions(): string {
 export function buildJobPrompt(row: JobRow, progressEnabled = true): string {
   progressEnabled = progressEnabled && row.source !== "dona_schedule";
   const progressPath = jobProgressPath(row);
+  const validatorCommand = jobResultValidationCommand(row.source === "dona_schedule")
+    .map((arg) => "'" + arg.replaceAll("'", "'\"'\"'") + "'").join(" ");
   const jobJson = JSON.stringify({
     schema_version: 1,
     job_id: row.job_id,
@@ -54,8 +57,11 @@ ${progressEnabled ? `工程が変わるたび、Dispatcherが指定したprogres
   "output": { "format": "markdown", "text": "Donaが利用者へ伝える詳細" },
   "artifacts": [],
   "actions": [],
-  "completed_at": "UTCのRFC 3339文字列"
+  "completed_at": "末尾ZのUTC RFC 3339文字列"
 }
+
+completed_atは末尾Zが必須です。秒のみ、または小数秒1桁以上（3・6・9桁を含む）を許可し、精度を丸めません。Nodeでは new Date().toISOString()、Pythonでは datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z') で生成してください。任意文字列や非UTC offsetをZへ付け替えてはいけません。
+一時ファイルを公開する前に、同じreader/schemaを使う検証コマンド ${validatorCommand} <tmpの絶対パス> <契約のjob_id> を実行し、exit code 0の場合だけrenameしてください。JSON parseや往復一致だけではschema検証になりません。検証失敗・コマンド利用不能なら公開しないでください。既存final Resultがある場合も新規公開を停止し、上書きせずread-onlyで照合してください。rename後は同じコマンドでread-backしてください。公開結果が曖昧な場合は再writeせず、file・DB status・receiptをread-onlyで照合し、needs_reviewを解除しないでください。
 
 失敗時はstatusをfailedとし、summaryへ安全に再実行できるか判断できる理由を書いてください。認証情報、token、private URL、メッセージ本文の不要な全文を結果へ含めないでください。`;
 }

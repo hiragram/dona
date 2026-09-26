@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { readJobResultEnvelope } from "../src/job-result.js";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -1988,4 +1991,56 @@ describe("JobSupervisor", () => {
     const supervisor=new JobSupervisor(database,runtime,{...config,queuePollMs:5},logger,()=>undefined,progress as never); supervisor.start();
     await waitFor(()=>disabled); await supervisor.stop(); assert.equal(reports,1); database.close();
   });
+});
+
+for (const valid of [true, false]) test(`legacy timestamp producer to DB: ${valid}`, async () => {
+  const { root, config } = await tempConfig(); roots.push(root);
+  const database = new DispatcherDatabase(config.databasePath);
+  const job = createScratchJob(database, config, `Ev-timestamp-${valid}`);
+  markRunning(database, job.job_id);
+  await fs.mkdir(path.dirname(job.result_path), { recursive: true });
+  const tmp = `${job.result_path}.tmp`;
+  // Python's UTC producer keeps its six-digit precision; only its known UTC suffix changes.
+  const pythonUtc = "2026-09-26T05:27:59.719371+00:00";
+  const timestamp = valid ? pythonUtc.replace("+00:00", "Z") : pythonUtc;
+  const candidate = { schema_version: 1, job_id: job.job_id, status: "completed", summary: "fixture", completed_at: timestamp };
+  const validate = () => spawnSync(process.execPath, ["--import", "tsx", fileURLToPath(new URL("../src/job-result-validate.ts", import.meta.url)), tmp, job.job_id], { encoding: "utf8" });
+  await fs.writeFile(tmp, "{malformed private fixture");
+  assert.equal(validate().status, 1);
+  assert.equal(existsSync(job.result_path), false);
+  await fs.writeFile(tmp, JSON.stringify(candidate), { mode: 0o600 });
+  const checked = validate();
+  assert.equal(checked.status, valid ? 0 : 1);
+  if (valid) {
+    await fs.rename(tmp, job.result_path);
+    assert.equal((await readJobResultEnvelope(job.result_path, job.job_id)).completed_at, timestamp);
+  } else {
+    assert.match(checked.stderr, /completed_at.*trailing Z/);
+    assert.equal(checked.stderr.includes(timestamp), false);
+    assert.equal(existsSync(job.result_path), false);
+    // Simulate an already published legacy invalid final, bypassing prevalidation.
+    await fs.copyFile(tmp, job.result_path);
+    const original = await fs.readFile(job.result_path);
+    await fs.writeFile(tmp, JSON.stringify({ ...candidate, completed_at: "private secret https://private.invalid" }));
+    const rejected = validate();
+    assert.equal(rejected.status, 1);
+    assert.equal(rejected.stderr.includes("private"), false);
+    assert.deepEqual(await fs.readFile(job.result_path), original);
+  }
+  const supervisor = new JobSupervisor(database, fakeRuntime({}), config, logger, () => undefined);
+  try {
+    supervisor.start();
+    await waitFor(() => database.getJob(job.job_id)?.completion_event_id !== null);
+    await supervisor.stop();
+    const stored = database.getJob(job.job_id)!;
+    assert.equal(stored.status, valid ? "completed" : "needs_review");
+    if (valid) assert.equal(JSON.parse(stored.result_json!).completed_at, timestamp);
+    else {
+      assert.equal(stored.result_json, null);
+      assert.equal(stored.completed_at, null);
+      assert.equal(stored.last_error_code, "invalid_result");
+      assert.match(stored.last_error_message!, /completed_at.*trailing Z/);
+    }
+    // fakeRuntime throws on prepare/prompt/wait: ingestion cannot replay worker side effects.
+  } finally { await supervisor.stop(); database.close(); }
 });

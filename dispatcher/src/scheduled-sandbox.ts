@@ -1,3 +1,4 @@
+import { jobResultValidationCommand, jobResultValidationReadPaths } from "./job-result-validation-command.js";
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
@@ -18,7 +19,7 @@ export async function scheduledExecutablePaths(executable:string):Promise<string
 export function scheduledPermissionArguments(resultDirectory:string,executables:readonly string[],workspacePath:string):string[] {
   if(!executables.length||executables.some(value=>!path.isAbsolute(value))) throw new Error("Scheduled sandbox executable identity is required");
   const rules=[`\":root\" = \"deny\"`,`\":minimal\" = \"read\"`,`${JSON.stringify(resultDirectory)} = "write"`,`${JSON.stringify(workspacePath)} = "read"`,
-    ...executables.map(value=>`${JSON.stringify(value)} = "read"`)];
+    ...[...new Set([...executables, ...jobResultValidationReadPaths()])].map(value=>`${JSON.stringify(value)} = "read"`)];
   return [...["memories","shell_snapshot","shell_snapshot_v2","browser_use","browser_use_external","browser_use_full_cdp_access"].flatMap(feature=>["--disable",feature]),"-c",`default_permissions = "${scheduledPermissionProfile}"`,"-c",`permissions = { ${scheduledPermissionProfile} = { filesystem = { ${rules.join(", ")} }, network = { enabled = false } } }`,
     "-c",'shell_environment_policy = { inherit = "none", set = { PATH = "/usr/bin:/bin" } }',"-c","project_doc_max_bytes = 0","-c",'web_search = "disabled"'];
 }
@@ -34,6 +35,7 @@ export function verifyScheduledPermissionContext(output:string,resultDirectory:s
   const codexHome=process.env.CODEX_HOME??path.join(os.homedir(),".codex");
   const helperRoot=normalize(path.join(codexHome,"tmp","arg0"))+path.sep;
   const runtimeShell=path.resolve(path.dirname(executables.at(-1)!),"..","codex-resources","zsh","bin","zsh");
+  const requiredValidatorReads = new Set(jobResultValidationReadPaths().map(normalize));
   let deniedRoot=false,writes=0,workspaceReads=0;
   for(const entry of entries) {
     const special=/<special>(.*?)<\/special>/.exec(entry[2]!)?.[1];
@@ -45,10 +47,11 @@ export function verifyScheduledPermissionContext(output:string,resultDirectory:s
     const resolved=normalize(decode(file));
     if(entry[1]==="write"&&resolved===normalize(resultDirectory)){writes++;continue;}
     if(entry[1]==="read"&&resolved===normalize(workspacePath)){workspaceReads++;continue;}
+    if(entry[1]==="read"&&requiredValidatorReads.delete(resolved)) continue;
     if(entry[1]==="read"&&(executables.some(value=>normalize(value)===resolved)||resolved===normalize(runtimeShell)||resolved.startsWith(helperRoot))) continue;
     throw new Error("Scheduled permission context contains an unexpected grant");
   }
-  if(!deniedRoot||writes!==1||workspaceReads!==1) throw new Error("Scheduled read isolation is not active");
+  if(!deniedRoot||writes!==1||workspaceReads!==1||requiredValidatorReads.size!==0) throw new Error("Scheduled read isolation is not active");
 }
 
 // 実際のCodex OS sandboxで、隣接canaryとsymlink経由のreadを拒否し、許可したResultへのwrite/readだけが成功することを確認する。
@@ -60,6 +63,7 @@ export async function verifyScheduledSandbox(resultDirectory:string,executables:
   const output=path.join(resultDirectory,`.sandbox-output-${path.basename(outside)}`);
   const workspaceInput=path.join(workspacePath,`.sandbox-input-${path.basename(outside)}`);
   const workspaceLink=path.join(workspacePath,`.sandbox-link-${path.basename(outside)}`);
+  const candidate=path.join(resultDirectory,`.sandbox-result-${path.basename(outside)}.tmp`);
   await fs.writeFile(canary,"fixture-only",{mode:0o600});
   try {
     await fs.symlink(canary,link);
@@ -75,7 +79,16 @@ export async function verifyScheduledSandbox(resultDirectory:string,executables:
       'if /bin/cat "$1" >/dev/null 2>&1 || /bin/cat "$2" >/dev/null 2>&1 || /bin/cat "$4" >/dev/null 2>&1; then exit 70; fi; test "$(/bin/cat "$3")" = approved-input || exit 72; if (printf changed > "$3") 2>/dev/null; then exit 71; fi; printf verified > "$5" && test "$(/bin/cat "$5")" = verified',
       "sandbox-probe",canary,link,workspaceInput,workspaceLink,output],timeoutMs);
     if(!checked.ok||await fs.readFile(output,"utf8").catch(()=>"")!=="verified") throw new Error("Scheduled read isolation could not be verified");
+    const validatorCommand = jobResultValidationCommand(true);
+    for (const valid of [true, false]) {
+      await fs.writeFile(candidate, JSON.stringify({schema_version:1, job_id:"job_sandbox_fixture", status:"completed", summary:"fixture", completed_at:valid ? "2026-09-26T05:27:59.719371Z" : "2026-09-26T05:27:59.719371+00:00"}), {mode:0o600});
+      const validation=await run(executables.at(-1)!,[...scheduledPermissionArguments(resultDirectory,executables,workspacePath),
+        "sandbox","--permission-profile",scheduledPermissionProfile,"-C",resultDirectory,"--",...validatorCommand,candidate,"job_sandbox_fixture"],timeoutMs);
+      if(valid ? !validation.ok : validation.ok || validation.exitCode!==1 || validation.timedOut || validation.aborted || validation.stderr.trim()!=="completed_at must be UTC RFC 3339 with trailing Z")
+        throw new Error("Scheduled Result validation could not be verified");
+    }
   } finally {
+    await fs.rm(candidate,{force:true});
     await fs.rm(workspaceInput,{force:true}); await fs.rm(workspaceLink,{force:true}); await fs.rm(link,{force:true}); await fs.rm(output,{force:true}); await fs.rm(outside,{recursive:true,force:true});
   }
 }

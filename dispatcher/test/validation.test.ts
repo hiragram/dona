@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import {
+  parseJobResultEnvelope,
   canonicalJobPayload,
   canonicalJobPayloadSha256,
   jobObjectiveCharacterMax,
@@ -187,4 +188,29 @@ describe("job creation validation", () => {
     assert.equal(parseInternalScheduleEventEnvelope(envelope).source, "dona_schedule");
     assert.throws(() => parseInternalScheduleEventEnvelope({ ...envelope, external_event_id: "schedule:v1:s2:2026-09-05T00:01:00Z" }), /mismatch/);
   });
+});
+
+describe("UTC Z timestamp contract shared by Job, Event and Event Result", () => {
+  const valid = ["0000-02-29T00:00:00Z", "0099-01-01T00:00:00Z", "2000-02-29T23:59:59Z",
+    "2024-02-29T00:00:00Z", "9999-12-31T23:59:59Z",
+    ...["", ".123", ".719371", ".123456789", ".1", ".123456789012"].map(f => `2026-09-26T05:27:59${f}Z`)];
+  const invalid = ["2026-09-26T05:27:59.719371+00:00", "2026-09-26T05:27:59+09:00",
+    "2026-09-26T05:27:59-00:00", "2026-09-26T05:27:59", "2026-02-30T00:00:00Z",
+    "1900-02-29T00:00:00Z", "2026-02-29T00:00:00Z", "2026-04-31T00:00:00Z",
+    "2026-00-01T00:00:00Z", "2026-13-01T00:00:00Z", "2026-01-00T00:00:00Z",
+    "2026-01-32T00:00:00Z", "2026-01-01T24:00:00Z", "2026-01-01T00:60:00Z",
+    "2026-01-01T00:00:60Z", "2026-01-01T00:00:00.Z", "2026-01-01T00:00:00z", "2026-01-01T00:00:00Z\n", "2026-01-01T00:00:00Z\r", "", null, 123];
+  for (const [accepted, values] of [[true, valid], [false, invalid]] as const) {
+    for (const value of values) test(`${accepted ? "accept" : "reject"} ${JSON.stringify(value)}`, () => {
+      const parsers = [
+        () => parseJobResultEnvelope({ schema_version: 1, job_id: "job_fixture", status: "completed", summary: "fixture", completed_at: value }, "job_fixture").completed_at,
+        () => parseEventEnvelope({ ...eventEnvelope("fixture"), occurred_at: value }).occurred_at,
+        () => parseResultEnvelope({ schema_version: 1, event_id: "evt_fixture", status: "completed", summary: "fixture", actions: [], memory_candidates: [], completed_at: value }, "evt_fixture").completed_at,
+      ];
+      for (const parse of parsers) {
+        if (accepted) assert.equal(parse(), value);
+        else assert.throws(parse);
+      }
+    });
+  }
 });
