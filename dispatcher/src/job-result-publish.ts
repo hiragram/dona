@@ -125,6 +125,7 @@ function hasLocalPath(value: string): boolean {
   const candidate = new RegExp(localPath.source, "giu");
   for (const match of value.matchAll(candidate)) {
     const route = match[0].trimStart();
+    if (/^<\/[A-Za-z][A-Za-z0-9:._-]*$/.test(route) && value[match.index! + match[0].length] === ">") continue;
     const prefix = value.slice(0, match.index);
     const slashPosition = match.index + match[0].indexOf("/");
     if (/\/\/\[[0-9a-f:.]+\]$/i.test(value.slice(0, slashPosition))) continue;
@@ -278,13 +279,14 @@ function decodeBase32Token(encoded: string): string | undefined {
       value &= (1 << bits) - 1;
     }
   }
-  if (bytes.length !== capabilityWindowLength || value !== 0) return undefined;
-  return Buffer.from(bytes).toString("ascii");
+  if (value !== 0 || bytes.length < 4 || bytes.length > 8_192) return undefined;
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(bytes)); }
+  catch { return undefined; }
 }
 function containsForbiddenCapability(value: string, digests: ReadonlySet<string>, fingerprints: ReadonlySet<number>): boolean {
   for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{69}={0,3})(?=$|[^A-Z2-7=])/g)) {
     const raw = decodeBase32Token(match[1]!);
-    if (raw && fingerprints.has(fingerprint(raw)) && digests.has(createHash("sha256").update(raw).digest("hex"))) return true;
+    if (raw && raw.length === capabilityWindowLength && fingerprints.has(fingerprint(raw)) && digests.has(createHash("sha256").update(raw).digest("hex"))) return true;
   }
   for (const match of value.matchAll(capabilityRun)) {
     const run = match[0];
@@ -311,6 +313,27 @@ function containsForbiddenCapability(value: string, digests: ReadonlySet<string>
 }
 const assignmentCandidate = /(?:\b[A-Za-z_][A-Za-z0-9_.-]*|["'][^"'\r\n]+["'])\s*[:=]/g;
 const cliCredentialCandidate = /--([A-Za-z][A-Za-z0-9-]*)\s+[^\s]+/g;
+function hasNetrcCredential(value: string): boolean {
+  for (const match of value.matchAll(/(?:^|\s)(?:machine\s+\S+|default)\b([^\r\n]*)/gi)) {
+    const fields = match[1]!.trim().split(/\s+/);
+    if (fields.some((field, index) => /^(?:password|account)$/i.test(field) && index + 1 < fields.length)) return true;
+  }
+  return false;
+}
+function hasBasicCredential(value: string): boolean {
+  for (const match of value.matchAll(/\bBasic\s+([A-Za-z0-9+/]{8,}={0,2})(?=$|[^A-Za-z0-9+/=])/gi)) {
+    const encoded = match[1]!;
+    const bytes = Buffer.from(encoded, "base64");
+    if (bytes.toString("base64").replace(/=+$/, "") !== encoded.replace(/=+$/, "")) continue;
+    const decoded = bytes.toString("utf8");
+    if (decoded.includes(":")) return true;
+  }
+  return false;
+}
+function hasCurlPrivateKeyCredential(value: string): boolean {
+  return /(?:^|\s)--pass(?:=|\s+)\S+/i.test(value) ||
+    /(?:^|\s)--cert(?:=|\s+)(?:"[^"]+"|'[^']+'|\S+):[^\s"']+/i.test(value);
+}
 function isPublicCountField(key: string, value: unknown): boolean {
   return /_count$/i.test(key.replace(/([a-z0-9])([A-Z])/g, "$1_$2")) &&
     typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -390,6 +413,15 @@ function hasEncodedPrivateValue(value: string, matcher: ForbiddenValueMatcher, d
     const encoded = match[0];
     if (encoded.length % 2 !== 0) continue;
     if (++budget.count > 1_024 || inspect(Buffer.from(encoded, "hex"))) return true;
+  }
+  for (const match of value.matchAll(/(?:^|[^A-Z2-7])([A-Z2-7]{16,}={0,6})(?=$|[^A-Z2-7=])/g)) {
+    const encoded = match[1]!;
+    const decoded = decodeBase32Token(encoded);
+    if (!decoded) continue;
+    if (++budget.count > 1_024) return true;
+    if (matcher.contains(decoded)) return true;
+    try { assertSafeJson(decoded, 0, digests, matcher, fingerprints, decodeDepth + 1, budget); }
+    catch (error) { if (error instanceof JobResultPublishError) return true; }
   }
   return false;
 }
@@ -473,7 +505,7 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       if (decodeDepth >= 2) throw new JobResultPublishError("content_requires_redaction");
       assertSafeJson(displayed, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
     }
-    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}/i.test(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
+    if ((value.includes("PuTTY-User-Key-File-") && value.includes("Private-Lines:")) || hasBasicCredential(value) || hasNetrcCredential(value) || hasCurlPrivateKeyCredential(value) || sensitive.test(value) || schemelessNumericUserinfo.test(value) || (decodeDepth < 3 && forbiddenValues && hasEncodedPrivateValue(value, forbiddenValues, decodeDepth, budget, forbiddenDigests, forbiddenFingerprints)) || pgpassCredential.test(value) || hasLocalPath(value) || windowsUncPath.test(value) || hasPrivateSlashAuthority(value, forbiddenValues) || slackMention.test(value) || hasPrivateJwkText(value) || hasJwt(value)) throw new JobResultPublishError("content_requires_redaction");
     if (hasInvalidUnicode(value)) throw new JobResultPublishError("invalid_request");
   } else if (Array.isArray(value)) {
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
@@ -574,6 +606,23 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
   }
   if (parsed.data.artifacts !== undefined) assertSafeJson(parsed.data.artifacts, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
   if (parsed.data.actions !== undefined) assertSafeJson(parsed.data.actions, 0, forbiddenDigests, matcher, forbiddenFingerprints, 0, encodedBudget);
+  if (forbiddenDigests && forbiddenFingerprints) {
+    const leaves: string[] = [];
+    const collect = (value: unknown): void => {
+      if (typeof value === "string") leaves.push(value);
+      else if (Array.isArray(value)) value.forEach(collect);
+      else if (value !== null && typeof value === "object") Object.values(value).forEach(collect);
+    };
+    collect(parsed.data.summary);
+    if (parsed.data.output) collect(parsed.data.output.text);
+    if (parsed.data.artifacts) collect(parsed.data.artifacts);
+    if (parsed.data.actions) collect(parsed.data.actions);
+    const combined = leaves.join("");
+    if (containsForbiddenCapability(combined, forbiddenDigests, forbiddenFingerprints) ||
+      containsForbiddenCapability(displayProjection(combined), forbiddenDigests, forbiddenFingerprints)) {
+      throw new JobResultPublishError("content_requires_redaction");
+    }
+  }
   const envelope: JobResultEnvelope = {
     schema_version: 1,
     job_id: job.job_id,
