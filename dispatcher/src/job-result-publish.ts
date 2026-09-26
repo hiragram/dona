@@ -36,7 +36,7 @@ export class JobResultPublishError extends Error {
 // These checks reject credential-shaped content, private URLs, and local paths before
 // it can enter a durable Result. Errors never contain any part of the supplied value.
 const sensitive = /(?:(?:^|\s)(?:-[uU]\s*|--(?:proxy-)?user(?:=|\s+))[^:\s]+:[^\s]+|(?:\bmachine\s+[^\s]+|\bdefault)\s+login\s+[^\s]+\s+password\s+[^\s]+|xox[a-z]-|xapp-|ya29\.[A-Za-z0-9._~-]{16,}|hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|gl(?:pat|ptt|ft|rt|cbt|imt|soat|agent)-[A-Za-z0-9_-]{12,}|(?:[rs]k_(?:live|test)|whsec)_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|-----BEGIN (?:(?:ENCRYPTED |OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----|PGP PRIVATE KEY BLOCK-----)|\b(?:token|password|secret|api[_ -]?key|access[_ -]?key|private[_ -]?key|credential|authorization)\s*[:=]|\bBearer\s+(?:[A-Za-z0-9._~-]{16,}|(?=[A-Za-z0-9._~-]{0,15}[0-9._~-])[A-Za-z0-9._~-]{8,})|file:\/\/\S+|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]+@|https?:\/\/(?:(?:files|hooks)\.slack\.com|localhost|127\.0\.0\.1))/i;
-const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~-]+:[^@\s/<>`]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?\/[^\s"'<>`]+/i;
+const schemelessNumericUserinfo = /(?:^|[^A-Za-z0-9_.@/:-])[A-Za-z0-9._~-]+:[^@\s/<>`]+@(?:[A-Za-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?(?:[/?#][^\s"'<>`]*|(?=$|[\s"'<>`]))/i;
 const ageSecretIdentity = /AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{20,}\b/i;
 const shortBearerCredential = /\bBearer\s+(?=[A-Za-z0-9._~-]{1,7}(?:\b|$))(?=[A-Za-z0-9._~-]*[0-9._~-])[A-Za-z0-9._~-]{1,7}\b/i;
 const pgpassCredential = /(?:^|\s)(?:\\.|[^\s:\\]){1,255}:(?:\d{1,5}|\*):(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}:(?:\\.|[^\s:\\]){1,255}(?=$|\s)/;
@@ -603,6 +603,16 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
   } else if (Array.isArray(value)) {
     if (value.length === 2 && typeof value[0] === "string" && value[1] !== null && value[1] !== "" &&
       forbiddenKey(normalizedStructuredKey(value[0]))) throw new JobResultPublishError("content_requires_redaction");
+    if (value.length >= 2 && value.every(item => typeof item === "number" && Number.isInteger(item) && item >= 0 && item <= 255)) {
+      try {
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(value));
+        if (++budget.count > 1_024) throw new JobResultPublishError("content_requires_redaction");
+        assertSafeJson(decoded, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth + 1, budget);
+      } catch (error) {
+        if (error instanceof JobResultPublishError) throw error;
+        // Invalid UTF-8 cannot reconstruct a text Result value.
+      }
+    }
     assertSafeFragmentCombinations(value, forbiddenDigests, forbiddenValues, forbiddenFingerprints, budget);
     for (const item of value) assertSafeJson(item, depth + 1, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
   } else if (value !== null && typeof value === "object") {
@@ -736,6 +746,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
     if (parsed.data.artifacts) collect(parsed.data.artifacts);
     if (parsed.data.actions) collect(parsed.data.actions);
     assertSafeFragmentCombinations(leaves, forbiddenDigests, matcher, forbiddenFingerprints, encodedBudget);
+    assertSafeFragmentCombinations(ordered, forbiddenDigests, matcher, forbiddenFingerprints, encodedBudget);
     for (const combined of new Set([leaves.join(""), keys.join(""), ordered.join(""),
       ...[...fieldValues.values()].filter(values => values.length > 1).map(values => values.join("")),
       ...[...numberedValues.values()].filter(values => values.length > 1).map(values =>
