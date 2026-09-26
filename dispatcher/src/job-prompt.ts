@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { JobRow, JobWorkspace } from "./types.js";
 import { parseJobWorkspace } from "./validation.js";
+import { jobResultPublishTtlMs } from "./job-result-publish.js";
 
 export function workspaceFromJob(row: JobRow): JobWorkspace {
   return parseJobWorkspace(JSON.parse(row.workspace_json));
@@ -8,6 +9,11 @@ export function workspaceFromJob(row: JobRow): JobWorkspace {
 
 export function jobProgressPath(row: JobRow): string {
   return path.join(path.dirname(row.workspace_path), ".dona-progress", path.basename(row.workspace_path), "progress.json");
+}
+
+/** Safe prompt fragment. The rollout must deliver the raw grant outside argv/prompt. */
+export function buildJobResultPublishInstructions(): string {
+  return `Result公開専用の短命capabilityは対象worker専用の非argv経路から取得してください。構造化公開requestはschema_version=1、status、summary、任意のoutput、artifacts（object配列）、actionsだけを送ります。job_id、path、completed_at、ownerは送らず、Dispatcherが永続job契約から補完します。capabilityはprompt、引数、環境変数、Result本文、log、artifactへ含めないでください。期限内でもworker session変更またはDispatcher restart後は再発行が必要です。最大有効期間は${jobResultPublishTtlMs / 60_000}分です。`;
 }
 
 export function buildJobPrompt(row: JobRow, progressEnabled = true): string {

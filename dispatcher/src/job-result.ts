@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 
 import type { JobResultEnvelope } from "./types.js";
+import { jobResultEnvelopeMaxBytes } from "./job-result-publish.js";
 import { parseJobResultEnvelope } from "./validation.js";
 
 export class JobResultNotFoundError extends Error {
@@ -21,7 +22,7 @@ export async function readJobResultEnvelope(resultPath: string, jobId: string): 
   try {
     const stats = await handle.stat();
     if (!stats.isFile()) throw new Error("Job result path is not a regular file");
-    if (stats.size > 1_048_576) throw new Error("Job result file exceeds 1 MiB");
+    if (stats.size > jobResultEnvelopeMaxBytes) throw new Error("Job result file exceeds 1 MiB");
     const content = await handle.readFile({ encoding: "utf8" });
     let parsed: unknown;
     try {
