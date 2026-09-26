@@ -41,7 +41,7 @@ function usage(): never {
   dona-dispatcher job inspect-late-result <job_id>
   dona-dispatcher job inspect-operator-recovery <job_id>
   dona-dispatcher job operator-recovery-record <job_id>
-  dona-dispatcher job recover-operator-assertion <job_id> <assertion_event_id> <expected_updated_at> <expected_cause> <valid|invalid|missing> <result_sha256|missing> <side_effects_evidence_sha256> <notification_evidence_sha256> --assertion-reviewed --side-effects-reviewed --notification-reviewed
+  dona-dispatcher job recover-operator-assertion <job_id> <assertion_event_id> <expected_updated_at> <expected_cause> <valid|invalid|missing> <result_sha256|missing> <side_effects_evidence_sha256> <notification_evidence_sha256> --assertion-reviewed --side-effects-reviewed --notification-reviewed --residual-risk-accepted
   dona-dispatcher job accept-late-result <job_id> <expected_updated_at> <expected_cause> <result_sha256> <stop_receipt_id> <side_effects_evidence_sha256> <notification_evidence_sha256> --worker-stopped-reviewed --side-effects-reviewed --notification-reviewed
   dona-dispatcher job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
@@ -162,14 +162,16 @@ async function main(): Promise<void> {
         console.log(JSON.stringify(record,null,2));return;
       }
       if(command==="recover-operator-assertion") {
-        if(args.length!==13||args[10]!=="--assertion-reviewed"||args[11]!=="--side-effects-reviewed"||
-          args[12]!=="--notification-reviewed"||!["valid","invalid","missing"].includes(args[6]!))usage();
+        if(args.length!==14||args[10]!=="--assertion-reviewed"||args[11]!=="--side-effects-reviewed"||
+          args[12]!=="--notification-reviewed"||args[13]!=="--residual-risk-accepted"||
+          !["valid","invalid","missing"].includes(args[6]!))usage();
         const principal=`local:${os.userInfo().username}:${process.getuid?.()??"unknown"}`;
         const row=database.recoverWithOperatorAssertion({jobId:eventIdAt(args,2),assertionEventId:eventIdAt(args,3),
           operatorPrincipal:principal,expectedUpdatedAt:eventIdAt(args,4),expectedCause:eventIdAt(args,5),
           expectedResultClass:args[6] as "valid"|"invalid"|"missing",
           expectedResultSha256:args[7]==="missing"?null:eventIdAt(args,7),
-          sideEffectsEvidenceSha256:eventIdAt(args,8),notificationEvidenceSha256:eventIdAt(args,9)});
+          sideEffectsEvidenceSha256:eventIdAt(args,8),notificationEvidenceSha256:eventIdAt(args,9),
+          residualRisksAccepted:true});
         console.log(JSON.stringify({job_id:row.job_id,status:row.status,updated_at:row.updated_at,
           last_error_code:row.last_error_code,completion_event_id:row.completion_event_id},null,2));return;
       }

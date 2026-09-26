@@ -4,19 +4,20 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {afterEach, test} from "node:test";
 import Database from "better-sqlite3";
-import {DispatcherDatabase} from "../src/database.js";
+import {DispatcherDatabase,migrateDispatcherDatabase} from "../src/database.js";
 import {eventEnvelope, tempConfig} from "./helpers.js";
 
 const roots:string[]=[];
 afterEach(async()=>{await Promise.all(roots.splice(0).map(root=>fs.rm(root,{recursive:true,force:true})));});
 const digest=(text:string)=>createHash("sha256").update(text).digest("hex");
 
-async function setup(cause="legacy_agent_sandbox_unknown"){
+async function setup(cause="legacy_agent_sandbox_unknown",attempted=true){
   const {root,config}=await tempConfig();roots.push(root);
   const database=new DispatcherDatabase(config.databasePath);
   const source=database.enqueue(eventEnvelope(`source-${root}`)).row;
   const created=database.createJob({source_event_id:source.event_id,objective:"recover",workspace:{kind:"scratch"}},
     config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  if(attempted)database.beginJobPreparation(created.job_id);
   database.markJobNeedsReview(created.job_id,cause,"legacy worker state unknown");
   database.sealJobGroup(source.event_id);
   const assertion=database.enqueue({...eventEnvelope(`assertion-${root}`),occurred_at:new Date().toISOString(),
@@ -28,7 +29,7 @@ async function setup(cause="legacy_agent_sandbox_unknown"){
     const preview=database.inspectOperatorAssertionRecovery(job.job_id);
     return {jobId:job.job_id,assertionEventId:assertion.event_id,operatorPrincipal:"local:test:501",
       expectedUpdatedAt:preview.updated_at,expectedCause:preview.cause!,expectedResultClass:preview.result_class,
-      expectedResultSha256:preview.result_sha256,sideEffectsEvidenceSha256,
+      expectedResultSha256:preview.result_sha256,sideEffectsEvidenceSha256,residualRisksAccepted:true,
       notificationEvidenceSha256:preview.notification_evidence_sha256};
   };
   return {database,config,job,assertion,input};
@@ -47,6 +48,8 @@ test("妥当な Result は申告と個別照合を記録して受理する",asyn
   assert.equal(state.database.operatorAssertionRecoveryRecord(state.job.job_id)?.operator_role,"job_owner");
   assert.equal(state.database.operatorAssertionRecoveryRecord(state.job.job_id)?.authorization_principal,
     "slack:U_TEST");
+  assert.equal(state.database.operatorAssertionRecoveryRecord(state.job.job_id)?.stop_time_status,"unknown");
+  assert.equal(state.database.operatorAssertionRecoveryRecord(state.job.job_id)?.evidence_class,"operator_assertion");
   assert.throws(()=>state.database.recoverWithOperatorAssertion(input),/already_recorded/);
   const raw=new Database(state.config.databasePath,{readonly:true});
   try {
@@ -63,6 +66,15 @@ test("別の旧needs_review原因でも妥当Resultを受理する",async()=>{
     status:"failed",summary:"未完了",completed_at:new Date().toISOString()}));
   assert.equal(state.database.recoverWithOperatorAssertion(state.input()).status,"failed");
   assert.equal(state.database.getJob(state.job.job_id)?.result_json!==null,true);
+});
+
+test("prompt前のResult collisionから成功を作らない",async()=>{
+  const state=await setup("result_path_exists",false);
+  await fs.mkdir(path.dirname(state.job.result_path),{recursive:true});
+  await fs.writeFile(state.job.result_path,JSON.stringify({schema_version:1,job_id:state.job.job_id,
+    status:"completed",summary:"別の出力",completed_at:new Date().toISOString()}));
+  assert.throws(()=>state.database.recoverWithOperatorAssertion(state.input()),/pre_dispatch_unavailable/);
+  assert.equal(state.database.getJob(state.job.job_id)?.result_json,null);
 });
 
 test("無効な Result と欠落 Result は成功を作らず失敗へ確定する",async()=>{
@@ -136,6 +148,7 @@ test("旧Result pathの再openはCASを動かさず別CLI起動で回復でき�
   const source=createdDb.enqueue(eventEnvelope(`legacy-source-${root}`)).row;
   const created=createdDb.createJob({source_event_id:source.event_id,objective:"legacy",workspace:{kind:"scratch"}},
     config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  createdDb.beginJobPreparation(created.job_id);
   createdDb.markJobNeedsReview(created.job_id,"prompt_acceptance_unknown","unknown");
   createdDb.sealJobGroup(source.event_id);
   createdDb.close();
@@ -160,7 +173,48 @@ test("旧Result pathの再openはCASを動かさず別CLI起動で回復でき�
     const row=recover.recoverWithOperatorAssertion({jobId:created.job_id,assertionEventId:assertion.event_id,
       operatorPrincipal:"local:test:501",expectedUpdatedAt:preview.updated_at,expectedCause:preview.cause!,
       expectedResultClass:preview.result_class,expectedResultSha256:preview.result_sha256,
-      sideEffectsEvidenceSha256:digest("reviewed"),notificationEvidenceSha256:preview.notification_evidence_sha256});
+      sideEffectsEvidenceSha256:digest("reviewed"),notificationEvidenceSha256:preview.notification_evidence_sha256,
+      residualRisksAccepted:true});
     assert.equal(row.status,"failed");
   } finally {recover.close();}
+});
+
+test("v2 bridgeのoperator台帳をv3 job再構築後も保持する",async()=>{
+  const {root,config}=await tempConfig();roots.push(root);
+  const initial=new Database(config.databasePath);
+  initial.exec(await fs.readFile(new URL("./fixtures/schema-v2.sql",import.meta.url),"utf8"));
+  initial.close();
+  const bridge=new DispatcherDatabase(config.databasePath);
+  const source=bridge.enqueue(eventEnvelope(`v2-source-${root}`)).row;
+  const created=bridge.createJob({source_event_id:source.event_id,objective:"v2 recovery",workspace:{kind:"scratch"}},
+    config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  bridge.beginJobPreparation(created.job_id);
+  bridge.markJobNeedsReview(created.job_id,"legacy_agent_sandbox_unknown","unknown");
+  bridge.sealJobGroup(source.event_id);
+  const assertion=bridge.enqueue({...eventEnvelope(`v2-assertion-${root}`),occurred_at:new Date().toISOString(),
+    payload:{text:"worker停止済み"}}).row;
+  bridge.manualComplete(assertion.event_id);
+  const preview=bridge.inspectOperatorAssertionRecovery(created.job_id);
+  bridge.recoverWithOperatorAssertion({jobId:created.job_id,assertionEventId:assertion.event_id,
+    operatorPrincipal:"local:test:501",expectedUpdatedAt:preview.updated_at,expectedCause:preview.cause!,
+    expectedResultClass:preview.result_class,expectedResultSha256:preview.result_sha256,
+    sideEffectsEvidenceSha256:digest("reviewed"),notificationEvidenceSha256:preview.notification_evidence_sha256,
+    residualRisksAccepted:true});
+  const before=bridge.operatorAssertionRecoveryRecord(created.job_id);
+  bridge.close();
+  const migrate=new Database(config.databasePath);
+  migrate.pragma("foreign_keys = ON");
+  try {
+    assert.throws(()=>migrateDispatcherDatabase(migrate,(step)=>{
+      if(step==="indexes_recreated")throw new Error("injected migration failure");
+    },false,3),/injected migration failure/);
+    assert.equal(migrate.pragma("user_version",{simple:true}),2);
+    assert.equal((migrate.prepare("SELECT recorded_at FROM job_operator_assertion_recoveries WHERE job_id=?")
+      .get(created.job_id) as {recorded_at:string}).recorded_at,before?.recorded_at);
+    migrateDispatcherDatabase(migrate,()=>{},false,3);
+    assert.equal(migrate.pragma("user_version",{simple:true}),3);
+  } finally {migrate.close();}
+  const after=new DispatcherDatabase(config.databasePath);
+  try {assert.deepEqual(after.operatorAssertionRecoveryRecord(created.job_id),before);}
+  finally {after.close();}
 });

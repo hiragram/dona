@@ -77,6 +77,39 @@ const jobsRunnableFairIndexSql = `
     ON jobs(source_event_id, created_at, job_id, available_at)
     WHERE status = 'queued'
 `;
+const operatorAssertionRecoverySchemaSql = `
+  CREATE TABLE IF NOT EXISTS job_operator_assertion_recoveries(
+    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+    assertion_event_id TEXT NOT NULL REFERENCES events(event_id),
+    assertion_actor_id TEXT NOT NULL,
+    assertion_tenant_id TEXT NOT NULL,
+    assertion_workspace_id TEXT NOT NULL,
+    assertion_channel_id TEXT NOT NULL,
+    assertion_occurred_at TEXT NOT NULL,
+    assertion_payload_sha256 TEXT NOT NULL,
+    authorization_principal TEXT NOT NULL,
+    operator_principal TEXT NOT NULL,
+    operator_role TEXT NOT NULL CHECK(operator_role='job_owner'),
+    prior_status TEXT NOT NULL,
+    prior_cause TEXT NOT NULL,
+    prior_updated_at TEXT NOT NULL,
+    result_class TEXT NOT NULL CHECK(result_class IN ('valid','invalid','missing')),
+    result_sha256 TEXT,
+    side_effects_evidence_sha256 TEXT NOT NULL,
+    notification_evidence_sha256 TEXT NOT NULL,
+    final_status TEXT NOT NULL CHECK(final_status IN ('completed','failed')),
+    final_updated_at TEXT NOT NULL,
+    evidence_class TEXT NOT NULL CHECK(evidence_class='operator_assertion'),
+    stop_time_status TEXT NOT NULL CHECK(stop_time_status='unknown'),
+    residual_risk_codes_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL);
+  CREATE TRIGGER IF NOT EXISTS job_operator_assertion_recoveries_no_update
+    BEFORE UPDATE ON job_operator_assertion_recoveries
+    BEGIN SELECT RAISE(ABORT,'operator_assertion_recovery_append_only'); END;
+  CREATE TRIGGER IF NOT EXISTS job_operator_assertion_recoveries_no_delete
+    BEFORE DELETE ON job_operator_assertion_recoveries
+    BEGIN SELECT RAISE(ABORT,'operator_assertion_recovery_append_only'); END;
+`;
 
 export interface JobAdmissionLimits { jobsPerEventMax: number; jobObjectiveTotalMaxBytes: number; }
 export class JobCreationError extends Error {
@@ -470,6 +503,10 @@ export function migrateDispatcherDatabase(
     const hasLegacyStopMarkers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_job_agents_to_stop'").get() !== undefined;
     db.exec("CREATE TEMP TABLE legacy_job_stop_markers_v3(job_id TEXT PRIMARY KEY, stopped_at TEXT)");
     if (hasLegacyStopMarkers) db.exec("INSERT INTO legacy_job_stop_markers_v3 SELECT job_id, stopped_at FROM legacy_job_agents_to_stop");
+    const hasOperatorRecoveries = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_operator_assertion_recoveries'").get() !== undefined;
+    if (hasOperatorRecoveries) db.exec(`CREATE TEMP TABLE preserved_operator_recoveries_v3 AS
+      SELECT * FROM job_operator_assertion_recoveries;
+      DROP TABLE job_operator_assertion_recoveries;`);
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
     const hasTerminalCleanups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_terminal_worker_cleanups'").get() !== undefined;
@@ -533,6 +570,9 @@ export function migrateDispatcherDatabase(
       CREATE INDEX jobs_event_idx ON jobs(source_event_id, created_at);
       ${jobsRunnableFairIndexSql};
     `);
+    if (hasOperatorRecoveries) db.exec(`${operatorAssertionRecoverySchemaSql}
+      INSERT INTO job_operator_assertion_recoveries SELECT * FROM preserved_operator_recoveries_v3;
+      DROP TABLE preserved_operator_recoveries_v3;`);
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
       SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);`);
     if (hasTerminalCleanups) db.exec(`INSERT INTO job_terminal_worker_cleanups(job_id,outcome,identity_json,updated_at)
@@ -682,32 +722,7 @@ export class DispatcherDatabase {
         final_updated_at TEXT NOT NULL)`);
       this.db.exec(`CREATE TRIGGER IF NOT EXISTS job_late_result_reconciliations_no_update
         BEFORE UPDATE ON job_late_result_reconciliations BEGIN SELECT RAISE(ABORT, 'late_result_reconciliation_append_only'); END`);
-      this.db.exec(`CREATE TABLE IF NOT EXISTS job_operator_assertion_recoveries(
-        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
-        assertion_event_id TEXT NOT NULL REFERENCES events(event_id),
-        assertion_actor_id TEXT NOT NULL,
-        assertion_tenant_id TEXT NOT NULL,
-        assertion_workspace_id TEXT NOT NULL,
-        assertion_channel_id TEXT NOT NULL,
-        assertion_occurred_at TEXT NOT NULL,
-        assertion_payload_sha256 TEXT NOT NULL,
-        authorization_principal TEXT NOT NULL,
-        operator_principal TEXT NOT NULL,
-        operator_role TEXT NOT NULL CHECK(operator_role='job_owner'),
-        prior_status TEXT NOT NULL,
-        prior_cause TEXT NOT NULL,
-        prior_updated_at TEXT NOT NULL,
-        result_class TEXT NOT NULL CHECK(result_class IN ('valid','invalid','missing')),
-        result_sha256 TEXT,
-        side_effects_evidence_sha256 TEXT NOT NULL,
-        notification_evidence_sha256 TEXT NOT NULL,
-        final_status TEXT NOT NULL CHECK(final_status IN ('completed','failed')),
-        final_updated_at TEXT NOT NULL,
-        recorded_at TEXT NOT NULL)`);
-      this.db.exec(`CREATE TRIGGER IF NOT EXISTS job_operator_assertion_recoveries_no_update
-        BEFORE UPDATE ON job_operator_assertion_recoveries BEGIN SELECT RAISE(ABORT,'operator_assertion_recovery_append_only'); END`);
-      this.db.exec(`CREATE TRIGGER IF NOT EXISTS job_operator_assertion_recoveries_no_delete
-        BEFORE DELETE ON job_operator_assertion_recoveries BEGIN SELECT RAISE(ABORT,'operator_assertion_recovery_append_only'); END`);
+      this.db.exec(operatorAssertionRecoverySchemaSql);
       for(const row of this.db.prepare("SELECT job_id,result_path,status FROM jobs").all() as Array<{job_id:string;result_path:string;status:string}>) {
         if(path.basename(row.result_path)!==`${row.job_id}.json`) continue;
         const mayHaveLiveLegacyAgent=["retryable_failed","preparing","dispatching","running","blocked","needs_review","cancelling"].includes(row.status);
@@ -1570,16 +1585,19 @@ export class DispatcherDatabase {
       authorization_principal,
       operator_principal,operator_role,prior_status,prior_cause,prior_updated_at,result_class,result_sha256,
       side_effects_evidence_sha256,notification_evidence_sha256,final_status,final_updated_at,recorded_at
+      ,evidence_class,stop_time_status,residual_risk_codes_json
       FROM job_operator_assertion_recoveries WHERE job_id=?`).get(jobId) as Record<string,unknown>|undefined;
   }
 
   recoverWithOperatorAssertion(input:{jobId:string;assertionEventId:string;operatorPrincipal:string;
     expectedUpdatedAt:string;expectedCause:string;expectedResultClass:"valid"|"invalid"|"missing";
-    expectedResultSha256:string|null;sideEffectsEvidenceSha256:string;notificationEvidenceSha256:string},at=new Date()):JobRow {
+    expectedResultSha256:string|null;sideEffectsEvidenceSha256:string;notificationEvidenceSha256:string;
+    residualRisksAccepted:boolean},at=new Date()):JobRow {
     for(const digest of [input.sideEffectsEvidenceSha256,input.notificationEvidenceSha256,
       ...(input.expectedResultSha256?[input.expectedResultSha256]:[])])
       if(!/^[0-9a-f]{64}$/.test(digest)) throw new Error("operator_evidence_digest_invalid");
     if(!input.operatorPrincipal||input.operatorPrincipal.length>256) throw new Error("operator_principal_invalid");
+    if(input.residualRisksAccepted!==true) throw new Error("operator_residual_risks_not_accepted");
     return this.db.transaction(()=>{
       const job=this.getJobRequired(input.jobId);
       if(this.db.prepare("SELECT 1 FROM job_operator_assertion_recoveries WHERE job_id=?").get(job.job_id))
@@ -1588,6 +1606,9 @@ export class DispatcherDatabase {
         job.status!=="needs_review"||!job.last_error_code||job.last_error_code!==input.expectedCause||
         job.updated_at!==input.expectedUpdatedAt||job.result_json!==null||job.steer_state!==null)
         throw new Error("operator_recovery_job_changed");
+      if(job.last_error_code==="result_path_exists"||
+        (job.attempt_count===0&&job.dispatch_started_at===null&&job.prompt_accepted_at===null&&job.herdr_workspace_id===null))
+        throw new Error("operator_recovery_pre_dispatch_unavailable");
       const assertion=this.getRequired(input.assertionEventId);
       const subject=JSON.parse(assertion.subject_json) as Record<string,unknown>;
       const actor=subject.actor_id,workspace=subject.workspace_id,channel=subject.channel_id;
@@ -1649,12 +1670,13 @@ export class DispatcherDatabase {
         throw new Error("operator_result_drift");
       this.enqueueJobNotification(job.job_id,at);
       const settled=this.getJobRequired(job.job_id);
-      this.db.prepare(`INSERT INTO job_operator_assertion_recoveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      this.db.prepare(`INSERT INTO job_operator_assertion_recoveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(job.job_id,assertion.event_id,actor,tenant,workspace,channel,assertion.occurred_at,
           createHash("sha256").update(assertion.payload_json).digest("hex"),`slack:${actor}`,
           input.operatorPrincipal,"job_owner",
           job.status,job.last_error_code,job.updated_at,file.kind,file.sha256,input.sideEffectsEvidenceSha256,
-          input.notificationEvidenceSha256,settled.status,settled.updated_at,at.toISOString());
+          input.notificationEvidenceSha256,settled.status,settled.updated_at,"operator_assertion","unknown",
+          stableStringify(["worker_stop_not_machine_observed","out_of_band_worker_recreation_unverified"]),at.toISOString());
       return settled;
     }).immediate();
   }

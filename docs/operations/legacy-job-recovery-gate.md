@@ -44,7 +44,9 @@ jobごとに外部副作用、通知の配送・曖昧性、正常finalの受理
 処理済みの申告Slack eventを用い、申告actorがjob ownerで同じtenant/workspace/channelに属し、申告時刻以前に作成・最終更新された`needs_review` jobだけを対象にする。`job list --status needs_review`で現況を読み、旧件数を固定しない。申告本文は監査台帳にdigestだけを保存する。申告者のroleは`job_owner`に限定し、ローカルCLI principalは実行履歴として区別して記録する。workspace IDをSlack tenant bindingとして扱う。別actorによる代理承認はこの経路では拒否する。
 
 1. `job show <job_id>`と`job inspect-operator-recovery <job_id>`を読み、原因、`updated_at`、Resultの`valid` / `invalid` / `missing`、SHA-256、通知証跡digestを保存する。外部副作用と既存通知の配送状態を個別に確認し、それぞれの証跡を保管する。
-2. `job recover-operator-assertion <job_id> <assertion_event_id> <expected_updated_at> <expected_cause> <valid|invalid|missing> <result_sha256|missing> <side_effects_evidence_sha256> <notification_evidence_sha256> --assertion-reviewed --side-effects-reviewed --notification-reviewed`を一度だけ呼ぶ。欠落Resultのみ`missing`を指定する。
+2. `job recover-operator-assertion <job_id> <assertion_event_id> <expected_updated_at> <expected_cause> <valid|invalid|missing> <result_sha256|missing> <side_effects_evidence_sha256> <notification_evidence_sha256> --assertion-reviewed --side-effects-reviewed --notification-reviewed --residual-risk-accepted`を一度だけ呼ぶ。欠落Resultのみ`missing`を指定する。
 3. 応答喪失時は`job show`、`job operator-recovery-record <job_id>`、`inspect-operator-recovery`と通知eventを再読し、blind retryしない。別jobへ申告を流用する場合も各jobのscopeと証跡を個別に照合する。
+
+`result_path_exists`とworker準備前のjobはResult collisionをworker出力とみなさず拒否する。台帳には停止の証拠クラス`operator_assertion`、実停止時刻が`unknown`であること、機械停止未観測とDona session外でのworker再生成未検証という受容リスクを記録する。
 
 妥当Resultは共有schemaで検証して元のResultを受理する。無効・欠落Resultは成功を捏造せず`failed`へ確定する。通知・groupの既存状態が曖昧な場合はwriteを拒否し、配信済み通知を再送しない。回復結果は`job_operator_assertion_recoveries`へ追記され、machine stop proofや旧停止markerは作らない。安全判定はこの台帳と現在のterminal状態・`updated_at`が一致するjobだけを別証拠として扱う。残るrunning job、未解決通知、Updater自身の`needs_review`は引き続き阻害条件である。
