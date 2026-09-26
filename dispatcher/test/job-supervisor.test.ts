@@ -130,7 +130,7 @@ describe("JobSupervisor", () => {
       database.close();
     });
   }
-  test("cancel stops an identity-recorded stale preparation agent before terminal status", async () => {
+  test("cancel leaves an identity-recorded stale preparation agent in the drain gate", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
@@ -146,7 +146,7 @@ describe("JobSupervisor", () => {
     await supervisor.cancel(job.job_id, job.source_event_id);
     assert.equal(cancelled, true);
     assert.equal(database.getJob(job.job_id)?.status, "cancelled");
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.close();
   });
 
@@ -1013,7 +1013,7 @@ describe("JobSupervisor", () => {
     assert.equal(database.getJob(job.job_id)?.objective.split("[DONA_FOLLOW_UP]").length, 3);
     database.close();
   });
-  test("definitive steer absence clears a terminal dispatching marker", async () => {
+  test("name-based steer absence keeps the terminal worker fence", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);
     const source = database.enqueue(eventEnvelope("Ev-steer-terminal-source")).row;
@@ -1030,8 +1030,8 @@ describe("JobSupervisor", () => {
     await assert.rejects(supervisor.steer(job.job_id, followUp.event_id, "追加条件"), /agent_not_found/);
     assert.equal(database.getJob(job.job_id)?.status, "completed");
     assert.equal(database.getJob(job.job_id)?.steer_state, null);
-    assert.equal(database.getJob(job.job_id)?.last_error_code, null);
-    assert.equal(database.updateSafetyStatus().active_worker_count, 0);
+    assert.equal(database.getJob(job.job_id)?.last_error_code, "terminal_steer_worker_unverified");
+    assert.equal(database.updateSafetyStatus().active_worker_count, 1);
     database.close();
   });
 

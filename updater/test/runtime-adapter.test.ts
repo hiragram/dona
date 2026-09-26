@@ -194,11 +194,8 @@ test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without liv
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
   const dispatcherDatabasePath = path.join(root, "Dona", "dona.sqlite3");
   const dispatcherDatabase = new Database(dispatcherDatabasePath);
-  dispatcherDatabase.exec("CREATE TABLE jobs (status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
+  dispatcherDatabase.exec("CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT, last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT)");
   dispatcherDatabase.exec("CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT)");
-  dispatcherDatabase.exec("ALTER TABLE jobs ADD COLUMN job_id TEXT");
-  dispatcherDatabase.prepare("INSERT INTO jobs (status,job_id) VALUES ('completed','old-terminal')").run();
-  dispatcherDatabase.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('old-terminal','2026-09-25T00:00:00Z')").run();
   dispatcherDatabase.close();
   await fs.chmod(dispatcherDatabasePath, 0o600);
   const requests: unknown[] = [];
@@ -262,7 +259,7 @@ test("RealRuntime refuses a legacy drained response while a durable worker remai
   }
 });
 
-test("RealRuntime counts terminal legacy agents until durable stop", async () => {
+test("RealRuntime keeps legacy name-based stop markers unsafe", async () => {
   const { root, policy } = await tempPolicy();
   await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
   await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
@@ -280,7 +277,7 @@ test("RealRuntime counts terminal legacy agents until durable stop", async () =>
     const stopped = new Database(databasePath);
     stopped.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at='2026-09-25T00:00:00Z'").run();
     stopped.close();
-    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
   } finally { await removeTree(root); }
 });
 
@@ -323,7 +320,7 @@ test("RealRuntime distinguishes unresolved steer from definite retryable agent a
     const retryable = new Database(databasePath);
     retryable.prepare("UPDATE jobs SET status='retryable_failed',herdr_workspace_id='recorded',last_error_code='agent_not_found'").run();
     retryable.close();
-    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
     const uncertain = new Database(databasePath);
     uncertain.prepare("UPDATE jobs SET last_error_code='stale_preparing'").run();
     uncertain.close();
@@ -338,11 +335,11 @@ test("RealRuntime distinguishes unresolved steer from definite retryable agent a
     proof.exec("CREATE TABLE job_terminal_worker_stop_proofs(job_id TEXT PRIMARY KEY,stopped_at TEXT NOT NULL)");
     proof.prepare("INSERT INTO job_terminal_worker_stop_proofs VALUES('terminal-job',?)").run(new Date().toISOString());
     proof.close();
-    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
     const stopped = new Database(databasePath);
     stopped.prepare("UPDATE jobs SET last_error_code='agent_not_found'").run();
     stopped.close();
-    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
   } finally { await removeTree(root); }
 });
 
@@ -374,24 +371,23 @@ test("RealRuntime excludes only a proven pre-prepare result collision", async ()
     const stopped = new Database(databasePath);
     stopped.prepare("UPDATE jobs SET last_error_code='invalid_result_agent_stopped'").run();
     stopped.close();
-    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
     for (const code of ["agent_not_found", "agent_not_running", "steer_acceptance_unknown"]) {
       const state = new Database(databasePath);
       state.prepare("UPDATE jobs SET last_error_code=?").run(code);
       state.close();
-      assert.equal((await runtime.workerSafety()).active_worker_count,
-        code === "steer_acceptance_unknown" ? 1 : 0);
+      assert.equal((await runtime.workerSafety()).active_worker_count, 1);
     }
     const legacy = new Database(databasePath);
     legacy.prepare("UPDATE jobs SET last_error_code='legacy_agent_sandbox_unknown'").run();
     legacy.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('collision-job',?)")
       .run(new Date().toISOString());
     legacy.close();
-    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
     const invalid = new Database(databasePath);
     invalid.prepare("UPDATE jobs SET last_error_code='invalid_result'").run();
     invalid.close();
-    assert.equal((await runtime.workerSafety()).active_worker_count, 0);
+    assert.equal((await runtime.workerSafety()).active_worker_count, 1);
   } finally {
     await removeTree(root);
   }

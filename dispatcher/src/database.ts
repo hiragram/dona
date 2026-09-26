@@ -808,11 +808,11 @@ export class DispatcherDatabase {
         OR (status IN ('completed','failed','cancelled') AND last_error_code='schedule_reconcile_worker_unverified')
         OR (status IN ('completed','failed','cancelled') AND last_error_code IN
           ('terminal_steer_worker_unverified','cancel_worker_unverified'))
-        OR (status IN ('completed','failed','cancelled') AND herdr_workspace_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM job_terminal_worker_stop_proofs p WHERE p.job_id=jobs.job_id)
-          AND COALESCE(last_error_code,'') NOT IN
-            ('agent_not_found','agent_not_running','invalid_result_agent_stopped',
-             'workspace_cleanup_agent_stopped','cancel_worker_stopped'))
+        -- Existing stop-proof rows have no provenance binding a Herdr session
+        -- to an atomic stop. Do not use them to exempt an allocated worker.
+        OR herdr_workspace_id IS NOT NULL
+        OR attempt_count > 0
+        OR EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l WHERE l.job_id=jobs.job_id)
       GROUP BY status
     `).all() as Array<{ status: string; count: number }>;
     for (const row of jobRows) unsafe.push(`jobs.${row.status}:${row.count}`);
@@ -820,18 +820,7 @@ export class DispatcherDatabase {
     // isolated result grant and Herdr session to the next Dispatcher. A stopped
     // supervisor is not proof that the external agent stopped. Refuse activation
     // while any such worker may exist, including legacy agents marked for stop.
-    const legacy = this.db.prepare(`SELECT COUNT(*) AS count FROM legacy_job_agents_to_stop l
-      JOIN jobs j ON j.job_id=l.job_id WHERE l.stopped_at IS NULL
-        AND COALESCE(j.steer_state,'') NOT IN ('dispatching','accepted')
-        AND COALESCE(j.last_error_code,'') <> 'schedule_reconcile_worker_unverified'
-        AND COALESCE(j.last_error_code,'') NOT IN ('terminal_steer_worker_unverified','cancel_worker_unverified')
-        AND NOT (j.status IN ('completed','failed','cancelled') AND j.herdr_workspace_id IS NOT NULL)
-        AND j.status NOT IN ('preparing','dispatching','running','blocked','needs_review','cancelling')
-        AND NOT (j.status='retryable_failed' AND (j.last_error_code='stale_preparing' OR
-          (j.herdr_workspace_id IS NOT NULL AND COALESCE(j.last_error_code,'') NOT IN ('agent_not_found','agent_not_running'))))`)
-      .get() as { count: number };
-    if (legacy.count > 0) unsafe.push(`jobs.legacy_shared_grant:${legacy.count}`);
-    const activeWorkerCount = jobRows.reduce((count, row) => count + row.count, 0) + legacy.count;
+    const activeWorkerCount = jobRows.reduce((count, row) => count + row.count, 0);
     const steer = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE steer_state = 'dispatching'")
       .get() as { count: number };
     if (steer.count > 0) unsafe.push(`jobs.steer_acceptance_unknown:${steer.count}`);
@@ -2084,13 +2073,11 @@ export class DispatcherDatabase {
 
   markJobCancelled(jobId: string, reason: string, at = new Date()): void {
     this.db.transaction(() => {
-      const workerStopped = this.getJobRequired(jobId).last_error_code === "cancel_worker_stopped";
       this.updateJob(jobId, ["cancelling"], "cancelled", {
         completed_at: at.toISOString(),
         last_error_code: "cancelled",
         last_error_message: reason,
       });
-      if (workerStopped) this.markTerminalWorkerStopProof(jobId);
       const job=this.getJobRequired(jobId);
       const attentionEventId=this.getJobGroup(job.source_event_id)?.attention_event_id;
       if(attentionEventId && readEventJobBinding(this.db,job.source_event_id)?.owner.kind==="slack_thread") {
@@ -2098,16 +2085,6 @@ export class DispatcherDatabase {
         if(payload.job_id===jobId) this.recordAttentionResolution(jobId,attentionEventId,"cancelled","operator_reconcile",null,at);
       }
     }).immediate();
-  }
-
-  markJobCancellationWorkerStopped(jobId: string): void {
-    this.db.prepare(`UPDATE jobs SET last_error_code=CASE
-      WHEN status='cancelling' THEN 'cancel_worker_stopped'
-      WHEN status='failed' THEN 'agent_reported_failure'
-      ELSE NULL END, last_error_message=NULL, updated_at=?
-      WHERE job_id=? AND (status='cancelling' OR
-        (status IN ('completed','failed','cancelled') AND last_error_code='cancel_worker_unverified'))`)
-      .run(nowUtc(),jobId);
   }
 
   enqueueJobNotification(jobId: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): EnqueueResult {
