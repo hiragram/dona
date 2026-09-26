@@ -430,6 +430,9 @@ describe("job result publish contract", () => {
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       actions: [[{ kty: "oct" }], [{ k: "c29tZXByaXZhdGVrZXk" }]] },
       () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      actions: [{ kty: "oct" }, { k: "c29tZXByaXZhdGVrZXk" }, { kty: "public" }] },
+      () => current), code("content_requires_redaction"));
     for (const summary of ["Basic YWxpY2U6aHVudGVyMh==", '保存値 "db.example.com:5432:app:alice:hunter2"',
       "10.0.0.5./private", "127.0.0.1./result", '<password value="hunter2"/>', '<api-key secret="CANARY"/>']) {
       assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, summary },

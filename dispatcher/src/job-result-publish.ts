@@ -701,7 +701,9 @@ function assertSafeJson(value: unknown, depth = 0, forbiddenDigests?: ReadonlySe
       }
     };
     collectSiblingObjects(value);
-    if (siblingObjects.length > 1 && hasPrivateJwkFields(Object.assign({}, ...siblingObjects))) {
+    if (siblingObjects.length > 1 &&
+      siblingObjects.some(item => typeof item.kty === "string" && ["RSA", "EC", "OKP", "oct"].includes(item.kty)) &&
+      siblingObjects.some(item => Object.keys(item).some(key => privateJwkParameter.has(key)))) {
       throw new JobResultPublishError("content_requires_redaction");
     }
     assertSafeMixedFragments(value, depth, forbiddenDigests, forbiddenValues, forbiddenFingerprints, decodeDepth, budget);
