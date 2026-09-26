@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
@@ -33,6 +33,7 @@ import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEvent
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import {
   insertLiveSessionReceipt,
+  liveSessionIdentityGenerationSha256,
   migrateLiveSession,
   projectLiveSessionReceipt,
   type LiveSessionIdentityRow,
@@ -1357,9 +1358,9 @@ export class DispatcherDatabase {
         &&existing.herdr_workspace_id===herdrWorkspaceId&&existing.herdr_pane_id===herdrPaneId&&existing.agent_name===agentName;
       if(!sameIdentity)this.db.prepare("DELETE FROM job_live_session_identities WHERE job_id=?").run(jobId);
       if (agentSessionId !== undefined&&!sameIdentity) this.db.prepare(`INSERT INTO job_live_session_identities(
-        job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at)
-        SELECT job_id,1,?,?,?,?,? FROM jobs WHERE job_id=?`)
-        .run(agentSessionId,herdrWorkspaceId,herdrPaneId,agentName,at.toISOString(),jobId);
+        job_id,identity_version,herdr_agent_session_id,herdr_workspace_id,herdr_pane_id,agent_name,recorded_at,generation_nonce)
+        SELECT job_id,1,?,?,?,?,?,? FROM jobs WHERE job_id=?`)
+        .run(agentSessionId,herdrWorkspaceId,herdrPaneId,agentName,at.toISOString(),randomUUID(),jobId);
     }).immediate();
   }
 
@@ -1369,18 +1370,30 @@ export class DispatcherDatabase {
 
   appendLiveSessionReceipt(sourceEventId: string | undefined, receipt: LiveSessionReceiptProjection, startedAt: string, identity?:LiveSessionIdentityRow): LiveSessionReceiptProjection {
     return this.db.transaction(() => {
-      let auditedReceipt=receipt;
+      const job=this.getJobRequired(receipt.job_id);
+      const currentIdentity=this.getJobLiveSessionIdentity(receipt.job_id);
+      const observedGeneration=liveSessionIdentityGenerationSha256(job,identity);
+      const currentGeneration=liveSessionIdentityGenerationSha256(job,currentIdentity);
+      const generationMismatch=(identity!==undefined||receipt.reconciliation.state==="session_absent")&&
+        (!observedGeneration||observedGeneration!==currentGeneration);
+      let auditedReceipt={...receipt,identity_generation_sha256:
+        !generationMismatch&&observedGeneration ? observedGeneration : null,
+        reconciliation:generationMismatch?{
+          state:"unknown" as const,confidence:"fail_closed" as const,
+          reason_codes:[...new Set([...receipt.reconciliation.reason_codes,"identity_generation_changed_during_query"])],
+          safe_next_action:"do_not_retry" as const,
+        }:receipt.reconciliation};
       const sequence=receipt.live_session.state_change_seq;
-      if(identity&&receipt.live_session.query_status==="observed"&&receipt.live_session.identity_match===true&&sequence!==null){
+      if(!generationMismatch&&identity&&receipt.live_session.query_status==="observed"&&receipt.live_session.identity_match===true&&sequence!==null){
         const currentSequence=this.latestLiveSessionStateChangeSeq(receipt.job_id,identity);
         if(currentSequence!==undefined&&sequence<currentSequence){
-          auditedReceipt={...receipt,reconciliation:{state:"unknown",confidence:"fail_closed",
+          auditedReceipt={...auditedReceipt,reconciliation:{state:"unknown",confidence:"fail_closed",
             reason_codes:[...new Set([...receipt.reconciliation.reason_codes,"same_identity","state_sequence_regressed"])],
             safe_next_action:"do_not_retry"}};
         }
       }
       insertLiveSessionReceipt(this.db,sourceEventId,auditedReceipt,startedAt);
-      if(identity&&auditedReceipt.live_session.query_status==="observed"&&auditedReceipt.live_session.identity_match===true&&sequence!==null){
+      if(!generationMismatch&&identity&&auditedReceipt.live_session.query_status==="observed"&&auditedReceipt.live_session.identity_match===true&&sequence!==null){
         const changed=this.db.prepare(`UPDATE job_live_session_identities SET max_state_change_seq=CASE
           WHEN max_state_change_seq IS NULL OR max_state_change_seq<? THEN ? ELSE max_state_change_seq END
           WHERE job_id=? AND recorded_at=? AND herdr_agent_session_id=? AND herdr_workspace_id=? AND herdr_pane_id=? AND agent_name=?`)
@@ -1396,6 +1409,18 @@ export class DispatcherDatabase {
     const row=this.db.prepare("SELECT * FROM live_session_query_receipts WHERE job_id=? AND receipt_id=?")
       .get(jobId,receiptId) as LiveSessionReceiptRow | undefined;
     return row ? projectLiveSessionReceipt(row) : undefined;
+  }
+
+  private assertLiveSessionStopProof(job: JobRow, receipt: LiveSessionReceiptProjection): void {
+    const current = liveSessionIdentityGenerationSha256(job, this.getJobLiveSessionIdentity(job.job_id));
+    if (receipt.reconciliation.state !== "session_absent" || !current ||
+        receipt.identity_generation_sha256 !== current) throw new Error("late_result_worker_stop_unproven");
+  }
+
+  private assertMaintenanceFenceReceipt(): void {
+    // A database restore can roll back both the nonce and the observation receipt.
+    // No independently durable host/supervisor fence can currently be verified.
+    throw new Error("maintenance_fence_receipt_required");
   }
 
   private lateResultFile(job: JobRow): {result:JobResultEnvelope;sha256:string} {
@@ -1477,8 +1502,8 @@ export class DispatcherDatabase {
       if(!receipt||latest?.receipt_id!==stopReceiptId||receipt.durable_status_after!=="needs_review"||
         receipt.result_present_after||Date.parse(receipt.observed_at)<Date.parse(job.updated_at)||
         receipt.live_session.query_status!=="agent_not_found"||
-        receipt.reconciliation.state!=="session_absent"||
-        !this.getJobLiveSessionIdentity(jobId)) throw new Error("late_result_worker_stop_unproven");
+        receipt.reconciliation.state!=="session_absent") throw new Error("late_result_worker_stop_unproven");
+      this.assertLiveSessionStopProof(job,receipt);
       if(this.lateResultNotificationEvidence(job)!==notificationEvidenceSha256)
         throw new Error("late_result_notification_drift");
       const group=this.getJobGroup(job.source_event_id);
@@ -1493,6 +1518,7 @@ export class DispatcherDatabase {
       }
       const file=this.lateResultFile(job);
       if(file.sha256!==expectedDigest) throw new Error("late_result_digest_drift");
+      this.assertMaintenanceFenceReceipt();
       this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
       if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.markTerminalWorkerStopProof(jobId);
@@ -1517,10 +1543,12 @@ export class DispatcherDatabase {
       const receipt = this.getLiveSessionReceipt(jobId, receiptId);
       if (!receipt || receipt.durable_status_after !== "needs_review" || receipt.result_present_after ||
           receipt.reconciliation.safe_next_action !== "do_not_retry") throw new Error("live_session_receipt_mismatch");
+      this.assertLiveSessionStopProof(job,receipt);
       if (Date.parse(receipt.observed_at) < Date.parse(job.updated_at)) throw new Error("live_session_receipt_precedes_job_state");
       const latest = this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
         .get(jobId) as {receipt_id:string}|undefined;
       if (latest?.receipt_id !== receiptId) throw new Error("newer_live_session_receipt_exists");
+      this.assertMaintenanceFenceReceipt();
       const group = this.getJobGroup(job.source_event_id);
       for (const eventId of new Set([job.completion_event_id, group?.attention_event_id, group?.all_terminal_event_id])) {
         if (!eventId) continue;
@@ -1600,6 +1628,8 @@ export class DispatcherDatabase {
           Date.parse(receipt.observed_at) < Date.parse(job.updated_at)) {
         throw new Error("live_session_receipt_mismatch");
       }
+      this.assertLiveSessionStopProof(job,receipt);
+      this.assertMaintenanceFenceReceipt();
       const latest = this.db.prepare("SELECT receipt_id FROM live_session_query_receipts WHERE job_id=? ORDER BY sequence DESC LIMIT 1")
         .get(jobId) as {receipt_id:string}|undefined;
       if (latest?.receipt_id !== receiptId) throw new Error("newer_live_session_receipt_exists");
@@ -1745,9 +1775,12 @@ export class DispatcherDatabase {
     const current=this.db.prepare(`SELECT max_state_change_seq FROM job_live_session_identities
       WHERE job_id=? AND recorded_at=? AND herdr_agent_session_id=? AND herdr_workspace_id=? AND herdr_pane_id=? AND agent_name=?`)
       .get(jobId,identity.recorded_at,identity.herdr_agent_session_id,identity.herdr_workspace_id,identity.herdr_pane_id,identity.agent_name) as {max_state_change_seq:number|null}|undefined;
+    const job=this.getJobRequired(jobId);
+    const generation=liveSessionIdentityGenerationSha256(job,identity);
     const receipt=this.db.prepare(`SELECT MAX(state_change_seq) AS state_change_seq FROM live_session_query_receipts
-      WHERE job_id=? AND completed_at>=? AND query_status='observed' AND identity_match=1 AND state_change_seq IS NOT NULL`)
-      .get(jobId,identity.recorded_at) as {state_change_seq:number|null}|undefined;
+      WHERE job_id=? AND completed_at>=? AND query_status='observed' AND identity_match=1
+        AND state_change_seq IS NOT NULL AND reconciliation_state!='unknown' AND identity_generation_sha256=?`)
+      .get(jobId,identity.recorded_at,generation??"") as {state_change_seq:number|null}|undefined;
     const values=[current?.max_state_change_seq,receipt?.state_change_seq].filter((value):value is number=>value!==null&&value!==undefined);
     return values.length>0?Math.max(...values):undefined;
   }
