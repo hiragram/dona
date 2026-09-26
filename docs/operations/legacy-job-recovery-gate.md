@@ -6,6 +6,8 @@
 
 現行のHerdr連携は個別agentの`get` / `prompt` / `wait`であり、全worker/process treeの完全inventory、admission freeze、再生成防止、host/supervisor generationを束ねた停止receiptを提供しない。したがって旧11件を解除するwrite経路は実装していない。`updateSafetyStatus()`とUpdaterの`workerSafety()`の危険判定も緩めない。
 
+`dispatcher/src/maintenance-fence.ts`には署名済みreceiptのDona側検証契約を実装した。これはsynthetic receiptを使う契約テスト用であり、現在のoperator復旧CLIには接続していない。現行Herdr 0.8.2の`agent list` / `workspace list`は表示用一覧で、全session・pane・process treeの完全性watermarkや、一覧から停止まで同一世代で再生成を禁止するatomic操作を返さない。`agent get`の`idle` / `done` / `agent_not_found`も停止の証明ではない。従って現行APIだけでproviderを構成してreceiptを発行してはならない。
+
 ## 外部componentに必要な契約
 
 Herdrまたはhost supervisorが次を同一generationへ束縛した検証可能なmaintenance receiptを提供する必要がある。
@@ -14,6 +16,10 @@ Herdrまたはhost supervisorが次を同一generationへ束縛した検証可�
 2. 保存済みjob IDに依存せず、Herdr session、pane、process group、子孫processを全件列挙する。paginationや上限到達、照会失敗では完全と見なさない。
 3. 各候補のterminal stopと、receiptから復旧transaction完了まで再生成されないことを示す。`idle`、`not_addressable`、Result file、Dispatcher停止、権限剥奪を停止証明にしない。
 4. host/boot identity、supervisor/fence generation、対象集合、観測期間、inventory完全性、発行者、改ざん検知情報を含める。再起動、generation変更、期限切れで失効する。
+
+必要な外部API案は、host supervisorまたはHerdr serverが発行するatomicな`begin_maintenance_fence(scope)`と、保護された同じgenerationを読む`current_maintenance_fence()`である。インストール済みHerdr 0.8.2の`herdr api schema --json`には該当methodがない。Herdr側で実装するなら[herdrdev/herdr](https://github.com/herdrdev/herdr)のserver/socket APIが依存先となる。前者は全ingress、Dispatcher admission、Updater activation、Herdr/host worker生成を凍結した後、全Herdr session/paneとhost所有Codex process group・子孫を上限・欠落なしで列挙し、各processのterminal stopを確認してから、対象job集合を含むEd25519署名receiptを返す必要がある。後者はDBのrollback domain外で保持したboot ID、supervisor/fence generation、各freezeとno-recreation guardの継続状態を返し、復旧transaction直前とUpdater activation直前に照合する。起動経路が複数なら全経路がこのgeneration fenceへ参加し、参加不能なら発行を拒否する。Herdrまたはhost supervisorのAPI/repository変更が先行しない限り、Donaは署名のtrust anchorとlive generation readerを安全に設定できない。
+
+現在の検証関数は署名、期限、job scope、完全性field、live世代を厳格に検査するが、fieldの真実性は発行元とlive readerの実装に依存する。providerが整うまではDispatcherの`maintenance_fence_receipt_required`を保持し、Updaterの安全判定も変更しない。
 
 ## receipt提供後のDona実装
 
