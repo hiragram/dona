@@ -11,13 +11,13 @@ const roots:string[]=[];
 afterEach(async()=>{await Promise.all(roots.splice(0).map(root=>fs.rm(root,{recursive:true,force:true})));});
 const digest=(text:string)=>createHash("sha256").update(text).digest("hex");
 
-async function setup(){
+async function setup(cause="legacy_agent_sandbox_unknown"){
   const {root,config}=await tempConfig();roots.push(root);
   const database=new DispatcherDatabase(config.databasePath);
   const source=database.enqueue(eventEnvelope(`source-${root}`)).row;
   const created=database.createJob({source_event_id:source.event_id,objective:"recover",workspace:{kind:"scratch"}},
     config.jobsWorkspaceRoot,config.jobResultsDir).row;
-  database.markJobNeedsReview(created.job_id,"legacy_agent_sandbox_unknown","legacy worker state unknown");
+  database.markJobNeedsReview(created.job_id,cause,"legacy worker state unknown");
   database.sealJobGroup(source.event_id);
   const assertion=database.enqueue({...eventEnvelope(`assertion-${root}`),occurred_at:new Date().toISOString(),
     payload:{text:"対象の待機 worker を終了した"}}).row;
@@ -42,6 +42,11 @@ test("妥当な Result は申告と個別照合を記録して受理する",asyn
   const input=state.input();
   assert.equal(state.database.recoverWithOperatorAssertion(input).status,"completed");
   assert.equal(state.database.getJob(state.job.job_id)?.result_json!==null,true);
+  assert.equal(state.database.operatorAssertionRecoveryRecord(state.job.job_id)?.assertion_event_id,
+    state.assertion.event_id);
+  assert.equal(state.database.operatorAssertionRecoveryRecord(state.job.job_id)?.operator_role,"job_owner");
+  assert.equal(state.database.operatorAssertionRecoveryRecord(state.job.job_id)?.authorization_principal,
+    "slack:U_TEST");
   assert.throws(()=>state.database.recoverWithOperatorAssertion(input),/already_recorded/);
   const raw=new Database(state.config.databasePath,{readonly:true});
   try {
@@ -49,6 +54,15 @@ test("妥当な Result は申告と個別照合を記録して受理する",asyn
       .get(state.job.job_id) as {result_class:string}).result_class,"valid");
     assert.equal(raw.prepare("SELECT 1 FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(state.job.job_id),undefined);
   } finally {raw.close();}
+});
+
+test("別の旧needs_review原因でも妥当Resultを受理する",async()=>{
+  const state=await setup("stale_preparing_agent_unverified");
+  await fs.mkdir(path.dirname(state.job.result_path),{recursive:true});
+  await fs.writeFile(state.job.result_path,JSON.stringify({schema_version:1,job_id:state.job.job_id,
+    status:"failed",summary:"未完了",completed_at:new Date().toISOString()}));
+  assert.equal(state.database.recoverWithOperatorAssertion(state.input()).status,"failed");
+  assert.equal(state.database.getJob(state.job.job_id)?.result_json!==null,true);
 });
 
 test("無効な Result と欠落 Result は成功を作らず失敗へ確定する",async()=>{
@@ -76,6 +90,11 @@ test("申告以降の状態変更、Result差し替え、異なるworkspaceを�
     subject:{workspace_id:"T_OTHER",channel_id:"C_TEST",actor_id:"U_TEST"}}).row;
   state.database.manualComplete(foreign.event_id);
   assert.throws(()=>state.database.recoverWithOperatorAssertion({...updated,assertionEventId:foreign.event_id}),/scope_or_time_mismatch/);
+  const otherActor=state.database.enqueue({...eventEnvelope("other-actor"),occurred_at:new Date().toISOString(),
+    subject:{workspace_id:"T_TEST",channel_id:"C_TEST",actor_id:"U_OTHER"}}).row;
+  state.database.manualComplete(otherActor.event_id);
+  assert.throws(()=>state.database.recoverWithOperatorAssertion({...updated,assertionEventId:otherActor.event_id}),
+    /scope_or_time_mismatch/);
 });
 
 test("旧shared grantは申告の監査記録と終状態が一致する場合だけ安全判定を通す",async()=>{
@@ -94,4 +113,54 @@ test("旧shared grantは申告の監査記録と終状態が一致する場合�
     verify.prepare("UPDATE jobs SET updated_at=? WHERE job_id=?").run(new Date(Date.now()+1000).toISOString(),row.job_id);
   } finally {verify.close();}
   assert.equal(state.database.updateSafetyStatus().safe,false);
+});
+
+test("配送中の旧通知は申告があっても再送せず状態を維持する",async()=>{
+  const state=await setup();
+  const event=state.database.enqueueJobNotification(state.job.job_id).row;
+  const raw=new Database(state.config.databasePath);
+  try {raw.prepare("UPDATE events SET status='dispatching' WHERE event_id=?").run(event.event_id);}
+  finally {raw.close();}
+  const assertion=state.database.enqueue({...eventEnvelope("after-notification"),
+    occurred_at:new Date().toISOString(),payload:{text:"worker停止済み"}}).row;
+  state.database.manualComplete(assertion.event_id);
+  const input={...state.input(),assertionEventId:assertion.event_id};
+  assert.throws(()=>state.database.recoverWithOperatorAssertion(input),/notification_requires_reconciliation/);
+  assert.equal(state.database.getJob(state.job.job_id)?.status,"needs_review");
+  assert.equal(state.database.get(event.event_id)?.status,"dispatching");
+});
+
+test("旧Result pathの再openはCASを動かさず別CLI起動で回復できる",async()=>{
+  const {root,config}=await tempConfig();roots.push(root);
+  const createdDb=new DispatcherDatabase(config.databasePath);
+  const source=createdDb.enqueue(eventEnvelope(`legacy-source-${root}`)).row;
+  const created=createdDb.createJob({source_event_id:source.event_id,objective:"legacy",workspace:{kind:"scratch"}},
+    config.jobsWorkspaceRoot,config.jobResultsDir).row;
+  createdDb.markJobNeedsReview(created.job_id,"prompt_acceptance_unknown","unknown");
+  createdDb.sealJobGroup(source.event_id);
+  createdDb.close();
+  const raw=new Database(config.databasePath);
+  try {raw.prepare("UPDATE jobs SET result_path=? WHERE job_id=?")
+    .run(path.join(path.dirname(path.dirname(created.result_path)),`${created.job_id}.json`),created.job_id);}
+  finally {raw.close();}
+  const first=new DispatcherDatabase(config.databasePath);
+  const migrated=first.getJob(created.job_id)!;
+  assert.equal(migrated.last_error_code,"legacy_agent_sandbox_unknown");
+  first.close();
+  const inspect=new DispatcherDatabase(config.databasePath);
+  assert.equal(inspect.getJob(created.job_id)?.updated_at,migrated.updated_at);
+  const assertion=inspect.enqueue({...eventEnvelope(`legacy-assertion-${root}`),occurred_at:new Date().toISOString(),
+    payload:{text:"worker停止済み"}}).row;
+  inspect.manualComplete(assertion.event_id);
+  const preview=inspect.inspectOperatorAssertionRecovery(created.job_id);
+  inspect.close();
+  const recover=new DispatcherDatabase(config.databasePath);
+  try {
+    assert.equal(recover.getJob(created.job_id)?.updated_at,preview.updated_at);
+    const row=recover.recoverWithOperatorAssertion({jobId:created.job_id,assertionEventId:assertion.event_id,
+      operatorPrincipal:"local:test:501",expectedUpdatedAt:preview.updated_at,expectedCause:preview.cause!,
+      expectedResultClass:preview.result_class,expectedResultSha256:preview.result_sha256,
+      sideEffectsEvidenceSha256:digest("reviewed"),notificationEvidenceSha256:preview.notification_evidence_sha256});
+    assert.equal(row.status,"failed");
+  } finally {recover.close();}
 });

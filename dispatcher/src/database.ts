@@ -691,7 +691,9 @@ export class DispatcherDatabase {
         assertion_channel_id TEXT NOT NULL,
         assertion_occurred_at TEXT NOT NULL,
         assertion_payload_sha256 TEXT NOT NULL,
+        authorization_principal TEXT NOT NULL,
         operator_principal TEXT NOT NULL,
+        operator_role TEXT NOT NULL CHECK(operator_role='job_owner'),
         prior_status TEXT NOT NULL,
         prior_cause TEXT NOT NULL,
         prior_updated_at TEXT NOT NULL,
@@ -712,7 +714,8 @@ export class DispatcherDatabase {
         if(mayHaveLiveLegacyAgent) this.db.prepare("INSERT OR IGNORE INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(row.job_id);
         if(mayHaveLiveLegacyAgent) this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='legacy_agent_sandbox_unknown',
           last_error_message='Legacy agent may retain the shared result-directory grant',updated_at=? WHERE job_id=?
-          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop marker WHERE marker.job_id=jobs.job_id AND marker.stopped_at IS NULL)`)
+          AND EXISTS (SELECT 1 FROM legacy_job_agents_to_stop marker WHERE marker.job_id=jobs.job_id AND marker.stopped_at IS NULL)
+          AND NOT (status='needs_review' AND last_error_code='legacy_agent_sandbox_unknown')`)
           .run(new Date().toISOString(),row.job_id);
         else if(row.status==="queued") this.db.prepare("UPDATE jobs SET result_path=? WHERE job_id=?").run(path.join(path.dirname(row.result_path),row.job_id,"result.json"),row.job_id);
       }
@@ -1561,6 +1564,15 @@ export class DispatcherDatabase {
       result_class:file.kind,result_sha256:file.sha256,notification_evidence_sha256:this.lateResultNotificationEvidence(job)};
   }
 
+  operatorAssertionRecoveryRecord(jobId:string):Record<string,unknown>|undefined {
+    return this.db.prepare(`SELECT job_id,assertion_event_id,assertion_actor_id,assertion_tenant_id,
+      assertion_workspace_id,assertion_channel_id,assertion_occurred_at,assertion_payload_sha256,
+      authorization_principal,
+      operator_principal,operator_role,prior_status,prior_cause,prior_updated_at,result_class,result_sha256,
+      side_effects_evidence_sha256,notification_evidence_sha256,final_status,final_updated_at,recorded_at
+      FROM job_operator_assertion_recoveries WHERE job_id=?`).get(jobId) as Record<string,unknown>|undefined;
+  }
+
   recoverWithOperatorAssertion(input:{jobId:string;assertionEventId:string;operatorPrincipal:string;
     expectedUpdatedAt:string;expectedCause:string;expectedResultClass:"valid"|"invalid"|"missing";
     expectedResultSha256:string|null;sideEffectsEvidenceSha256:string;notificationEvidenceSha256:string},at=new Date()):JobRow {
@@ -1583,7 +1595,8 @@ export class DispatcherDatabase {
       const assertionPayload=JSON.parse(assertion.payload_json) as Record<string,unknown>;
       if(assertion.source!=="slack"||!["app_mention","message"].includes(assertion.event_type)||
         assertion.status!=="completed"||typeof assertionPayload.text!=="string"||!assertionPayload.text.trim()||
-        typeof actor!=="string"||!actor||typeof tenant!=="string"||tenant!==job.workspace_id||
+        typeof actor!=="string"||!actor||actor!==job.actor_id||
+        typeof tenant!=="string"||tenant!==job.workspace_id||
         typeof workspace!=="string"||workspace!==job.workspace_id||
         typeof channel!=="string"||channel!==job.channel_id||
         !Number.isFinite(Date.parse(assertion.occurred_at))||
@@ -1636,9 +1649,10 @@ export class DispatcherDatabase {
         throw new Error("operator_result_drift");
       this.enqueueJobNotification(job.job_id,at);
       const settled=this.getJobRequired(job.job_id);
-      this.db.prepare(`INSERT INTO job_operator_assertion_recoveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      this.db.prepare(`INSERT INTO job_operator_assertion_recoveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(job.job_id,assertion.event_id,actor,tenant,workspace,channel,assertion.occurred_at,
-          createHash("sha256").update(assertion.payload_json).digest("hex"),input.operatorPrincipal,
+          createHash("sha256").update(assertion.payload_json).digest("hex"),`slack:${actor}`,
+          input.operatorPrincipal,"job_owner",
           job.status,job.last_error_code,job.updated_at,file.kind,file.sha256,input.sideEffectsEvidenceSha256,
           input.notificationEvidenceSha256,settled.status,settled.updated_at,at.toISOString());
       return settled;
@@ -2122,7 +2136,7 @@ export class DispatcherDatabase {
       const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
       if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
         throw new Error("scheduled_work_result_deadline_exceeded");
-      const recoverAmbiguous=job.status==="needs_review"&&((operatorLate&&["result_missing","invalid_result","invalid_result_agent_stopped","legacy_agent_sandbox_unknown"].includes(job.last_error_code??""))||["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
+      const recoverAmbiguous=job.status==="needs_review"&&(operatorLate||["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
         (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
       if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
         throw new Error("completed_at_precedes_prompt_dispatch");

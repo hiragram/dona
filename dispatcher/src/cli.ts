@@ -40,6 +40,7 @@ function usage(): never {
   dona-dispatcher job resolve-invalid-result <job_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher job inspect-late-result <job_id>
   dona-dispatcher job inspect-operator-recovery <job_id>
+  dona-dispatcher job operator-recovery-record <job_id>
   dona-dispatcher job recover-operator-assertion <job_id> <assertion_event_id> <expected_updated_at> <expected_cause> <valid|invalid|missing> <result_sha256|missing> <side_effects_evidence_sha256> <notification_evidence_sha256> --assertion-reviewed --side-effects-reviewed --notification-reviewed
   dona-dispatcher job accept-late-result <job_id> <expected_updated_at> <expected_cause> <result_sha256> <stop_receipt_id> <side_effects_evidence_sha256> <notification_evidence_sha256> --worker-stopped-reviewed --side-effects-reviewed --notification-reviewed
   dona-dispatcher job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed
@@ -153,6 +154,12 @@ async function main(): Promise<void> {
       if(command==="inspect-operator-recovery") {
         if(args.length!==3)usage();
         console.log(JSON.stringify(database.inspectOperatorAssertionRecovery(eventIdAt(args,2)),null,2));return;
+      }
+      if(command==="operator-recovery-record") {
+        if(args.length!==3)usage();
+        const record=database.operatorAssertionRecoveryRecord(eventIdAt(args,2));
+        if(!record)throw new Error("operator_recovery_record_not_found");
+        console.log(JSON.stringify(record,null,2));return;
       }
       if(command==="recover-operator-assertion") {
         if(args.length!==13||args[10]!=="--assertion-reviewed"||args[11]!=="--side-effects-reviewed"||

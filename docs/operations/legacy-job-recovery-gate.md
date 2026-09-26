@@ -10,7 +10,7 @@
 
 利用者が待機中のCodexプロセスを手動終了し、残る異常状態jobを停止済みと扱う判断を明示した場合、その判断は`operator_assertion`として記録する。これは停止に関する運用上の受容判断であり、`session_absent`、`job_terminal_worker_stop_proofs`、独立したmaintenance fence receiptへ変換しない。申告だけで既存の`maintenance_fence_receipt_required`を通過させない。個別の照合と監査記録が完了したjobだけ、Dispatcher・Updaterの安全判定で別証拠として評価する。
 
-監査記録には、申告元event ID、保存済み申告者actor ID、申告受信時刻、申告本文のdigest、実際の停止時刻が不明ならその事実、候補job IDと各`updated_at`、申告を候補へ適用した判断時刻、証拠クラス、残余リスクを含める。復旧writeの承認者は申告者と区別し、認証済みoperator principal・role・対象workspace/channelとjobのtenant bindingをwrite直前に検証して記録する。候補はその時点のdurable stateから再取得し、過去の件数を固定しない。申告後に作成・再開したworkerは申告の対象と推定しない。記録は元のResultやDBの停止proofを上書きせず、追記とread-backができる別の監査成果物にする。
+監査記録には、申告元event ID、保存済み申告者actor ID、申告受信時刻、申告本文のdigest、実際の停止時刻が不明ならその事実、候補job IDと各`updated_at`、申告を候補へ適用した判断時刻、証拠クラス、残余リスクを含める。復旧判断の権限は保存済みSlack eventのactorが対象jobのactorと一致する`job_owner` roleに限定し、tenant/workspace/channel/jobのscopeをwrite直前に検証して記録する。CLI実行者のローカルprincipalは実行履歴として別に記録し、それ自体を停止判断の権限とはみなさない。候補はその時点のdurable stateから再取得し、過去の件数を固定しない。申告後に作成・再開したworkerは申告の対象と推定しない。記録は元のResultやDBの停止proofを上書きせず、追記とread-backができる別の監査成果物にする。
 
 申告を使って旧jobを解決する経路を実装する場合は、machine proof経路と異なる明示的なoperator decisionとして設計する。対象job・認証済みoperator・申告時点・Result file identity・DB状態・通知・group・副作用の証跡をwrite直前に再照合し、どの不確実性をoperatorが受容したかをjob単位で記録する。`jobs.updated_at`はworker identityの変更を必ずしも表さない。現行Dona sessionの単一writer契約では、`needs_review` jobは通常のpreparation / prompt / steerの対象にならない。対象jobの状態・時刻・steer状態を同じtransactionで再確認し、申告後の状態変更があれば拒否する。この契約外の手動Herdr起動までは観測できないため、operatorが残余リスクとして受容する。妥当なfinalだけを共有validatorと正規の受理経路へ渡し、無効・欠落finalから成功Resultを生成しない。配送済み・未送信・応答不明の通知を別々に扱い、曖昧な送信を自動再試行しない。旧jobを解決しても、残るrunning workerやUpdater自身の`needs_review`を解決済みとみなさず、双方の安全判定を再読する。
 
@@ -41,10 +41,10 @@ jobごとに外部副作用、通知の配送・曖昧性、正常finalの受理
 
 ## operator assertionによる個別回復
 
-申告が保存されたSlack eventを用い、同じworkspace/channelに属し、申告時刻以前に作成・最終更新された`needs_review` jobだけを対象にする。`job list --status needs_review`で現況を読み、旧件数を固定しない。申告本文は監査台帳にdigestだけを保存する。実行者は権限を持つローカルCLI principalとして記録し、申告者actorとは区別する。workspace IDをSlack tenant bindingとして扱う。
+処理済みの申告Slack eventを用い、申告actorがjob ownerで同じtenant/workspace/channelに属し、申告時刻以前に作成・最終更新された`needs_review` jobだけを対象にする。`job list --status needs_review`で現況を読み、旧件数を固定しない。申告本文は監査台帳にdigestだけを保存する。申告者のroleは`job_owner`に限定し、ローカルCLI principalは実行履歴として区別して記録する。workspace IDをSlack tenant bindingとして扱う。別actorによる代理承認はこの経路では拒否する。
 
 1. `job show <job_id>`と`job inspect-operator-recovery <job_id>`を読み、原因、`updated_at`、Resultの`valid` / `invalid` / `missing`、SHA-256、通知証跡digestを保存する。外部副作用と既存通知の配送状態を個別に確認し、それぞれの証跡を保管する。
 2. `job recover-operator-assertion <job_id> <assertion_event_id> <expected_updated_at> <expected_cause> <valid|invalid|missing> <result_sha256|missing> <side_effects_evidence_sha256> <notification_evidence_sha256> --assertion-reviewed --side-effects-reviewed --notification-reviewed`を一度だけ呼ぶ。欠落Resultのみ`missing`を指定する。
-3. 応答喪失時は`job show`、`inspect-operator-recovery`、監査台帳と通知eventを再読し、blind retryしない。別jobへ申告を流用する場合も各jobのscopeと証跡を個別に照合する。
+3. 応答喪失時は`job show`、`job operator-recovery-record <job_id>`、`inspect-operator-recovery`と通知eventを再読し、blind retryしない。別jobへ申告を流用する場合も各jobのscopeと証跡を個別に照合する。
 
 妥当Resultは共有schemaで検証して元のResultを受理する。無効・欠落Resultは成功を捏造せず`failed`へ確定する。通知・groupの既存状態が曖昧な場合はwriteを拒否し、配信済み通知を再送しない。回復結果は`job_operator_assertion_recoveries`へ追記され、machine stop proofや旧停止markerは作らない。安全判定はこの台帳と現在のterminal状態・`updated_at`が一致するjobだけを別証拠として扱う。残るrunning job、未解決通知、Updater自身の`needs_review`は引き続き阻害条件である。
