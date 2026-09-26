@@ -347,6 +347,10 @@ describe("job result publish contract", () => {
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base, output: { format: "markdown", text: "private _objective_ text" } },
       () => current), code("content_requires_redaction"));
+    const numericEntityGrants = new JobResultPublishCapabilities(() => "entity-session");
+    const entityCapability = numericEntityGrants.issue(row({ job_id: "job_entity", objective: "private & objective" }), "entity-session");
+    assert.throws(() => numericEntityGrants.validate(entityCapability.capability, "entity-session", { ...base,
+      summary: "private &#38; objective" }, () => row({ job_id: "job_entity", status: "running", objective: "private & objective" })), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       summary: grant.capability.slice(0, 20), output: { format: "markdown", text: grant.capability.slice(20) } },
       () => current), code("content_requires_redaction"));
@@ -358,6 +362,12 @@ describe("job result publish contract", () => {
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: [{ parts: [grant.capability.slice(0, 20), "ok", grant.capability.slice(20)] }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: [{ parts: ["private objective ", "ok", "text"] }] },
+      () => current), code("content_requires_redaction"));
+    assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
+      artifacts: Array.from({ length: 3 }, () => ({ parts: Array.from({ length: 12 }, () => "____") })) },
       () => current), code("content_requires_redaction"));
     assert.throws(() => grants.validate(grant.capability, "session-one", { ...base,
       artifacts: grant.capability.match(/.{1,7}/g)!.map((part, index) => ({ [`part${index + 1}`]: part })).flatMap((part, index) => index === 0 ? [part, { note: "ok" }] : [part]) },
