@@ -74,6 +74,17 @@ async function directoryNames(parent: string): Promise<string[]> {
 
 const schedulerStatsIntervalMs = 60_000;
 
+function terminalAgentAbsentFromList(result:HerdrCommandResult,agentName:string):boolean {
+  if(!result.ok||result.timedOut||result.aborted)return false;
+  try {
+    const parsed=JSON.parse(result.stdout) as {result?:{type?:unknown;agents?:unknown}};
+    return parsed.result?.type==="agent_list"&&Array.isArray(parsed.result.agents)&&
+      parsed.result.agents.every((item:unknown)=>item!==null&&typeof item==="object"&&
+        typeof (item as {name?:unknown}).name==="string"&&
+        (item as {name:string}).name!==agentName);
+  } catch { return false; }
+}
+
 export interface JobControlResult {
   row: JobRow;
   duplicate: boolean;
@@ -114,6 +125,54 @@ export class JobSupervisor {
   private stopping = false;
   private staleJobsRecovered = false;
   private terminalStopProofCursor = "";
+  private terminalCleanupCursor = "";
+
+  private async reconcileTerminalCleanup(job:JobRow,outcome:"pending"|"attempting",claimedIdentity:string|null):Promise<void> {
+    const identity=this.database.getJobLiveSessionIdentity(job.job_id);
+    const expected=expectedLiveSessionIdentity(job,identity);
+    if(outcome==="pending") {
+      if(!expected||!job.herdr_pane_id||!this.runtime.listAgents) {
+        this.database.finishTerminalWorkerCleanup(job.job_id,"pending","rejected");
+        return;
+      }
+      const byName=await this.runtime.get(job.agent_name,this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
+      if(!byName.ok) {
+        const absent=!byName.timedOut&&!byName.aborted&&
+          ["agent_not_found","agent_not_running"].includes(byName.errorCode??"");
+        const listed=absent?await this.runtime.listAgents(this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs)):undefined;
+        this.database.finishTerminalWorkerCleanup(job.job_id,"pending",listed&&terminalAgentAbsentFromList(listed,job.agent_name)?"stopped":"unknown");
+        return;
+      }
+      if(byName.agentIdentity!==expected||
+        expectedLiveSessionIdentity(this.database.getJob(job.job_id)!,this.database.getJobLiveSessionIdentity(job.job_id))!==expected) {
+        this.database.finishTerminalWorkerCleanup(job.job_id,"pending","rejected");
+        return;
+      }
+      if(!["idle","done"].includes(byName.agentStatus??"")) return;
+      if(!this.database.claimTerminalWorkerCleanup(job.job_id,expected)) return;
+      // The durable claim precedes the only control write. A crash or timeout never causes a resend.
+      try {
+        await this.runtime.cancel(job.agent_name,this.abortController.signal);
+      } catch { /* An ambiguous send is reconciled by read only. */ }
+    } else if(!claimedIdentity||claimedIdentity!==expected) {
+      this.database.finishTerminalWorkerCleanup(job.job_id,"attempting","unknown");
+      return;
+    }
+    const deadline=Date.now()+Math.min(2_000,this.config.jobCommandTimeoutMs);
+    do {
+      const observed=await this.runtime.get(job.agent_name,this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
+      if(!observed.ok&&!observed.timedOut&&!observed.aborted&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {
+        const listed=await this.runtime.listAgents?.(this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
+        if(listed&&terminalAgentAbsentFromList(listed,job.agent_name)) {
+          this.database.finishTerminalWorkerCleanup(job.job_id,"attempting","stopped");
+          return;
+        }
+      }
+      if(!observed.ok||observed.agentIdentity!==expected||this.stopping) break;
+      await abortableDelay(100,this.abortController.signal);
+    } while(Date.now()<deadline);
+    this.database.finishTerminalWorkerCleanup(job.job_id,"attempting","unknown");
+  }
 
   constructor(
     private readonly database: DispatcherDatabase,
@@ -430,6 +489,20 @@ export class JobSupervisor {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
+      let cleanupCandidates=this.database.listTerminalWorkerCleanupCandidates(this.terminalCleanupCursor);
+      if(cleanupCandidates.length===0&&this.terminalCleanupCursor) {
+        this.terminalCleanupCursor="";
+        cleanupCandidates=this.database.listTerminalWorkerCleanupCandidates();
+      }
+      for(const candidate of cleanupCandidates) {
+        this.terminalCleanupCursor=candidate.job.job_id;
+        try { await this.reconcileTerminalCleanup(candidate.job,candidate.outcome,candidate.identity_json); }
+        catch(error) {
+          if(!this.stopping) this.database.finishTerminalWorkerCleanup(candidate.job.job_id,candidate.outcome,"unknown");
+          this.logger.warn("Terminal worker cleanup observation failed",{job_id:candidate.job.job_id,
+            error_message:error instanceof Error?error.message:String(error)});
+        }
+      }
       for(const job of this.database.listAmbiguousScheduledJobs()) try {
         if(await this.reconcileAmbiguousScheduledJob(job)) continue;
         if(!["cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance"].includes(job.last_error_code??"")) continue;

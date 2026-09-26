@@ -1601,6 +1601,11 @@ describe("DispatcherDatabase", () => {
     assert.equal(first.agent_name.length, 30);
     assert.doesNotMatch(first.agent_name, /private|token|example/);
     assert.notEqual(second.agent_name, first.agent_name);
+    const raw=new Database(config.databasePath);
+    assert.throws(()=>raw.prepare("UPDATE jobs SET agent_name=? WHERE job_id=?").run("replacement",first.job_id),/job_agent_identity_immutable/);
+    assert.throws(()=>raw.prepare("UPDATE jobs SET job_id=? WHERE job_id=?").run("replacement",first.job_id),/job_agent_identity_immutable/);
+    assert.throws(()=>raw.prepare("UPDATE jobs SET agent_name=? WHERE job_id=?").run(first.agent_name,second.job_id));
+    raw.close();
     database.close();
   });
 
