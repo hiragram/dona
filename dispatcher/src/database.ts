@@ -525,6 +525,10 @@ export function migrateDispatcherDatabase(
     if (hasOperatorRecoveries) db.exec(`CREATE TEMP TABLE preserved_operator_recoveries_v3 AS
       SELECT * FROM job_operator_assertion_recoveries;
       DROP TABLE job_operator_assertion_recoveries;`);
+    const hasAttentionNoPost = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_attention_no_post_reconciliations'").get() !== undefined;
+    if (hasAttentionNoPost) db.exec(`CREATE TEMP TABLE preserved_attention_no_post_v3 AS
+      SELECT * FROM job_attention_no_post_reconciliations;
+      DROP TABLE job_attention_no_post_reconciliations;`);
     const hasGroups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_groups'").get() !== undefined;
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
     const hasTerminalCleanups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_terminal_worker_cleanups'").get() !== undefined;
@@ -591,6 +595,22 @@ export function migrateDispatcherDatabase(
     if (hasOperatorRecoveries) db.exec(`${operatorAssertionRecoverySchemaSql}
       INSERT INTO job_operator_assertion_recoveries SELECT * FROM preserved_operator_recoveries_v3;
       DROP TABLE preserved_operator_recoveries_v3;`);
+    if (hasAttentionNoPost) db.exec(`CREATE TABLE job_attention_no_post_reconciliations (
+      attention_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+      source_event_id TEXT NOT NULL REFERENCES events(event_id),
+      job_id TEXT NOT NULL REFERENCES jobs(job_id),
+      expected_event_updated_at TEXT NOT NULL,
+      expected_job_updated_at TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      thread_ts TEXT NOT NULL,
+      result_sha256 TEXT NOT NULL,
+      evidence_sha256 TEXT NOT NULL,
+      operator_principal TEXT NOT NULL,
+      reconciled_at TEXT NOT NULL
+    );
+    INSERT INTO job_attention_no_post_reconciliations SELECT * FROM preserved_attention_no_post_v3;
+    DROP TABLE preserved_attention_no_post_v3;`);
     if (hasLegacyStopMarkers) db.exec(`INSERT OR REPLACE INTO legacy_job_agents_to_stop(job_id, stopped_at)
       SELECT marker.job_id, marker.stopped_at FROM legacy_job_stop_markers_v3 marker JOIN jobs USING(job_id);`);
     if (hasTerminalCleanups) db.exec(`INSERT INTO job_terminal_worker_cleanups(job_id,outcome,identity_json,updated_at)

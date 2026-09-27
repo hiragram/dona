@@ -245,7 +245,7 @@ test("旧Result pathの再openはCASを動かさず別CLI起動で回復でき�
   } finally {recover.close();}
 });
 
-test("v2 bridgeのoperator台帳をv3 job再構築後も保持する",async()=>{
+test("v2 bridgeのoperator台帳と未投稿監査記録をv3 job再構築後も保持する",async()=>{
   const {root,config}=await tempConfig();roots.push(root);
   const initial=new Database(config.databasePath);
   initial.exec(await fs.readFile(new URL("./fixtures/schema-v2.sql",import.meta.url),"utf8"));
@@ -266,7 +266,15 @@ test("v2 bridgeのoperator台帳をv3 job再構築後も保持する",async()=>{
     expectedResultClass:preview.result_class,expectedResultSha256:preview.result_sha256,
     sideEffectsEvidenceSha256:digest("reviewed"),notificationEvidenceSha256:preview.notification_evidence_sha256,
     residualRisksAccepted:true});
+  const audit=new Database(config.databasePath);
+  try {
+    audit.prepare(`INSERT INTO job_attention_no_post_reconciliations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(assertion.event_id,source.event_id,created.job_id,assertion.updated_at,
+        preview.updated_at,"T_TEST","C_TEST","1756722030.123456",digest("result"),
+        digest("history"),"local:test:501",new Date().toISOString());
+  } finally {audit.close();}
   const before=bridge.operatorAssertionRecoveryRecord(created.job_id);
+  const noPostBefore=bridge.attentionNoPostRecord(assertion.event_id);
   bridge.close();
   const migrate=new Database(config.databasePath);
   migrate.pragma("foreign_keys = ON");
@@ -277,10 +285,15 @@ test("v2 bridgeのoperator台帳をv3 job再構築後も保持する",async()=>{
     assert.equal(migrate.pragma("user_version",{simple:true}),2);
     assert.equal((migrate.prepare("SELECT recorded_at FROM job_operator_assertion_recoveries WHERE job_id=?")
       .get(created.job_id) as {recorded_at:string}).recorded_at,before?.recorded_at);
+    assert.deepEqual(migrate.prepare("SELECT * FROM job_attention_no_post_reconciliations WHERE attention_event_id=?")
+      .get(assertion.event_id),noPostBefore);
     migrateDispatcherDatabase(migrate,()=>{},false,3);
     assert.equal(migrate.pragma("user_version",{simple:true}),3);
   } finally {migrate.close();}
   const after=new DispatcherDatabase(config.databasePath);
-  try {assert.deepEqual(after.operatorAssertionRecoveryRecord(created.job_id),before);}
+  try {
+    assert.deepEqual(after.operatorAssertionRecoveryRecord(created.job_id),before);
+    assert.deepEqual(after.attentionNoPostRecord(assertion.event_id),noPostBefore);
+  }
   finally {after.close();}
 });
