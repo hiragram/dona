@@ -557,3 +557,33 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
     await removeTree(root);
   }
 });
+
+test("保守bridgeは通常main adapterを通して世代固有MCPを必須接続で起動する", async () => {
+  const bridgeUrl = new URL('../../scripts/maintenance/main_bridge.mjs', import.meta.url).href;
+  const {operate} = await import(bridgeUrl);
+  const {root,policy} = await tempPolicy();
+  try {
+    const release = path.join(policy.release_root,targetSha);
+    await fs.mkdir(path.join(release,'.codex'),{recursive:true});
+    await fs.writeFile(path.join(release,'.codex/config.toml'),'');
+    await fs.mkdir(policy.config_root,{recursive:true,mode:0o700});
+    for (const name of ['dispatcher','slack']) await fs.writeFile(path.join(policy.config_root,`${name}.env`),'',{mode:0o600});
+    const oldRelease=path.join(policy.release_root,'1'.repeat(40));
+    const recorder=new AgentRunner(oldRelease);
+    class BridgeProcess { run(executable:string,args:readonly string[],options:RunOptions) { return recorder.run(executable,args,options); } }
+    const old=await operate({action:'status',release:oldRelease},policy,RealRuntime,BridgeProcess);
+    assert.equal(old.session_id,'session-old');
+    assert.equal((await operate({action:'stop',expected:old},policy,RealRuntime,BridgeProcess)).outcome,'stopped');
+    const started=await operate({action:'start',release,pane:old.pane_id,previous_session:old.session_id},policy,RealRuntime,BridgeProcess);
+    assert.equal(started.outcome,'started');
+    assert.equal(started.observation.session_id,'session-new');
+    const call=recorder.calls.find(c=>c.args[2]==='agent'&&c.args[3]==='start')!;
+    for (const [server,name] of [['dona_dispatcher','dispatcher'],['dona_slack','slack']]) {
+      assert.ok(call.args.includes(`mcp_servers.${server}.required=true`));
+      assert.ok(call.args.includes(`mcp_servers.${server}.args=${JSON.stringify([path.join(policy.config_root,`mcp-${name}.mjs`)])}`));
+      assert.ok(call.args.includes(`mcp_servers.${server}.command=${JSON.stringify(policy.executables.node)}`));
+    }
+    assert.equal(recorder.calls.filter(c=>c.args[3]==='start').length,1);
+    assert.equal(recorder.calls.some(c=>c.args.includes('session')&&c.args.includes('kill')),false);
+  } finally { await removeTree(root); }
+});
