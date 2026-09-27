@@ -156,11 +156,12 @@ def http_unix(socket_path, route):
 
 
 class Launchd:
-    def __init__(self):
+    def __init__(self, maintenance_label=None):
+        self.maintenance_label = maintenance_label
         self.domain = 'gui/' + str(os.getuid())
 
     def observe(self, label):
-        require(label in LABELS, 'label_scope')
+        require(label in LABELS or label == self.maintenance_label, 'label_scope')
         r = subprocess.run(['/bin/launchctl', 'print', self.domain + '/' + label], capture_output=True, timeout=5)
         if r.returncode != 0:
             # 他のエラー（権限やdomain不在）を未登録と取り違えない。
@@ -264,13 +265,14 @@ def inventory():
             'old_results': [d['resultsDir'], d['jobResultsDir']], 'captured_at': stamp()}
 
 
-def prepare(run, repository, event_id, job_id):
+def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
     require(re.fullmatch(r'evt_[0-9A-HJKMNP-TV-Z]{26}', event_id, re.I), 'event_id')
     require(re.fullmatch(r'job_[0-9a-hjkmnp-tv-z]{26}', job_id, re.I), 'job_id')
     require(not run.exists(), 'run_already_exists')
     run.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     run.mkdir(mode=0o700)  # exclusive prepare
     atomic(run/'runner.py', Path(__file__).read_bytes())
+    atomic(run/'main_bridge.mjs', Path(__file__).with_name('main_bridge.mjs').read_bytes())
     inv = inventory()
     atomic(run/'inventory.json', encode(inv))
     executables = inv['policy']['executables']
@@ -304,7 +306,7 @@ def prepare(run, repository, event_id, job_id):
     plan = {'schema_version': 1, 'trust': trust, 'target_sha': sha, 'generation': str(generation), 'release': str(release),
             'event_id': event_id, 'job_id': job_id, 'inventory_sha256': digest((run/'inventory.json').read_bytes()),
             'runner_sha256': digest((run/'runner.py').read_bytes()),
-            'created_at': stamp(), 'strategy': 'isolated_generation', 'operator_assertion_required': True}
+            'created_at': stamp(), 'strategy': 'isolated_generation', 'operator_assertion_required': True, 'snapshot_old_databases': snapshot_old_databases}
     render(run, plan, inv)
     validate_staging(run, plan, node)
     migrate(plan, node)
@@ -313,6 +315,7 @@ def prepare(run, repository, event_id, job_id):
     # staging成果全体をseal。node_modulesを含め、prepare後の変更を停止前に検知する。
     plan['generation_seal'] = tree_seal(generation)
     plan['plists_seal'] = tree_seal(run/'plists')
+    plan['service_programs'] = {label: plistlib.loads((run/'plists'/(label+'.plist')).read_bytes())['ProgramArguments'][1] for label in LABELS}
     plan['static_seal'] = static_seal(generation)
     atomic(run/'plan.json', encode(plan))
     atomic(run/'journal.json', encode({'phase': 'prepared', 'plan_sha256': digest((run/'plan.json').read_bytes()), 'steps': []}))
@@ -379,6 +382,7 @@ def render(run, plan, inv):
     # stable updater自身を通常release retentionの削除対象へ置かない。
     shutil.copytree(release/'updater', g/'control/updater', symlinks=True)
     atomic(g/'control/policy.json', encode(policy))
+    atomic(g/'config/main_bridge.mjs', (run/'main_bridge.mjs').read_bytes())
     atomic(g/'control/dispatcher.token', (os.urandom(32).hex()+'\n').encode())
     overrides = {'DONA_DATABASE_PATH': str(g/'dona.sqlite3'), 'DONA_RESULTS_DIR': str(g/'results'),
                  'DONA_JOB_RESULTS_DIR': str(g/'job-results'), 'DONA_JOB_PROGRESS_DATABASE_PATH': str(g/'job-progress.sqlite3'),
@@ -518,15 +522,16 @@ class Runner:
         require(digest((self.run/'plan.json').read_bytes()) == self.journal['plan_sha256'], 'plan_changed')
         require(digest((self.run/'inventory.json').read_bytes()) == self.plan['inventory_sha256'], 'inventory_changed')
         require(digest((self.run/'runner.py').read_bytes()) == self.plan['runner_sha256'], 'runner_changed')
-        require(tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
         self.services = services or Launchd()
         self.database = database or NodeDatabase(self.inv['policy']['executables']['node'], Path(self.plan['generation'])/'control/updater/node_modules/better-sqlite3/lib/index.js')
         self.generation = Path(self.plan['generation'])
 
     def record(self, phase, **fields):
-        self.journal.update(phase=phase, updated_at=stamp(), **fields)
-        self.journal['steps'].append({'phase': phase, 'at': stamp()})
-        atomic(self.run/'journal.json', encode(self.journal))
+        updated = json.loads(json.dumps(self.journal))
+        updated.update(phase=phase, updated_at=stamp(), **fields)
+        updated['steps'].append({'phase': phase, 'at': stamp()})
+        atomic(self.run/'journal.json', encode(updated))
+        self.journal = updated
 
     def validate_source(self):
         for name, sha in self.inv['files'].items():
@@ -539,35 +544,165 @@ class Runner:
         require(rows == [(0,)], 'normal_update_in_progress')
 
     def stop_all(self):
+        failures = []
         for label in LABELS:
-            # PIDは所有serviceから取得。PIDへsignalは送らない。
-            current = self.services.observe(label)
-            if current and current.get('pid'):
-                identity = self.services.process(current['pid'])
-                plist_path = Path.home()/'Library/LaunchAgents'/ (label+'.plist')
-                plist = plistlib.loads(plist_path.read_bytes())
-                require(identity and identity.split()[0] == str(os.getuid()) and plist['ProgramArguments'][1] in identity, 'service_process_owner')
-                self.journal.setdefault('stopping', {})[label] = {'pid': current['pid'], 'identity': digest(identity.encode())}
-                self.record(self.journal['phase'])
-            self.services.stop(label)
+            try:
+                # PIDは所有serviceから取得。PIDへsignalは送らない。
+                current = self.services.observe(label)
+                if current and current.get('pid'):
+                    identity = self.services.process(current['pid'])
+                    programs = [self.inv['plists'][label]['ProgramArguments'][1], self.plan.get('service_programs', {}).get(label)]
+                    require(identity and identity.split()[0] == str(os.getuid()) and any(program and program in identity for program in programs), 'service_process_owner')
+                    self.journal.setdefault('stopping', {})[label] = {'pid': current['pid'], 'identity': digest(identity.encode())}
+                    try:
+                        self.record(self.journal['phase'])
+                    except OSError as error:
+                        failures.append(error)  # journal障害でも確認済serviceを止める。
+                self.services.stop(label)
+            except Exception as error:
+                failures.append(error)  # 1serviceの失敗でSlackの停止までskipしない。
         for item in self.journal.get('stopping', {}).values():
             current = self.services.process(item['pid'])
             require(current is None or digest(current.encode()) != item['identity'], 'service_pid_still_alive')
+        if failures: raise failures[0]
         require(all(self.services.observe(label) is None for label in LABELS), 'service_recreated')
 
-    def confirm_main(self, spec):
-        require(self.journal['phase'] in ('awaiting_main', 'forward_recovery'), 'main_confirmation_phase')
-        require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
-        self.assert_installed()
+    def arm(self, receipt_path, launcher=None):
+        require(self.journal['phase'] == 'prepared', 'arm_phase')
+        require(receipt_path.resolve().parent == self.run.resolve(), 'handoff_location')
+        self.validate_source()
+        require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
+        require(tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
+        receipt = read_json(regular(receipt_path))
+        try:
+            validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv, self.database.read)
+        except RuntimeError as error:
+            require(str(error) in ('handoff_not_terminal', 'parent_notification_not_terminal'), str(error))
+        label = 'dev.dona.maintenance.' + self.journal['plan_sha256'][:16]
+        launcher = launcher or Launchd(label)
+        intent = self.run/'arm.json'
+        if intent.exists():
+            require(read_json(intent).get('label') == label and launcher.observe(label) is not None, 'arm_acceptance_unknown')
+            return label  # 登録済みone-shotをkickstartしない。
+        require(launcher.observe(label) is None, 'maintenance_label_busy')
+        plist = self.run/'maintenance.plist'
+        atomic(plist, plistlib.dumps({'Label': label, 'RunAtLoad': True, 'KeepAlive': False,
+            'ProgramArguments': [str(Path(sys.executable).resolve()), '-B', str(self.run/'runner.py'), 'wait-execute',
+                                 '--run', str(self.run), '--handoff', str(receipt_path)],
+            'WorkingDirectory': str(self.run), 'StandardOutPath': str(self.run/'operator.log'),
+            'StandardErrorPath': str(self.run/'operator.log'), 'Umask': 0o077}))
+        atomic(intent, encode({'label': label, 'phase': 'bootstrap_intent', 'at': stamp(),
+                              'handoff_sha256': digest(encode(receipt))}))
+        launcher.start(label, plist)
+        return label
+
+    def wait_handoff(self, receipt, timeout=600):
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv, self.database.read)
+                return
+            except RuntimeError as error:
+                if str(error) not in ('handoff_not_terminal', 'parent_notification_not_terminal'): raise
+                require(time.monotonic() < deadline, 'handoff_wait_expired')
+                time.sleep(1)
+
+    def main_call(self, **request):
+        proc = subprocess.run([self.inv['policy']['executables']['node'], str(self.generation/'config/main_bridge.mjs'),
+                               str(self.generation/'control')], input=encode(request), capture_output=True, timeout=300)
+        require(proc.returncode == 0, 'main_bridge_failed')
+        return json.loads(proc.stdout)
+
+    def find_main_pid(self, release):
+        raw = command(['/bin/ps', '-ww', '-axo', 'pid=,command='])
+        executable = self.inv['policy']['executables']['codex']
+        candidates = []
+        for line in raw.splitlines():
+            pid, cmd = line.strip().split(maxsplit=1)
+            if str(release) in cmd and any(value in cmd for value in (executable, str(Path(executable).resolve()))):
+                candidates.append(int(pid))
+        require(len(candidates) == 1, 'main_process_not_unique')
+        return candidates[0]
+
+    def main_step(self, phase, **fields):
+        state = read_json(self.run/'main-lifecycle.json') if (self.run/'main-lifecycle.json').exists() else {}
+        state.update(phase=phase, **fields)
+        atomic(self.run/'main-lifecycle.json', encode(state))
+        return state
+
+    def ensure_main(self):
+        # main制御は通常UpdaterのRealRuntimeを再利用。旧jobの解決・worker操作は行わない。
+        file = self.run/'main-lifecycle.json'
+        state = read_json(file) if file.exists() else None
+        if state is None:
+            deadline = time.monotonic() + 60
+            while True:
+                old = self.main_call(action='status', release=self.inv['old_pointer'])
+                if old.get('status') != 'working' or time.monotonic() >= deadline: break
+                time.sleep(1)
+            require(old.get('exists') and old.get('name') == 'dona-main' and old.get('kind') == 'codex'
+                    and old.get('matches_release') and old.get('session_id') and old.get('pane_id')
+                    and old.get('status') in ('idle', 'done'), 'old_main_not_ready_for_handoff')
+            previous_pid = self.find_main_pid(self.inv['old_pointer'])
+            state = self.main_step('stop_intent', old=old, previous_pid=previous_pid)
+            outcome = self.main_call(action='stop', expected=old)
+            require(outcome.get('outcome') == 'stopped', 'main_stop_acceptance_unknown')
+            state = self.main_step('stopped')
+        if state['phase'] == 'stop_intent':
+            # 喪失したstopを再送しない。固定paneの非在だけをmachine fenceとは扱わない。
+            raise RuntimeError('main_stop_acceptance_unknown')
+        if state['phase'] == 'stopped':
+            state = self.main_step('start_intent')
+            outcome = self.main_call(action='start', release=self.plan['release'], pane=state['old']['pane_id'],
+                                     previous_session=state['old']['session_id'])
+            # timeout後も以下のread-only照合で受理済みmainを発見できる。start再送はしない。
+            if outcome.get('outcome') == 'started':
+                state = self.main_step('started', observation=outcome['observation'])
+        observed = self.main_call(action='status', release=self.plan['release'])
+        require(observed.get('exists') and observed.get('name') == 'dona-main' and observed.get('kind') == 'codex'
+                and observed.get('pane_id') == state['old']['pane_id'] and observed.get('matches_release')
+                and observed.get('session_id') and observed['session_id'] != state['old']['session_id']
+                and observed.get('interactive_ready') and observed.get('status') in ('idle', 'done'), 'new_main_not_ready')
+        if state.get('observation'):
+            require(observed['session_id'] == state['observation']['session_id'], 'new_main_session_changed')
+        state = self.main_step('started', observation=observed)
+        main_pid = self.find_main_pid(self.plan['release'])
+        main_command = read_process(main_pid)['command']
+        require(all('mcp_servers.'+name+'.required=true' in main_command and 'mcp_servers.'+name+'.enabled=true' in main_command
+                    for name in ('dona_dispatcher', 'dona_slack')), 'main_required_mcp_configuration')
+        # required=trueの両MCPが初期化に成功したCodexだけが起動確認READYを終えられる。
+        # 実process treeでも固定wrapperの子processを確認し、別世代/別mainを排除する。
+        raw = command(['/bin/ps', '-ww', '-axo', 'pid=,command='])
+        pids = {}
+        for role in ('dispatcher', 'slack'):
+            wrapper = str(self.generation/'config'/('mcp-'+role+'.mjs'))
+            matches = []
+            for line in raw.splitlines():
+                pid, cmd = line.strip().split(maxsplit=1)
+                if wrapper in cmd and int(pid) != main_pid:
+                    record = read_process(int(pid))
+                    parent = record['parent']
+                    for _ in range(16):
+                        if parent == main_pid: break
+                        ancestor = read_process(parent)
+                        if ancestor['parent'] == parent: break
+                        parent = ancestor['parent']
+                    if parent == main_pid: matches.append(int(pid))
+            require(len(matches) == 1, 'main_mcp_process_not_unique')
+            pids[role+'_pid'] = matches[0]
+        spec = dict(pids, main_pid=main_pid, previous_main_pid=state['previous_pid'], session_id=observed['session_id'],
+                    dispatcher_target_confirmed=True, mcp_handshake_confirmed=True)
         evidence = main_evidence(self.plan, self.inv, spec)
         atomic(self.run/'main-ready.json', encode({'schema_version': 1, 'plan_sha256': self.journal['plan_sha256'],
-               'mapping_evidence': 'operator_assertion', 'spec': spec, 'observations': evidence, 'issued_at_unix': time.time(), 'created_at': stamp()}))
+               'mapping_evidence': 'updater_runtime_and_required_mcp', 'spec': spec, 'observations': evidence,
+               'issued_at_unix': time.time(), 'created_at': stamp()}))
 
     def assert_main_ready(self):
         file = self.run/'main-ready.json'
         if not file.exists(): return False
         receipt = read_json(regular(file))
-        require(receipt.get('schema_version') == 1 and receipt.get('plan_sha256') == self.journal['plan_sha256'] and receipt.get('mapping_evidence') == 'operator_assertion', 'main_receipt_binding')
+        require(receipt.get('schema_version') == 1 and receipt.get('plan_sha256') == self.journal['plan_sha256']
+                and receipt.get('mapping_evidence') == 'updater_runtime_and_required_mcp', 'main_receipt_binding')
         issued = receipt.get('issued_at_unix')
         require(type(issued) in (int, float) and 0 <= time.time() - issued <= 120, 'main_receipt_expired')
         require(main_evidence(self.plan, self.inv, receipt['spec']) == receipt['observations'], 'main_receipt_stale')
@@ -580,6 +715,7 @@ class Runner:
                 if partial.is_file() or partial.is_symlink(): partial.unlink()
 
     def preflight_space(self):
+        if not self.plan.get('snapshot_old_databases', True): return
         size = 0
         for source in self.inv['databases']:
             for suffix in ('', '-wal'):
@@ -588,6 +724,9 @@ class Runner:
         require(shutil.disk_usage(self.run).free >= size + self.inv['policy'].get('disk_floor_bytes', 0), 'backup_disk_floor')
 
     def backup(self):
+        if not self.plan.get('snapshot_old_databases', True):
+            self.record('backing_up', backup_scope='old_generation_retained_in_place_without_snapshot')
+            return
         self.preflight_space()
         backup = private_dir(self.run/'backup')
         manifest = []
@@ -638,6 +777,7 @@ class Runner:
             require(p.read_bytes() == expected, 'installed_plist_drift')
 
     def start_all(self, include_slack=True, original=False):
+        if not original: require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
         self.assert_installed(original)
         for label in START if include_slack else START[:2]:
             self.services.start(label, Path.home()/'Library/LaunchAgents'/ (label+'.plist'))
@@ -688,7 +828,7 @@ class Runner:
         self.record('rolled_back', rollback_scope='original_plists_and_retained_old_generation')
 
     def restore(self):
-        require(self.journal['phase'] in ('stopping', 'backing_up', 'switching', 'starting_core', 'awaiting_main', 'rolling_back'), 'restore_after_ingress_forbidden')
+        require(self.journal['phase'] in ('stopping', 'backing_up', 'switching', 'starting_core', 'rolling_back'), 'restore_after_ingress_forbidden')
         self.rollback()
 
     def execute(self, receipt):
@@ -702,6 +842,7 @@ class Runner:
             self.rollback()
             return
         try:
+            require(tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
             # DB/log/socketは起動後mutable。code/config/pointerは全再開で照合する。
             require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
             if phase in ('prepared', 'stopping', 'backing_up', 'switching'):
@@ -730,6 +871,8 @@ class Runner:
                 self.record('starting_core')
             if self.journal['phase'] == 'starting_core':
                 self.stop_all()  # 再開時も検証済plistから新しくbootstrapする。
+                if phase != 'starting_core':
+                    require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
                 self.start_all(include_slack=False)
                 self.health(include_slack=False)
                 self.record('awaiting_main')
@@ -738,11 +881,13 @@ class Runner:
                     self.stop_all()
                     self.start_all(include_slack=False)
                     self.health(include_slack=False)
-                if not self.assert_main_ready(): return
+                self.ensure_main()
+                require(self.assert_main_ready(), 'main_not_ready')
                 self.health(include_slack=False)
                 # このintent以後はACK済eventがあり得る。旧DBへの自動rollbackは禁止。
                 self.record('starting_ingress')
             if self.journal['phase'] in ('starting_ingress', 'forward_recovery'):
+                if self.journal['phase'] == 'forward_recovery': self.ensure_main()
                 require(self.assert_main_ready(), 'main_not_ready')
                 self.install_slack()
                 if phase in ('starting_ingress', 'forward_recovery'):
@@ -759,9 +904,11 @@ class Runner:
         except Exception:
             if self.journal['phase'] == 'prepared':
                 raise
-            if self.journal['phase'] in ('starting_ingress', 'forward_recovery'):
-                self.record('forward_recovery', failure='ingress_may_have_accepted_events', old_generation_restore_forbidden=True)
-                self.stop_all()
+            if self.journal['phase'] in ('awaiting_main', 'starting_ingress', 'forward_recovery', 'succeeded'):
+                try:
+                    self.record('forward_recovery', failure='main_handoff_or_ingress_started', old_generation_restore_forbidden=True)
+                finally:
+                    self.stop_all()
             else:
                 self.record('rolling_back', failure='activation_failed')
                 self.rollback()
@@ -769,13 +916,13 @@ class Runner:
 
 
 @contextlib.contextmanager
-def locked(run):
+def locked(run, wait=False):
     lock_root = private_dir(Path.home()/'.dona-maintenance')
     with open(lock_root/'service.lock', 'a') as global_lock, open(run/'runner.lock', 'a') as file:
         os.chmod(lock_root/'service.lock', 0o600)
         os.chmod(run/'runner.lock', 0o600)
-        fcntl.flock(global_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(global_lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        fcntl.flock(file, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         yield
 
 
@@ -792,16 +939,13 @@ def main():
     p.add_argument('--repository', type=Path, required=True)
     p.add_argument('--event-id', required=True)
     p.add_argument('--job-id', required=True)
-    p = sub.add_parser('execute')
+    p.add_argument('--snapshot-old-databases', action='store_true')
+    for action in ('execute', 'arm', 'wait-execute'):
+        p = sub.add_parser(action)
+        p.add_argument('--run', type=Path, required=True)
+        p.add_argument('--handoff', type=Path, required=True)
+    p = sub.add_parser('probe-mcp')
     p.add_argument('--run', type=Path, required=True)
-    p.add_argument('--handoff', type=Path, required=True)
-    p = sub.add_parser('confirm-main')
-    p.add_argument('--run', type=Path, required=True)
-    for name in ('main-pid', 'dispatcher-pid', 'slack-pid', 'previous-main-pid'):
-        p.add_argument('--'+name, type=int, required=True)
-    p.add_argument('--session-id', required=True)
-    p.add_argument('--confirm-dispatcher-target', action='store_true')
-    p.add_argument('--confirm-mcp-handshake', action='store_true')
     p = sub.add_parser('restore')
     p.add_argument('--run', type=Path, required=True)
     p = sub.add_parser('status')
@@ -809,20 +953,31 @@ def main():
     args = parser.parse_args()
     require(args.run.is_absolute(), 'run_path_absolute')
     if args.action == 'prepare':
-        plan = prepare(args.run, args.repository, args.event_id, args.job_id)
+        plan = prepare(args.run, args.repository, args.event_id, args.job_id, args.snapshot_old_databases)
         print(json.dumps({'phase': 'prepared', 'target_sha': plan['target_sha'], 'plan_sha256': digest((args.run/'plan.json').read_bytes())}))
-    elif args.action == 'execute':
+    elif args.action == 'probe-mcp':
         assert_running_copy(args.run)
         with locked(args.run):
-            Runner(args.run).execute(read_json(regular(args.handoff)))
+            runner = Runner(args.run)
+            require(static_seal(runner.generation) == runner.plan['static_seal'], 'static_generation_drift')
+            result = runner.main_call(action='probe')
+            atomic(args.run/'mcp-probe.json', encode({'at': stamp(), 'plan_sha256': runner.journal['plan_sha256'], 'servers': result}))
+        print(json.dumps({'servers': result}))
+    elif args.action == 'arm':
+        assert_running_copy(args.run)
+        with locked(args.run):
+            label = Runner(args.run).arm(args.handoff)
+        print(json.dumps({'phase': 'armed', 'label': label}))
+    elif args.action in ('execute', 'wait-execute'):
+        assert_running_copy(args.run)
+        receipt = read_json(regular(args.handoff))
+        if args.action == 'wait-execute':
+            intent = read_json(args.run/'arm.json')
+            require(intent['handoff_sha256'] == digest(encode(receipt)), 'armed_handoff_changed')
+            Runner(args.run).wait_handoff(receipt)
+        with locked(args.run, wait=args.action == 'wait-execute'):
+            Runner(args.run).execute(receipt)
         print(json.dumps({'phase': read_json(args.run/'journal.json')['phase']}))
-    elif args.action == 'confirm-main':
-        assert_running_copy(args.run)
-        with locked(args.run):
-            Runner(args.run).confirm_main({'main_pid': args.main_pid, 'dispatcher_pid': args.dispatcher_pid, 'slack_pid': args.slack_pid,
-                'previous_main_pid': args.previous_main_pid, 'session_id': args.session_id,
-                'dispatcher_target_confirmed': args.confirm_dispatcher_target, 'mcp_handshake_confirmed': args.confirm_mcp_handshake})
-        print(json.dumps({'phase': 'main_ready_recorded'}))
     elif args.action == 'restore':
         assert_running_copy(args.run)
         with locked(args.run):

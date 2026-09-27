@@ -17,6 +17,7 @@ spec.loader.exec_module(m)
 REAL_HEALTH = m.Runner.health
 REAL_TRUST = m.verify_trust
 REAL_MAIN_READY = m.Runner.assert_main_ready
+REAL_ENSURE_MAIN = m.Runner.ensure_main
 
 
 class FixtureDatabase:
@@ -84,6 +85,7 @@ class RunnerTest(unittest.TestCase):
                'plists': self.plists, 'databases': [str(self.db)], 'old_results': [str(self.old/'results')]}
         m.atomic(self.run/'inventory.json', m.encode(inv))
         m.atomic(self.run/'runner.py', Path(m.__file__).read_bytes())
+        m.atomic(self.run/'main_bridge.mjs',Path(m.__file__).with_name('main_bridge.mjs').read_bytes())
         plan = {'runner_sha256': m.digest((self.run/'runner.py').read_bytes()), 'generation': str(self.g), 'target_sha': 'a'*40, 'event_id': 'event', 'job_id': 'job',
                 'inventory_sha256': m.digest((self.run/'inventory.json').read_bytes()),
                 'generation_seal': m.tree_seal(self.g), 'static_seal':m.static_seal(self.g), 'plists_seal': m.tree_seal(self.run/'plists')}
@@ -95,6 +97,8 @@ class RunnerTest(unittest.TestCase):
         self.services = Services()
         self.health_patch = patch.object(m.Runner, 'health')
         self.health = self.health_patch.start()
+        self.ensure_patch = patch.object(m.Runner, 'ensure_main')
+        self.ensure = self.ensure_patch.start()
         self.main_patch = patch.object(m.Runner, 'assert_main_ready', return_value=True)
         self.main_ready = self.main_patch.start()
         self.trust_patch = patch.object(m, 'verify_trust', return_value={})
@@ -103,6 +107,7 @@ class RunnerTest(unittest.TestCase):
         self.old_health = self.rollback_patch.start()
 
     def tearDown(self):
+        self.ensure_patch.stop()
         self.main_patch.stop()
         self.trust_patch.stop()
         self.rollback_patch.stop()
@@ -162,7 +167,7 @@ class RunnerTest(unittest.TestCase):
     def test_staged_plist_drift_blocks_stop(self):
         (self.run/'plists'/ (m.LABELS[0]+'.plist')).write_bytes(b'changed')
         with self.assertRaisesRegex(RuntimeError, 'staged_plists_changed'):
-            self.runner()
+            self.runner().execute(self.receipt)
         self.assertEqual(self.services.calls, [])
 
     def test_health_failure_restores_original_configuration(self):
@@ -250,6 +255,7 @@ with Server(p,Handler) as server: server.serve_forever()
             p.write_bytes(plistlib.dumps({'Label':label,'ProgramArguments':[sys.executable,str(fixture)],'EnvironmentVariables':{'SHA':'a'*40,'SERVICE':service,'SOCKET':str(self.g/sock)}}))
         plan=m.read_json(self.run/'plan.json')
         plan['plists_seal']=m.tree_seal(self.run/'plists')
+        plan['service_programs']={label:str(fixture) for label in m.LABELS}
         plan['generation_seal']=m.tree_seal(self.g)
         plan['static_seal']=m.static_seal(self.g)
         m.atomic(self.run/'plan.json',m.encode(plan))
@@ -433,8 +439,8 @@ with Server(p,Handler) as server: server.serve_forever()
 
     def test_main_not_ready_keeps_slack_ingress_stopped(self):
         self.main_ready.return_value=False
-        self.runner().execute(self.receipt)
-        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'awaiting_main')
+        with self.assertRaisesRegex(RuntimeError,'main_not_ready'): self.runner().execute(self.receipt)
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'forward_recovery')
         self.assertNotIn(('start','dev.dona.slack-adapter'),self.services.calls)
         self.assertNotIn('dev.dona.slack-adapter',self.services.registered)
         slack=self.home/'Library/LaunchAgents/dev.dona.slack-adapter.plist'
@@ -516,7 +522,7 @@ with Server(p,Handler) as server: server.serve_forever()
         release=m.private_dir(self.home/'main-release')
         launcher=self.home/'main_fixture.py'
         launcher.write_text("import subprocess,sys,time,json\na=subprocess.Popen([sys.executable,sys.argv[1]],stdout=subprocess.PIPE,text=True);b=subprocess.Popen([sys.executable,sys.argv[2]],stdout=subprocess.PIPE,text=True)\nassert a.stdout.readline().strip()=='ready';assert b.stdout.readline().strip()=='ready'\nprint(json.dumps([a.pid,b.pid]),flush=True)\ntry: time.sleep(30)\nfinally: a.terminate();b.terminate();a.wait();b.wait()\n")
-        process=subprocess.Popen([sys.executable,str(launcher),str(config/'mcp-dispatcher.mjs'),str(config/'mcp-slack.mjs'),str(release)],stdout=subprocess.PIPE,text=True)
+        process=subprocess.Popen([sys.executable,str(launcher),str(config/'mcp-dispatcher.mjs'),str(config/'mcp-slack.mjs'),str(release), 'mcp_servers.dona_dispatcher.required=true','mcp_servers.dona_dispatcher.enabled=true','mcp_servers.dona_slack.required=true','mcp_servers.dona_slack.enabled=true'],stdout=subprocess.PIPE,text=True)
         children=[]
         try:
             children=json.loads(process.stdout.readline())
@@ -527,6 +533,20 @@ with Server(p,Handler) as server: server.serve_forever()
             spec={'main_pid':process.pid,'dispatcher_pid':children[0],'slack_pid':children[1],'previous_main_pid':os.getpid(),'session_id':'fixture-new','dispatcher_target_confirmed':True,'mcp_handshake_confirmed':True}
             evidence=m.main_evidence(plan,inv,spec)
             self.assertEqual([r['pid'] for r in evidence],[process.pid,*children])
+            runner=self.runner();runner.plan.update(plan);runner.inv['policy']=inv['policy'];runner.generation=config.parent
+            old={'exists':True,'name':'dona-main','kind':'codex','matches_release':True,'pane_id':'w1:p1','session_id':'old','status':'idle'}
+            observed=dict(old,session_id='fixture-new',interactive_ready=True)
+            with patch.object(runner,'main_call',side_effect=[old,{'outcome':'stopped'},{'outcome':'started','observation':observed},observed]) as calls, patch.object(runner,'find_main_pid',side_effect=[os.getpid(),process.pid]):
+                REAL_ENSURE_MAIN(runner)
+                self.assertEqual([c.kwargs['action'] for c in calls.call_args_list],['status','stop','start','status'])
+            self.assertTrue(REAL_MAIN_READY(runner))
+            # start応答喪失後も同じmainと実childをread-only照合し、startを再送しない。
+            state=m.read_json(self.run/'main-lifecycle.json');state['phase']='start_intent';state.pop('observation')
+            m.atomic(self.run/'main-lifecycle.json',m.encode(state))
+            with patch.object(runner,'main_call',return_value=observed) as calls, patch.object(runner,'find_main_pid',return_value=process.pid):
+                REAL_ENSURE_MAIN(runner)
+                self.assertEqual([c.kwargs['action'] for c in calls.call_args_list],['status'])
+
         finally:
             # fixture子だけをexact PIDで終了。production/Herdrは対象外。
             for pid in children:
@@ -536,7 +556,7 @@ with Server(p,Handler) as server: server.serve_forever()
 
     def test_main_receipt_is_plan_bound_and_expires(self):
         runner=self.runner()
-        receipt={'schema_version':1,'plan_sha256':runner.journal['plan_sha256'],'mapping_evidence':'operator_assertion','spec':{},'observations':[],'issued_at_unix':m.time.time()}
+        receipt={'schema_version':1,'plan_sha256':runner.journal['plan_sha256'],'mapping_evidence':'updater_runtime_and_required_mcp','spec':{},'observations':[],'issued_at_unix':m.time.time()}
         m.atomic(self.run/'main-ready.json',m.encode(receipt))
         with patch.object(m,'main_evidence',return_value=[]): self.assertTrue(REAL_MAIN_READY(runner))
         receipt['issued_at_unix']-=121
@@ -573,3 +593,92 @@ with Server(p,Handler) as server: server.serve_forever()
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RecoveryRegressionTest(unittest.TestCase):
+    setUp=RunnerTest.setUp
+    tearDown=RunnerTest.tearDown
+    runner=RunnerTest.runner
+    def test_plist_tamper_after_ingress_stops_registered_services(self):
+        runner=self.runner();runner.switch();runner.record('starting_ingress');runner.install_slack()
+        (self.run/'plists'/(m.LABELS[0]+'.plist')).write_bytes(b'tampered')
+        with self.assertRaisesRegex(RuntimeError,'staged_plists_changed'): self.runner().execute({})
+        self.assertEqual(self.services.registered,set())
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'forward_recovery')
+
+    def test_success_journal_write_failure_never_restores_old_ingress(self):
+        original=m.atomic
+        def failing(file,data):
+            if file == self.run/'journal.json' and json.loads(data).get('phase')=='succeeded': raise OSError('disk_failure')
+            return original(file,data)
+        with patch.object(m,'atomic',side_effect=failing):
+            with self.assertRaisesRegex(OSError,'disk_failure'): self.runner().execute(self.receipt)
+        self.assertEqual(self.services.registered,set())
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'forward_recovery')
+        self.old_health.assert_not_called()
+
+    def test_backup_time_generation_change_is_rejected_before_bootstrap(self):
+        runner=self.runner();backup=runner.backup
+        def changed():
+            backup();(self.g/'config/changed').write_text('modified')
+        runner.backup=changed
+        with self.assertRaisesRegex(RuntimeError,'prepared_generation_drift'): runner.execute(self.receipt)
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'rolled_back')
+        self.health.assert_not_called()
+
+    def test_main_handoff_failure_cannot_restore_old_main_mapping(self):
+        self.ensure.side_effect=RuntimeError('main_stop_acceptance_unknown')
+        with self.assertRaisesRegex(RuntimeError,'main_stop_acceptance_unknown'): self.runner().execute(self.receipt)
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'forward_recovery')
+        self.old_health.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError,'restore_after_ingress_forbidden'): self.runner().restore()
+
+    def test_main_stop_intent_is_never_blind_retried(self):
+        runner=self.runner();runner.main_step('stop_intent',old={})
+        with patch.object(runner,'main_call') as call:
+            with self.assertRaisesRegex(RuntimeError,'main_stop_acceptance_unknown'): REAL_ENSURE_MAIN(runner)
+            call.assert_not_called()
+
+    def test_optional_snapshot_does_not_gate_switch_on_old_database_backup(self):
+        runner=self.runner();runner.plan['snapshot_old_databases']=False
+        with patch.object(runner.database,'backup',side_effect=RuntimeError('old_database_unavailable')) as backup:
+            runner.execute(self.receipt)
+            backup.assert_not_called()
+        self.assertEqual(runner.journal['phase'],'succeeded')
+
+
+    def test_arm_uses_independent_one_shot_and_never_bootstraps_twice(self):
+        receipt=self.run/'handoff.json';m.atomic(receipt,m.encode(self.receipt))
+        runner=self.runner()
+        label=runner.arm(receipt,self.services)
+        plist=plistlib.loads((self.run/'maintenance.plist').read_bytes())
+        self.assertEqual(plist['Label'],label)
+        self.assertFalse(plist['KeepAlive'])
+        self.assertIn('wait-execute',plist['ProgramArguments'])
+        self.assertNotIn(label,m.LABELS)
+        runner.arm(receipt,self.services)
+        self.assertEqual(self.services.calls,[('start',label)])
+        self.services.registered.remove(label)
+        with self.assertRaisesRegex(RuntimeError,'arm_acceptance_unknown'): runner.arm(receipt,self.services)
+        self.assertEqual(self.services.calls,[('start',label)])
+
+    def test_wait_handoff_polls_parent_terminal_without_stopping_services(self):
+        with sqlite3.connect(self.db) as db: db.execute("UPDATE events SET status='dispatching' WHERE event_id='notification'")
+        def finish(_):
+            with sqlite3.connect(self.db) as db: db.execute("UPDATE events SET status='completed' WHERE event_id='notification'")
+        with patch.object(m.time,'sleep',side_effect=finish) as sleep:
+            self.runner().wait_handoff(self.receipt)
+            sleep.assert_called_once()
+        self.assertEqual(self.services.calls,[])
+
+    def test_forward_recovery_stops_slack_even_if_updater_stop_fails(self):
+        runner=self.runner();runner.record('starting_ingress')
+        original=self.services.stop
+        def stop(label):
+            if label=='dev.dona.updater': raise RuntimeError('updater_stop_failure')
+            original(label)
+        self.services.stop=stop
+        (self.g/'config/changed').write_text('drift')
+        with self.assertRaisesRegex(RuntimeError,'updater_stop_failure'): runner.execute({})
+        self.assertNotIn('dev.dona.slack-adapter',self.services.registered)
+        self.assertNotIn('dev.dona.dispatcher',self.services.registered)
