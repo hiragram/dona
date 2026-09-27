@@ -546,6 +546,16 @@ with Server(p,Handler) as server: server.serve_forever()
         m.atomic(self.run/'main-ready.json',m.encode(receipt))
         with self.assertRaisesRegex(RuntimeError,'main_receipt_binding'): REAL_MAIN_READY(runner)
 
+    def test_crash_partial_backup_is_removed_before_capacity_check(self):
+        runner=self.runner();runner.record('backing_up')
+        partial=m.private_dir(self.run/'backup')/'0.tmp';partial.write_bytes(b'partial')
+        original=runner.preflight_space
+        def capacity():
+            self.assertFalse(partial.exists());original()
+        runner.preflight_space=capacity
+        runner.execute({})
+        self.assertEqual(runner.journal['phase'],'succeeded')
+
     def test_atomic_crash_temporary_recovery(self):
         target=self.run/'status.json'
         target.with_suffix('.json.tmp').write_bytes(b'incomplete')

@@ -573,6 +573,12 @@ class Runner:
         require(main_evidence(self.plan, self.inv, receipt['spec']) == receipt['observations'], 'main_receipt_stale')
         return True
 
+    def cleanup_partial_backups(self):
+        for index in range(len(self.inv['databases'])):
+            for suffix in ('', '-wal', '-shm'):
+                partial = self.run/'backup'/(str(index)+'.tmp'+suffix)
+                if partial.is_file() or partial.is_symlink(): partial.unlink()
+
     def preflight_space(self):
         size = 0
         for source in self.inv['databases']:
@@ -690,6 +696,8 @@ class Runner:
         require(phase in ('prepared', 'stopping', 'backing_up', 'switching', 'starting_core', 'awaiting_main', 'starting_ingress', 'forward_recovery', 'rolling_back', 'rolled_back', 'succeeded'), 'journal_phase')
         if phase in ('succeeded', 'rolled_back'):
             return
+        if phase in ('backing_up', 'rolling_back'):
+            self.cleanup_partial_backups()  # crash後も容量確認やjournal writeより先に部分fileを回収。
         if phase == 'rolling_back':
             self.rollback()
             return
