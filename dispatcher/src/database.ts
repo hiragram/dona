@@ -232,6 +232,24 @@ function ensureJobAttentionResolutionSchema(db: Database.Database): void { db.ex
     body_sha256 TEXT NOT NULL,
     verified_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS job_attention_no_post_reconciliations (
+    attention_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+    source_event_id TEXT NOT NULL REFERENCES events(event_id),
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    expected_event_updated_at TEXT NOT NULL,
+    expected_job_updated_at TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    thread_ts TEXT NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL,
+    operator_principal TEXT NOT NULL,
+    reconciled_at TEXT NOT NULL
+  );
+  CREATE TRIGGER IF NOT EXISTS job_attention_no_post_no_update BEFORE UPDATE ON job_attention_no_post_reconciliations
+    BEGIN SELECT RAISE(ABORT,'attention_no_post_append_only'); END;
+  CREATE TRIGGER IF NOT EXISTS job_attention_no_post_no_delete BEFORE DELETE ON job_attention_no_post_reconciliations
+    BEGIN SELECT RAISE(ABORT,'attention_no_post_append_only'); END;
   CREATE TABLE IF NOT EXISTS job_attention_delivery_claims (
     attention_event_id TEXT PRIMARY KEY REFERENCES events(event_id),
     source_event_id TEXT NOT NULL REFERENCES events(event_id),
@@ -1545,6 +1563,7 @@ export class DispatcherDatabase {
         completion:this.db.prepare("SELECT * FROM job_completion_results WHERE notification_event_id=?").get(id)??null,
         delivery:this.db.prepare("SELECT * FROM job_attention_delivery_receipts WHERE attention_event_id=?").get(id)??null,
         claim:this.db.prepare("SELECT * FROM job_attention_delivery_claims WHERE attention_event_id=?").get(id)??null,
+        no_post:this.db.prepare("SELECT * FROM job_attention_no_post_reconciliations WHERE attention_event_id=?").get(id)??null,
         settled:this.attentionNotificationSettled(event)};
     });
     const migration=this.db.prepare("SELECT * FROM job_legacy_notification_migration WHERE job_id=?").get(job.job_id)??null;
@@ -1877,6 +1896,51 @@ export class DispatcherDatabase {
     }).immediate();
   }
 
+  reconcileAttentionNotPosted(sourceEventId:string,jobId:string,attentionEventId:string,
+    expectedJobUpdatedAt:string,expectedEventUpdatedAt:string,evidenceSha256:string,
+    operatorPrincipal:string,at=new Date()):{attention_event_id:string;decision:"not_posted";reconciled_at:string} {
+    if(!/^[0-9a-f]{64}$/.test(evidenceSha256)||!operatorPrincipal||operatorPrincipal.length>256)
+      throw new Error("attention_no_post_evidence_invalid");
+    return this.db.transaction(()=>{
+      const job=this.getJobRequired(jobId);
+      const group=this.getJobGroupRequired(sourceEventId);
+      const event=this.getRequired(attentionEventId);
+      const owner=readEventJobBinding(this.db,sourceEventId)?.owner;
+      const payload=JSON.parse(event.payload_json) as {job_id?:string;group?:{source_event_id?:string;transition?:string}};
+      const target=event.reply_target_json?JSON.parse(event.reply_target_json) as Record<string,unknown>:null;
+      if(job.source_event_id!==sourceEventId||job.status!=="needs_review"||job.updated_at!==expectedJobUpdatedAt||
+        job.result_json!==null||job.steer_state!==null||owner?.kind!=="slack_thread"||
+        owner.workspace_id!==job.workspace_id||owner.channel_id!==job.channel_id||owner.thread_ts!==job.thread_ts||
+        group.notification_mode!=="grouped"||group.attention_event_id!==attentionEventId||group.all_terminal_event_id||
+        event.source!=="dona_job"||event.status!=="completed"||event.last_error_code!==null||
+        event.updated_at!==expectedEventUpdatedAt||
+        !event.result_json||payload.job_id!==jobId||payload.group?.source_event_id!==sourceEventId||
+        payload.group.transition!=="attention"||target?.kind!=="slack_thread"||
+        target.workspace_id!==job.workspace_id||target.channel_id!==job.channel_id||target.thread_ts!==job.thread_ts||
+        this.db.prepare("SELECT 1 FROM job_attention_delivery_receipts WHERE attention_event_id=?").get(attentionEventId)||
+        this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE attention_event_id=?").get(attentionEventId)||
+        this.db.prepare("SELECT 1 FROM job_attention_no_post_reconciliations WHERE attention_event_id=?").get(attentionEventId))
+        throw new Error("attention_no_post_binding_or_state_changed");
+      const result=JSON.parse(event.result_json) as ResultEnvelope;
+      if(result.event_id!==attentionEventId||result.status!=="completed"||!Array.isArray(result.actions)||
+        result.actions.length!==0||this.attentionNotificationSettled(event))
+        throw new Error("attention_no_post_result_not_empty");
+      const reconciledAt=at.toISOString();
+      this.db.prepare(`INSERT INTO job_attention_no_post_reconciliations
+        (attention_event_id,source_event_id,job_id,expected_event_updated_at,expected_job_updated_at,
+         workspace_id,channel_id,thread_ts,result_sha256,evidence_sha256,operator_principal,reconciled_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(attentionEventId,sourceEventId,jobId,expectedEventUpdatedAt,
+          expectedJobUpdatedAt,job.workspace_id,job.channel_id,job.thread_ts,
+          createHash("sha256").update(event.result_json).digest("hex"),evidenceSha256,operatorPrincipal,reconciledAt);
+      return {attention_event_id:attentionEventId,decision:"not_posted" as const,reconciled_at:reconciledAt};
+    }).immediate();
+  }
+
+  attentionNoPostRecord(attentionEventId:string):Record<string,unknown>|undefined {
+    return this.db.prepare("SELECT * FROM job_attention_no_post_reconciliations WHERE attention_event_id=?")
+      .get(attentionEventId) as Record<string,unknown>|undefined;
+  }
+
   attentionDeliveryVerificationRequest(
     sourceEventId: string, attentionEventId: string, messageTs: string, bodySha256: string,
   ): JobNotificationVerificationRequest {
@@ -1884,6 +1948,7 @@ export class DispatcherDatabase {
     const event = this.getRequired(attentionEventId);
     if (group.attention_event_id !== attentionEventId || group.all_terminal_event_id !== null ||
         event.status !== "completed" || !event.result_json ||
+        this.db.prepare("SELECT 1 FROM job_attention_no_post_reconciliations WHERE attention_event_id=?").get(attentionEventId) ||
         !/^[a-f0-9]{64}$/.test(bodySha256) || !/^\d+\.\d+$/.test(messageTs)) {
       throw new Error("attention_delivery_reconciliation_unavailable");
     }
@@ -3478,8 +3543,26 @@ export class DispatcherDatabase {
     const payload = JSON.parse(event.payload_json) as { group?: { transition?: string } };
     const result = JSON.parse(event.result_json) as ResultEnvelope;
     if (payload.group?.transition !== "attention" || result.event_id !== event.event_id || result.status !== "completed") return false;
-    if (this.db.prepare("SELECT 1 FROM job_attention_delivery_receipts WHERE attention_event_id=?")
-      .get(event.event_id)) return true;
+    const delivered=this.db.prepare("SELECT 1 FROM job_attention_delivery_receipts WHERE attention_event_id=?")
+      .get(event.event_id);
+    const noPost=this.db.prepare("SELECT * FROM job_attention_no_post_reconciliations WHERE attention_event_id=?")
+      .get(event.event_id) as {source_event_id:string;job_id:string;expected_event_updated_at:string;
+        workspace_id:string;channel_id:string;thread_ts:string;result_sha256:string}|undefined;
+    if(noPost) {
+      const job=this.getJob(noPost.job_id);
+      const owner=readEventJobBinding(this.db,noPost.source_event_id)?.owner;
+      const target=event.reply_target_json?JSON.parse(event.reply_target_json) as Record<string,unknown>:null;
+      return !delivered&&event.updated_at===noPost.expected_event_updated_at&&job?.source_event_id===noPost.source_event_id&&
+        job.workspace_id===noPost.workspace_id&&job.channel_id===noPost.channel_id&&job.thread_ts===noPost.thread_ts&&
+        owner?.kind==="slack_thread"&&owner.workspace_id===noPost.workspace_id&&
+        owner.channel_id===noPost.channel_id&&owner.thread_ts===noPost.thread_ts&&
+        target?.workspace_id===noPost.workspace_id&&target.channel_id===noPost.channel_id&&
+        target.thread_ts===noPost.thread_ts&&
+        createHash("sha256").update(event.result_json).digest("hex")===noPost.result_sha256&&
+        Array.isArray(result.actions)&&result.actions.length===0&&
+        !this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE attention_event_id=?").get(event.event_id);
+    }
+    if(delivered) return true;
     const actions = result.actions ?? [];
     const target = event.reply_target_json ? JSON.parse(event.reply_target_json) as Record<string, unknown> : null;
     if (target?.kind !== "slack_thread" || typeof target.workspace_id !== "string" ||

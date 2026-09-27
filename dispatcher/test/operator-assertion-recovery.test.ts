@@ -15,7 +15,7 @@ async function setup(cause="legacy_agent_sandbox_unknown",attempted=true){
   const {root,config}=await tempConfig();roots.push(root);
   const database=new DispatcherDatabase(config.databasePath);
   const source=database.enqueue(eventEnvelope(`source-${root}`)).row;
-  const created=database.createJob({source_event_id:source.event_id,objective:"recover",workspace:{kind:"scratch"}},
+  const created=database.createJob({source_event_id:source.event_id,job_key:"operator-recovery",objective:"recover",workspace:{kind:"scratch"}},
     config.jobsWorkspaceRoot,config.jobResultsDir).row;
   if(attempted)database.beginJobPreparation(created.job_id);
   database.markJobNeedsReview(created.job_id,cause,"legacy worker state unknown");
@@ -140,6 +140,72 @@ test("配送中の旧通知は申告があっても再送せず状態を維持�
   assert.throws(()=>state.database.recoverWithOperatorAssertion(input),/notification_requires_reconciliation/);
   assert.equal(state.database.getJob(state.job.job_id)?.status,"needs_review");
   assert.equal(state.database.get(event.event_id)?.status,"dispatching");
+});
+
+test("処理済み未投稿attentionを個別照合して妥当Resultと申告を受理する",async()=>{
+  const state=await setup();
+  await fs.mkdir(path.dirname(state.job.result_path),{recursive:true});
+  await fs.writeFile(state.job.result_path,JSON.stringify({schema_version:1,job_id:state.job.job_id,
+    status:"completed",summary:"完了",completed_at:new Date().toISOString()}));
+  state.database.manualComplete(state.job.source_event_id);
+  const attention=state.database.enqueueJobNotification(state.job.job_id).row;
+  assert.equal((JSON.parse(attention.payload_json) as {group:{transition:string}}).group.transition,"attention");
+  state.database.beginDispatch(attention.event_id,`${state.config.resultsDir}/${attention.event_id}.json`);
+  state.database.markWaiting(attention.event_id);
+  state.database.saveCompleted(attention.event_id,{schema_version:1,event_id:attention.event_id,
+    status:"completed",summary:"処理済み",actions:[],completed_at:new Date().toISOString()},
+    `${state.config.resultsDir}/${attention.event_id}.json`);
+  const event=state.database.get(attention.event_id)!;
+  const assertion=state.database.enqueue({...eventEnvelope("post-attention-assertion"),
+    occurred_at:new Date().toISOString(),payload:{text:"停止済みと申告"}}).row;
+  state.database.manualComplete(assertion.event_id);
+  const input={...state.input(),assertionEventId:assertion.event_id};
+  assert.throws(()=>state.database.recoverWithOperatorAssertion(input),/notification_requires_reconciliation/);
+  const evidence=digest("同一threadの通知履歴を確認した");
+  const reconcile=()=>state.database.reconcileAttentionNotPosted(state.job.source_event_id,state.job.job_id,
+    attention.event_id,input.expectedUpdatedAt,event.updated_at,evidence,"local:test:501");
+  const rawBefore=new Database(state.config.databasePath);
+  try {
+    const originalTarget=event.reply_target_json!;
+    const originalResult=event.result_json!;
+    rawBefore.prepare("UPDATE events SET reply_target_json=? WHERE event_id=?")
+      .run(JSON.stringify({...JSON.parse(originalTarget),thread_ts:"999.999"}),attention.event_id);
+    assert.throws(reconcile,/binding_or_state_changed/);
+    rawBefore.prepare("UPDATE events SET reply_target_json=? WHERE event_id=?").run(originalTarget,attention.event_id);
+    rawBefore.prepare("UPDATE events SET result_json=? WHERE event_id=?")
+      .run(JSON.stringify({...JSON.parse(originalResult),actions:[{tool:"dona_slack.post_message",ambiguous:true}]}),attention.event_id);
+    assert.throws(reconcile,/result_not_empty/);
+    rawBefore.prepare("UPDATE events SET result_json=? WHERE event_id=?").run(originalResult,attention.event_id);
+    rawBefore.prepare("UPDATE jobs SET updated_at=? WHERE job_id=?").run("2030-01-01T00:00:00.000Z",state.job.job_id);
+    assert.throws(reconcile,/binding_or_state_changed/);
+    rawBefore.prepare("UPDATE jobs SET updated_at=? WHERE job_id=?")
+      .run(input.expectedUpdatedAt,state.job.job_id);
+    rawBefore.prepare(`INSERT INTO job_attention_delivery_claims
+      (attention_event_id,source_event_id,claim_token,expected_event_updated_at,message_ts,body_sha256,claimed_at)
+      VALUES(?,?,?,?,?,?,?)`).run(attention.event_id,state.job.source_event_id,"claimed",
+        event.updated_at,"123.456",digest("body"),new Date().toISOString());
+    assert.throws(reconcile,/binding_or_state_changed/);
+    rawBefore.prepare("DELETE FROM job_attention_delivery_claims WHERE attention_event_id=?").run(attention.event_id);
+    rawBefore.prepare(`INSERT INTO job_attention_delivery_receipts
+      (attention_event_id,source_event_id,workspace_id,channel_id,thread_ts,message_ts,body_sha256,verified_at)
+      VALUES(?,?,?,?,?,?,?,?)`).run(attention.event_id,state.job.source_event_id,"T_TEST","C_TEST",
+        "1756722030.123456","123.456",digest("body"),new Date().toISOString());
+    assert.throws(reconcile,/binding_or_state_changed/);
+    rawBefore.prepare("DELETE FROM job_attention_delivery_receipts WHERE attention_event_id=?").run(attention.event_id);
+  } finally {rawBefore.close();}
+  assert.equal(reconcile().decision,"not_posted");
+  assert.equal(state.database.attentionNoPostRecord(attention.event_id)?.evidence_sha256,evidence);
+  assert.throws(reconcile,/binding_or_state_changed/);
+  assert.throws(()=>state.database.recoverWithOperatorAssertion(input),/notification_drift/);
+  const recovered=state.database.recoverWithOperatorAssertion({...state.input(),assertionEventId:assertion.event_id});
+  assert.equal(recovered.status,"completed");
+  const raw=new Database(state.config.databasePath,{readonly:true});
+  try {
+    assert.equal((raw.prepare("SELECT evidence_sha256 FROM job_attention_no_post_reconciliations WHERE attention_event_id=?")
+      .get(attention.event_id) as {evidence_sha256:string}).evidence_sha256,evidence);
+    assert.equal(raw.prepare("SELECT 1 FROM job_attention_delivery_receipts WHERE attention_event_id=?")
+      .get(attention.event_id),undefined);
+  } finally {raw.close();}
 });
 
 test("旧Result pathの再openはCASを動かさず別CLI起動で回復できる",async()=>{

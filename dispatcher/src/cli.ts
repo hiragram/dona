@@ -46,6 +46,8 @@ function usage(): never {
   dona-dispatcher job resolve-failed-attention <source_event_id> <job_id> <attention_event_id> <expected_updated_at> --notification-reviewed --side-effects-reviewed
   dona-dispatcher job resolve-review-attention <source_event_id> <job_id> <attention_event_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher job attention-recovery <source_event_id>
+  dona-dispatcher job reconcile-attention-not-posted <source_event_id> <job_id> <attention_event_id> <expected_job_updated_at> <expected_event_updated_at> <evidence_sha256> --notification-reviewed --no-post-confirmed
+  dona-dispatcher job attention-no-post-record <attention_event_id>
   dona-dispatcher job reconcile-attention-delivery <source_event_id> <attention_event_id> <expected_event_updated_at> <message_ts> <body_sha256> --notification-reviewed [--resume <claim_token>]
   dona-dispatcher job release-rejected-attention-claim <source_event_id> <attention_event_id> <expected_event_updated_at> <claim_token> --definitive-rejection-reviewed --no-session-write-reviewed
   dona-dispatcher scheduler health
@@ -202,6 +204,18 @@ async function main(): Promise<void> {
         const sourceEventId=eventIdAt(args,2);
         console.log(JSON.stringify({group:database.getJobGroup(sourceEventId),
           legacy_claim:database.getLegacyAttentionClaim(sourceEventId)},null,2));return;
+      }
+      if(command==="reconcile-attention-not-posted") {
+        if(args.length!==10||args[8]!=="--notification-reviewed"||args[9]!=="--no-post-confirmed")usage();
+        const principal=`local:${os.userInfo().username}:${process.getuid?.()??"unknown"}`;
+        console.log(JSON.stringify(database.reconcileAttentionNotPosted(eventIdAt(args,2),eventIdAt(args,3),
+          eventIdAt(args,4),eventIdAt(args,5),eventIdAt(args,6),eventIdAt(args,7),principal),null,2));return;
+      }
+      if(command==="attention-no-post-record") {
+        if(args.length!==3)usage();
+        const record=database.attentionNoPostRecord(eventIdAt(args,2));
+        if(!record)throw new Error("attention_no_post_record_not_found");
+        console.log(JSON.stringify(record,null,2));return;
       }
       if(command==="release-rejected-attention-claim") {
         if(args.length!==8 || args[6]!=="--definitive-rejection-reviewed" || args[7]!=="--no-session-write-reviewed")usage();
