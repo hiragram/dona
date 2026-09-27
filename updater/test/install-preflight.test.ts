@@ -470,6 +470,11 @@ test("generation target validation rejects a mismatched installed updater before
       DONA_SOCKET_PATH: path.join(root, "run/d.sock"), SLACK_HEALTH_SOCKET_PATH: path.join(root, "run/s.sock"),
       DONA_DATABASE_PATH: path.join(root, "dona.sqlite3"),
       DONA_RELEASE_MANIFEST_PATH: path.join(root, "runtime/current/release-manifest.json"),
+      DONA_RESULTS_DIR: path.join(root, "results"),
+      DONA_JOB_RESULTS_DIR: path.join(root, "job-results"),
+      DONA_JOB_PROGRESS_DATABASE_PATH: path.join(root, "job-progress.sqlite3"),
+      DONA_UPDATE_NOTIFICATION_DATABASE_PATH: path.join(root, "update-notifications.sqlite3"),
+      DOTENV_CONFIG_PATH: path.join(root, "config/dispatcher.env"),
       GENERATION_ONLY: "preserved",
     }));
     const testBin = path.join(home, "bin");
@@ -484,6 +489,15 @@ test("generation target validation rejects a mismatched installed updater before
     await execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } });
     const updated = await fs.readFile(path.join(rendered, "dev.dona.dispatcher.plist"), "utf8");
     assert.match(updated, /GENERATION_ONLY/);
+    const receipt = path.join(root, "control/control-plane-receipt.json");
+    await fs.mkdir(receipt);
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } }));
+    await fs.rmdir(receipt);
+    const dispatcherPlist = path.join(launchAgents, "dev.dona.dispatcher.plist");
+    const originalDispatcher = await fs.readFile(dispatcherPlist, "utf8");
+    await fs.writeFile(dispatcherPlist, originalDispatcher.replace(path.join(root, "job-results"), path.join(home, "other/job-results")));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } }));
+    await fs.writeFile(dispatcherPlist, originalDispatcher);
     await fs.writeFile(path.join(launchAgents, "dev.dona.updater.plist"), plist("dev.dona.updater", path.join(home, "other/updater/dist/cli.js"), {
       DONA_UPDATE_POLICY_PATH: path.join(root, "control/policy.json"), DONA_UPDATER_BUILD_SHA: sha,
     }));

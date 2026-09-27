@@ -191,7 +191,7 @@ trap cleanup_temp EXIT
 
 $NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}"
 if [[ -n "$TARGET_ROOT" ]]; then
-  /usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR"
+  EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR")
 fi
 /usr/bin/plutil -lint "$INSTALL_TMP/rendered/dev.dona.updater.plist" \
   "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" \
@@ -335,6 +335,10 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     exit 1
   fi
   OLD_UPDATER_SHA=$($NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-control-upgrade-safe "$UPDATER_SOCKET")
+  if [[ -n "$TARGET_ROOT" && "$OLD_UPDATER_SHA" != "$EXPECTED_OLD_UPDATER_SHA" ]]; then
+    print -u2 "稼働中Updaterと保存済みplistのSHAが一致しないため、停止しません。"
+    exit 1
+  fi
   if [[ ! -f "$CONTROL_ROOT/updater.sqlite3" ]]; then
     print -u2 "updater databaseを確認できないため、stable updaterを停止しません。"
     exit 1

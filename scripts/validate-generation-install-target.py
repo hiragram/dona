@@ -43,6 +43,7 @@ def main():
     require(current.is_symlink())
     active = current.resolve(strict=True)
     require(active.parent == root / 'runtime/releases' and re.fullmatch(r'[0-9a-f]{40}', active.name))
+    old_updater_sha = None
     for label in ('dev.dona.updater', 'dev.dona.dispatcher'):
         installed = plistlib.loads(regular(launch_agents / (label + '.plist')).read_bytes())
         candidate_file = rendered / (label + '.plist')
@@ -56,6 +57,7 @@ def main():
         if label.endswith('updater'):
             require(env.get('DONA_UPDATE_POLICY_PATH') == str(control / 'policy.json'))
             require(re.fullmatch(r'[0-9a-f]{40}', env.get('DONA_UPDATER_BUILD_SHA', '')))
+            old_updater_sha = env['DONA_UPDATER_BUILD_SHA']
         else:
             require(env.get('DONA_UPDATER_SOCKET_PATH') == str(control / 'updater.sock'))
             require(env.get('DONA_UPDATE_INTERNAL_TOKEN_PATH') == str(control / 'dispatcher.token'))
@@ -63,6 +65,14 @@ def main():
             require(env.get('SLACK_HEALTH_SOCKET_PATH') == str(root / 'run/s.sock'))
             require(env.get('DONA_DATABASE_PATH') == str(root / 'dona.sqlite3'))
             require(env.get('DONA_RELEASE_MANIFEST_PATH') == str(current / 'release-manifest.json'))
+            for key, suffix in {
+                'DONA_RESULTS_DIR': 'results',
+                'DONA_JOB_RESULTS_DIR': 'job-results',
+                'DONA_JOB_PROGRESS_DATABASE_PATH': 'job-progress.sqlite3',
+                'DONA_UPDATE_NOTIFICATION_DATABASE_PATH': 'update-notifications.sqlite3',
+                'DOTENV_CONFIG_PATH': 'config/dispatcher.env',
+            }.items():
+                require(env.get(key) == str(root / suffix))
             # Keep generation-specific environment that the generic template does not describe.
             updated = dict(env)
             updated.update(candidate['EnvironmentVariables'])
@@ -71,10 +81,10 @@ def main():
             os.chmod(candidate_file, 0o600)
     receipt = control / 'control-plane-receipt.json'
     if receipt.exists():
-        require(not receipt.is_symlink())
+        regular(receipt)
     database = control / 'updater.sqlite3'
     require(regular(database))
-    print('selected installed generation and launch agents match')
+    print(old_updater_sha)
 
 
 if __name__ == '__main__':
