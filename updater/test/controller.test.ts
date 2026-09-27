@@ -918,7 +918,7 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
     for (const [kind, service] of [["stop_slack", "slack_adapter"], ["stop_dispatcher", "dispatcher"]] as const) {
       f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, currentSha, null);
-      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "accepted", null, { exit_code: 0 });
+      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, {});
     }
     f.runtime.simulateStoppedRuntime();
     f.runtime.simulateSlackRestarted();
@@ -927,11 +927,32 @@ describe("UpdateController isolated end-to-end", () => {
     f.runtime.rotateMainAgentSessionOnStart = true;
     f.advance(f.policy.timeouts.lease_ms + 1);
     await f.controller.processNext();
-    assert.equal(f.database.runtimeOperation(row.request_id, "stop_slack")?.phase, "accepted");
+    assert.equal(f.database.runtimeOperation(row.request_id, "stop_slack")?.phase, "observed");
     assert.equal(f.runtime.calls.includes("quiesceSlack"), false);
     assert.equal(f.runtime.calls.includes("stopSlack"), false);
     assert.equal(f.database.get(row.request_id)?.state, "failed");
     assert.equal(f.database.get(row.request_id)?.last_error_code, "slack_adapter_reappeared_after_stop");
+    f.database.close();
+  });
+  test("waits for an accepted Slack stop without treating its live socket as a restart", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stop-pending" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_slack", "slack_adapter", currentSha, null);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_slack", "accepted", null, { exit_code: 0 });
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "quiescing");
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "stop_slack_acceptance_unknown");
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    assert.equal(f.runtime.calls.includes("quiesceSlack"), false);
+    assert.equal(f.runtime.calls.includes("stopSlack"), false);
     f.database.close();
   });
   test("restores the old runtime when Dispatcher reappears after a persisted stop", async () => {
@@ -949,7 +970,7 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
     for (const [kind, service] of [["stop_slack", "slack_adapter"], ["stop_dispatcher", "dispatcher"]] as const) {
       f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, currentSha, null);
-      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "accepted", null, { exit_code: 0 });
+      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, {});
     }
     f.runtime.simulateStoppedRuntime();
     f.runtime.simulateDispatcherRestarted();
@@ -1009,6 +1030,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.get(row.request_id)?.last_error_code,
       "rollback_main_agent_start_acceptance_unknown");
     assert.equal(f.runtime.calls.includes("startDispatcher"), false);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
     f.database.close();
   });
   test("does not stop the main agent when a persisted Slack stop is still registered", async () => {

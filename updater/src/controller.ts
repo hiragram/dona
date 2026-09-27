@@ -585,6 +585,10 @@ export class UpdateController {
           return;
         }
         if (persistedSlackStop) {
+          if (persistedSlackStop.phase !== "observed" && !this.reconcileDeadlineExpired(row)) {
+            this.deferOrReview(row, "stop_slack_acceptance_unknown", "The persisted Slack stop is still live");
+            return;
+          }
           await this.restoreQuiescedServices(row, "slack_adapter_reappeared_after_stop",
             dispatcherPreviouslyQuiesced, true);
           return;
@@ -593,7 +597,8 @@ export class UpdateController {
         try { slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha); }
         catch {
           this.assertLease(row);
-          await this.restoreQuiescedServices(row, "slack_adapter_quiesce_unverified", false, true);
+          const slackQuiesced = await this.quiesceRecoveryScope(row, "slack_adapter");
+          await this.restoreQuiescedServices(row, "slack_adapter_quiesce_unverified", false, slackQuiesced);
           return;
         }
         this.assertLease(row);
@@ -628,6 +633,10 @@ export class UpdateController {
           return;
         }
         if (persistedDispatcherStop) {
+          if (persistedDispatcherStop.phase !== "observed" && !this.reconcileDeadlineExpired(row)) {
+            this.deferOrReview(row, "stop_dispatcher_acceptance_unknown", "The persisted Dispatcher stop is still live");
+            return;
+          }
           await this.restoreQuiescedServices(row, "dispatcher_reappeared_after_stop");
           return;
         }
@@ -635,7 +644,8 @@ export class UpdateController {
         try { dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha); }
         catch {
           this.assertLease(row);
-          await this.restoreQuiescedServices(row, "dispatcher_quiesce_unverified");
+          const dispatcherQuiesced = await this.quiesceRecoveryScope(row, "dispatcher");
+          await this.restoreQuiescedServices(row, "dispatcher_quiesce_unverified", dispatcherQuiesced, true);
           return;
         }
         this.assertLease(row);
@@ -1430,6 +1440,27 @@ export class UpdateController {
       deadline,
       now,
     );
+  }
+
+  private reconcileDeadlineExpired(row: UpdateRow): boolean {
+    return row.reconcile_deadline !== null &&
+      this.clock.now().getTime() >= new Date(row.reconcile_deadline).getTime();
+  }
+
+  private async quiesceRecoveryScope(row: UpdateRow, service: HealthSnapshot["service"]): Promise<boolean> {
+    try {
+      const health = service === "dispatcher" ? await this.runtime.dispatcherHealth() : await this.runtime.slackHealth();
+      this.assertLease(row);
+      if (!health.live || health.build_sha !== row.current_sha || health.ready) return false;
+      const drain = service === "dispatcher" ? await this.runtime.dispatcherDrainStatus()
+        : await this.runtime.slackDrainStatus();
+      this.assertLease(row);
+      return drain.service === service && drain.quiescing && drain.drained && drain.in_flight === 0 &&
+        drain.unsafe_states.length === 0;
+    } catch {
+      this.assertLease(row);
+      return false;
+    }
   }
 
   private async ensureRollbackMainAgentStopped(
