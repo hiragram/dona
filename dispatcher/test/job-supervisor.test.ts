@@ -982,10 +982,11 @@ describe("JobSupervisor", () => {
     const steers: string[] = [];
     const steerTargets: string[] = [];
     const steerTimeouts: Array<number | undefined> = [];
+    const submissionModes: Array<boolean | undefined> = [];
     const runtime: JobAgentRuntime = {
       async prepare() { throw new Error("not used"); },
       async get() { return ok("idle"); },
-      async prompt(agentName, text, _signal, timeoutMs) { steerTargets.push(agentName); steers.push(text); steerTimeouts.push(timeoutMs); return ok("working"); },
+      async prompt(agentName, text, _signal, timeoutMs, submissionOnly) { steerTargets.push(agentName); steers.push(text); steerTimeouts.push(timeoutMs); submissionModes.push(submissionOnly); return ok("idle"); },
       async wait() { return { ...ok("working"), ok: false, timedOut: true, errorCode: "timeout" }; },
       async cancel() { return ok("idle"); },
     };
@@ -995,6 +996,7 @@ describe("JobSupervisor", () => {
     assert.deepEqual(steers, ["追加条件"]);
     assert.deepEqual(steerTargets, [job.agent_name]);
     assert.deepEqual(steerTimeouts, [undefined]);
+    assert.deepEqual(submissionModes, [true]);
     assert.equal(database.getJob(job.job_id)?.steer_state, "accepted");
     database.close();
   });
