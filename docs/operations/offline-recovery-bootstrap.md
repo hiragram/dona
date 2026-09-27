@@ -32,15 +32,31 @@
 次はoperatorが固定した値を代入した後に実行するコマンドの形である。`backup_dir`は毎回新規のowner-only directoryとし、既存backupを上書きしない。
 
 ```sh
+set -euo pipefail
 dona_base="$HOME/Library/Application Support/Dona"
 mkdir -p -m 700 "$dona_base/recovery-backups"
 backup_dir="$(mktemp -d "$dona_base/recovery-backups/attempt.XXXXXX")"
+dispatcher_pid="$(launchctl list | awk '$3=="dev.dona.dispatcher" {print $1}')"
+slack_pid="$(launchctl list | awk '$3=="dev.dona.slack-adapter" {print $1}')"
+case "$dispatcher_pid:$slack_pid" in
+  *[!0-9:]*|:*|*:) printf '%s\n' '停止前のDona PIDを確定できません。' >&2; exit 1 ;;
+esac
 launchctl bootout "gui/$UID/dev.dona.slack-adapter"
 launchctl bootout "gui/$UID/dev.dona.dispatcher"
-launchctl print "gui/$UID/dev.dona.slack-adapter" # 未登録であることを確認
-launchctl print "gui/$UID/dev.dona.dispatcher"   # 未登録であることを確認
-node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_base/run/dispatcher.sock"
-node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_base/run/slack-adapter.sock"
+if launchctl print "gui/$UID/dev.dona.slack-adapter" >/dev/null 2>&1 ||
+   launchctl print "gui/$UID/dev.dona.dispatcher" >/dev/null 2>&1; then
+  printf '%s\n' 'Dona serviceの登録が残っています。DB操作へ進みません。' >&2
+  exit 1
+fi
+if ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_base/run/dispatcher.sock" ||
+   ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_base/run/slack-adapter.sock"; then
+  printf '%s\n' 'Dona socketが使用中です。DB操作へ進みません。' >&2
+  exit 1
+fi
+if kill -0 "$dispatcher_pid" 2>/dev/null || kill -0 "$slack_pid" 2>/dev/null; then
+  printf '%s\n' '停止前のDona PIDが残っています。DB操作へ進みません。' >&2
+  exit 1
+fi
 python3 - "$dona_base/dona.sqlite3" "$backup_dir/dona.sqlite3" <<'PY'
 import os, sqlite3, sys
 descriptor = os.open(sys.argv[2], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
@@ -79,11 +95,14 @@ env DOTENV_CONFIG_PATH="$HOME/Library/Application Support/Dona/config/dispatcher
 回復後、全対象のterminal statusと監査記録を確認する。残る危険状態の原因が一意に説明できなければ停止を維持する。現在の`runtime/current`の旧SHAを`runtime/previous`へ保存してから、`runtime/current`を対象releaseへ同一filesystem上の一時symlinkから切り替える。macOS `mv -f`はdestination symlinkをdirectoryとして追跡するため、`mv -fh`でsymlink自体を置換する。Dispatcherだけを`launchctl bootstrap`し、versioned healthと`/v1/admin/update-safety`が対象SHA・`safe: true`・`unsafe_states: []`を示すまでSlack Adapterを起動しない。安全判定がclearでなければ停止下の個別確認へ戻る。Slack起動後に両serviceのhealth、DB schema 3、socket/PIDの新世代、通知重複なしを再読する。`dona-main`のcwd/sessionが旧releaseなら**完全なruntime更新とは報告しない**。この手順はHerdr agentの再作成権限を含まない。
 
 ```sh
+set -euo pipefail
 runtime_root="$HOME/Library/Application Support/Dona/runtime"
 target_sha='<承認済みのexact SHA>'
 old_sha='<事前記録した旧currentのexact SHA>'
 test "$(readlink "$runtime_root/current")" = "releases/$old_sha"
 test -f "$runtime_root/releases/$target_sha/release-manifest.json"
+test ! -e "$runtime_root/.previous.recovery.tmp" && test ! -L "$runtime_root/.previous.recovery.tmp"
+test ! -e "$runtime_root/.current.recovery.tmp" && test ! -L "$runtime_root/.current.recovery.tmp"
 ln -s "releases/$old_sha" "$runtime_root/.previous.recovery.tmp"
 mv -fh "$runtime_root/.previous.recovery.tmp" "$runtime_root/previous"
 test "$(readlink "$runtime_root/previous")" = "releases/$old_sha"
@@ -101,7 +120,15 @@ if ! safety_json="$(curl --fail --silent --show-error --unix-socket \
   printf '%s\n' 'Dispatcherの安全状態を取得できません。Slack ingressは停止したままにします。' >&2
   exit 1
 fi
-if ! printf '%s\n' "$safety_json" | jq -e '.safe == true and .unsafe_states == []' >/dev/null; then
+if ! printf '%s\n' "$safety_json" | node -e '
+let body="";
+process.stdin.on("data", chunk => { body += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const snapshot=JSON.parse(body);
+    if(snapshot.safe!==true || !Array.isArray(snapshot.unsafe_states) || snapshot.unsafe_states.length!==0) process.exitCode=1;
+  } catch { process.exitCode=1; }
+});'; then
   printf '%s\n' 'Dispatcherの安全判定がclearではありません。Slack ingressは停止したままにします。' >&2
   exit 1
 fi
