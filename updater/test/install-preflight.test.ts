@@ -472,7 +472,14 @@ test("generation target validation rejects a mismatched installed updater before
       DONA_RELEASE_MANIFEST_PATH: path.join(root, "runtime/current/release-manifest.json"),
       GENERATION_ONLY: "preserved",
     }));
-    await execute(process.execPath, [fileURLToPath(new URL("../../scripts/render-self-update-templates.mjs", import.meta.url)), rendered, sha, root, "generation"]);
+    const testBin = path.join(home, "bin");
+    await fs.mkdir(testBin);
+    for (const name of ["herdr", "codex"]) {
+      await fs.writeFile(path.join(testBin, name), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    }
+    await execute(process.execPath, [fileURLToPath(new URL("../../scripts/render-self-update-templates.mjs", import.meta.url)), rendered, sha, root, "generation"], {
+      env: { ...process.env, PATH: `${testBin}:${process.env.PATH}` },
+    });
     const helper = fileURLToPath(new URL("../../scripts/validate-generation-install-target.py", import.meta.url));
     await execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } });
     const updated = await fs.readFile(path.join(rendered, "dev.dona.dispatcher.plist"), "utf8");
