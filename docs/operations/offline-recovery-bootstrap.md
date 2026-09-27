@@ -34,29 +34,62 @@
 ```sh
 set -euo pipefail
 dona_base="$HOME/Library/Application Support/Dona"
+command -v python3 >/dev/null
+python3 -c 'import sqlite3'
+command -v ditto >/dev/null
+command -v curl >/dev/null
 target_release="$dona_base/runtime/releases/<承認済みのexact SHA>"
 dispatcher_env="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:DOTENV_CONFIG_PATH' \
   "$HOME/Library/LaunchAgents/dev.dona.dispatcher.plist")"
-test -f "$dispatcher_env"
-resolved_paths="$(node - "$target_release" "$dispatcher_env" <<'JS'
+slack_env="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:DOTENV_CONFIG_PATH' \
+  "$HOME/Library/LaunchAgents/dev.dona.slack-adapter.plist")"
+test -f "$dispatcher_env" && test -f "$slack_env"
+resolved_paths="$(node - "$target_release" "$dispatcher_env" "$slack_env" <<'JS'
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const {pathToFileURL} = require('node:url');
 const release = process.argv[2];
 const environmentFile = process.argv[3];
+const slackEnvironmentFile = process.argv[4];
 const dotenv = require(path.join(release, 'dispatcher/node_modules/dotenv'));
 const environment = {...dotenv.parse(fs.readFileSync(environmentFile))};
+const slackEnvironment = {...dotenv.parse(fs.readFileSync(slackEnvironmentFile))};
+for(const name of ['DONA_DATABASE_PATH','DONA_RESULTS_DIR','DONA_JOB_RESULTS_DIR',
+  'DONA_SOCKET_PATH','SLACK_HEALTH_SOCKET_PATH']) {
+  const value=environment[name];
+  if(value && !path.isAbsolute(value) && !value.startsWith('~/')) {
+    throw new Error(`${name} must be absolute for offline recovery`);
+  }
+}
+for(const name of ['DONA_SOCKET_PATH','SLACK_HEALTH_SOCKET_PATH']) {
+  const value=slackEnvironment[name];
+  if(value && !path.isAbsolute(value) && !value.startsWith('~/')) {
+    throw new Error(`${name} must be absolute for offline recovery`);
+  }
+}
+const expand=value => value?.startsWith('~/') ? path.join(os.homedir(),value.slice(2)) :
+  value ? path.resolve(value) : undefined;
 environment.DONA_RELEASE_MANIFEST_PATH = path.join(release, 'release-manifest.json');
 import(pathToFileURL(path.join(release, 'dispatcher/dist/config.js')).href).then(({loadConfig}) => {
   const config = loadConfig(environment);
+  const slackDispatcherSocket=expand(slackEnvironment.DONA_SOCKET_PATH) ??
+    path.join(os.homedir(),'Library/Application Support/Dona/run/dispatcher.sock');
+  if(slackDispatcherSocket!==config.socketPath) throw new Error('dispatcher_socket_config_mismatch');
+  const slackSocket=expand(slackEnvironment.SLACK_HEALTH_SOCKET_PATH) ??
+    path.join(os.homedir(),'Library/Application Support/Dona/run/slack-adapter.sock');
+  if(slackSocket!==config.slackAdapterSocketPath) throw new Error('slack_socket_config_mismatch');
   process.stdout.write(JSON.stringify({database:config.databasePath,
-    results:config.resultsDir,job_results:config.jobResultsDir}));
+    results:config.resultsDir,job_results:config.jobResultsDir,
+    dispatcher_socket:config.socketPath,slack_socket:slackSocket}));
 }).catch(error => { process.stderr.write(String(error)); process.exitCode=1; });
 JS
 )"
 dona_database="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).database))')"
 dona_results="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).results))')"
 dona_job_results="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).job_results))')"
+dona_dispatcher_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).dispatcher_socket))')"
+dona_slack_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).slack_socket))')"
 test -f "$dona_database" && test -d "$dona_results" && test -d "$dona_job_results"
 mkdir -p -m 700 "$dona_base/recovery-backups"
 backup_dir="$(mktemp -d "$dona_base/recovery-backups/attempt.XXXXXX")"
@@ -65,17 +98,23 @@ slack_pid="$(launchctl list | awk '$3=="dev.dona.slack-adapter" {print $1}')"
 case "$dispatcher_pid:$slack_pid" in
   *[!0-9:]*|:*|*:) printf '%s\n' '停止前のDona PIDを確定できません。' >&2; exit 1 ;;
 esac
-launchctl bootout "gui/$UID/dev.dona.slack-adapter"
-launchctl bootout "gui/$UID/dev.dona.dispatcher"
+slack_bootout_exit=0
+launchctl bootout "gui/$UID/dev.dona.slack-adapter" || slack_bootout_exit=$?
+dispatcher_bootout_exit=0
+launchctl bootout "gui/$UID/dev.dona.dispatcher" || dispatcher_bootout_exit=$?
 if launchctl print "gui/$UID/dev.dona.slack-adapter" >/dev/null 2>&1 ||
    launchctl print "gui/$UID/dev.dona.dispatcher" >/dev/null 2>&1; then
   printf '%s\n' 'Dona serviceの登録が残っています。DB操作へ進みません。' >&2
   exit 1
 fi
-if ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_base/run/dispatcher.sock" ||
-   ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_base/run/slack-adapter.sock"; then
+if ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_dispatcher_socket" ||
+   ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_slack_socket"; then
   printf '%s\n' 'Dona socketが使用中です。DB操作へ進みません。' >&2
   exit 1
+fi
+if [ "$slack_bootout_exit" -ne 0 ] || [ "$dispatcher_bootout_exit" -ne 0 ]; then
+  printf 'bootout非0を停止状態で照合済み: Slack=%s Dispatcher=%s\n' \
+    "$slack_bootout_exit" "$dispatcher_bootout_exit" >&2
 fi
 if kill -0 "$dispatcher_pid" 2>/dev/null || kill -0 "$slack_pid" 2>/dev/null; then
   printf '%s\n' '停止前のDona PIDが残っています。DB操作へ進みません。' >&2
@@ -137,12 +176,12 @@ ln -s "releases/$target_sha" "$runtime_root/.current.recovery.tmp"
 mv -fh "$runtime_root/.current.recovery.tmp" "$runtime_root/current"
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.dispatcher.plist"
 if ! node scripts/self-update-install-preflight.mjs wait-dispatcher-sha \
-  "$HOME/Library/Application Support/Dona/run/dispatcher.sock" "$target_sha" 30000; then
+  "$dona_dispatcher_socket" "$target_sha" 30000; then
   printf '%s\n' 'Dispatcherのexact SHA healthを確認できません。Slack ingressは停止したままにします。' >&2
   exit 1
 fi
 if ! safety_json="$(curl --fail --silent --show-error --unix-socket \
-  "$HOME/Library/Application Support/Dona/run/dispatcher.sock" \
+  "$dona_dispatcher_socket" \
   http://localhost/v1/admin/update-safety)"; then
   printf '%s\n' 'Dispatcherの安全状態を取得できません。Slack ingressは停止したままにします。' >&2
   exit 1
