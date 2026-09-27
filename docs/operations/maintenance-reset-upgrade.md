@@ -12,6 +12,7 @@ DB履歴を引き継がず、新しい世代を準備して3サービスを切�
 
 - 対象サービスは `dev.dona.slack-adapter`、`dev.dona.dispatcher`、`dev.dona.updater` のみです。
 - 元のlaunchd plist、dotenv、Updater policyから実際のDB、Result、socket、release、設定を取得します。
+  parse値とhashは同じbytesから作り、snapshot終了時にも設定とpointerを再照合します。
   prepare時と停止前で設定のhash・pointerを照合します。
 - canonical `hiragram/dona` のmainをGitHub APIとfetchの両方でexact SHAへ固定し、archiveを独立領域でbuildします。
   prepareとexecute / 再開時に、既存policyのrequired checks（GitHub Actions・同SHA・最新run成功）と要求される署名検証を確認します。
@@ -58,7 +59,9 @@ run directoryは新規の絶対pathにしてください。prepareの失敗時�
 
 空DBはtarget releaseの `DispatcherDatabase`、`UpdateNotificationDatabase`、`JobProgressStore`、
 `UpdateDatabase` のconstructorで正規migrationします。既存DBへmigrationしません。
+releaseとstable updaterのfileは0400、directoryは0500へ固定してからsealを作ります。
 prepare後に元設定や準備成果が変わった場合、実行を拒否して再準備します。
+execute / restore / confirm-mainは準備領域のsealed `runner.py`自身からだけ起動できます。
 
 ## 親へのhandoffと実行
 
@@ -100,24 +103,52 @@ nohup python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" execute 
    停止後に通常updateの非terminal requestと元pointer / 設定を再照合し、並行activationを検出します。
    service由来のPID・UID・command identityを記録し、未登録を連続観測し、元PIDが残存していないことを確認します。
    これは3サービスの観測であり、Herdr worker全体の停止証明ではありません。
-3. 旧DBのsnapshotを保存します。旧Resultはpathごと保持し、遅延writeも旧世代へ残します。
-4. LaunchAgent plistを新世代のrelease pointer / 設定へ切り替えます。
-5. UpdaterとDispatcherを起動してcore healthを確認した後、ingress開始intentを永続化してSlackを起動します。
+3. 停止前とbackup前に必要容量と既定の空き容量floorを確認して旧DBのsnapshotを保存します。
+   backup失敗時にはpartial snapshotとsidecarを削除してから復元します。旧Resultはpathごと保持し、遅延writeも旧世代へ残します。
+4. UpdaterとDispatcherのplistを新世代のrelease pointer / 設定へ切り替えます。
+   Slackの新plistはmain確認後のingress開始intentまでinstallせず、旧plistを未登録のまま保持します。
+5. UpdaterとDispatcherを起動してcore healthを確認し、`awaiting_main`で待機します。
+   後述のmain確認receiptが揃った後だけ、ingress開始intentを永続化し、Slack plistのinstallと起動を行います。
    bootstrap応答が曖昧な場合は同writeを再送せず観測します。
 6. 3サービスの`/health/version`でexact SHA / readyを、DispatcherとSlackで`update_notification_protocol == 1`を、
    Slackで`workspaces_ready`と`dispatcher_ready`を確認します。
    成功を独立journalへ記録します。
 
-### main agentの接続切替
+### main agentの接続切替と受付barrier
 
-サービスhealth成功は、既存Codex main sessionのMCP接続先を変更した証明ではありません。
-このrunnerは既存Herdr session / paneを終了・再作成しません。
-新main sessionへ引き継ぐ際は、親operatorがDispatcherの正規管理経路で接続切替を行い、
-新世代 `config/dispatcher.env` と `config/slack.env` を使う必要があります。
-古いMCPは停止した旧socketへ接続するため、そのままでは新受付を処理できません。
-現行Dispatcherにはmain sessionを再生成する公開APIがないため、この接続切替は未自動化です。
-通常Updaterのexact-plan経路には既存のmain起動処理がありますが、この保守runnerから承認gateを迂回して呼びません。
-本番の運用再開完了を宣言する前に、利用可能な正規管理経路の整備と新mainからの疎通確認が必要です。
+core起動後は `awaiting_main` で戻り、Slack ingressは停止したままです。
+runnerはHerdrを直接操作せず、main lifecycleの再生成自体は未自動化です。
+親operatorが利用可能な正規管理経路で新mainを登録し、Dispatcherの `HERDR_SESSION / DONA_AGENT_NAME`
+がそのmainへ解決することを確認してください。現行Dispatcherには公開main-rebind APIがなく、
+この経路を整備・確定するまではcore準備と待機までで、本番の運用再開を完了扱いできません。
+
+新mainはtarget releaseをworking directoryにし、MCPのcommandをpolicy指定node、argsをそれぞれ
+`<generation>/config/mcp-dispatcher.mjs` と `mcp-slack.mjs` に設定します。
+この固定wrapperは新世代のdotenvを読み、継承された旧設定を上書きしてtarget MCPを起動します。
+wrapper自体もread-onlyかつstatic sealの対象です。secretをcommand lineへ渡しません。
+
+新mainのMCP handshakeとDispatcher宛先登録を確認したoperatorは、次のread-only process照合でreceiptを発行します。
+PIDは実際に観測した値を指定し、以下のplaceholderをそのまま使わないでください。
+
+```sh
+python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" confirm-main \
+  --run "$HOME/.dona-maintenance/reset-YYYYMMDD-unique" \
+  --main-pid NEW_MAIN_PID --previous-main-pid OLD_MAIN_PID \
+  --dispatcher-pid DISPATCHER_MCP_PID --slack-pid SLACK_MCP_PID \
+  --session-id NEW_MAIN_SESSION_ID \
+  --confirm-dispatcher-target --confirm-mcp-handshake
+```
+
+runnerは新旧PIDの区別、同一UID、target releaseを指定したCodex command、固定wrapperを実行する
+2つのMCP process、その親子関係、process start identityの不変性をOSから確認します。
+Herdrのname→PID / session mappingとMCP handshakeは**operator assertion**であり、
+OS観測だけでHerdrのatomic identityや完全停止を証明したとは扱いません。
+確認できないmappingをflagで補わないでください。
+
+`main-ready.json`はplan hashと観測identityへ束縛され、有効期間は120秒です。
+発行後に同じ `execute` commandを再実行してください。Slack起動直前と成功記録前にも
+main / MCPのidentityを再観測します。receiptがない間は受付しません。
+processの置換・receipt失効では再確認が必要で、ingress開始後の不一致は新世代を保持して停止します。
 
 ## 失敗と再開
 
@@ -152,7 +183,7 @@ python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" status \
   --run "$HOME/.dona-maintenance/reset-YYYYMMDD-unique"
 ```
 
-`prepared`、`succeeded`、`rolled_back`、`rolling_back`、`forward_recovery`を区別してください。
+`prepared`、`awaiting_main`、`succeeded`、`rolled_back`、`rolling_back`、`forward_recovery`を区別してください。
 `succeeded`は上記サービス切替・healthの範囲です。Slack投稿や新mainでのevent処理成功を意味しません。
 
 ## 検証
@@ -166,7 +197,8 @@ npm run test:skills
 health失敗・復元失敗、handoff未成立、設定drift、共通lock、未公開tempの再開を検証します。
 3つの実child processとUNIX HTTP socketによる起動・health・停止も通します。
 CI失敗・署名不一致、install済plistの旧DB混入、ingress後のseal drift、内部通知protocol欠落、
-permission drift、backup hashのchunk計算も検証します。
+permission drift、backup hashのchunk計算、partial backup回収、容量不足、sealed entrypoint、
+main未準備時のingress停止、実process treeのmain / MCP対応も検証します。
 launchd adapterと本物のSlack接続は本番停止を伴うため、ここでは未実行です。
 UpdaterのCIではDonaと同じNode SQLiteでclose後DBのread-only照合とlive WALのbackupも検証します。
 通常self-update gate・Herdr・本番DBの変更はありません。

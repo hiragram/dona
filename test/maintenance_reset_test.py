@@ -16,6 +16,7 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 REAL_HEALTH = m.Runner.health
 REAL_TRUST = m.verify_trust
+REAL_MAIN_READY = m.Runner.assert_main_ready
 
 
 class FixtureDatabase:
@@ -79,7 +80,7 @@ class RunnerTest(unittest.TestCase):
             f.write_bytes(plistlib.dumps(plist))
             self.files[str(f)] = m.digest(f.read_bytes())
             m.atomic(self.run/'plists'/f.name, plistlib.dumps(dict(plist, ProgramArguments=['node', '/new/'+label])))
-        inv = {'files': self.files, 'policy': {'current_pointer': str(self.old/'current'), 'control_root': str(self.old)}, 'old_pointer': str(self.old/'release'),
+        inv = {'files': self.files, 'policy': {'current_pointer': str(self.old/'current'), 'control_root': str(self.old), 'executables': {'node':sys.executable, 'codex':sys.executable}}, 'old_pointer': str(self.old/'release'),
                'plists': self.plists, 'databases': [str(self.db)], 'old_results': [str(self.old/'results')]}
         m.atomic(self.run/'inventory.json', m.encode(inv))
         m.atomic(self.run/'runner.py', Path(m.__file__).read_bytes())
@@ -94,12 +95,15 @@ class RunnerTest(unittest.TestCase):
         self.services = Services()
         self.health_patch = patch.object(m.Runner, 'health')
         self.health = self.health_patch.start()
+        self.main_patch = patch.object(m.Runner, 'assert_main_ready', return_value=True)
+        self.main_ready = self.main_patch.start()
         self.trust_patch = patch.object(m, 'verify_trust', return_value={})
         self.trust = self.trust_patch.start()
         self.rollback_patch = patch.object(m.Runner, 'old_health')
         self.old_health = self.rollback_patch.start()
 
     def tearDown(self):
+        self.main_patch.stop()
         self.trust_patch.stop()
         self.rollback_patch.stop()
         self.health_patch.stop()
@@ -364,7 +368,7 @@ with Server(p,Handler) as server: server.serve_forever()
         self.assertEqual(len(self.services.calls),count)
 
     def test_post_ingress_static_drift_stops_ingress_and_preserves_generation(self):
-        runner=self.runner();runner.switch();runner.record('starting_ingress')
+        runner=self.runner();runner.switch();runner.record('starting_ingress');runner.install_slack()
         (self.g/'config/tampered.env').write_text('changed')
         with self.assertRaisesRegex(RuntimeError,'static_generation_drift'):
             self.runner().execute({})
@@ -426,6 +430,121 @@ with Server(p,Handler) as server: server.serve_forever()
         self.trust.side_effect=RuntimeError('required_check_not_success')
         with self.assertRaisesRegex(RuntimeError,'required_check_not_success'): self.runner().execute(self.receipt)
         self.assertEqual(self.services.calls,[])
+
+    def test_main_not_ready_keeps_slack_ingress_stopped(self):
+        self.main_ready.return_value=False
+        self.runner().execute(self.receipt)
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'awaiting_main')
+        self.assertNotIn(('start','dev.dona.slack-adapter'),self.services.calls)
+        self.assertNotIn('dev.dona.slack-adapter',self.services.registered)
+        slack=self.home/'Library/LaunchAgents/dev.dona.slack-adapter.plist'
+        self.assertEqual(m.file_digest(slack),self.files[str(slack)])
+        self.main_ready.return_value=True
+        self.runner().execute(self.receipt)
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'succeeded')
+
+    def test_dotenv_parse_and_hash_share_one_read_during_replacement(self):
+        env=self.home/'source.env';env.write_text('KEY=old')
+        plist={'EnvironmentVariables':{'DOTENV_CONFIG_PATH':str(env)},'WorkingDirectory':str(self.home),'ProgramArguments':[sys.executable]}
+        def parse(argv,**options):
+            data=json.loads(options['input'])
+            env.write_text('KEY=new')
+            return json.dumps({'config':{},'values':{'KEY':data['dotenv'].split('=')[1]}})
+        with patch.object(m,'command',side_effect=parse): result=m.effective_config(plist,'dispatcher')
+        self.assertEqual(result['values']['KEY'],'old')
+        self.assertEqual(result['dotenv_sha256'],m.digest(b'KEY=old'))
+        self.assertNotEqual(result['dotenv_sha256'],m.file_digest(env))
+
+    def test_code_tree_becomes_read_only_before_sealing(self):
+        root=m.private_dir(self.home/'code');child=m.private_dir(root/'sub')
+        file=child/'code.js';file.write_text('code')
+        m.make_immutable(root)
+        self.assertEqual(file.stat().st_mode & 0o777,0o400)
+        self.assertEqual(root.stat().st_mode & 0o777,0o500)
+        self.assertEqual(child.stat().st_mode & 0o777,0o500)
+        # fixtureをcleanupするためだけにpermissionを戻す。
+        os.chmod(root,0o700);os.chmod(child,0o700);os.chmod(file,0o600)
+
+    def test_partial_backup_is_reclaimed_before_rollback(self):
+        runner=self.runner()
+        def failed(source,destination):
+            for suffix in ('','-wal','-shm'): Path(str(destination)+suffix).write_bytes(b'partial')
+            raise OSError(28,'No space left')
+        runner.database.backup=failed
+        with self.assertRaises(OSError): runner.execute(self.receipt)
+        self.assertFalse(any((self.run/'backup').iterdir()))
+        self.assertEqual(runner.journal['phase'],'rolled_back')
+
+    def test_insufficient_backup_capacity_never_stops_services(self):
+        class Disk: free=0
+        with patch.object(m.shutil,'disk_usage',return_value=Disk()):
+            with self.assertRaisesRegex(RuntimeError,'backup_disk_floor'): self.runner().execute(self.receipt)
+        self.assertEqual(self.services.calls,[])
+
+    def test_execute_and_restore_require_the_sealed_entrypoint(self):
+        for action in ('execute','restore'):
+            argv=[sys.executable,'-B',m.__file__,action,'--run',str(self.run)]
+            if action=='execute': argv+=['--handoff',str(self.run/'absent.json')]
+            result=subprocess.run(argv,capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('sealed_runner_required',result.stderr)
+        result=subprocess.run([sys.executable,'-B',str(self.run/'runner.py'),'restore','--run',str(self.run)],capture_output=True,text=True)
+        self.assertIn('restore_after_ingress_forbidden',result.stderr)
+        self.assertNotIn('sealed_runner_required',result.stderr)
+
+    def test_main_process_receipt_binds_new_pid_children_and_wrapper_paths(self):
+        plan={'release':'/release','generation':'/generation'}
+        inv={'policy':{'executables':{'node':'/bin/node','codex':'/bin/codex'}}}
+        spec={'main_pid':100,'dispatcher_pid':101,'slack_pid':102,'previous_main_pid':99,'session_id':'new-session','dispatcher_target_confirmed':True,'mcp_handshake_confirmed':True}
+        records={100:{'uid':os.getuid(),'parent':10,'identity':'main-new','command':'/bin/codex -C /release'},
+                 101:{'uid':os.getuid(),'parent':100,'identity':'dispatcher-new','command':'/bin/node /generation/config/mcp-dispatcher.mjs'},
+                 102:{'uid':os.getuid(),'parent':100,'identity':'slack-new','command':'/bin/node /generation/config/mcp-slack.mjs'}}
+        evidence=m.main_evidence(plan,inv,spec,records.__getitem__)
+        self.assertEqual(len(evidence),3)
+        for change in ({'previous_main_pid':100},{'dispatcher_target_confirmed':False},{'mcp_handshake_confirmed':False}):
+            with self.assertRaises(RuntimeError): m.main_evidence(plan,inv,dict(spec,**change),records.__getitem__)
+        records[101]['command']='/bin/node /old/config/mcp-dispatcher.mjs'
+        with self.assertRaisesRegex(RuntimeError,'main_process_binding'): m.main_evidence(plan,inv,spec,records.__getitem__)
+        records[101]['command']='/bin/node /generation/config/mcp-dispatcher.mjs'
+        records[101]['parent']=102;records[102]['parent']=102
+        with self.assertRaisesRegex(RuntimeError,'main_parent_binding'): m.main_evidence(plan,inv,spec,records.__getitem__)
+
+    def test_main_evidence_observes_actual_owned_process_tree(self):
+        config=m.private_dir(self.home/'main-config/config')
+        for name in ('dispatcher','slack'):
+            (config/('mcp-'+name+'.mjs')).write_text('import time;print(\"ready\",flush=True);time.sleep(30)')
+        release=m.private_dir(self.home/'main-release')
+        launcher=self.home/'main_fixture.py'
+        launcher.write_text("import subprocess,sys,time,json\na=subprocess.Popen([sys.executable,sys.argv[1]],stdout=subprocess.PIPE,text=True);b=subprocess.Popen([sys.executable,sys.argv[2]],stdout=subprocess.PIPE,text=True)\nassert a.stdout.readline().strip()=='ready';assert b.stdout.readline().strip()=='ready'\nprint(json.dumps([a.pid,b.pid]),flush=True)\ntry: time.sleep(30)\nfinally: a.terminate();b.terminate();a.wait();b.wait()\n")
+        process=subprocess.Popen([sys.executable,str(launcher),str(config/'mcp-dispatcher.mjs'),str(config/'mcp-slack.mjs'),str(release)],stdout=subprocess.PIPE,text=True)
+        children=[]
+        try:
+            children=json.loads(process.stdout.readline())
+            plan={'release':str(release),'generation':str(config.parent)}
+            # macOSのPython launcherはframework binaryへexecするので、その実binaryをfixture policyへ固定する。
+            binary=subprocess.check_output(['/bin/ps','-p',str(process.pid),'-o','comm='],text=True).strip()
+            inv={'policy':{'executables':{'node':binary,'codex':binary}}}
+            spec={'main_pid':process.pid,'dispatcher_pid':children[0],'slack_pid':children[1],'previous_main_pid':os.getpid(),'session_id':'fixture-new','dispatcher_target_confirmed':True,'mcp_handshake_confirmed':True}
+            evidence=m.main_evidence(plan,inv,spec)
+            self.assertEqual([r['pid'] for r in evidence],[process.pid,*children])
+        finally:
+            # fixture子だけをexact PIDで終了。production/Herdrは対象外。
+            for pid in children:
+                try: os.kill(pid,15)
+                except ProcessLookupError: pass
+            process.terminate();process.wait(timeout=5);process.stdout.close()
+
+    def test_main_receipt_is_plan_bound_and_expires(self):
+        runner=self.runner()
+        receipt={'schema_version':1,'plan_sha256':runner.journal['plan_sha256'],'mapping_evidence':'operator_assertion','spec':{},'observations':[],'issued_at_unix':m.time.time()}
+        m.atomic(self.run/'main-ready.json',m.encode(receipt))
+        with patch.object(m,'main_evidence',return_value=[]): self.assertTrue(REAL_MAIN_READY(runner))
+        receipt['issued_at_unix']-=121
+        m.atomic(self.run/'main-ready.json',m.encode(receipt))
+        with self.assertRaisesRegex(RuntimeError,'main_receipt_expired'): REAL_MAIN_READY(runner)
+        receipt['plan_sha256']='other'
+        m.atomic(self.run/'main-ready.json',m.encode(receipt))
+        with self.assertRaisesRegex(RuntimeError,'main_receipt_binding'): REAL_MAIN_READY(runner)
 
     def test_atomic_crash_temporary_recovery(self):
         target=self.run/'status.json'

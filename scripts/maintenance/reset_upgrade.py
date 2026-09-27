@@ -91,9 +91,9 @@ def read_json(file):
     return json.loads(Path(file).read_text())
 
 
-def command(argv, cwd=None, env=None, timeout=60):
+def command(argv, cwd=None, env=None, timeout=60, input=None):
     # コマンド出力にはsecretが含まれ得るので例外・journalへ転載しない。
-    result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=timeout)
+    result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=timeout, input=input)
     require(result.returncode == 0, 'command_failed: ' + Path(argv[0]).name)
     return result.stdout.decode().strip()
 
@@ -193,7 +193,7 @@ class Launchd:
         require(self.observe(label) is not None, 'service_start_unconfirmed')
 
     def process(self, pid):
-        r = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'uid=', '-o', 'lstart=', '-o', 'command='], capture_output=True, timeout=5)
+        r = subprocess.run(['/bin/ps', '-ww', '-p', str(pid), '-o', 'uid=', '-o', 'lstart=', '-o', 'command='], capture_output=True, timeout=5)
         if r.returncode == 1:
             return None
         require(r.returncode == 0, 'process_observation_unknown')
@@ -206,13 +206,15 @@ def effective_config(plist, component):
     node = plist['ProgramArguments'][0]
     module = 'config' if component == 'dispatcher' else 'adapter-config'
     method = 'loadConfig' if component == 'dispatcher' else 'loadAdapterConfig'
+    dotenv_bytes = regular(env['DOTENV_CONFIG_PATH']).read_bytes()
     script = f'''import fs from 'node:fs';
 import {{parse}} from {json.dumps((cwd/'node_modules/dotenv/lib/main.js').as_uri())};
 import {{{method}}} from {json.dumps((cwd/'dist'/ (module+'.js')).as_uri())};
-const input=JSON.parse(process.argv[1]);
-const values={{...parse(fs.readFileSync(input.DOTENV_CONFIG_PATH)),...input}};
+const input=JSON.parse(fs.readFileSync(0,'utf8'));
+const values={{...parse(input.dotenv),...input.env}};
 console.log(JSON.stringify({{config:{method}(values),values}}));'''
-    return json.loads(command([node, '--input-type=module', '-e', script, json.dumps(env)], cwd=cwd))
+    result = json.loads(command([node, '--input-type=module', '-e', script], cwd=cwd, input=encode({'env': env, 'dotenv': dotenv_bytes.decode('utf8')})))
+    return dict(result, dotenv_sha256=digest(dotenv_bytes), cwd=str(cwd))
 
 
 def inventory():
@@ -223,9 +225,10 @@ def inventory():
     observations = {}
     for label in LABELS:
         p = regular(home/'Library/LaunchAgents'/ (label+'.plist'))
-        plists[label] = plistlib.loads(p.read_bytes())
+        plist_bytes = p.read_bytes()
+        plists[label] = plistlib.loads(plist_bytes)
         require(plists[label]['Label'] == label, 'plist_label_mismatch')
-        files[str(p)] = digest(p.read_bytes())
+        files[str(p)] = digest(plist_bytes)
         observation = live.observe(label)
         require(observation and observation['pid'], 'source_service_not_running')
         process = live.process(observation['pid'])
@@ -234,20 +237,26 @@ def inventory():
         observations[label] = {**observation, 'identity_hash': digest(process.encode())}
     configs = {c: effective_config(plists['dev.dona.'+label], c) for c, label in [('dispatcher', 'dispatcher'), ('slack', 'slack-adapter')]}
     policy_path = regular(plists['dev.dona.updater']['EnvironmentVariables']['DONA_UPDATE_POLICY_PATH'])
-    policy = read_json(policy_path)
+    policy_bytes = policy_path.read_bytes()
+    policy = json.loads(policy_bytes)
     require(policy['repository'] == 'hiragram/dona' and policy['canonical_remote'] == REMOTE, 'policy_scope')
     d = configs['dispatcher']['config']
     s = configs['slack']['config']
     require(d['herdrSession'] == 'dona' and d['socketPath'] == s['dispatcherSocketPath'], 'runtime_scope')
     for component in configs.values():
         p = regular(component['values']['DOTENV_CONFIG_PATH'])
-        files[str(p)] = digest(p.read_bytes())
-    files[str(policy_path)] = digest(policy_path.read_bytes())
+        files[str(p)] = component['dotenv_sha256']
+    files[str(policy_path)] = digest(policy_bytes)
     # tokenは保存するが出力しない。新世代ではrotateして旧MCPによる内部通知を拒否する。
     token = regular(d['updateInternalTokenPath'])
     files[str(token)] = digest(token.read_bytes())
     pointer = Path(policy['current_pointer'])
     require(pointer.is_symlink(), 'current_pointer_not_symlink')
+    resolved_pointer = pointer.resolve()
+    require(Path(configs['dispatcher']['cwd']) == resolved_pointer/'dispatcher' and Path(configs['slack']['cwd']) == resolved_pointer/'sources/slack', 'inventory_pointer_drift')
+    for file, expected in files.items():
+        require(file_digest(file) == expected, 'inventory_configuration_drift')
+    require(pointer.resolve() == resolved_pointer, 'inventory_pointer_drift')
     return {'plists': plists, 'configs': configs, 'policy': policy, 'files': files,
             'old_pointer': str(pointer.resolve()), 'services': observations,
             'databases': [d['databasePath'], d['updateNotificationDatabasePath'], d['jobProgressDatabasePath'],
@@ -264,17 +273,18 @@ def prepare(run, repository, event_id, job_id):
     atomic(run/'runner.py', Path(__file__).read_bytes())
     inv = inventory()
     atomic(run/'inventory.json', encode(inv))
-    sha = command(['gh', 'api', 'repos/hiragram/dona/git/ref/heads/main', '--jq', '.object.sha'])
+    executables = inv['policy']['executables']
+    sha = command([executables['gh'], 'api', 'repos/hiragram/dona/git/ref/heads/main', '--jq', '.object.sha'])
     require(re.fullmatch('[0-9a-f]{40}', sha), 'canonical_sha')
-    require(command(['git', '-C', str(repository), 'remote', 'get-url', 'origin']) in (REMOTE, REMOTE[:-4]), 'remote_scope')
-    command(['git', '-C', str(repository), 'fetch', 'origin', 'main'])
-    require(command(['git', '-C', str(repository), 'rev-parse', 'origin/main']) == sha, 'main_drift')
+    require(command([executables['git'], '-C', str(repository), 'remote', 'get-url', 'origin']) in (REMOTE, REMOTE[:-4]), 'remote_scope')
+    command([executables['git'], '-C', str(repository), 'fetch', 'origin', 'main'])
+    require(command([executables['git'], '-C', str(repository), 'rev-parse', 'origin/main']) == sha, 'main_drift')
     trust = verify_trust(sha, inv['policy'])
     generation = private_dir(Path.home()/'.dona/g'/digest(str(run).encode())[:12])
     require(not list(generation.iterdir()), 'generation_not_empty')
     release = private_dir(generation/'runtime/releases'/sha)
     archive = run/'source.tar'
-    command(['git', '-C', str(repository), 'archive', '--format=tar', '-o', str(archive), sha])
+    command([executables['git'], '-C', str(repository), 'archive', '--format=tar', '-o', str(archive), sha])
     with tarfile.open(archive) as tar:
         for member in tar.getmembers():
             require(not member.issym() and not member.islnk() and not member.name.startswith('/') and '..' not in Path(member.name).parts, 'archive_path')
@@ -298,6 +308,8 @@ def prepare(run, repository, event_id, job_id):
     render(run, plan, inv)
     validate_staging(run, plan, node)
     migrate(plan, node)
+    make_immutable(release)
+    make_immutable(generation/'control/updater')
     # staging成果全体をseal。node_modulesを含め、prepare後の変更を停止前に検知する。
     plan['generation_seal'] = tree_seal(generation)
     plan['plists_seal'] = tree_seal(run/'plists')
@@ -305,6 +317,14 @@ def prepare(run, repository, event_id, job_id):
     atomic(run/'plan.json', encode(plan))
     atomic(run/'journal.json', encode({'phase': 'prepared', 'plan_sha256': digest((run/'plan.json').read_bytes()), 'steps': []}))
     return plan
+
+
+def make_immutable(root):
+    root = Path(root)
+    for file in root.rglob('*'):
+        if not file.is_symlink():
+            os.chmod(file, 0o500 if file.is_dir() else 0o400)
+    os.chmod(root, 0o500)
 
 
 def tree_seal(root):
@@ -385,6 +405,17 @@ def render(run, plan, inv):
             # 通常updaterのmain MCPもこの世代固有envを読む。
             body = dotenv(values)
             atomic(g/'config'/ (key+'.env'), body.encode())
+            # argvから接続設定を監査でき、古い継承envを新世代設定で上書きする固定wrapper。
+            wrapper = f'''import fs from 'node:fs';
+import {{parse}} from {json.dumps((release/component/'node_modules/dotenv/lib/main.js').as_uri())};
+const file={json.dumps(str(g/'config'/(key+'.env')))};
+Object.assign(process.env,parse(fs.readFileSync(file)),{{DOTENV_CONFIG_PATH:file}});
+delete process.env.DONA_BUILD_SHA;
+await import({json.dumps((g/'runtime/current'/component/'dist/mcp/index.js').as_uri())});
+'''
+            wrapper_path = g/'config'/('mcp-'+key+'.mjs')
+            atomic(wrapper_path, wrapper.encode())
+            os.chmod(wrapper_path, 0o400)
             env.update(overrides)
             env.pop('DONA_BUILD_SHA', None)
             env['DOTENV_CONFIG_PATH'] = str(g/'config'/ (key+'.env'))
@@ -444,6 +475,40 @@ def validate_handoff(plan, plan_hash, receipt, inv, database_reader):
     require(parent == [('completed',)], 'parent_notification_not_terminal')
 
 
+def read_process(pid):
+    result = subprocess.run(['/bin/ps', '-ww', '-p', str(pid), '-o', 'uid=', '-o', 'ppid=', '-o', 'lstart=', '-o', 'command='], capture_output=True, timeout=5)
+    require(result.returncode == 0, 'main_process_missing')
+    raw = result.stdout.decode().strip()
+    uid, parent, rest = raw.split(maxsplit=2)
+    return {'uid': int(uid), 'parent': int(parent), 'identity': digest((str(pid)+raw).encode()), 'command': rest}
+
+
+def main_evidence(plan, inv, spec, observer=read_process):
+    require(spec.get('dispatcher_target_confirmed') is True and spec.get('mcp_handshake_confirmed') is True, 'main_operator_mapping_required')
+    require(isinstance(spec.get('session_id'), str) and 0 < len(spec['session_id']) <= 512 and '\n' not in spec['session_id'], 'main_session_identity')
+    ids = [spec.get(key) for key in ('main_pid', 'dispatcher_pid', 'slack_pid', 'previous_main_pid')]
+    require(all(type(pid) is int and pid > 1 for pid in ids) and len(set(ids)) == 4, 'main_pid_identity')
+    expected = {'main': [inv['policy']['executables']['codex'], plan['release']],
+                'dispatcher': [inv['policy']['executables']['node'], str(Path(plan['generation'])/'config/mcp-dispatcher.mjs')],
+                'slack': [inv['policy']['executables']['node'], str(Path(plan['generation'])/'config/mcp-slack.mjs')]}
+    observations = []
+    for role, pid in zip(('main', 'dispatcher', 'slack'), ids[:3]):
+        record = observer(pid)
+        require(record['uid'] == os.getuid() and any(value in record['command'] for value in (expected[role][0], str(Path(expected[role][0]).resolve()))) and expected[role][1] in record['command'], 'main_process_binding')
+        if role != 'main':
+            parent = record['parent']
+            for _ in range(16):
+                if parent == ids[0]: break
+                ancestor = observer(parent)
+                require(ancestor['uid'] == os.getuid() and ancestor['parent'] != parent, 'main_parent_binding')
+                parent = ancestor['parent']
+            require(parent == ids[0], 'main_parent_binding')
+        observations.append({'role': role, 'pid': pid, 'identity': record['identity']})
+    for record in observations:
+        require(observer(record['pid'])['identity'] == record['identity'], 'main_process_changed')
+    return observations
+
+
 class Runner:
     def __init__(self, run, services=None, database=None):
         self.run = Path(run)
@@ -490,7 +555,34 @@ class Runner:
             require(current is None or digest(current.encode()) != item['identity'], 'service_pid_still_alive')
         require(all(self.services.observe(label) is None for label in LABELS), 'service_recreated')
 
+    def confirm_main(self, spec):
+        require(self.journal['phase'] in ('awaiting_main', 'forward_recovery'), 'main_confirmation_phase')
+        require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
+        self.assert_installed()
+        evidence = main_evidence(self.plan, self.inv, spec)
+        atomic(self.run/'main-ready.json', encode({'schema_version': 1, 'plan_sha256': self.journal['plan_sha256'],
+               'mapping_evidence': 'operator_assertion', 'spec': spec, 'observations': evidence, 'issued_at_unix': time.time(), 'created_at': stamp()}))
+
+    def assert_main_ready(self):
+        file = self.run/'main-ready.json'
+        if not file.exists(): return False
+        receipt = read_json(regular(file))
+        require(receipt.get('schema_version') == 1 and receipt.get('plan_sha256') == self.journal['plan_sha256'] and receipt.get('mapping_evidence') == 'operator_assertion', 'main_receipt_binding')
+        issued = receipt.get('issued_at_unix')
+        require(type(issued) in (int, float) and 0 <= time.time() - issued <= 120, 'main_receipt_expired')
+        require(main_evidence(self.plan, self.inv, receipt['spec']) == receipt['observations'], 'main_receipt_stale')
+        return True
+
+    def preflight_space(self):
+        size = 0
+        for source in self.inv['databases']:
+            for suffix in ('', '-wal'):
+                p = Path(source + suffix)
+                if p.exists(): size += p.stat().st_size
+        require(shutil.disk_usage(self.run).free >= size + self.inv['policy'].get('disk_floor_bytes', 0), 'backup_disk_floor')
+
     def backup(self):
+        self.preflight_space()
         backup = private_dir(self.run/'backup')
         manifest = []
         for i, name in enumerate(self.inv['databases']):
@@ -503,7 +595,13 @@ class Runner:
             temporary = destination.with_suffix('.tmp')
             if temporary.exists():
                 temporary.unlink()
-            self.database.backup(source, temporary)
+            try:
+                self.database.backup(source, temporary)
+            except Exception:
+                for suffix in ('', '-wal', '-shm'):
+                    partial = Path(str(temporary) + suffix)
+                    if partial.is_file() or partial.is_symlink(): partial.unlink()
+                raise
             with open(temporary, 'rb') as snapshot:
                 os.fsync(snapshot.fileno())
             os.chmod(temporary, 0o600)
@@ -514,11 +612,22 @@ class Runner:
 
     def switch(self):
         for label in LABELS:
+            if label == 'dev.dona.slack-adapter': continue
             atomic(Path.home()/'Library/LaunchAgents'/ (label+'.plist'), (self.run/'plists'/ (label+'.plist')).read_bytes())
+
+    def install_slack(self):
+        label = 'dev.dona.slack-adapter'
+        p = regular(Path.home()/'Library/LaunchAgents'/(label+'.plist'))
+        staged = (self.run/'plists'/p.name).read_bytes()
+        require(p.read_bytes() == staged or file_digest(p) == self.inv['files'][str(p)], 'installed_plist_drift')
+        atomic(p, staged)
 
     def assert_installed(self, original=False):
         for label in LABELS:
             p = regular(Path.home()/'Library/LaunchAgents'/(label+'.plist'))
+            if not original and label == 'dev.dona.slack-adapter' and self.journal['phase'] in ('starting_core', 'awaiting_main'):
+                require(file_digest(p) == self.inv['files'][str(p)], 'installed_plist_drift')
+                continue
             expected = plistlib.dumps(self.inv['plists'][label]) if original else (self.run/'plists'/p.name).read_bytes()
             require(p.read_bytes() == expected, 'installed_plist_drift')
 
@@ -573,12 +682,12 @@ class Runner:
         self.record('rolled_back', rollback_scope='original_plists_and_retained_old_generation')
 
     def restore(self):
-        require(self.journal['phase'] in ('stopping', 'backing_up', 'switching', 'starting_core', 'rolling_back'), 'restore_after_ingress_forbidden')
+        require(self.journal['phase'] in ('stopping', 'backing_up', 'switching', 'starting_core', 'awaiting_main', 'rolling_back'), 'restore_after_ingress_forbidden')
         self.rollback()
 
     def execute(self, receipt):
         phase = self.journal['phase']
-        require(phase in ('prepared', 'stopping', 'backing_up', 'switching', 'starting_core', 'starting_ingress', 'forward_recovery', 'rolling_back', 'rolled_back', 'succeeded'), 'journal_phase')
+        require(phase in ('prepared', 'stopping', 'backing_up', 'switching', 'starting_core', 'awaiting_main', 'starting_ingress', 'forward_recovery', 'rolling_back', 'rolled_back', 'succeeded'), 'journal_phase')
         if phase in ('succeeded', 'rolled_back'):
             return
         if phase == 'rolling_back':
@@ -594,6 +703,7 @@ class Runner:
                 validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv, self.database.read)
                 self.validate_source()
                 self.assert_updater_idle()
+                self.preflight_space()
                 self.record('stopping', handoff_sha256=digest(encode(receipt)), residual_risk='operator_assertion_not_machine_stop_proof')
             if self.journal['phase'] == 'stopping':
                 self.stop_all()  # Updaterを最初に止め、並行activationの生成元を除く。
@@ -614,17 +724,29 @@ class Runner:
                 self.stop_all()  # 再開時も検証済plistから新しくbootstrapする。
                 self.start_all(include_slack=False)
                 self.health(include_slack=False)
+                self.record('awaiting_main')
+            if self.journal['phase'] == 'awaiting_main':
+                if phase == 'awaiting_main':
+                    self.stop_all()
+                    self.start_all(include_slack=False)
+                    self.health(include_slack=False)
+                if not self.assert_main_ready(): return
+                self.health(include_slack=False)
                 # このintent以後はACK済eventがあり得る。旧DBへの自動rollbackは禁止。
                 self.record('starting_ingress')
             if self.journal['phase'] in ('starting_ingress', 'forward_recovery'):
+                require(self.assert_main_ready(), 'main_not_ready')
+                self.install_slack()
                 if phase in ('starting_ingress', 'forward_recovery'):
                     self.stop_all()
                 self.start_all(include_slack=False)
                 self.health(include_slack=False)
                 self.assert_installed()
+                require(self.assert_main_ready(), 'main_not_ready')
                 label = 'dev.dona.slack-adapter'
                 self.services.start(label, Path.home()/'Library/LaunchAgents'/(label+'.plist'))
                 self.health()
+                require(self.assert_main_ready(), 'main_not_ready')
                 self.record('succeeded', target_sha=self.plan['target_sha'], slack_connected=True)
         except Exception:
             if self.journal['phase'] == 'prepared':
@@ -649,6 +771,11 @@ def locked(run):
         yield
 
 
+def assert_running_copy(run):
+    expected = regular(run/'runner.py')
+    require(Path(__file__).resolve() == expected.resolve() and file_digest(__file__) == read_json(run/'plan.json')['runner_sha256'], 'sealed_runner_required')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
@@ -660,6 +787,13 @@ def main():
     p = sub.add_parser('execute')
     p.add_argument('--run', type=Path, required=True)
     p.add_argument('--handoff', type=Path, required=True)
+    p = sub.add_parser('confirm-main')
+    p.add_argument('--run', type=Path, required=True)
+    for name in ('main-pid', 'dispatcher-pid', 'slack-pid', 'previous-main-pid'):
+        p.add_argument('--'+name, type=int, required=True)
+    p.add_argument('--session-id', required=True)
+    p.add_argument('--confirm-dispatcher-target', action='store_true')
+    p.add_argument('--confirm-mcp-handshake', action='store_true')
     p = sub.add_parser('restore')
     p.add_argument('--run', type=Path, required=True)
     p = sub.add_parser('status')
@@ -670,10 +804,19 @@ def main():
         plan = prepare(args.run, args.repository, args.event_id, args.job_id)
         print(json.dumps({'phase': 'prepared', 'target_sha': plan['target_sha'], 'plan_sha256': digest((args.run/'plan.json').read_bytes())}))
     elif args.action == 'execute':
+        assert_running_copy(args.run)
         with locked(args.run):
             Runner(args.run).execute(read_json(regular(args.handoff)))
         print(json.dumps({'phase': read_json(args.run/'journal.json')['phase']}))
+    elif args.action == 'confirm-main':
+        assert_running_copy(args.run)
+        with locked(args.run):
+            Runner(args.run).confirm_main({'main_pid': args.main_pid, 'dispatcher_pid': args.dispatcher_pid, 'slack_pid': args.slack_pid,
+                'previous_main_pid': args.previous_main_pid, 'session_id': args.session_id,
+                'dispatcher_target_confirmed': args.confirm_dispatcher_target, 'mcp_handshake_confirmed': args.confirm_mcp_handshake})
+        print(json.dumps({'phase': 'main_ready_recorded'}))
     elif args.action == 'restore':
+        assert_running_copy(args.run)
         with locked(args.run):
             Runner(args.run).restore()
         print(json.dumps({'phase': read_json(args.run/'journal.json')['phase']}))
