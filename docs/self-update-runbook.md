@@ -80,6 +80,8 @@ reconcileはpointer、receipt、DB fence/checkpoint、保存済みruntime intent
 
 maintenance windowを確保し、cleanな最新main checkoutで次を実行します。`needs_review`はterminalなので存在してもよいですが、未承認planを含む非terminal requestが1件でもあれば拒否します。
 
+世代別installを更新する場合は、対象の既存rootを第二引数へ絶対パスで明示します（例: `./scripts/install-self-update.sh --upgrade-control "$HOME/.dona/g/<generation>"`）。installerはそのrootの既存policy、current pointer、Updater/Dispatcher plistを照合し、別のinstallを指す場合は停止前に拒否します。既定installを更新する場合は従来どおり引数を省略します。対象rootを推測せず、稼働中plistと照合してから指定してください。
+
 ```sh
 ./scripts/install-self-update.sh --upgrade-control
 ```
