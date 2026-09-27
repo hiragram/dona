@@ -640,7 +640,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
-  test("restores the current Dispatcher when a worker appears during drain", async () => {
+  test("does not restart a Dispatcher with an active worker during drain", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
     const plan = planned.plan as { plan_id: string; plan_hash: string };
@@ -648,10 +648,12 @@ describe("UpdateController isolated end-to-end", () => {
       plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-drain-race" });
     f.dispatcher.terminal = true;
     f.runtime.dispatcherDrainIncomplete = true;
+    f.runtime.slackHealthUnreadyWhenQuiescing = true;
     await f.controller.processNext();
-    assert.equal(f.database.get(planned.request_id as string)?.state, "failed");
-    assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "dispatcher_drain_incomplete");
-    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "startDispatcher", "startSlack"]);
+    assert.equal(f.database.get(planned.request_id as string)?.state, "needs_review");
+    assert.equal(f.database.get(planned.request_id as string)?.last_error_code,
+      "quiesce_recovery_dispatcher_health_failed");
+    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "startSlack"]);
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
@@ -663,6 +665,7 @@ describe("UpdateController isolated end-to-end", () => {
       plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-dispatcher-restarted" });
     f.dispatcher.terminal = true;
     f.runtime.dispatcherRestartedDuringDrain = true;
+    f.runtime.slackHealthUnreadyWhenQuiescing = true;
     await f.controller.processNext();
     const row = f.database.get(planned.request_id as string)!;
     assert.equal(row.state, "failed", JSON.stringify({ error: row.last_error_code, calls: f.runtime.calls,
@@ -930,6 +933,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.runtimeOperation(row.request_id, "stop_slack")?.phase, "observed");
     assert.equal(f.runtime.calls.includes("quiesceSlack"), false);
     assert.equal(f.runtime.calls.includes("stopSlack"), false);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
     assert.equal(f.database.get(row.request_id)?.state, "failed");
     assert.equal(f.database.get(row.request_id)?.last_error_code, "slack_adapter_reappeared_after_stop");
     f.database.close();
@@ -953,6 +957,33 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.runtime.calls.includes("startSlack"), false);
     assert.equal(f.runtime.calls.includes("quiesceSlack"), false);
     assert.equal(f.runtime.calls.includes("stopSlack"), false);
+    f.database.close();
+  });
+  test("restores the main agent immediately after a rejected Slack stop", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stop-rejected" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_slack", "slack_adapter", currentSha, null);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_slack", "rejected", null, { exit_code: 1 });
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.simulateSlackRestarted();
+    f.runtime.simulateDispatcherRestarted();
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    assert.equal(f.runtime.calls.includes(`startMainAgent:${currentSha}`), true);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    assert.equal(f.runtime.calls.includes("startDispatcher"), false);
     f.database.close();
   });
   test("restores the old runtime when Dispatcher reappears after a persisted stop", async () => {
@@ -981,6 +1012,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.get(row.request_id)?.last_error_code, "dispatcher_reappeared_after_stop");
     assert.equal(f.runtime.calls.includes("quiesceDispatcher"), false);
     assert.equal(f.runtime.calls.includes("stopDispatcher"), false);
+    assert.equal(f.runtime.calls.includes("startDispatcher"), false);
     assert.equal(f.runtime.calls.includes(`startMainAgent:${currentSha}`), true);
     f.database.close();
   });
@@ -994,6 +1026,7 @@ describe("UpdateController isolated end-to-end", () => {
       f.dispatcher.terminal = true;
       if (service === "dispatcher") f.runtime.dispatcherWrongShaDuringQuiesce = true;
       else f.runtime.slackWrongShaDuringQuiesce = true;
+      f.runtime.slackHealthUnreadyWhenQuiescing = true;
       await f.controller.processNext();
       assert.equal(f.database.get(planned.request_id as string)?.state, "needs_review");
       assert.equal(f.database.get(planned.request_id as string)?.last_error_code,
@@ -1216,9 +1249,9 @@ describe("UpdateController isolated end-to-end", () => {
     f.runtime.forwardSlackDrainIncomplete = true;
     await f.controller.processNext();
     const row = f.database.get(planned.request_id as string)!;
-    assert.equal(row.state, "failed");
-    assert.equal(row.last_error_code, "slack_adapter_drain_incomplete");
-    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "startSlack"]);
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_slack_health_failed");
+    assert.deepEqual(f.runtime.calls, ["quiesceSlack"]);
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher"), undefined);
     f.database.close();
   });

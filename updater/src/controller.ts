@@ -547,7 +547,6 @@ export class UpdateController {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
       const persistedSlackStop = this.database.runtimeOperation(row.request_id, "stop_slack");
       const persistedDispatcherStop = this.database.runtimeOperation(row.request_id, "stop_dispatcher");
-      const dispatcherPreviouslyQuiesced = Boolean(persistedDispatcherStop || persistedStop);
       const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
         this.database.runtimeOperation(row.request_id, "restart_current_slack") ??
         this.database.runtimeOperation(row.request_id, "start_previous_main_agent");
@@ -580,30 +579,38 @@ export class UpdateController {
       this.assertLease(row);
       if (slackHealth.live) {
         if (slackHealth.build_sha !== row.current_sha) {
+          const dispatcherQuiesced = await this.recoveryServiceQuiesced(row, "dispatcher",
+            Boolean(persistedDispatcherStop || persistedStop));
           await this.restoreQuiescedServices(row, "slack_adapter_wrong_sha_during_quiesce",
-            dispatcherPreviouslyQuiesced, false);
+            dispatcherQuiesced, false);
           return;
         }
         if (persistedSlackStop) {
-          if (persistedSlackStop.phase !== "observed" && !this.reconcileDeadlineExpired(row)) {
+          if (persistedSlackStop.phase !== "observed" && persistedSlackStop.phase !== "rejected" &&
+              !this.reconcileDeadlineExpired(row)) {
             this.deferOrReview(row, "stop_slack_acceptance_unknown", "The persisted Slack stop is still live");
             return;
           }
-          await this.restoreQuiescedServices(row, "slack_adapter_reappeared_after_stop",
-            dispatcherPreviouslyQuiesced, true);
+          const dispatcherQuiesced = await this.recoveryServiceQuiesced(row, "dispatcher",
+            Boolean(persistedDispatcherStop || persistedStop));
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter", true);
+          await this.restoreQuiescedServices(row, persistedSlackStop.phase === "rejected"
+            ? "stop_slack_rejected" : "slack_adapter_reappeared_after_stop",
+            dispatcherQuiesced, slackQuiesced);
           return;
         }
         let slackDrain: Awaited<ReturnType<RuntimePort["quiesceSlack"]>>;
         try { slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha); }
         catch {
           this.assertLease(row);
-          const slackQuiesced = await this.quiesceRecoveryScope(row, "slack_adapter");
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter");
           await this.restoreQuiescedServices(row, "slack_adapter_quiesce_unverified", false, slackQuiesced);
           return;
         }
         this.assertLease(row);
         if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
-          await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false, slackDrain.quiescing);
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter");
+          await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false, slackQuiesced);
           return;
         }
       } else if (!persistedSlackStop) {
@@ -613,15 +620,20 @@ export class UpdateController {
         try { registered = await this.runtime.slackRegistered(); }
         catch {
           this.assertLease(row);
+          const dispatcherQuiesced = await this.recoveryServiceQuiesced(row, "dispatcher",
+            Boolean(persistedDispatcherStop || persistedStop));
           await this.restoreQuiescedServices(row, "stop_slack_registration_unverified",
-            dispatcherPreviouslyQuiesced, false);
+            dispatcherQuiesced, false);
           return;
         }
         this.assertLease(row);
         if (persistedSlackStop.target_ref !== "slack_adapter" || persistedSlackStop.expected_sha !== row.current_sha ||
           persistedSlackStop.phase === "rejected" || registered) {
+          const dispatcherQuiesced = await this.recoveryServiceQuiesced(row, "dispatcher",
+            Boolean(persistedDispatcherStop || persistedStop));
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter", true);
           await this.restoreQuiescedServices(row, "stop_slack_current_state_unverified",
-            dispatcherPreviouslyQuiesced, !registered);
+            dispatcherQuiesced, slackQuiesced);
           return;
         }
       }
@@ -629,28 +641,43 @@ export class UpdateController {
       this.assertLease(row);
       if (dispatcherHealth.live) {
         if (dispatcherHealth.build_sha !== row.current_sha) {
-          await this.restoreQuiescedServices(row, "dispatcher_wrong_sha_during_quiesce", false, true);
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter",
+            Boolean(persistedSlackStop));
+          await this.restoreQuiescedServices(row, "dispatcher_wrong_sha_during_quiesce", false, slackQuiesced);
           return;
         }
         if (persistedDispatcherStop) {
-          if (persistedDispatcherStop.phase !== "observed" && !this.reconcileDeadlineExpired(row)) {
+          if (persistedDispatcherStop.phase !== "observed" && persistedDispatcherStop.phase !== "rejected" &&
+              !this.reconcileDeadlineExpired(row)) {
             this.deferOrReview(row, "stop_dispatcher_acceptance_unknown", "The persisted Dispatcher stop is still live");
             return;
           }
-          await this.restoreQuiescedServices(row, "dispatcher_reappeared_after_stop");
+          const dispatcherQuiesced = await this.recoveryServiceQuiesced(row, "dispatcher", true);
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter",
+            Boolean(persistedSlackStop));
+          await this.restoreQuiescedServices(row, persistedDispatcherStop.phase === "rejected"
+            ? "stop_dispatcher_rejected" : "dispatcher_reappeared_after_stop",
+            dispatcherQuiesced, slackQuiesced);
           return;
         }
         let dispatcherDrain: Awaited<ReturnType<RuntimePort["quiesceDispatcher"]>>;
         try { dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha); }
         catch {
           this.assertLease(row);
-          const dispatcherQuiesced = await this.quiesceRecoveryScope(row, "dispatcher");
-          await this.restoreQuiescedServices(row, "dispatcher_quiesce_unverified", dispatcherQuiesced, true);
+          const dispatcherQuiesced = await this.recoveryServiceQuiesced(row, "dispatcher");
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter",
+            Boolean(persistedSlackStop));
+          await this.restoreQuiescedServices(row, "dispatcher_quiesce_unverified",
+            dispatcherQuiesced, slackQuiesced);
           return;
         }
         this.assertLease(row);
         if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
-          await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete", dispatcherDrain.quiescing);
+          const dispatcherQuiesced = await this.recoveryServiceQuiesced(row, "dispatcher");
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter",
+            Boolean(persistedSlackStop));
+          await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete",
+            dispatcherQuiesced, slackQuiesced);
           return;
         }
       } else if (!persistedDispatcherStop) {
@@ -660,14 +687,20 @@ export class UpdateController {
         try { registered = await this.runtime.dispatcherRegistered(); }
         catch {
           this.assertLease(row);
-          await this.restoreQuiescedServices(row, "stop_dispatcher_registration_unverified", false, true);
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter",
+            Boolean(persistedSlackStop));
+          await this.restoreQuiescedServices(row, "stop_dispatcher_registration_unverified", false, slackQuiesced);
           return;
         }
         this.assertLease(row);
         if (persistedDispatcherStop.target_ref !== "dispatcher" ||
           persistedDispatcherStop.expected_sha !== row.current_sha ||
           persistedDispatcherStop.phase === "rejected" || registered) {
-          await this.restoreQuiescedServices(row, "stop_dispatcher_current_state_unverified", !registered, true);
+          const dispatcherQuiesced = await this.recoveryServiceQuiesced(row, "dispatcher", true);
+          const slackQuiesced = await this.recoveryServiceQuiesced(row, "slack_adapter",
+            Boolean(persistedSlackStop));
+          await this.restoreQuiescedServices(row, "stop_dispatcher_current_state_unverified",
+            dispatcherQuiesced, slackQuiesced);
           return;
         }
       }
@@ -1447,11 +1480,20 @@ export class UpdateController {
       this.clock.now().getTime() >= new Date(row.reconcile_deadline).getTime();
   }
 
-  private async quiesceRecoveryScope(row: UpdateRow, service: HealthSnapshot["service"]): Promise<boolean> {
+  private async recoveryServiceQuiesced(
+    row: UpdateRow, service: HealthSnapshot["service"], persistedStop = false,
+  ): Promise<boolean> {
     try {
       const health = service === "dispatcher" ? await this.runtime.dispatcherHealth() : await this.runtime.slackHealth();
       this.assertLease(row);
-      if (!health.live || health.build_sha !== row.current_sha || health.ready) return false;
+      if (!health.live) {
+        if (!persistedStop) return false;
+        const registered = service === "dispatcher" ? await this.runtime.dispatcherRegistered()
+          : await this.runtime.slackRegistered();
+        this.assertLease(row);
+        return !registered;
+      }
+      if (health.build_sha !== row.current_sha || health.ready) return false;
       const drain = service === "dispatcher" ? await this.runtime.dispatcherDrainStatus()
         : await this.runtime.slackDrainStatus();
       this.assertLease(row);
