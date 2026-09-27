@@ -27,7 +27,7 @@
 
 操作前にSlack ingressを止め、次にDispatcherを止める。両者のlabel、socket、PID停止を再読してから、Updaterの全requestがterminalであることを再確認し、stable Updaterも止める。Updater停止の応答だけを証明にせず、label、socket、PIDを再読する。これでbackup・回復CLI・手動pointer操作中にUpdater activationが並走しない。Codex/Herdr worker停止は別のoperator判断であり、この観測から推論しない。
 
-停止後にowner-only directoryへSQLite Online Backup APIでDispatcher DBとUpdater DBを保存する。WAL中のDB本体だけを`cp`しない。`job-results`とlegacy `results`、current/previous pointerの実体、3つのLaunchAgent plist、現行release manifest、control-plane receiptを同じ世代のbackup inventoryへ記録する。backupは0600、directoryは0700とし、DBの`integrity_check=ok`、`foreign_key_check`が空、Dispatcher `user_version=3`、Updater `user_version=7`、主要table件数を照合する。backup pathとdigestを記録してから先へ進む。backup/Resultを公開場所へ置かない。
+停止後にowner-only directoryへSQLite Online Backup APIでDispatcher本体・通知・進捗DBとUpdater DBを保存する。WAL中のDB本体だけを`cp`しない。`job-results`とlegacy `results`、current/previous pointerの実体、3つのLaunchAgent plist、実際の両env file、現行release manifest、control-plane receiptを同じ世代のbackup inventoryへ記録する。backupは0600、directoryは0700とし、全DBの`integrity_check=ok`と`foreign_key_check`空、各`user_version`、主要table件数を照合する。backup pathとdigestを記録してから先へ進む。backup/Resultを公開場所へ置かない。
 
 次はoperatorが固定した値を代入し、同じmaintenance shellで続けて実行するコマンドの形である。`backup_dir`は毎回新規のowner-only directoryとし、既存backupを上書きしない。
 
@@ -56,6 +56,7 @@ const dotenv = require(path.join(release, 'dispatcher/node_modules/dotenv'));
 const environment = {...dotenv.parse(fs.readFileSync(environmentFile))};
 const slackEnvironment = {...dotenv.parse(fs.readFileSync(slackEnvironmentFile))};
 for(const name of ['DONA_DATABASE_PATH','DONA_RESULTS_DIR','DONA_JOB_RESULTS_DIR',
+  'DONA_UPDATE_NOTIFICATION_DATABASE_PATH','DONA_JOB_PROGRESS_DATABASE_PATH',
   'DONA_SOCKET_PATH','SLACK_HEALTH_SOCKET_PATH']) {
   const value=environment[name];
   if(value && !path.isAbsolute(value) && !value.startsWith('~/')) {
@@ -81,6 +82,8 @@ import(pathToFileURL(path.join(release, 'dispatcher/dist/config.js')).href).then
   if(slackSocket!==config.slackAdapterSocketPath) throw new Error('slack_socket_config_mismatch');
   process.stdout.write(JSON.stringify({database:config.databasePath,
     results:config.resultsDir,job_results:config.jobResultsDir,
+    update_notifications:config.updateNotificationDatabasePath,
+    job_progress:config.jobProgressDatabasePath,
     dispatcher_socket:config.socketPath,slack_socket:slackSocket}));
 }).catch(error => { process.stderr.write(String(error)); process.exitCode=1; });
 JS
@@ -88,9 +91,12 @@ JS
 dona_database="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).database))')"
 dona_results="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).results))')"
 dona_job_results="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).job_results))')"
+dona_update_notifications="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).update_notifications))')"
+dona_job_progress="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).job_progress))')"
 dona_dispatcher_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).dispatcher_socket))')"
 dona_slack_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).slack_socket))')"
-test -f "$dona_database" && test -d "$dona_results" && test -d "$dona_job_results"
+test -f "$dona_database" && test -f "$dona_update_notifications" &&
+  test -f "$dona_job_progress" && test -d "$dona_results" && test -d "$dona_job_results"
 updater_socket="$dona_base/update-control/updater.sock"
 old_updater_health="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
   --unix-socket "$updater_socket" http://localhost/health/version)"
@@ -153,9 +159,12 @@ if count != 0:
     raise RuntimeError('updater_nonterminal_request_after_stop')
 PY
 python3 - "$dona_database" "$backup_dir/dona.sqlite3" \
-  "$dona_base/update-control/updater.sqlite3" "$backup_dir/updater.sqlite3" <<'PY'
+  "$dona_base/update-control/updater.sqlite3" "$backup_dir/updater.sqlite3" \
+  "$dona_update_notifications" "$backup_dir/update-notifications.sqlite3" \
+  "$dona_job_progress" "$backup_dir/job-progress.sqlite3" <<'PY'
 import os, sqlite3, sys
-for source_path, target_path, expected_schema in ((sys.argv[1],sys.argv[2],3),(sys.argv[3],sys.argv[4],7)):
+for source_path, target_path, expected_schema in ((sys.argv[1],sys.argv[2],3),(sys.argv[3],sys.argv[4],7),
+                                                  (sys.argv[5],sys.argv[6],2),(sys.argv[7],sys.argv[8],2)):
     descriptor = os.open(target_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
     os.close(descriptor)
     source = sqlite3.connect('file:' + source_path + '?mode=ro', uri=True)
@@ -174,9 +183,10 @@ for source_path, target_path, expected_schema in ((sys.argv[1],sys.argv[2],3),(s
 PY
 ditto "$dona_job_results" "$backup_dir/job-results"
 ditto "$dona_results" "$backup_dir/results"
-python3 - "$dona_base" "$backup_dir" "$dona_database" "$dona_results" "$dona_job_results" <<'PY'
+python3 - "$dona_base" "$backup_dir" "$dona_database" "$dona_results" "$dona_job_results" \
+  "$dispatcher_env" "$slack_env" "$dona_update_notifications" "$dona_job_progress" <<'PY'
 import datetime, hashlib, json, os, re, shutil, sqlite3, stat, sys
-base, root, database, results, job_results = sys.argv[1:]
+base, root, database, results, job_results, dispatcher_env, slack_env, update_notifications, job_progress = sys.argv[1:]
 runtime = os.path.join(base, 'runtime')
 pointers = {}
 for name in ('current', 'previous'):
@@ -191,8 +201,8 @@ sources = {
     'release-manifest.json': os.path.join(runtime, 'current/release-manifest.json'),
     'control-plane-receipt.json': os.path.join(base, 'update-control/control-plane-receipt.json'),
     'policy.json': os.path.join(base, 'update-control/policy.json'),
-    'dispatcher.env': os.path.join(base, 'config/dispatcher.env'),
-    'slack.env': os.path.join(base, 'config/slack.env'),
+    'dispatcher.env': dispatcher_env,
+    'slack.env': slack_env,
 }
 for name, source in sources.items():
     if not stat.S_ISREG(os.stat(source).st_mode) or os.path.islink(source):
@@ -203,12 +213,13 @@ for name, source in sources.items():
         write.flush(); os.fsync(write.fileno())
     os.chmod(destination, 0o600)
 counts = {}
-for name, tables in (('dona.sqlite3', ('jobs','events','job_groups')),
-                     ('updater.sqlite3', ('update_requests','update_outbox'))):
+for name, tables, source_path in (('dona.sqlite3', ('jobs','events','job_groups'), database),
+                                  ('updater.sqlite3', ('update_requests','update_outbox'), os.path.join(base, 'update-control/updater.sqlite3')),
+                                  ('update-notifications.sqlite3', ('update_notifications',), update_notifications),
+                                  ('job-progress.sqlite3', ('job_progress','job_progress_throttles'), job_progress)):
     db = sqlite3.connect('file:' + os.path.join(root, name) + '?mode=ro', uri=True)
     counts[name] = {table: db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] for table in tables}
     db.close()
-    source_path = database if name == 'dona.sqlite3' else os.path.join(base, 'update-control/updater.sqlite3')
     source_db = sqlite3.connect('file:' + source_path + '?mode=ro', uri=True)
     source_counts = {table: source_db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] for table in tables}
     source_db.close()
@@ -227,7 +238,9 @@ for directory, directories, files in os.walk(root, followlinks=False):
                 digest.update(chunk)
         digests[os.path.relpath(candidate, root)] = digest.hexdigest()
 inventory = {'schema_version':1, 'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
-             'source_paths':{'database':database,'results':results,'job_results':job_results},
+             'source_paths':{'database':database,'results':results,'job_results':job_results,
+                             'dispatcher_env':dispatcher_env,'slack_env':slack_env,
+                             'update_notifications':update_notifications,'job_progress':job_progress},
              'pointers':pointers,'table_counts':counts,'sha256':digests}
 temporary = os.path.join(root, 'inventory.json.tmp')
 with open(temporary, 'x', encoding='utf-8') as stream:
@@ -378,4 +391,15 @@ trap - EXIT
 
 新Dispatcherがhealthを満たさない場合はSlack/Dispatcherを停止し、両labelとsocketの停止を確認してから旧pointerへ戻す。DBを旧releaseが開けることをDBコピーとschemaで確認する。回復CLIがDBへ書いた後のbackup restoreは監査記録と通知状態を巻き戻すため、機械的には行わない。restoreが必要なら全service停止下でbackup integrity、失われる回復・通知・job変更を個別照合し、別のoperator判断を得る。pointer rollbackとDB restoreを同一操作と見なさない。
 
-対象releaseでDispatcherが起動し、危険状態が空になった後だけ、terminalでない更新planがないことを再確認して`--upgrade-control`を使う。現行installerのcontrol upgradeは既定のDispatcher socket pathを固定しているため、`dona_dispatcher_socket`が`$dona_base/run/dispatcher.sock`と異なる場合は実行を禁止し、その構成に対応するinstaller修正を先にreviewする。これはstable Updater/policyを更新する別操作で、installer内のbackupとrollback・exact SHA healthを確認する。新しい通常self-update plan/applyはさらに別のexact plan承認を要する。対象SHAへpointerを先に切り替えた場合、同じSHAへのplan/applyで`dona-main`が再起動すると推測しない。main agentのrelease identityを揃える手段は別に確認する。
+対象releaseでDispatcherが起動し、危険状態が空になった後だけ、terminalでない更新planがないことを再確認して`--upgrade-control`を使う。現行installerはDispatcher/Slack socketと両env fileの位置を既定値へ固定するため、`dona_dispatcher_socket`、`dona_slack_socket`、`dispatcher_env`、`slack_env`のいずれかがそれぞれ`$dona_base/run/dispatcher.sock`、`$dona_base/run/slack-adapter.sock`、`$dona_base/config/dispatcher.env`、`$dona_base/config/slack.env`と異なる場合は実行を禁止し、その構成に対応するinstaller修正を先にreviewする。これはstable Updater/policyを更新する別操作で、installer内のbackupとrollback・exact SHA healthを確認する。新しい通常self-update plan/applyはさらに別のexact plan承認を要する。対象SHAへpointerを先に切り替えた場合、同じSHAへのplan/applyで`dona-main`が再起動すると推測しない。main agentのrelease identityを揃える手段は別に確認する。
+
+```sh
+test "$dona_dispatcher_socket" = "$dona_base/run/dispatcher.sock" &&
+  test "$dona_slack_socket" = "$dona_base/run/slack-adapter.sock" &&
+  test "$dispatcher_env" = "$dona_base/config/dispatcher.env" &&
+  test "$slack_env" = "$dona_base/config/slack.env" || {
+    printf '%s\n' 'custom構成では現行control installerを実行できません。' >&2
+    exit 1
+  }
+./scripts/install-self-update.sh --upgrade-control
+```
