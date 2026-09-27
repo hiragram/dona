@@ -343,6 +343,8 @@ def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
                 require(not member.issym() and not member.islnk() and not member.name.startswith('/') and '..' not in Path(member.name).parts, 'archive_path')
             tar.extractall(release)
         archive.unlink()
+        target_checks = target_required_checks(release)
+        target_trust = verify_trust(sha, dict(inv['policy'], required_checks=target_checks))
         npm = inv['policy']['executables']['npm']
         node = inv['policy']['executables']['node']
         for component in ('dispatcher', 'sources/slack', 'updater'):
@@ -353,8 +355,6 @@ def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
             staging_space(generation, inv['policy'], reserve=False)
         command([node, str(release/'scripts/write-release-manifest.mjs'), str(release), sha,
                  command([npm, '--version']), inv['policy']['policy_version']])
-        target_checks = target_required_checks(release)
-        target_trust = verify_trust(sha, dict(inv['policy'], required_checks=target_checks))
         for p in ('config', 'control', 'results', 'job-results', 'run', 'logs'):
             private_dir(generation/p)
         # updaterはcontrol_root/updater.sock固定なので長いUNIX socket pathを準備段階で拒否。
