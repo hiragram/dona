@@ -573,8 +573,9 @@ export class UpdateController {
         return;
       }
       // Reboot can restart a previously stopped launchd service. Re-observe each
-      // service independently: live services must drain again, while an unavailable
-      // UDS is accepted as stopped only when this request has durable stop evidence.
+      // service independently: live services must drain again. A persisted stop
+      // intent is reconciled with health and launchd registration below, including
+      // when the command was accepted but observation was interrupted.
       const slackHealth = await this.runtime.slackHealth();
       this.assertLease(row);
       if (slackHealth.live) {
@@ -584,7 +585,7 @@ export class UpdateController {
           await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false, slackDrain.quiescing);
           return;
         }
-      } else if (persistedSlackStop?.phase !== "observed") {
+      } else if (!persistedSlackStop) {
         throw new Error("slack_adapter_current_state_unverified");
       }
       const dispatcherHealth = await this.runtime.dispatcherHealth();
@@ -596,7 +597,7 @@ export class UpdateController {
           await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete", dispatcherDrain.quiescing);
           return;
         }
-      } else if (persistedDispatcherStop?.phase !== "observed") {
+      } else if (!persistedDispatcherStop) {
         throw new Error("dispatcher_current_state_unverified");
       }
       if (!persistedStop) {
