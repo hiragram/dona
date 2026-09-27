@@ -18,7 +18,8 @@
 非rootのmacOS GUI userで、cleanなcanonical `main` checkoutから実行する。`--stage-recovery`は既存installerと同じexact `origin/main`、GitHub Actionsの3 check、`npm ci`/test/typecheck/build、manifest、既存releaseとの内容比較を使い、immutable releaseを配置して終了する。Updater、pointer、service、DB、Resultは変更しない。
 
 ```sh
-./scripts/install-self-update.sh --stage-recovery
+dona_base="$HOME/.dona/g/<事前確認した世代ID>"
+./scripts/install-self-update.sh --stage-recovery "$dona_base"
 ```
 
 実行直後に`runtime/releases/<target-sha>/release-manifest.json`のSHAと互換性、`dispatcher/dist/cli.js`、`sources/slack/dist/index.js`を再読する。stageだけではbootstrap成功としない。
@@ -33,7 +34,8 @@
 
 ```sh
 set -euo pipefail
-dona_base="$HOME/Library/Application Support/Dona"
+dona_base="$HOME/.dona/g/<事前確認した世代ID>"
+test -d "$dona_base" && test ! -L "$dona_base"
 command -v python3 >/dev/null
 python3 -c 'import sqlite3'
 command -v ditto >/dev/null
@@ -75,10 +77,10 @@ environment.DONA_RELEASE_MANIFEST_PATH = path.join(release, 'release-manifest.js
 import(pathToFileURL(path.join(release, 'dispatcher/dist/config.js')).href).then(({loadConfig}) => {
   const config = loadConfig(environment);
   const slackDispatcherSocket=expand(slackEnvironment.DONA_SOCKET_PATH) ??
-    path.join(os.homedir(),'Library/Application Support/Dona/run/dispatcher.sock');
+    path.join(path.dirname(path.dirname(path.dirname(release))),'run/d.sock');
   if(slackDispatcherSocket!==config.socketPath) throw new Error('dispatcher_socket_config_mismatch');
   const slackSocket=expand(slackEnvironment.SLACK_HEALTH_SOCKET_PATH) ??
-    path.join(os.homedir(),'Library/Application Support/Dona/run/slack-adapter.sock');
+    path.join(path.dirname(path.dirname(path.dirname(release))),'run/s.sock');
   if(slackSocket!==config.slackAdapterSocketPath) throw new Error('slack_socket_config_mismatch');
   process.stdout.write(JSON.stringify({database:config.databasePath,
     results:config.resultsDir,job_results:config.jobResultsDir,
@@ -97,7 +99,7 @@ dona_dispatcher_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";proc
 dona_slack_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).slack_socket))')"
 test -f "$dona_database" && test -f "$dona_update_notifications" &&
   test -f "$dona_job_progress" && test -d "$dona_results" && test -d "$dona_job_results"
-updater_socket="$dona_base/update-control/updater.sock"
+updater_socket="$dona_base/control/updater.sock"
 old_updater_health="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
   --unix-socket "$updater_socket" http://localhost/health/version)"
 old_updater_sha="$(printf '%s' "$old_updater_health" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.service!=="updater"||v.status!=="ready"||!(/^[0-9a-f]{40}$/.test(v.build_sha)))process.exitCode=1;else process.stdout.write(v.build_sha)})')"
@@ -130,7 +132,7 @@ if kill -0 "$dispatcher_pid" 2>/dev/null || kill -0 "$slack_pid" 2>/dev/null; th
   printf '%s\n' '停止前のDona PIDが残っています。DB操作へ進みません。' >&2
   exit 1
 fi
-updater_status="$(node "$dona_base/update-control/updater/dist/cli.js" status)"
+updater_status="$(node "$dona_base/control/updater/dist/cli.js" status)"
 if ! printf '%s' "$updater_status" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.nonterminal_count!==0||!Array.isArray(v.updates)||v.updates.some(x=>!["succeeded","failed","rolled_back","needs_review","cancelled"].includes(x.state)))process.exitCode=1})'; then
   printf '%s\n' 'Updaterに非terminal requestが残っています。DB操作へ進みません。' >&2
   exit 1
@@ -150,7 +152,7 @@ fi
 if [ "$updater_bootout_exit" -ne 0 ]; then
   printf 'Updater bootout非0を停止状態で照合済み: %s\n' "$updater_bootout_exit" >&2
 fi
-python3 - "$dona_base/update-control/updater.sqlite3" <<'PY'
+python3 - "$dona_base/control/updater.sqlite3" <<'PY'
 import sqlite3, sys
 db = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
 count = db.execute("SELECT COUNT(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled')").fetchone()[0]
@@ -159,7 +161,7 @@ if count != 0:
     raise RuntimeError('updater_nonterminal_request_after_stop')
 PY
 python3 - "$dona_database" "$backup_dir/dona.sqlite3" \
-  "$dona_base/update-control/updater.sqlite3" "$backup_dir/updater.sqlite3" \
+  "$dona_base/control/updater.sqlite3" "$backup_dir/updater.sqlite3" \
   "$dona_update_notifications" "$backup_dir/update-notifications.sqlite3" \
   "$dona_job_progress" "$backup_dir/job-progress.sqlite3" <<'PY'
 import os, sqlite3, sys
@@ -275,7 +277,7 @@ env DOTENV_CONFIG_PATH="$dispatcher_env" \
 
 ```sh
 set -euo pipefail
-runtime_root="$HOME/Library/Application Support/Dona/runtime"
+runtime_root="$dona_base/runtime"
 target_sha='<承認済みのexact SHA>'
 old_sha='<事前記録した旧currentのexact SHA>'
 test "$(readlink "$runtime_root/current")" = "releases/$old_sha"
@@ -391,15 +393,15 @@ trap - EXIT
 
 新Dispatcherがhealthを満たさない場合はSlack/Dispatcherを停止し、両labelとsocketの停止を確認してから旧pointerへ戻す。DBを旧releaseが開けることをDBコピーとschemaで確認する。回復CLIがDBへ書いた後のbackup restoreは監査記録と通知状態を巻き戻すため、機械的には行わない。restoreが必要なら全service停止下でbackup integrity、失われる回復・通知・job変更を個別照合し、別のoperator判断を得る。pointer rollbackとDB restoreを同一操作と見なさない。
 
-対象releaseでDispatcherが起動し、危険状態が空になった後だけ、terminalでない更新planがないことを再確認して`--upgrade-control`を使う。現行installerはDispatcher/Slack socketと両env fileの位置を既定値へ固定するため、`dona_dispatcher_socket`、`dona_slack_socket`、`dispatcher_env`、`slack_env`のいずれかがそれぞれ`$dona_base/run/dispatcher.sock`、`$dona_base/run/slack-adapter.sock`、`$dona_base/config/dispatcher.env`、`$dona_base/config/slack.env`と異なる場合は実行を禁止し、その構成に対応するinstaller修正を先にreviewする。これはstable Updater/policyを更新する別操作で、installer内のbackupとrollback・exact SHA healthを確認する。新しい通常self-update plan/applyはさらに別のexact plan承認を要する。対象SHAへpointerを先に切り替えた場合、同じSHAへのplan/applyで`dona-main`が再起動すると推測しない。main agentのrelease identityを揃える手段は別に確認する。
+対象releaseでDispatcherが起動し、危険状態が空になった後だけ、terminalでない更新planがないことを再確認して`--upgrade-control`を使う。世代別rootではsocketと両env fileがその世代内にあることを確認する。installerは既存policy、pointer、plist、DBを照合してから更新する。これはstable Updater/policyを更新する別操作で、installer内のbackupとrollback・exact SHA healthを確認する。新しい通常self-update plan/applyはさらに別のexact plan承認を要する。対象SHAへpointerを先に切り替えた場合、同じSHAへのplan/applyで`dona-main`が再起動すると推測しない。main agentのrelease identityを揃える手段は別に確認する。
 
 ```sh
-test "$dona_dispatcher_socket" = "$dona_base/run/dispatcher.sock" &&
-  test "$dona_slack_socket" = "$dona_base/run/slack-adapter.sock" &&
+test "$dona_dispatcher_socket" = "$dona_base/run/d.sock" &&
+  test "$dona_slack_socket" = "$dona_base/run/s.sock" &&
   test "$dispatcher_env" = "$dona_base/config/dispatcher.env" &&
   test "$slack_env" = "$dona_base/config/slack.env" || {
     printf '%s\n' 'custom構成では現行control installerを実行できません。' >&2
     exit 1
   }
-./scripts/install-self-update.sh --upgrade-control
+./scripts/install-self-update.sh --upgrade-control "$dona_base"
 ```

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate an explicitly selected installed generation before control upgrade."""
+"""Validate an explicitly selected installed generation before staging or control upgrade."""
 import inspect
 import json
 import os
@@ -20,7 +20,9 @@ def regular(path):
 
 
 def main():
-    root, rendered, launch_agents = map(Path, sys.argv[1:])
+    root, rendered, launch_agents = map(Path, sys.argv[1:4])
+    mode = sys.argv[4]
+    require(mode in ('--upgrade-control', '--stage-recovery'))
     generation_parent = Path.home() / '.dona' / 'g'
     require(root.parent == generation_parent and re.fullmatch(r'[0-9a-f]{12}', root.name))
     require(root.is_dir() and not root.is_symlink())
@@ -77,8 +79,16 @@ def main():
             updated = dict(env)
             updated.update(candidate['EnvironmentVariables'])
             candidate['EnvironmentVariables'] = updated
-            candidate_file.write_bytes(plistlib.dumps(candidate))
-            os.chmod(candidate_file, 0o600)
+            if mode == '--upgrade-control':
+                candidate_file.write_bytes(plistlib.dumps(candidate))
+                os.chmod(candidate_file, 0o600)
+    slack = plistlib.loads(regular(launch_agents / 'dev.dona.slack-adapter.plist').read_bytes())
+    require(slack.get('Label') == 'dev.dona.slack-adapter')
+    slack_env = slack.get('EnvironmentVariables', {})
+    require(isinstance(slack_env, dict))
+    require(slack_env.get('DONA_SOCKET_PATH') == str(root / 'run/d.sock'))
+    require(slack_env.get('SLACK_HEALTH_SOCKET_PATH') == str(root / 'run/s.sock'))
+    require(slack_env.get('DOTENV_CONFIG_PATH') == str(root / 'config/slack.env'))
     receipt = control / 'control-plane-receipt.json'
     if receipt.exists():
         regular(receipt)
@@ -89,7 +99,7 @@ def main():
 
 if __name__ == '__main__':
     try:
-        require(len(sys.argv) == 4)
+        require(len(sys.argv) == 5)
         main()
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)

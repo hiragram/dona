@@ -6,8 +6,8 @@ REPOSITORY_DIR=${SCRIPT_DIR:h}
 MODE=${1:-}
 TARGET_ROOT=${2:-}
 if [[ -n "$TARGET_ROOT" ]]; then
-  if [[ "$MODE" != "--upgrade-control" || $# -ne 2 || "$TARGET_ROOT" != /* || "$TARGET_ROOT" == */ || ! -d "$TARGET_ROOT" || -L "$TARGET_ROOT" ]]; then
-    print -u2 -- "--upgrade-controlの既存absolute target rootだけを指定できます。"
+  if [[ ( "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ) || $# -ne 2 || "$TARGET_ROOT" != /* || "$TARGET_ROOT" == */ || ! -d "$TARGET_ROOT" || -L "$TARGET_ROOT" ]]; then
+    print -u2 -- "--upgrade-controlまたは--stage-recoveryの既存absolute target rootだけを指定できます。"
     exit 2
   fi
   BASE_DIR="$TARGET_ROOT"
@@ -163,7 +163,7 @@ restore_control_plane() {
 }
 
 if [[ "$MODE" != "--check" && "$MODE" != "--install" && "$MODE" != "--bootstrap" && "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]]; then
-  print -u2 "Usage: $0 --check | --install | --bootstrap | --upgrade-control [existing-absolute-target-root] | --stage-recovery"
+  print -u2 "Usage: $0 --check | --install | --bootstrap | --upgrade-control [existing-absolute-target-root] | --stage-recovery [existing-absolute-target-root]"
   print -u2 -- "--checkはtemplateのみ検証し、--installは初期配置、--bootstrapは初回起動、--upgrade-controlは停止確認付きでstable control-planeを更新します。"
   print -u2 -- "--stage-recoveryはCI検証済みreleaseだけを配置し、service、pointer、DB、Updaterは変更しません。"
   exit 2
@@ -191,7 +191,7 @@ trap cleanup_temp EXIT
 
 $NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}"
 if [[ -n "$TARGET_ROOT" ]]; then
-  EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR")
+  EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR" "$MODE")
 fi
 /usr/bin/plutil -lint "$INSTALL_TMP/rendered/dev.dona.updater.plist" \
   "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" \
