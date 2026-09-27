@@ -477,6 +477,11 @@ test("generation target validation rejects a mismatched installed updater before
       DOTENV_CONFIG_PATH: path.join(root, "config/dispatcher.env"),
       GENERATION_ONLY: "preserved",
     }));
+    await fs.writeFile(path.join(launchAgents, "dev.dona.slack-adapter.plist"), plist("dev.dona.slack-adapter", path.join(root, "runtime/current/sources/slack/dist/index.js"), {
+      DONA_SOCKET_PATH: path.join(root, "run/d.sock"),
+      SLACK_HEALTH_SOCKET_PATH: path.join(root, "run/s.sock"),
+      DOTENV_CONFIG_PATH: path.join(root, "config/slack.env"),
+    }));
     const testBin = path.join(home, "bin");
     await fs.mkdir(testBin);
     for (const name of ["herdr", "codex"]) {
@@ -486,22 +491,26 @@ test("generation target validation rejects a mismatched installed updater before
       env: { ...process.env, PATH: `${testBin}:${process.env.PATH}` },
     });
     const helper = fileURLToPath(new URL("../../scripts/validate-generation-install-target.py", import.meta.url));
-    await execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } });
+    const renderedDispatcher = path.join(rendered, "dev.dona.dispatcher.plist");
+    const beforeStage = await fs.readFile(renderedDispatcher);
+    await execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } });
+    assert.deepEqual(await fs.readFile(renderedDispatcher), beforeStage);
+    await execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--upgrade-control"], { env: { ...process.env, HOME: home } });
     const updated = await fs.readFile(path.join(rendered, "dev.dona.dispatcher.plist"), "utf8");
     assert.match(updated, /GENERATION_ONLY/);
     const receipt = path.join(root, "control/control-plane-receipt.json");
     await fs.mkdir(receipt);
-    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } }));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
     await fs.rmdir(receipt);
     const dispatcherPlist = path.join(launchAgents, "dev.dona.dispatcher.plist");
     const originalDispatcher = await fs.readFile(dispatcherPlist, "utf8");
     await fs.writeFile(dispatcherPlist, originalDispatcher.replace(path.join(root, "job-results"), path.join(home, "other/job-results")));
-    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } }));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
     await fs.writeFile(dispatcherPlist, originalDispatcher);
     await fs.writeFile(path.join(launchAgents, "dev.dona.updater.plist"), plist("dev.dona.updater", path.join(home, "other/updater/dist/cli.js"), {
       DONA_UPDATE_POLICY_PATH: path.join(root, "control/policy.json"), DONA_UPDATER_BUILD_SHA: sha,
     }));
-    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } }));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
   } finally {
     await fs.rm(home, { recursive: true, force: true });
   }
