@@ -776,6 +776,9 @@ class RecoveryRegressionTest(unittest.TestCase):
         launch=m.Launchd()
         with patch.object(launch,'observe',return_value=None),patch.object(m.subprocess,'run',return_value=subprocess.CompletedProcess([],5,b'',b'')):
             with self.assertRaises(m.LaunchdRejected): launch.start(m.LABELS[0],self.run/'fixture.plist')
+        for code in (-15,0):
+            with patch.object(launch,'observe',return_value=None),patch.object(m.subprocess,'run',return_value=subprocess.CompletedProcess([],code,b'',b'')):
+                with self.assertRaisesRegex(RuntimeError,'service_start_unconfirmed'): launch.start(m.LABELS[0],self.run/'fixture.plist')
         with patch.object(launch,'observe',return_value=None),patch.object(m.subprocess,'run',side_effect=subprocess.TimeoutExpired([],35)):
             with self.assertRaisesRegex(RuntimeError,'service_start_unconfirmed'): launch.start(m.LABELS[0],self.run/'fixture.plist')
 
@@ -787,3 +790,15 @@ class RecoveryRegressionTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,'main_stop_rejected'): REAL_ENSURE_MAIN(runner)
                 self.assertEqual(m.read_json(self.run/'main-lifecycle.json')['phase'],'stop_rejected')
             self.assertEqual([c.kwargs['action'] for c in call.call_args_list],['status','stop','status','stop'])
+
+
+    def test_main_start_rejection_retries_but_unknown_only_reconciles(self):
+        runner=self.runner();runner.plan['release']='/release'
+        runner.main_step('stopped',old={'pane_id':'pane','session_id':'old'},previous_pid=999)
+        with patch.object(runner,'main_call',side_effect=[{'outcome':'rejected'},{'outcome':'accepted_unknown'},{'exists':False},{'exists':False}]) as call:
+            with self.assertRaisesRegex(RuntimeError,'main_start_rejected'): REAL_ENSURE_MAIN(runner)
+            self.assertEqual(m.read_json(self.run/'main-lifecycle.json')['phase'],'start_rejected')
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError,'new_main_not_ready'): REAL_ENSURE_MAIN(runner)
+                self.assertEqual(m.read_json(self.run/'main-lifecycle.json')['phase'],'start_intent')
+            self.assertEqual([c.kwargs['action'] for c in call.call_args_list],['start','start','status','status'])

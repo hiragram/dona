@@ -104,7 +104,7 @@ Result公開時刻以後の親event完了を確認します。過去のtimeout�
 一度だけ動く独立LaunchAgentが最大10分terminalを待ち、3サービスや旧mainを止めても継続します。
 plistはrun領域に置くためlogin時には自動再実行されません。`KeepAlive=false`で、再度armしてもkickstartしません。
 登録応答が不明な場合はexact labelをread-only照合し、応答不明かつ未登録なら再送せず `arm_acceptance_unknown` とします。
-bootstrapの明確な非zero応答と未登録の両方を確認できた場合は `bootstrap_rejected` を記録し、次のarmで再照合後に再試行できます。
+bootstrapの明確な正の非zero応答と未登録の両方を確認できた場合は `bootstrap_rejected` を記録し、次のarmで再照合後に再試行できます。
 
 ```sh
 python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" arm \
@@ -143,6 +143,8 @@ python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" arm \
 新release・同pane・旧と異なるsession・interactive readyをread-only照合して回復できます。
 stop応答喪失は `main_stop_acceptance_unknown` とし、新サービスを停止したまま保ちます。
 停止write前の確定拒否は `stop_rejected` と区別し、次のexecuteで旧mainのidentityを新しく観測してから再試行できます。
+起動の確定拒否も `start_rejected` として記録し、次のexecuteで通常adapterがreleaseとpaneを再観測してから再試行できます。
+起動応答不明の `start_intent` は再送せず、現在のmainのread-only照合だけを行います。
 
 新mainはtarget releaseをworking directoryにし、両MCPにpolicy指定node、世代固有wrapper、
 `enabled=true` / `required=true` をCLI overrideします。MCP初期化失敗時にCodexの起動を失敗させる設定は

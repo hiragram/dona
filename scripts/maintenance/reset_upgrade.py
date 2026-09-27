@@ -198,7 +198,7 @@ class Launchd:
         except subprocess.TimeoutExpired:
             pass
         if self.observe(label) is None:
-            if result is not None and result.returncode != 0:
+            if result is not None and result.returncode > 0:
                 raise LaunchdRejected('service_start_rejected')
             raise RuntimeError('service_start_unconfirmed')
 
@@ -736,10 +736,13 @@ class Runner:
         if state['phase'] == 'stop_intent':
             # 喪失したstopを再送しない。固定paneの非在だけをmachine fenceとは扱わない。
             raise RuntimeError('main_stop_acceptance_unknown')
-        if state['phase'] == 'stopped':
+        if state['phase'] in ('stopped', 'start_rejected'):
             state = self.main_step('start_intent')
             outcome = self.main_call(action='start', release=self.plan['release'], pane=state['old']['pane_id'],
                                      previous_session=state['old']['session_id'])
+            if outcome.get('outcome') == 'rejected':
+                self.main_step('start_rejected')
+                raise RuntimeError('main_start_rejected')
             # timeout後も以下のread-only照合で受理済みmainを発見できる。start再送はしない。
             if outcome.get('outcome') == 'started':
                 state = self.main_step('started', observation=outcome['observation'])
