@@ -41,6 +41,16 @@ jobごとに外部副作用、通知の配送・曖昧性、正常finalの受理
 
 ## operator assertionによる個別回復
 
+### 処理済みだが未投稿のattention通知
+
+`attention`通知eventが`completed`で、保存済みResultの`actions`が空、投稿receiptも配送claimもない場合は、元threadのSlack履歴を個別に確認する。投稿済み・送信結果が曖昧・別thread・確認不能の場合は、この経路を使わない。履歴確認の証跡を保管し、そのSHA-256を指定する。これを投稿receiptやworker停止proofとして扱わない。
+
+1. `job show`、`event show`、`job attention-recovery`で対象jobとattention eventの現在値、owner、固定宛先、`updated_at`を照合する。
+2. `job reconcile-attention-not-posted <source_event_id> <job_id> <attention_event_id> <expected_job_updated_at> <expected_event_updated_at> <evidence_sha256> --notification-reviewed --no-post-confirmed`を一度だけ実行する。書き込み直前のtransactionで同一source/job、owner、workspace/channel/thread、空のResult actions、配送claim/receiptの不在、groupと両`updated_at`を再照合する。元通知は再送しない。
+3. `job attention-no-post-record <attention_event_id>`で追記専用の判断記録を再読し、改めて`job inspect-operator-recovery`の通知digestを取得する。その新しいdigestを使い、下記のoperator assertion回復を個別に実施する。応答喪失時は記録とevent/jobをread-onlyで照合し、blind retryしない。
+
+回復後に生成され得るgroup最終通知は別eventである。元attentionの未投稿判断を、その最終通知の配送確認に流用しない。
+
 処理済みの申告Slack eventを用い、申告actorがjob ownerで同じtenant/workspace/channelに属し、申告時刻以前に作成・最終更新された`needs_review` jobだけを対象にする。`job list --status needs_review`で現況を読み、旧件数を固定しない。申告本文は監査台帳にdigestだけを保存する。申告者のroleは`job_owner`に限定し、ローカルCLI principalは実行履歴として区別して記録する。workspace IDをSlack tenant bindingとして扱う。別actorによる代理承認はこの経路では拒否する。
 
 1. `job show <job_id>`と`job inspect-operator-recovery <job_id>`を読み、原因、`updated_at`、Resultの`valid` / `invalid` / `missing`、SHA-256、通知証跡digestを保存する。外部副作用と既存通知の配送状態を個別に確認し、それぞれの証跡を保管する。
