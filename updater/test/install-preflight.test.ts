@@ -481,7 +481,9 @@ test("generation target validation rejects a mismatched installed updater before
       DONA_SOCKET_PATH: path.join(root, "run/d.sock"),
       SLACK_HEALTH_SOCKET_PATH: path.join(root, "run/s.sock"),
       DOTENV_CONFIG_PATH: path.join(root, "config/slack.env"),
-    }));
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: path.join(root, "control/dispatcher.token"),
+      DONA_RELEASE_MANIFEST_PATH: path.join(root, "runtime/current/release-manifest.json"),
+    }).replace("<string>serve</string>", ""));
     const testBin = path.join(home, "bin");
     await fs.mkdir(testBin);
     for (const name of ["herdr", "codex"]) {
@@ -507,6 +509,11 @@ test("generation target validation rejects a mismatched installed updater before
     await fs.writeFile(dispatcherPlist, originalDispatcher.replace(path.join(root, "job-results"), path.join(home, "other/job-results")));
     await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
     await fs.writeFile(dispatcherPlist, originalDispatcher);
+    const slackPlist = path.join(launchAgents, "dev.dona.slack-adapter.plist");
+    const originalSlack = await fs.readFile(slackPlist, "utf8");
+    await fs.writeFile(slackPlist, originalSlack.replace(path.join(root, "control/dispatcher.token"), path.join(home, "other/dispatcher.token")));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents, "--stage-recovery"], { env: { ...process.env, HOME: home } }));
+    await fs.writeFile(slackPlist, originalSlack);
     await fs.writeFile(path.join(launchAgents, "dev.dona.updater.plist"), plist("dev.dona.updater", path.join(home, "other/updater/dist/cli.js"), {
       DONA_UPDATE_POLICY_PATH: path.join(root, "control/policy.json"), DONA_UPDATER_BUILD_SHA: sha,
     }));
