@@ -34,6 +34,30 @@
 ```sh
 set -euo pipefail
 dona_base="$HOME/Library/Application Support/Dona"
+target_release="$dona_base/runtime/releases/<承認済みのexact SHA>"
+dispatcher_env="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:DOTENV_CONFIG_PATH' \
+  "$HOME/Library/LaunchAgents/dev.dona.dispatcher.plist")"
+test -f "$dispatcher_env"
+resolved_paths="$(node - "$target_release" "$dispatcher_env" <<'JS'
+const fs = require('node:fs');
+const path = require('node:path');
+const {pathToFileURL} = require('node:url');
+const release = process.argv[2];
+const environmentFile = process.argv[3];
+const dotenv = require(path.join(release, 'dispatcher/node_modules/dotenv'));
+const environment = {...dotenv.parse(fs.readFileSync(environmentFile))};
+environment.DONA_RELEASE_MANIFEST_PATH = path.join(release, 'release-manifest.json');
+import(pathToFileURL(path.join(release, 'dispatcher/dist/config.js')).href).then(({loadConfig}) => {
+  const config = loadConfig(environment);
+  process.stdout.write(JSON.stringify({database:config.databasePath,
+    results:config.resultsDir,job_results:config.jobResultsDir}));
+}).catch(error => { process.stderr.write(String(error)); process.exitCode=1; });
+JS
+)"
+dona_database="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).database))')"
+dona_results="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).results))')"
+dona_job_results="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).job_results))')"
+test -f "$dona_database" && test -d "$dona_results" && test -d "$dona_job_results"
 mkdir -p -m 700 "$dona_base/recovery-backups"
 backup_dir="$(mktemp -d "$dona_base/recovery-backups/attempt.XXXXXX")"
 dispatcher_pid="$(launchctl list | awk '$3=="dev.dona.dispatcher" {print $1}')"
@@ -57,7 +81,7 @@ if kill -0 "$dispatcher_pid" 2>/dev/null || kill -0 "$slack_pid" 2>/dev/null; th
   printf '%s\n' '停止前のDona PIDが残っています。DB操作へ進みません。' >&2
   exit 1
 fi
-python3 - "$dona_base/dona.sqlite3" "$backup_dir/dona.sqlite3" <<'PY'
+python3 - "$dona_database" "$backup_dir/dona.sqlite3" <<'PY'
 import os, sqlite3, sys
 descriptor = os.open(sys.argv[2], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
 os.close(descriptor)
@@ -67,13 +91,16 @@ source.backup(target)
 target.close(); source.close()
 os.chmod(sys.argv[2], 0o600)
 check = sqlite3.connect('file:' + sys.argv[2] + '?mode=ro', uri=True)
-assert check.execute('pragma integrity_check').fetchone()[0] == 'ok'
-assert check.execute('pragma foreign_key_check').fetchone() is None
-assert check.execute('pragma user_version').fetchone()[0] == 3
+if check.execute('pragma integrity_check').fetchone()[0] != 'ok':
+    raise RuntimeError('backup_integrity_check_failed')
+if check.execute('pragma foreign_key_check').fetchone() is not None:
+    raise RuntimeError('backup_foreign_key_check_failed')
+if check.execute('pragma user_version').fetchone()[0] != 3:
+    raise RuntimeError('backup_schema_mismatch')
 check.close()
 PY
-ditto "$dona_base/job-results" "$backup_dir/job-results"
-ditto "$dona_base/results" "$backup_dir/results"
+ditto "$dona_job_results" "$backup_dir/job-results"
+ditto "$dona_results" "$backup_dir/results"
 ```
 
 `bootout`が非0やtimeoutでもblind retryしない。`launchctl print`、socket、PIDを照合し、停止が一意に確認できなければDB writeへ進まない。上記の`print`は未登録時に非0となることが期待値である。
@@ -81,10 +108,10 @@ ditto "$dona_base/results" "$backup_dir/results"
 対象releaseのCLIを、`DOTENV_CONFIG_PATH`で既存Dispatcher設定、`DONA_RELEASE_MANIFEST_PATH`で**対象release自身のmanifest**、`DONA_DATABASE_PATH`でproduction DBへ固定して実行する。`DispatcherDatabase`のconstructorはschema/補助tableのmigrationを行うため、`inspect`もwriteとして扱い、停止とbackupより前に実行しない。rollback用backup DBをCLIのdry runに使わない。DBコピーでも保存済みの絶対`result_path`がproductionを指し、routing migrationがResult fileを動かし得る。隔離試験を行うなら、rollback snapshotと異なる作業コピーを用い、全Result pathをコピー内の隔離先へ書き換え、production pathへ到達しないことを確認する。このmaintenance手順はその試験に依存しない。
 
 ```sh
-env DOTENV_CONFIG_PATH="$HOME/Library/Application Support/Dona/config/dispatcher.env" \
-  DONA_DATABASE_PATH="$HOME/Library/Application Support/Dona/dona.sqlite3" \
-  DONA_RELEASE_MANIFEST_PATH="$HOME/Library/Application Support/Dona/runtime/releases/<target-sha>/release-manifest.json" \
-  node "$HOME/Library/Application Support/Dona/runtime/releases/<target-sha>/dispatcher/dist/cli.js" \
+env DOTENV_CONFIG_PATH="$dispatcher_env" \
+  DONA_DATABASE_PATH="$dona_database" \
+  DONA_RELEASE_MANIFEST_PATH="$target_release/release-manifest.json" \
+  node "$target_release/dispatcher/dist/cli.js" \
   job inspect-operator-recovery <job_id>
 ```
 
