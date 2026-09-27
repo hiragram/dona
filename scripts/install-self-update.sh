@@ -146,9 +146,10 @@ restore_control_plane() {
   return 0
 }
 
-if [[ "$MODE" != "--check" && "$MODE" != "--install" && "$MODE" != "--bootstrap" && "$MODE" != "--upgrade-control" ]]; then
-  print -u2 "Usage: $0 --check | --install | --bootstrap | --upgrade-control"
+if [[ "$MODE" != "--check" && "$MODE" != "--install" && "$MODE" != "--bootstrap" && "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]]; then
+  print -u2 "Usage: $0 --check | --install | --bootstrap | --upgrade-control | --stage-recovery"
   print -u2 -- "--checkはtemplateのみ検証し、--installは初期配置、--bootstrapは初回起動、--upgrade-controlは停止確認付きでstable control-planeを更新します。"
+  print -u2 -- "--stage-recoveryはCI検証済みreleaseだけを配置し、service、pointer、DB、Updaterは変更しません。"
   exit 2
 fi
 
@@ -209,7 +210,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
 fi
 
 if [[ "$(uname -s)" != "Darwin" || "$UID" == "0" ]]; then
-  print -u2 -- "--installと--upgrade-controlは非rootのmacOS GUI userだけで実行できます。"
+  print -u2 -- "--install、--upgrade-control、--stage-recoveryは非rootのmacOS GUI userだけで実行できます。"
   exit 1
 fi
 if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-remote \
@@ -247,8 +248,14 @@ if [[ "$MODE" == "--upgrade-control" && ! -d "$CONTROL_ROOT/updater" ]]; then
   exit 1
 fi
 umask 077
-mkdir -p "$CONTROL_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT" "$LAUNCH_AGENTS_DIR"
-chmod 700 "$BASE_DIR" "$CONTROL_ROOT" "$RUNTIME_ROOT" "$RELEASE_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT"
+if [[ "$MODE" == "--stage-recovery" ]]; then
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || { print -u2 "既存release rootを確認できません。"; exit 1; }
+  mkdir -p "$RELEASE_ROOT/.staging"
+  chmod 700 "$RELEASE_ROOT/.staging"
+else
+  mkdir -p "$CONTROL_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT" "$LAUNCH_AGENTS_DIR"
+  chmod 700 "$BASE_DIR" "$CONTROL_ROOT" "$RUNTIME_ROOT" "$RELEASE_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT"
+fi
 STAGING_DIR=$(mktemp -d "$RELEASE_ROOT/.staging/install.XXXXXX")
 $GIT_PATH -C "$REPOSITORY_DIR" archive --format=tar --output="$INSTALL_TMP/release.tar" "$INSTALL_SHA"
 /usr/bin/tar -xf "$INSTALL_TMP/release.tar" -C "$STAGING_DIR"
@@ -279,7 +286,7 @@ NPM_VERSION=$($NPM_PATH --version)
 $NODE_PATH "$SCRIPT_DIR/write-release-manifest.mjs" "$STAGING_DIR" "$INSTALL_SHA" "$NPM_VERSION" "2026-09-03.2"
 FINAL_RELEASE="$RELEASE_ROOT/$INSTALL_SHA"
 if [[ -e "$FINAL_RELEASE" ]]; then
-  if [[ "$MODE" != "--upgrade-control" ]] || \
+  if [[ "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]] || \
     ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-existing-release \
       "$FINAL_RELEASE" "$STAGING_DIR" "$INSTALL_SHA"; then
     print -u2 "release $INSTALL_SHA は既に存在し、今回のmodeでは再利用できません。上書きしません。"
@@ -291,9 +298,13 @@ if [[ -e "$FINAL_RELEASE" ]]; then
 else
   /bin/mv "$STAGING_DIR" "$FINAL_RELEASE"
   STAGING_DIR=
+fi
+find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
+find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
 
-  find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
-  find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
+if [[ "$MODE" == "--stage-recovery" ]]; then
+  print "検証済みimmutable release $INSTALL_SHA を配置しました。service、pointer、DB、Updaterは変更していません。"
+  exit 0
 fi
 
 if [[ "$MODE" == "--upgrade-control" ]]; then

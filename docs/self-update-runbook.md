@@ -38,6 +38,8 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 
 ### 稼働中のbackground worker
 
+旧Dispatcherがoperator回復CLIを持たず、残存`needs_review`が通常更新とcontrol-plane更新の両方を塞ぐ場合は、[停止下bootstrap手順](operations/offline-recovery-bootstrap.md)でexact releaseをstageし、承認済みmaintenance windowに限って復旧する。
+
 現行のrelease間には、Herdr agent identityとjob単位のresult grantを次のDispatcherへ引き継いだことを証明するreceiptがありません。このため、`running`、`blocked`、`needs_review`等のworkerが残る場合は、isolated result pathでも更新を継続しません。stable Updaterはquiesce前とDispatcher drain後にowner-privateなjob DBを再読し、handoff不能または観測不能ならservice停止、schema migration、pointer切替より前に停止します。workerをcancel/closeしたり、promptを再送したりしません。
 
 Dispatcherの`update-safety`と`drain-status`に出るworker件数と`unsafe_states`は集計値だけです。`active_worker_handoff_unavailable`ならworkerのterminal Resultとnotificationを通常のDispatcherで回収・確認してから、新しいexact planで再開します。`worker_state_unverified`や`jobs.handoff_observation_unknown`ではDBの所有者、状態、healthを読み取りで照合し、更新writeを反復しません。稼働workerを跨ぐ更新は、release間のidentity・grant・terminal ownerを検証するhandoff契約とprocess境界テストが完成するまで未対応です。
