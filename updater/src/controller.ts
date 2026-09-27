@@ -572,35 +572,47 @@ export class UpdateController {
           persistedRecovery ? evidence.slack_quiesced as boolean : true);
         return;
       }
-      // Reboot can restart a previously stopped launchd service. Re-observe each
-      // service independently: live services must drain again. A persisted stop
-      // intent is reconciled with health and launchd registration below, including
-      // when the command was accepted but observation was interrupted.
+      // Re-observe each service after a restart. A service that reappeared after
+      // a persisted stop cannot reuse that operation to authorize another stop.
+      // Restore the current runtime and stop this update instead.
       const slackHealth = await this.runtime.slackHealth();
       this.assertLease(row);
       if (slackHealth.live) {
         if (slackHealth.build_sha !== row.current_sha) {
-          this.needsReview(row, "slack_adapter_wrong_sha_during_quiesce");
+          await this.restoreQuiescedServices(row, "slack_adapter_wrong_sha_during_quiesce", true, false);
           return;
         }
-        const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha).catch(async (error: unknown) => {
+        if (persistedSlackStop) {
+          await this.restoreQuiescedServices(row, "slack_adapter_reappeared_after_stop");
+          return;
+        }
+        const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha).catch(async () => {
           this.assertLease(row);
-          if (!persistedSlackStop || (await this.runtime.slackHealth()).live || await this.runtime.slackRegistered()) {
-            throw error;
-          }
+          await this.restoreQuiescedServices(row, "slack_adapter_quiesce_unverified", false, true);
           return undefined;
         });
         this.assertLease(row);
-        if (slackDrain && (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0)) {
+        if (!slackDrain) return;
+        if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
           await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false, slackDrain.quiescing);
           return;
         }
       } else if (!persistedSlackStop) {
         throw new Error("slack_adapter_current_state_unverified");
-      } else if (!(await this.ensureServiceStopped(
-        row, "stop_slack", "slack_adapter", row.current_sha, () => this.runtime.stopSlack(),
-      ))) {
-        return;
+      } else {
+        let registered: boolean;
+        try { registered = await this.runtime.slackRegistered(); }
+        catch {
+          this.assertLease(row);
+          await this.restoreQuiescedServices(row, "stop_slack_registration_unverified", true, false);
+          return;
+        }
+        this.assertLease(row);
+        if (persistedSlackStop.target_ref !== "slack_adapter" || persistedSlackStop.expected_sha !== row.current_sha ||
+          persistedSlackStop.phase === "rejected" || registered) {
+          await this.restoreQuiescedServices(row, "stop_slack_current_state_unverified", true, !registered);
+          return;
+        }
       }
       const dispatcherHealth = await this.runtime.dispatcherHealth();
       this.assertLease(row);
@@ -609,25 +621,38 @@ export class UpdateController {
           await this.restoreQuiescedServices(row, "dispatcher_wrong_sha_during_quiesce", false, true);
           return;
         }
-        const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha).catch(async (error: unknown) => {
+        if (persistedDispatcherStop) {
+          await this.restoreQuiescedServices(row, "dispatcher_reappeared_after_stop");
+          return;
+        }
+        const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha).catch(async () => {
           this.assertLease(row);
-          if (!persistedDispatcherStop || (await this.runtime.dispatcherHealth()).live ||
-            await this.runtime.dispatcherRegistered()) {
-            throw error;
-          }
+          await this.restoreQuiescedServices(row, "dispatcher_quiesce_unverified");
           return undefined;
         });
         this.assertLease(row);
-        if (dispatcherDrain && (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length)) {
+        if (!dispatcherDrain) return;
+        if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
           await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete", dispatcherDrain.quiescing);
           return;
         }
       } else if (!persistedDispatcherStop) {
         throw new Error("dispatcher_current_state_unverified");
-      } else if (!(await this.ensureServiceStopped(
-        row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
-      ))) {
-        return;
+      } else {
+        let registered: boolean;
+        try { registered = await this.runtime.dispatcherRegistered(); }
+        catch {
+          this.assertLease(row);
+          await this.restoreQuiescedServices(row, "stop_dispatcher_registration_unverified", false, true);
+          return;
+        }
+        this.assertLease(row);
+        if (persistedDispatcherStop.target_ref !== "dispatcher" ||
+          persistedDispatcherStop.expected_sha !== row.current_sha ||
+          persistedDispatcherStop.phase === "rejected" || registered) {
+          await this.restoreQuiescedServices(row, "stop_dispatcher_current_state_unverified", !registered, true);
+          return;
+        }
       }
       if (!persistedStop) {
         const drainedMainAgent = await this.runtime.waitForMainAgentIdle();
