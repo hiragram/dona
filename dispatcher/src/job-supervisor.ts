@@ -128,50 +128,49 @@ export class JobSupervisor {
   private terminalCleanupCursor = "";
   private terminalCleanupOperation:Promise<void>|undefined;
 
-  private async reconcileTerminalCleanup(job:JobRow,outcome:"pending"|"attempting",claimedIdentity:string|null):Promise<void> {
-    const identity=this.database.getJobLiveSessionIdentity(job.job_id);
-    const expected=expectedLiveSessionIdentity(job,identity);
+  private async reconcileTerminalCleanup(job:JobRow,outcome:"pending"|"attempting",claimedAgentName:string|null):Promise<void> {
+    // Herdrへの制御は不変のjob名で宛先を指定する。sessionとpaneは送信条件にしない。
+    const agentName=job.job_id;
     if(outcome==="pending") {
-      if(!expected||!job.herdr_pane_id||!this.runtime.listAgents) {
+      if(job.agent_name!==agentName||!this.runtime.listAgents) {
         this.database.finishTerminalWorkerCleanup(job.job_id,"pending","rejected");
         return;
       }
-      const byName=await this.runtime.get(job.agent_name,this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
+      const byName=await this.runtime.get(agentName,this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
       if(!byName.ok) {
         const absent=!byName.timedOut&&!byName.aborted&&
           ["agent_not_found","agent_not_running"].includes(byName.errorCode??"");
         if(!absent) return;
         const listed=absent?await this.runtime.listAgents(this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs)):undefined;
-        if(listed&&terminalAgentAbsentFromList(listed,job.agent_name))
+        if(listed&&terminalAgentAbsentFromList(listed,agentName))
           this.database.finishTerminalWorkerCleanup(job.job_id,"pending","stopped");
         return;
       }
-      if(byName.agentIdentity!==expected||
-        expectedLiveSessionIdentity(this.database.getJob(job.job_id)!,this.database.getJobLiveSessionIdentity(job.job_id))!==expected) {
+      if(this.database.getJob(job.job_id)?.agent_name!==agentName) {
         this.database.finishTerminalWorkerCleanup(job.job_id,"pending","rejected");
         return;
       }
       if(!["idle","done"].includes(byName.agentStatus??"")) return;
-      if(!this.database.claimTerminalWorkerCleanup(job.job_id,expected)) return;
+      if(!this.database.claimTerminalWorkerCleanup(job.job_id,agentName)) return;
       // The durable claim precedes the only control write. A crash or timeout never causes a resend.
       try {
-        await this.runtime.cancel(job.agent_name,this.abortController.signal);
+        await this.runtime.cancel(agentName,this.abortController.signal);
       } catch { /* An ambiguous send is reconciled by read only. */ }
-    } else if(!claimedIdentity||claimedIdentity!==expected) {
+    } else if(!claimedAgentName||job.agent_name!==agentName) {
       this.database.finishTerminalWorkerCleanup(job.job_id,"attempting","unknown");
       return;
     }
     const deadline=Date.now()+Math.min(2_000,this.config.jobCommandTimeoutMs);
     do {
-      const observed=await this.runtime.get(job.agent_name,this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
+      const observed=await this.runtime.get(agentName,this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
       if(!observed.ok&&!observed.timedOut&&!observed.aborted&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {
         const listed=await this.runtime.listAgents?.(this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
-        if(listed&&terminalAgentAbsentFromList(listed,job.agent_name)) {
+        if(listed&&terminalAgentAbsentFromList(listed,agentName)) {
           this.database.finishTerminalWorkerCleanup(job.job_id,"attempting","stopped");
           return;
         }
       }
-      if(!observed.ok||observed.agentIdentity!==expected||this.stopping) break;
+      if(!observed.ok||this.stopping) break;
       await abortableDelay(100,this.abortController.signal);
     } while(Date.now()<deadline);
     this.database.finishTerminalWorkerCleanup(job.job_id,"attempting","unknown");

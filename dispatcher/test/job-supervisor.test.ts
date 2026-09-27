@@ -1879,7 +1879,7 @@ describe("JobSupervisor", () => {
     await supervisor.stop(); raw.close(); database.close();
   });
 
-  test("terminal cleanup rejects missing identity and agent reuse without sending", async () => {
+  test("terminal cleanup sends by job name without a saved session or matching pane identity", async () => {
     for(const caseName of ["missing","reused"]) {
       const {root,config}=await tempConfig(); roots.push(root);
       const database=new DispatcherDatabase(config.databasePath);
@@ -1890,13 +1890,13 @@ describe("JobSupervisor", () => {
       database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
       let sends=0;
       const supervisor=new JobSupervisor(database,fakeRuntime({
-        async get(){return {...ok("done"),agentIdentity:JSON.stringify(["w1","w1:p1",job.agent_name,"replacement"])};},
-        async cancel(){sends++;return ok("done");},
+        async get(){return sends?failed("agent_not_found"):{...ok("done"),agentIdentity:JSON.stringify(["other","other:pane",job.agent_name,"replacement"])};},
+        async cancel(name){assert.equal(name,job.job_id);sends++;return ok("done");},
         async listAgents(){return {...ok("done"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
       }),{...config,queuePollMs:5},logger,()=>undefined);
       supervisor.start(); const raw=new Database(config.databasePath);
-      await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="rejected");
-      assert.equal(sends,0);await supervisor.stop();raw.close();database.close();
+      await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
+      assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
     }
   });
   test("terminal cleanup reconciles an interrupted claim without resending", async () => {
@@ -1906,7 +1906,7 @@ describe("JobSupervisor", () => {
     database.beginJobPreparation(job.job_id);database.setJobRuntime(job.job_id,"w1","w1:p1","session-1");
     database.beginJobDispatch(job.job_id);database.markJobRunning(job.job_id);
     database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},job.result_path);
-    assert.equal(database.claimTerminalWorkerCleanup(job.job_id,JSON.stringify(["w1","w1:p1",job.agent_name,"session-1"])),true);
+    assert.equal(database.claimTerminalWorkerCleanup(job.job_id,job.agent_name),true);
     database.close();
     const reopened=new DispatcherDatabase(config.databasePath);
     let sends=0;
@@ -2017,6 +2017,7 @@ describe("JobSupervisor", () => {
     assert.equal(database.claimTerminalWorkerCleanup(job.job_id,"identity"),false);
     raw.prepare("UPDATE jobs SET steer_state=NULL WHERE job_id=?").run(job.job_id);
     assert.equal(database.listTerminalWorkerCleanupCandidates().length,1);
+    assert.equal(database.claimTerminalWorkerCleanup(job.job_id,"different-agent"),false);
     raw.close();database.close();
   });
   test("discovers cleanup candidates from progress directories instead of cancelled history", async () => {
