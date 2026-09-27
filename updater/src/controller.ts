@@ -597,12 +597,16 @@ export class UpdateController {
         }
       } else if (!persistedSlackStop) {
         throw new Error("slack_adapter_current_state_unverified");
+      } else if (!(await this.ensureServiceStopped(
+        row, "stop_slack", "slack_adapter", row.current_sha, () => this.runtime.stopSlack(),
+      ))) {
+        return;
       }
       const dispatcherHealth = await this.runtime.dispatcherHealth();
       this.assertLease(row);
       if (dispatcherHealth.live) {
         if (dispatcherHealth.build_sha !== row.current_sha) {
-          this.needsReview(row, "dispatcher_wrong_sha_during_quiesce");
+          await this.restoreQuiescedServices(row, "dispatcher_wrong_sha_during_quiesce", false, true);
           return;
         }
         const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha).catch(async (error: unknown) => {
@@ -620,6 +624,10 @@ export class UpdateController {
         }
       } else if (!persistedDispatcherStop) {
         throw new Error("dispatcher_current_state_unverified");
+      } else if (!(await this.ensureServiceStopped(
+        row, "stop_dispatcher", "dispatcher", row.current_sha, () => this.runtime.stopDispatcher(),
+      ))) {
+        return;
       }
       if (!persistedStop) {
         const drainedMainAgent = await this.runtime.waitForMainAgentIdle();
