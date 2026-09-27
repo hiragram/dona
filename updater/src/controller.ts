@@ -547,6 +547,7 @@ export class UpdateController {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
       const persistedSlackStop = this.database.runtimeOperation(row.request_id, "stop_slack");
       const persistedDispatcherStop = this.database.runtimeOperation(row.request_id, "stop_dispatcher");
+      const dispatcherPreviouslyQuiesced = Boolean(persistedDispatcherStop || persistedStop);
       const persistedRecovery = this.database.runtimeOperation(row.request_id, "restart_current_dispatcher") ??
         this.database.runtimeOperation(row.request_id, "restart_current_slack") ??
         this.database.runtimeOperation(row.request_id, "start_previous_main_agent");
@@ -579,20 +580,23 @@ export class UpdateController {
       this.assertLease(row);
       if (slackHealth.live) {
         if (slackHealth.build_sha !== row.current_sha) {
-          await this.restoreQuiescedServices(row, "slack_adapter_wrong_sha_during_quiesce", true, false);
+          await this.restoreQuiescedServices(row, "slack_adapter_wrong_sha_during_quiesce",
+            dispatcherPreviouslyQuiesced, false);
           return;
         }
         if (persistedSlackStop) {
-          await this.restoreQuiescedServices(row, "slack_adapter_reappeared_after_stop");
+          await this.restoreQuiescedServices(row, "slack_adapter_reappeared_after_stop",
+            dispatcherPreviouslyQuiesced, true);
           return;
         }
-        const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha).catch(async () => {
+        let slackDrain: Awaited<ReturnType<RuntimePort["quiesceSlack"]>>;
+        try { slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha); }
+        catch {
           this.assertLease(row);
           await this.restoreQuiescedServices(row, "slack_adapter_quiesce_unverified", false, true);
-          return undefined;
-        });
+          return;
+        }
         this.assertLease(row);
-        if (!slackDrain) return;
         if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
           await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false, slackDrain.quiescing);
           return;
@@ -604,13 +608,15 @@ export class UpdateController {
         try { registered = await this.runtime.slackRegistered(); }
         catch {
           this.assertLease(row);
-          await this.restoreQuiescedServices(row, "stop_slack_registration_unverified", true, false);
+          await this.restoreQuiescedServices(row, "stop_slack_registration_unverified",
+            dispatcherPreviouslyQuiesced, false);
           return;
         }
         this.assertLease(row);
         if (persistedSlackStop.target_ref !== "slack_adapter" || persistedSlackStop.expected_sha !== row.current_sha ||
           persistedSlackStop.phase === "rejected" || registered) {
-          await this.restoreQuiescedServices(row, "stop_slack_current_state_unverified", true, !registered);
+          await this.restoreQuiescedServices(row, "stop_slack_current_state_unverified",
+            dispatcherPreviouslyQuiesced, !registered);
           return;
         }
       }
@@ -625,13 +631,14 @@ export class UpdateController {
           await this.restoreQuiescedServices(row, "dispatcher_reappeared_after_stop");
           return;
         }
-        const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha).catch(async () => {
+        let dispatcherDrain: Awaited<ReturnType<RuntimePort["quiesceDispatcher"]>>;
+        try { dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha); }
+        catch {
           this.assertLease(row);
           await this.restoreQuiescedServices(row, "dispatcher_quiesce_unverified");
-          return undefined;
-        });
+          return;
+        }
         this.assertLease(row);
-        if (!dispatcherDrain) return;
         if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
           await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete", dispatcherDrain.quiescing);
           return;

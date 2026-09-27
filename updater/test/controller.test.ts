@@ -981,9 +981,36 @@ describe("UpdateController isolated end-to-end", () => {
       assert.equal((await f.store.observe()).current_sha, currentSha);
       assert.equal(f.runtime.calls.includes(service === "dispatcher" ? "quiesceDispatcher" : "quiesceSlack"), false);
       if (service === "dispatcher") assert.equal(f.runtime.calls.includes("startSlack"), true);
+      else assert.equal(f.runtime.calls.includes("startDispatcher"), false);
       f.database.close();
     });
   }
+  test("keeps bounded main-agent reconciliation after a Slack quiesce exception", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-quiesce-error" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.simulateSlackRestarted();
+    f.runtime.simulateDispatcherRestarted();
+    f.runtime.mainStartUnknownOnce = true;
+    f.runtime.quiesceSlack = async () => { throw new Error("quiesce_socket_lost"); };
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "quiescing");
+    assert.equal(f.database.get(row.request_id)?.last_error_code,
+      "rollback_main_agent_start_acceptance_unknown");
+    assert.equal(f.runtime.calls.includes("startDispatcher"), false);
+    f.database.close();
+  });
   test("does not stop the main agent when a persisted Slack stop is still registered", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
