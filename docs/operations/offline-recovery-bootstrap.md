@@ -27,7 +27,7 @@
 
 操作前にSlack ingressを止め、次にDispatcherを止める。両者のlabel、socket、PID停止を再読してから、Updaterの全requestがterminalであることを再確認し、stable Updaterも止める。Updater停止の応答だけを証明にせず、label、socket、PIDを再読する。これでbackup・回復CLI・手動pointer操作中にUpdater activationが並走しない。Codex/Herdr worker停止は別のoperator判断であり、この観測から推論しない。
 
-停止後にowner-only directoryへSQLite Online Backup APIで`dona.sqlite3`を保存する。WAL中のDB本体だけを`cp`しない。`job-results`とlegacy `results`、current/previous pointerの実体、両LaunchAgent plist、現行release manifest、control-plane receiptを同じ世代のbackup inventoryへ記録する。backupは0600、directoryは0700とし、DBの`integrity_check=ok`、`foreign_key_check`が空、`user_version=3`、主要table件数を照合する。backup pathとdigestを記録してから先へ進む。backup/Resultを公開場所へ置かない。
+停止後にowner-only directoryへSQLite Online Backup APIでDispatcher DBとUpdater DBを保存する。WAL中のDB本体だけを`cp`しない。`job-results`とlegacy `results`、current/previous pointerの実体、3つのLaunchAgent plist、現行release manifest、control-plane receiptを同じ世代のbackup inventoryへ記録する。backupは0600、directoryは0700とし、DBの`integrity_check=ok`、`foreign_key_check`が空、Dispatcher `user_version=3`、Updater `user_version=7`、主要table件数を照合する。backup pathとdigestを記録してから先へ進む。backup/Resultを公開場所へ置かない。
 
 次はoperatorが固定した値を代入し、同じmaintenance shellで続けて実行するコマンドの形である。`backup_dir`は毎回新規のowner-only directoryとし、既存backupを上書きしない。
 
@@ -92,7 +92,8 @@ dona_dispatcher_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";proc
 dona_slack_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).slack_socket))')"
 test -f "$dona_database" && test -d "$dona_results" && test -d "$dona_job_results"
 updater_socket="$dona_base/update-control/updater.sock"
-old_updater_health="$(curl --fail --silent --show-error --unix-socket "$updater_socket" http://localhost/health/version)"
+old_updater_health="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
+  --unix-socket "$updater_socket" http://localhost/health/version)"
 old_updater_sha="$(printf '%s' "$old_updater_health" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.service!=="updater"||v.status!=="ready"||!(/^[0-9a-f]{40}$/.test(v.build_sha)))process.exitCode=1;else process.stdout.write(v.build_sha)})')"
 mkdir -p -m 700 "$dona_base/recovery-backups"
 backup_dir="$(mktemp -d "$dona_base/recovery-backups/attempt.XXXXXX")"
@@ -173,6 +174,71 @@ for source_path, target_path, expected_schema in ((sys.argv[1],sys.argv[2],3),(s
 PY
 ditto "$dona_job_results" "$backup_dir/job-results"
 ditto "$dona_results" "$backup_dir/results"
+python3 - "$dona_base" "$backup_dir" "$dona_database" "$dona_results" "$dona_job_results" <<'PY'
+import datetime, hashlib, json, os, re, shutil, sqlite3, stat, sys
+base, root, database, results, job_results = sys.argv[1:]
+runtime = os.path.join(base, 'runtime')
+pointers = {}
+for name in ('current', 'previous'):
+    target = os.readlink(os.path.join(runtime, name))
+    if not re.fullmatch(r'releases/[0-9a-f]{40}', target):
+        raise RuntimeError('runtime_pointer_invalid')
+    pointers[name] = target
+sources = {
+    'dispatcher.plist': os.path.join(os.path.expanduser('~'), 'Library/LaunchAgents/dev.dona.dispatcher.plist'),
+    'slack-adapter.plist': os.path.join(os.path.expanduser('~'), 'Library/LaunchAgents/dev.dona.slack-adapter.plist'),
+    'updater.plist': os.path.join(os.path.expanduser('~'), 'Library/LaunchAgents/dev.dona.updater.plist'),
+    'release-manifest.json': os.path.join(runtime, 'current/release-manifest.json'),
+    'control-plane-receipt.json': os.path.join(base, 'update-control/control-plane-receipt.json'),
+    'policy.json': os.path.join(base, 'update-control/policy.json'),
+    'dispatcher.env': os.path.join(base, 'config/dispatcher.env'),
+    'slack.env': os.path.join(base, 'config/slack.env'),
+}
+for name, source in sources.items():
+    if not stat.S_ISREG(os.stat(source).st_mode) or os.path.islink(source):
+        raise RuntimeError('backup_source_not_regular:' + name)
+    destination = os.path.join(root, name)
+    with open(source, 'rb') as read, open(destination, 'xb') as write:
+        shutil.copyfileobj(read, write)
+        write.flush(); os.fsync(write.fileno())
+    os.chmod(destination, 0o600)
+counts = {}
+for name, tables in (('dona.sqlite3', ('jobs','events','job_groups')),
+                     ('updater.sqlite3', ('update_requests','update_outbox'))):
+    db = sqlite3.connect('file:' + os.path.join(root, name) + '?mode=ro', uri=True)
+    counts[name] = {table: db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] for table in tables}
+    db.close()
+    source_path = database if name == 'dona.sqlite3' else os.path.join(base, 'update-control/updater.sqlite3')
+    source_db = sqlite3.connect('file:' + source_path + '?mode=ro', uri=True)
+    source_counts = {table: source_db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] for table in tables}
+    source_db.close()
+    if source_counts != counts[name]: raise RuntimeError('backup_table_count_mismatch')
+digests = {}
+for directory, directories, files in os.walk(root, followlinks=False):
+    for entry in directories + files:
+        candidate = os.path.join(directory, entry)
+        if os.path.islink(candidate): raise RuntimeError('backup_symlink_present')
+    for name in files:
+        candidate = os.path.join(directory, name)
+        if not stat.S_ISREG(os.stat(candidate).st_mode): raise RuntimeError('backup_file_not_regular')
+        digest = hashlib.sha256()
+        with open(candidate, 'rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        digests[os.path.relpath(candidate, root)] = digest.hexdigest()
+inventory = {'schema_version':1, 'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             'source_paths':{'database':database,'results':results,'job_results':job_results},
+             'pointers':pointers,'table_counts':counts,'sha256':digests}
+temporary = os.path.join(root, 'inventory.json.tmp')
+with open(temporary, 'x', encoding='utf-8') as stream:
+    os.chmod(temporary, 0o600)
+    json.dump(inventory, stream, sort_keys=True)
+    stream.flush(); os.fsync(stream.fileno())
+os.replace(temporary, os.path.join(root, 'inventory.json'))
+descriptor = os.open(root, os.O_RDONLY)
+os.fsync(descriptor); os.close(descriptor)
+print('backup inventory recorded:', len(digests), 'files')
+PY
 ```
 
 `bootout`が非0やtimeoutでもblind retryしない。`launchctl print`、socket、PIDを照合し、停止が一意に確認できなければDB writeへ進まない。上記の`print`は未登録時に非0となることが期待値である。
@@ -256,13 +322,17 @@ if [ "$updater_bootstrap_exit" -ne 0 ]; then
   printf 'Updater bootstrap非0をexact SHA healthで照合済み: %s\n' "$updater_bootstrap_exit" >&2
 fi
 recovery_dispatcher_attempted=1
-launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.dispatcher.plist"
+dispatcher_bootstrap_exit=0
+launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.dispatcher.plist" || dispatcher_bootstrap_exit=$?
 if ! node scripts/self-update-install-preflight.mjs wait-dispatcher-sha \
   "$dona_dispatcher_socket" "$target_sha" 30000; then
   printf '%s\n' 'Dispatcherのexact SHA healthを確認できません。Slack ingressは停止したままにします。' >&2
   exit 1
 fi
-if ! safety_json="$(curl --fail --silent --show-error --unix-socket \
+if [ "$dispatcher_bootstrap_exit" -ne 0 ]; then
+  printf 'Dispatcher bootstrap非0をexact SHA healthで照合済み: %s\n' "$dispatcher_bootstrap_exit" >&2
+fi
+if ! safety_json="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 --unix-socket \
   "$dona_dispatcher_socket" \
   http://localhost/v1/admin/update-safety)"; then
   printf '%s\n' 'Dispatcherの安全状態を取得できません。Slack ingressは停止したままにします。' >&2
@@ -281,10 +351,12 @@ process.stdin.on("end", () => {
   exit 1
 fi
 recovery_slack_attempted=1
-launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.slack-adapter.plist"
+slack_bootstrap_exit=0
+launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.slack-adapter.plist" || slack_bootstrap_exit=$?
 slack_ready=0
-for attempt in {1..60}; do
-  if slack_health="$(curl --fail --silent --show-error --unix-socket "$dona_slack_socket" \
+slack_deadline=$((SECONDS+30))
+while (( SECONDS < slack_deadline )); do
+  if slack_health="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 --unix-socket "$dona_slack_socket" \
     http://localhost/health/version 2>/dev/null)" &&
      printf '%s' "$slack_health" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.service!=="slack_adapter"||v.status!=="ready"||v.build_sha!==process.argv[1])process.exitCode=1})' "$target_sha"; then
     slack_ready=1
@@ -293,6 +365,11 @@ for attempt in {1..60}; do
   sleep 0.5
 done
 test "$slack_ready" -eq 1
+if [ "$slack_bootstrap_exit" -ne 0 ]; then
+  printf 'Slack bootstrap非0をexact SHA healthで照合済み: %s\n' "$slack_bootstrap_exit" >&2
+fi
+node scripts/self-update-install-preflight.mjs wait-updater-sha "$updater_socket" "$old_updater_sha" 2000
+node scripts/self-update-install-preflight.mjs wait-dispatcher-sha "$dona_dispatcher_socket" "$target_sha" 2000
 recovery_bootstrap_complete=1
 trap - EXIT
 ```
