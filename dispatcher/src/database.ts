@@ -1255,11 +1255,12 @@ export class DispatcherDatabase {
       });
   }
 
-  claimTerminalWorkerCleanup(jobId:string,identityJson:string):boolean {
+  claimTerminalWorkerCleanup(jobId:string,agentName:string):boolean {
     return this.db.prepare(`UPDATE job_terminal_worker_cleanups SET outcome='attempting',identity_json=?,updated_at=?
       WHERE job_id=? AND outcome='pending' AND EXISTS(SELECT 1 FROM jobs WHERE job_id=?
+        AND agent_name=job_id AND agent_name=?
         AND status IN ('completed','failed') AND result_json IS NOT NULL
-        AND COALESCE(steer_state,'') <> 'dispatching')`).run(identityJson,nowUtc(),jobId,jobId).changes===1;
+        AND COALESCE(steer_state,'') <> 'dispatching')`).run(agentName,nowUtc(),jobId,jobId,agentName).changes===1;
   }
 
   finishTerminalWorkerCleanup(jobId:string,expected:"pending"|"attempting",outcome:"stopped"|"unknown"|"rejected"):void {
