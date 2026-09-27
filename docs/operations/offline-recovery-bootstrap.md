@@ -18,8 +18,12 @@
 非rootのmacOS GUI userで、cleanなcanonical `main` checkoutから実行する。`--stage-recovery`は既存installerと同じexact `origin/main`、GitHub Actionsの3 check、`npm ci`/test/typecheck/build、manifest、既存releaseとの内容比較を使い、immutable releaseを配置して終了する。Updater、pointer、service、DB、Resultは変更しない。
 
 ```sh
-dona_base="$HOME/.dona/g/<事前確認した世代ID>"
-./scripts/install-self-update.sh --stage-recovery "$dona_base"
+dona_base="$HOME/.dona/g/<事前確認した世代ID>" # 既定installなら "$HOME/Library/Application Support/Dona"
+if [[ "$dona_base" == "$HOME/Library/Application Support/Dona" ]]; then
+  ./scripts/install-self-update.sh --stage-recovery
+else
+  ./scripts/install-self-update.sh --stage-recovery "$dona_base"
+fi
 ```
 
 実行直後に`runtime/releases/<target-sha>/release-manifest.json`のSHAと互換性、`dispatcher/dist/cli.js`、`sources/slack/dist/index.js`を再読する。stageだけではbootstrap成功としない。
@@ -34,8 +38,17 @@ dona_base="$HOME/.dona/g/<事前確認した世代ID>"
 
 ```sh
 set -euo pipefail
-dona_base="$HOME/.dona/g/<事前確認した世代ID>"
+dona_base="$HOME/.dona/g/<事前確認した世代ID>" # 既定installなら "$HOME/Library/Application Support/Dona"
 test -d "$dona_base" && test ! -L "$dona_base"
+if [[ "$dona_base" == "$HOME/Library/Application Support/Dona" ]]; then
+  control_root="$dona_base/update-control"
+  expected_dispatcher_socket="$dona_base/run/dispatcher.sock"
+  expected_slack_socket="$dona_base/run/slack-adapter.sock"
+else
+  control_root="$dona_base/control"
+  expected_dispatcher_socket="$dona_base/run/d.sock"
+  expected_slack_socket="$dona_base/run/s.sock"
+fi
 command -v python3 >/dev/null
 python3 -c 'import sqlite3'
 command -v ditto >/dev/null
@@ -46,7 +59,7 @@ dispatcher_env="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:DOTENV
 slack_env="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:DOTENV_CONFIG_PATH' \
   "$HOME/Library/LaunchAgents/dev.dona.slack-adapter.plist")"
 test -f "$dispatcher_env" && test -f "$slack_env"
-resolved_paths="$(node - "$target_release" "$dispatcher_env" "$slack_env" <<'JS'
+resolved_paths="$(node - "$target_release" "$dispatcher_env" "$slack_env" "$dona_base" <<'JS'
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -54,6 +67,8 @@ const {pathToFileURL} = require('node:url');
 const release = process.argv[2];
 const environmentFile = process.argv[3];
 const slackEnvironmentFile = process.argv[4];
+const base = process.argv[5];
+const generation = base !== path.join(os.homedir(), "Library/Application Support/Dona");
 const dotenv = require(path.join(release, 'dispatcher/node_modules/dotenv'));
 const environment = {...dotenv.parse(fs.readFileSync(environmentFile))};
 const slackEnvironment = {...dotenv.parse(fs.readFileSync(slackEnvironmentFile))};
@@ -77,10 +92,10 @@ environment.DONA_RELEASE_MANIFEST_PATH = path.join(release, 'release-manifest.js
 import(pathToFileURL(path.join(release, 'dispatcher/dist/config.js')).href).then(({loadConfig}) => {
   const config = loadConfig(environment);
   const slackDispatcherSocket=expand(slackEnvironment.DONA_SOCKET_PATH) ??
-    path.join(path.dirname(path.dirname(path.dirname(release))),'run/d.sock');
+    path.join(base,'run',generation ? 'd.sock' : 'dispatcher.sock');
   if(slackDispatcherSocket!==config.socketPath) throw new Error('dispatcher_socket_config_mismatch');
   const slackSocket=expand(slackEnvironment.SLACK_HEALTH_SOCKET_PATH) ??
-    path.join(path.dirname(path.dirname(path.dirname(release))),'run/s.sock');
+    path.join(base,'run',generation ? 's.sock' : 'slack-adapter.sock');
   if(slackSocket!==config.slackAdapterSocketPath) throw new Error('slack_socket_config_mismatch');
   process.stdout.write(JSON.stringify({database:config.databasePath,
     results:config.resultsDir,job_results:config.jobResultsDir,
@@ -99,7 +114,7 @@ dona_dispatcher_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";proc
 dona_slack_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).slack_socket))')"
 test -f "$dona_database" && test -f "$dona_update_notifications" &&
   test -f "$dona_job_progress" && test -d "$dona_results" && test -d "$dona_job_results"
-updater_socket="$dona_base/control/updater.sock"
+updater_socket="$control_root/updater.sock"
 old_updater_health="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
   --unix-socket "$updater_socket" http://localhost/health/version)"
 old_updater_sha="$(printf '%s' "$old_updater_health" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.service!=="updater"||v.status!=="ready"||!(/^[0-9a-f]{40}$/.test(v.build_sha)))process.exitCode=1;else process.stdout.write(v.build_sha)})')"
@@ -132,7 +147,7 @@ if kill -0 "$dispatcher_pid" 2>/dev/null || kill -0 "$slack_pid" 2>/dev/null; th
   printf '%s\n' '停止前のDona PIDが残っています。DB操作へ進みません。' >&2
   exit 1
 fi
-updater_status="$(node "$dona_base/control/updater/dist/cli.js" status)"
+updater_status="$(node "$control_root/updater/dist/cli.js" status)"
 if ! printf '%s' "$updater_status" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.nonterminal_count!==0||!Array.isArray(v.updates)||v.updates.some(x=>!["succeeded","failed","rolled_back","needs_review","cancelled"].includes(x.state)))process.exitCode=1})'; then
   printf '%s\n' 'Updaterに非terminal requestが残っています。DB操作へ進みません。' >&2
   exit 1
@@ -152,7 +167,7 @@ fi
 if [ "$updater_bootout_exit" -ne 0 ]; then
   printf 'Updater bootout非0を停止状態で照合済み: %s\n' "$updater_bootout_exit" >&2
 fi
-python3 - "$dona_base/control/updater.sqlite3" <<'PY'
+python3 - "$control_root/updater.sqlite3" <<'PY'
 import sqlite3, sys
 db = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
 count = db.execute("SELECT COUNT(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled')").fetchone()[0]
@@ -161,7 +176,7 @@ if count != 0:
     raise RuntimeError('updater_nonterminal_request_after_stop')
 PY
 python3 - "$dona_database" "$backup_dir/dona.sqlite3" \
-  "$dona_base/control/updater.sqlite3" "$backup_dir/updater.sqlite3" \
+  "$control_root/updater.sqlite3" "$backup_dir/updater.sqlite3" \
   "$dona_update_notifications" "$backup_dir/update-notifications.sqlite3" \
   "$dona_job_progress" "$backup_dir/job-progress.sqlite3" <<'PY'
 import os, sqlite3, sys
@@ -185,10 +200,10 @@ for source_path, target_path, expected_schema in ((sys.argv[1],sys.argv[2],3),(s
 PY
 ditto "$dona_job_results" "$backup_dir/job-results"
 ditto "$dona_results" "$backup_dir/results"
-python3 - "$dona_base" "$backup_dir" "$dona_database" "$dona_results" "$dona_job_results" \
+python3 - "$dona_base" "$control_root" "$backup_dir" "$dona_database" "$dona_results" "$dona_job_results" \
   "$dispatcher_env" "$slack_env" "$dona_update_notifications" "$dona_job_progress" <<'PY'
 import datetime, hashlib, json, os, re, shutil, sqlite3, stat, sys
-base, root, database, results, job_results, dispatcher_env, slack_env, update_notifications, job_progress = sys.argv[1:]
+base, control, root, database, results, job_results, dispatcher_env, slack_env, update_notifications, job_progress = sys.argv[1:]
 runtime = os.path.join(base, 'runtime')
 pointers = {}
 for name in ('current', 'previous'):
@@ -201,8 +216,8 @@ sources = {
     'slack-adapter.plist': os.path.join(os.path.expanduser('~'), 'Library/LaunchAgents/dev.dona.slack-adapter.plist'),
     'updater.plist': os.path.join(os.path.expanduser('~'), 'Library/LaunchAgents/dev.dona.updater.plist'),
     'release-manifest.json': os.path.join(runtime, 'current/release-manifest.json'),
-    'control-plane-receipt.json': os.path.join(base, 'update-control/control-plane-receipt.json'),
-    'policy.json': os.path.join(base, 'update-control/policy.json'),
+    'control-plane-receipt.json': os.path.join(control, 'control-plane-receipt.json'),
+    'policy.json': os.path.join(control, 'policy.json'),
     'dispatcher.env': dispatcher_env,
     'slack.env': slack_env,
 }
@@ -216,7 +231,7 @@ for name, source in sources.items():
     os.chmod(destination, 0o600)
 counts = {}
 for name, tables, source_path in (('dona.sqlite3', ('jobs','events','job_groups'), database),
-                                  ('updater.sqlite3', ('update_requests','update_outbox'), os.path.join(base, 'update-control/updater.sqlite3')),
+                                  ('updater.sqlite3', ('update_requests','update_outbox'), os.path.join(control, 'updater.sqlite3')),
                                   ('update-notifications.sqlite3', ('update_notifications',), update_notifications),
                                   ('job-progress.sqlite3', ('job_progress','job_progress_throttles'), job_progress)):
     db = sqlite3.connect('file:' + os.path.join(root, name) + '?mode=ro', uri=True)
@@ -396,12 +411,16 @@ trap - EXIT
 対象releaseでDispatcherが起動し、危険状態が空になった後だけ、terminalでない更新planがないことを再確認して`--upgrade-control`を使う。世代別rootではsocketと両env fileがその世代内にあることを確認する。installerは既存policy、pointer、plist、DBを照合してから更新する。これはstable Updater/policyを更新する別操作で、installer内のbackupとrollback・exact SHA healthを確認する。新しい通常self-update plan/applyはさらに別のexact plan承認を要する。対象SHAへpointerを先に切り替えた場合、同じSHAへのplan/applyで`dona-main`が再起動すると推測しない。main agentのrelease identityを揃える手段は別に確認する。
 
 ```sh
-test "$dona_dispatcher_socket" = "$dona_base/run/d.sock" &&
-  test "$dona_slack_socket" = "$dona_base/run/s.sock" &&
+test "$dona_dispatcher_socket" = "$expected_dispatcher_socket" &&
+  test "$dona_slack_socket" = "$expected_slack_socket" &&
   test "$dispatcher_env" = "$dona_base/config/dispatcher.env" &&
   test "$slack_env" = "$dona_base/config/slack.env" || {
     printf '%s\n' 'custom構成では現行control installerを実行できません。' >&2
     exit 1
   }
-./scripts/install-self-update.sh --upgrade-control "$dona_base"
+if [[ "$dona_base" == "$HOME/Library/Application Support/Dona" ]]; then
+  ./scripts/install-self-update.sh --upgrade-control
+else
+  ./scripts/install-self-update.sh --upgrade-control "$dona_base"
+fi
 ```

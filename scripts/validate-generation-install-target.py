@@ -84,11 +84,15 @@ def main():
                 os.chmod(candidate_file, 0o600)
     slack = plistlib.loads(regular(launch_agents / 'dev.dona.slack-adapter.plist').read_bytes())
     require(slack.get('Label') == 'dev.dona.slack-adapter')
+    slack_argv = slack.get('ProgramArguments', [])
+    require(len(slack_argv) == 2 and slack_argv[1] == str(current / 'sources/slack/dist/index.js'))
     slack_env = slack.get('EnvironmentVariables', {})
     require(isinstance(slack_env, dict))
     require(slack_env.get('DONA_SOCKET_PATH') == str(root / 'run/d.sock'))
     require(slack_env.get('SLACK_HEALTH_SOCKET_PATH') == str(root / 'run/s.sock'))
     require(slack_env.get('DOTENV_CONFIG_PATH') == str(root / 'config/slack.env'))
+    require(slack_env.get('DONA_UPDATE_INTERNAL_TOKEN_PATH') == str(control / 'dispatcher.token'))
+    require(slack_env.get('DONA_RELEASE_MANIFEST_PATH') == str(current / 'release-manifest.json'))
     receipt = control / 'control-plane-receipt.json'
     if receipt.exists():
         regular(receipt)
