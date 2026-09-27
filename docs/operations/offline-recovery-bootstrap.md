@@ -32,7 +32,7 @@ fi
 
 操作前にSlack ingressを止め、次にDispatcherを止める。両者のlabel、socket、PID停止を再読してから、Updaterの全requestがterminalであることを再確認し、stable Updaterも止める。Updater停止の応答だけを証明にせず、label、socket、PIDを再読する。これでbackup・回復CLI・手動pointer操作中にUpdater activationが並走しない。Codex/Herdr worker停止は別のoperator判断であり、この観測から推論しない。
 
-停止後にowner-only directoryへSQLite Online Backup APIでDispatcher本体・通知・進捗DBとUpdater DBを保存する。WAL中のDB本体だけを`cp`しない。`job-results`とlegacy `results`、current/previous pointerの実体、3つのLaunchAgent plist、実際の両env file、現行release manifest、control-plane receiptを同じ世代のbackup inventoryへ記録する。backupは0600、directoryは0700とし、全DBの`integrity_check=ok`と`foreign_key_check`空、各`user_version`、主要table件数を照合する。backup pathとdigestを記録してから先へ進む。backup/Resultを公開場所へ置かない。
+停止後にowner-only directoryへSQLite Online Backup APIでDispatcher本体・通知・進捗DBとUpdater DBを保存する。WAL中のDB本体だけを`cp`しない。`job-results`とlegacy `results`、current/previous pointerの実体、3つのLaunchAgent plist、実際の両env file、現行release manifest、存在する場合はcontrol-plane receiptを同じ世代のbackup inventoryへ記録する。backupは0600、directoryは0700とし、全DBの`integrity_check=ok`と`foreign_key_check`空、各`user_version`、主要table件数を照合する。backup pathとdigestを記録してから先へ進む。backup/Resultを公開場所へ置かない。
 
 次はoperatorが固定した値を代入し、同じmaintenance shellで続けて実行するコマンドの形である。`backup_dir`は毎回新規のowner-only directoryとし、既存backupを上書きしない。
 
@@ -147,7 +147,7 @@ if kill -0 "$dispatcher_pid" 2>/dev/null || kill -0 "$slack_pid" 2>/dev/null; th
   printf '%s\n' '停止前のDona PIDが残っています。DB操作へ進みません。' >&2
   exit 1
 fi
-updater_status="$(node "$control_root/updater/dist/cli.js" status)"
+updater_status="$(DONA_UPDATE_POLICY_PATH="$control_root/policy.json" node "$control_root/updater/dist/cli.js" status)"
 if ! printf '%s' "$updater_status" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.nonterminal_count!==0||!Array.isArray(v.updates)||v.updates.some(x=>!["succeeded","failed","rolled_back","needs_review","cancelled"].includes(x.state)))process.exitCode=1})'; then
   printf '%s\n' 'Updaterに非terminal requestが残っています。DB操作へ進みません。' >&2
   exit 1
@@ -216,11 +216,13 @@ sources = {
     'slack-adapter.plist': os.path.join(os.path.expanduser('~'), 'Library/LaunchAgents/dev.dona.slack-adapter.plist'),
     'updater.plist': os.path.join(os.path.expanduser('~'), 'Library/LaunchAgents/dev.dona.updater.plist'),
     'release-manifest.json': os.path.join(runtime, 'current/release-manifest.json'),
-    'control-plane-receipt.json': os.path.join(control, 'control-plane-receipt.json'),
     'policy.json': os.path.join(control, 'policy.json'),
     'dispatcher.env': dispatcher_env,
     'slack.env': slack_env,
 }
+receipt = os.path.join(control, 'control-plane-receipt.json')
+if os.path.lexists(receipt):
+    sources['control-plane-receipt.json'] = receipt
 for name, source in sources.items():
     if not stat.S_ISREG(os.stat(source).st_mode) or os.path.islink(source):
         raise RuntimeError('backup_source_not_regular:' + name)
