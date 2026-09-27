@@ -143,17 +143,30 @@ export class RealGit implements GitPort {
         env: minimalEnvironment({ HOME: os.homedir(), GH_PROMPT_DISABLED: "1" }),
       });
       if (result.exit_code !== 0 || result.timed_out || result.output_truncated) return false;
-      let checkRuns: Array<{ name?: unknown; status?: unknown; conclusion?: unknown; app?: { slug?: unknown } }>;
+      let checks: unknown;
       try {
-        const parsed = JSON.parse(result.stdout) as { check_runs?: unknown };
-        checkRuns = Array.isArray(parsed.check_runs) ? parsed.check_runs : [];
+        checks = JSON.parse(result.stdout);
       } catch {
         return false;
       }
-      const trusted = this.policy.required_checks.every((name) => checkRuns.some((run) =>
-        run.name === name && run.status === "completed" && run.conclusion === "success" && run.app?.slug === "github-actions",
-      ));
-      if (!trusted) return false;
+      const runId = trustedMainPushRunId(checks, targetSha, this.policy.required_checks);
+      if (runId === null) return false;
+      const workflow = await this.runner.run(this.policy.executables.gh, [
+        "api", "--method", "GET", `repos/${this.policy.repository}/actions/runs/${runId}`,
+      ], {
+        timeoutMs: this.policy.timeouts.command_ms,
+        outputLimitBytes: this.policy.output_limit_bytes,
+        env: minimalEnvironment({ HOME: os.homedir(), GH_PROMPT_DISABLED: "1" }),
+      });
+      if (workflow.exit_code !== 0 || workflow.timed_out || workflow.output_truncated) return false;
+      try {
+        const run = JSON.parse(workflow.stdout) as Record<string, unknown>;
+        if (run.id !== runId || run.event !== "push" || run.head_branch !== this.policy.default_branch ||
+          run.head_sha !== targetSha || run.status !== "completed" || run.conclusion !== "success" ||
+          run.name !== "CI") return false;
+      } catch {
+        return false;
+      }
     }
     if (this.policy.require_verified_signature) {
       const result = await this.runner.run(this.policy.executables.gh, [
@@ -203,6 +216,29 @@ export class RealGit implements GitPort {
     }
     return value as SchemaRollout;
   }
+}
+
+export function trustedMainPushRunId(checks: unknown, targetSha: string, names: readonly string[]): number | null {
+  if (!checks || typeof checks !== "object") return null;
+  const response = checks as { total_count?: unknown; check_runs?: unknown };
+  if (!Array.isArray(response.check_runs) || response.total_count !== response.check_runs.length ||
+    response.check_runs.length > 100) return null;
+  const runs = response.check_runs as Array<Record<string, unknown>>;
+  const matched = names.map(name => runs.filter(run => run.name === name));
+  if (matched.some(group => group.length !== 1)) return null;
+  let runId: number | null = null;
+  for (const group of matched) {
+    const run = group[0];
+    if (!run) return null;
+    const url = typeof run.details_url === "string" ? run.details_url.match(/^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/) : null;
+    const id = url ? Number(url[1]) : null;
+    if (!id || !Number.isSafeInteger(id) || run.head_sha !== targetSha ||
+      run.status !== "completed" || run.conclusion !== "success" ||
+      (run.app as { slug?: unknown } | null)?.slug !== "github-actions") return null;
+    if (runId !== null && runId !== id) return null;
+    runId = id;
+  }
+  return runId;
 }
 
 function versionAtLeast(actual: string, minimum: string): boolean {
@@ -290,7 +326,7 @@ export class CanonicalBuild implements BuildPort {
       const lockPath = path.join(directory, "package-lock.json");
       const before = sha256(await fs.readFile(lockPath));
       lockHashes[component] = before;
-      for (const args of [["ci"], ["test"], ["run", "typecheck"], ["run", "build"]] as const) {
+      for (const args of [["ci"], ["run", "typecheck"], ["run", "build"]] as const) {
         const result = await this.runner.run(this.policy.executables.npm, args, {
           cwd: directory,
           timeoutMs: this.policy.timeouts.command_ms,
