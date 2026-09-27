@@ -25,11 +25,11 @@
 
 ## 停止、backup、単発CLI
 
-操作前にSlack ingressを止め、次にDispatcherを止める。`launchctl bootout gui/$UID/dev.dona.slack-adapter`と`launchctl bootout gui/$UID/dev.dona.dispatcher`の応答だけを停止証明にせず、両labelがunregistered、両socketがunused、該当PIDが消失したことを再読する。stable Updaterはこの段階で止めない。Codex/Herdr worker停止は別のoperator判断であり、この観測から推論しない。
+操作前にSlack ingressを止め、次にDispatcherを止める。両者のlabel、socket、PID停止を再読してから、Updaterの全requestがterminalであることを再確認し、stable Updaterも止める。Updater停止の応答だけを証明にせず、label、socket、PIDを再読する。これでbackup・回復CLI・手動pointer操作中にUpdater activationが並走しない。Codex/Herdr worker停止は別のoperator判断であり、この観測から推論しない。
 
 停止後にowner-only directoryへSQLite Online Backup APIで`dona.sqlite3`を保存する。WAL中のDB本体だけを`cp`しない。`job-results`とlegacy `results`、current/previous pointerの実体、両LaunchAgent plist、現行release manifest、control-plane receiptを同じ世代のbackup inventoryへ記録する。backupは0600、directoryは0700とし、DBの`integrity_check=ok`、`foreign_key_check`が空、`user_version=3`、主要table件数を照合する。backup pathとdigestを記録してから先へ進む。backup/Resultを公開場所へ置かない。
 
-次はoperatorが固定した値を代入した後に実行するコマンドの形である。`backup_dir`は毎回新規のowner-only directoryとし、既存backupを上書きしない。
+次はoperatorが固定した値を代入し、同じmaintenance shellで続けて実行するコマンドの形である。`backup_dir`は毎回新規のowner-only directoryとし、既存backupを上書きしない。
 
 ```sh
 set -euo pipefail
@@ -91,6 +91,9 @@ dona_job_results="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.st
 dona_dispatcher_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).dispatcher_socket))')"
 dona_slack_socket="$(printf '%s' "$resolved_paths" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).slack_socket))')"
 test -f "$dona_database" && test -d "$dona_results" && test -d "$dona_job_results"
+updater_socket="$dona_base/update-control/updater.sock"
+old_updater_health="$(curl --fail --silent --show-error --unix-socket "$updater_socket" http://localhost/health/version)"
+old_updater_sha="$(printf '%s' "$old_updater_health" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.service!=="updater"||v.status!=="ready"||!(/^[0-9a-f]{40}$/.test(v.build_sha)))process.exitCode=1;else process.stdout.write(v.build_sha)})')"
 mkdir -p -m 700 "$dona_base/recovery-backups"
 backup_dir="$(mktemp -d "$dona_base/recovery-backups/attempt.XXXXXX")"
 dispatcher_pid="$(launchctl list | awk '$3=="dev.dona.dispatcher" {print $1}')"
@@ -120,23 +123,53 @@ if kill -0 "$dispatcher_pid" 2>/dev/null || kill -0 "$slack_pid" 2>/dev/null; th
   printf '%s\n' '停止前のDona PIDが残っています。DB操作へ進みません。' >&2
   exit 1
 fi
-python3 - "$dona_database" "$backup_dir/dona.sqlite3" <<'PY'
+updater_status="$(node "$dona_base/update-control/updater/dist/cli.js" status)"
+if ! printf '%s' "$updater_status" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.nonterminal_count!==0||!Array.isArray(v.updates)||v.updates.some(x=>!["succeeded","failed","rolled_back","needs_review","cancelled"].includes(x.state)))process.exitCode=1})'; then
+  printf '%s\n' 'Updaterに非terminal requestが残っています。DB操作へ進みません。' >&2
+  exit 1
+fi
+updater_pid="$(launchctl list | awk '$3=="dev.dona.updater" {print $1}')"
+case "$updater_pid" in
+  ''|*[!0-9]*) printf '%s\n' '停止前のUpdater PIDを確定できません。' >&2; exit 1 ;;
+esac
+updater_bootout_exit=0
+launchctl bootout "gui/$UID/dev.dona.updater" || updater_bootout_exit=$?
+if launchctl print "gui/$UID/dev.dona.updater" >/dev/null 2>&1 ||
+   ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$updater_socket" ||
+   kill -0 "$updater_pid" 2>/dev/null; then
+  printf '%s\n' 'Updaterの停止を確認できません。DB操作へ進みません。' >&2
+  exit 1
+fi
+if [ "$updater_bootout_exit" -ne 0 ]; then
+  printf 'Updater bootout非0を停止状態で照合済み: %s\n' "$updater_bootout_exit" >&2
+fi
+python3 - "$dona_base/update-control/updater.sqlite3" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
+count = db.execute("SELECT COUNT(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled')").fetchone()[0]
+db.close()
+if count != 0:
+    raise RuntimeError('updater_nonterminal_request_after_stop')
+PY
+python3 - "$dona_database" "$backup_dir/dona.sqlite3" \
+  "$dona_base/update-control/updater.sqlite3" "$backup_dir/updater.sqlite3" <<'PY'
 import os, sqlite3, sys
-descriptor = os.open(sys.argv[2], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-os.close(descriptor)
-source = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
-target = sqlite3.connect(sys.argv[2])
-source.backup(target)
-target.close(); source.close()
-os.chmod(sys.argv[2], 0o600)
-check = sqlite3.connect('file:' + sys.argv[2] + '?mode=ro', uri=True)
-if check.execute('pragma integrity_check').fetchone()[0] != 'ok':
-    raise RuntimeError('backup_integrity_check_failed')
-if check.execute('pragma foreign_key_check').fetchone() is not None:
-    raise RuntimeError('backup_foreign_key_check_failed')
-if check.execute('pragma user_version').fetchone()[0] != 3:
-    raise RuntimeError('backup_schema_mismatch')
-check.close()
+for source_path, target_path, expected_schema in ((sys.argv[1],sys.argv[2],3),(sys.argv[3],sys.argv[4],7)):
+    descriptor = os.open(target_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(descriptor)
+    source = sqlite3.connect('file:' + source_path + '?mode=ro', uri=True)
+    target = sqlite3.connect(target_path)
+    source.backup(target)
+    target.close(); source.close()
+    os.chmod(target_path, 0o600)
+    check = sqlite3.connect('file:' + target_path + '?mode=ro', uri=True)
+    if check.execute('pragma integrity_check').fetchone()[0] != 'ok':
+        raise RuntimeError('backup_integrity_check_failed')
+    if check.execute('pragma foreign_key_check').fetchone() is not None:
+        raise RuntimeError('backup_foreign_key_check_failed')
+    if check.execute('pragma user_version').fetchone()[0] != expected_schema:
+        raise RuntimeError('backup_schema_mismatch')
+    check.close()
 PY
 ditto "$dona_job_results" "$backup_dir/job-results"
 ditto "$dona_results" "$backup_dir/results"
@@ -147,18 +180,19 @@ ditto "$dona_results" "$backup_dir/results"
 対象releaseのCLIを、`DOTENV_CONFIG_PATH`で既存Dispatcher設定、`DONA_RELEASE_MANIFEST_PATH`で**対象release自身のmanifest**、`DONA_DATABASE_PATH`でproduction DBへ固定して実行する。`DispatcherDatabase`のconstructorはschema/補助tableのmigrationを行うため、`inspect`もwriteとして扱い、停止とbackupより前に実行しない。rollback用backup DBをCLIのdry runに使わない。DBコピーでも保存済みの絶対`result_path`がproductionを指し、routing migrationがResult fileを動かし得る。隔離試験を行うなら、rollback snapshotと異なる作業コピーを用い、全Result pathをコピー内の隔離先へ書き換え、production pathへ到達しないことを確認する。このmaintenance手順はその試験に依存しない。
 
 ```sh
+job_id='<確認済みの個別job ID>'
 env DOTENV_CONFIG_PATH="$dispatcher_env" \
   DONA_DATABASE_PATH="$dona_database" \
   DONA_RELEASE_MANIFEST_PATH="$target_release/release-manifest.json" \
   node "$target_release/dispatcher/dist/cli.js" \
-  job inspect-operator-recovery <job_id>
+  job inspect-operator-recovery "$job_id"
 ```
 
 `recover-operator-assertion`には、直前の`inspect`から得た`updated_at`、`cause`、`result_class`、`result_sha256`または`missing`、`notification_evidence_sha256`と、別途レビューした副作用証跡SHA-256、保存済み申告event IDを渡す。CLIのflagは[旧job回復手順](legacy-job-recovery-gate.md)のexact順序に従う。1件ごとに`job show`、`operator-recovery-record`、Resultと通知状態を再読する。応答喪失時はこれらを照合し、blind retryしない。無効・欠落Resultは成功に変換されず`failed`となる。全件を機械的に一括承認しない。
 
 ## runtime bootstrapとrollback
 
-回復後、全対象のterminal statusと監査記録を確認する。残る危険状態の原因が一意に説明できなければ停止を維持する。現在の`runtime/current`の旧SHAを`runtime/previous`へ保存してから、`runtime/current`を対象releaseへ同一filesystem上の一時symlinkから切り替える。macOS `mv -f`はdestination symlinkをdirectoryとして追跡するため、`mv -fh`でsymlink自体を置換する。Dispatcherだけを`launchctl bootstrap`し、versioned healthと`/v1/admin/update-safety`が対象SHA・`safe: true`・`unsafe_states: []`を示すまでSlack Adapterを起動しない。安全判定がclearでなければ停止下の個別確認へ戻る。Slack起動後に両serviceのhealth、DB schema 3、socket/PIDの新世代、通知重複なしを再読する。`dona-main`のcwd/sessionが旧releaseなら**完全なruntime更新とは報告しない**。この手順はHerdr agentの再作成権限を含まない。
+回復後、全対象のterminal statusと監査記録を確認する。残る危険状態の原因が一意に説明できなければ停止を維持する。現在の`runtime/current`の旧SHAを`runtime/previous`へ保存してから、`runtime/current`を対象releaseへ同一filesystem上の一時symlinkから切り替える。macOS `mv -f`はdestination symlinkをdirectoryとして追跡するため、`mv -fh`でsymlink自体を置換する。停止中のUpdaterを旧build SHAで起動・確認した後、Dispatcherを起動する。Dispatcherのversioned healthと`/v1/admin/update-safety`が対象SHA・`safe: true`・`unsafe_states: []`を示すまでSlack Adapterを起動しない。失敗時はbootstrapを試みたDispatcherとSlack Adapterを再停止・照合する。Slack起動後に両serviceのhealth、DB schema 3、socket/PIDの新世代、通知重複なしを再読する。`dona-main`のcwd/sessionが旧releaseなら**完全なruntime更新とは報告しない**。この手順はHerdr agentの再作成権限を含まない。
 
 ```sh
 set -euo pipefail
@@ -174,6 +208,54 @@ mv -fh "$runtime_root/.previous.recovery.tmp" "$runtime_root/previous"
 test "$(readlink "$runtime_root/previous")" = "releases/$old_sha"
 ln -s "releases/$target_sha" "$runtime_root/.current.recovery.tmp"
 mv -fh "$runtime_root/.current.recovery.tmp" "$runtime_root/current"
+recovery_updater_attempted=0
+recovery_dispatcher_attempted=0
+recovery_slack_attempted=0
+recovery_bootstrap_complete=0
+stop_failed_bootstrap() {
+  if [ "$recovery_bootstrap_complete" -eq 1 ]; then return; fi
+  local failed_slack_pid failed_dispatcher_pid failed_updater_pid
+  failed_slack_pid="$(launchctl list | awk '$3=="dev.dona.slack-adapter" {print $1}')" || failed_slack_pid=''
+  failed_dispatcher_pid="$(launchctl list | awk '$3=="dev.dona.dispatcher" {print $1}')" || failed_dispatcher_pid=''
+  failed_updater_pid="$(launchctl list | awk '$3=="dev.dona.updater" {print $1}')" || failed_updater_pid=''
+  if [ "$recovery_slack_attempted" -eq 1 ]; then
+    launchctl bootout "gui/$UID/dev.dona.slack-adapter" || true
+    if launchctl print "gui/$UID/dev.dona.slack-adapter" >/dev/null 2>&1 ||
+       ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_slack_socket" ||
+       { [[ "$failed_slack_pid" =~ ^[0-9]+$ ]] && kill -0 "$failed_slack_pid" 2>/dev/null; }; then
+      printf '%s\n' 'Slack Adapterの再停止を確認できません。' >&2
+    fi
+  fi
+  if [ "$recovery_dispatcher_attempted" -eq 1 ]; then
+    launchctl bootout "gui/$UID/dev.dona.dispatcher" || true
+    if launchctl print "gui/$UID/dev.dona.dispatcher" >/dev/null 2>&1 ||
+       ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_dispatcher_socket" ||
+       { [[ "$failed_dispatcher_pid" =~ ^[0-9]+$ ]] && kill -0 "$failed_dispatcher_pid" 2>/dev/null; }; then
+      printf '%s\n' 'Dispatcherの再停止を確認できません。' >&2
+    fi
+  fi
+  if [ "$recovery_updater_attempted" -eq 1 ]; then
+    launchctl bootout "gui/$UID/dev.dona.updater" || true
+    if launchctl print "gui/$UID/dev.dona.updater" >/dev/null 2>&1 ||
+       ! node scripts/self-update-install-preflight.mjs assert-socket-unused "$updater_socket" ||
+       { [[ "$failed_updater_pid" =~ ^[0-9]+$ ]] && kill -0 "$failed_updater_pid" 2>/dev/null; }; then
+      printf '%s\n' 'Updaterの再停止を確認できません。' >&2
+    fi
+  fi
+}
+trap stop_failed_bootstrap EXIT
+recovery_updater_attempted=1
+updater_bootstrap_exit=0
+launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.updater.plist" || updater_bootstrap_exit=$?
+if ! node scripts/self-update-install-preflight.mjs wait-updater-sha \
+  "$updater_socket" "$old_updater_sha" 30000; then
+  printf '%s\n' '旧Updaterのexact SHA healthを確認できません。DispatcherとSlackは停止したままにします。' >&2
+  exit 1
+fi
+if [ "$updater_bootstrap_exit" -ne 0 ]; then
+  printf 'Updater bootstrap非0をexact SHA healthで照合済み: %s\n' "$updater_bootstrap_exit" >&2
+fi
+recovery_dispatcher_attempted=1
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.dispatcher.plist"
 if ! node scripts/self-update-install-preflight.mjs wait-dispatcher-sha \
   "$dona_dispatcher_socket" "$target_sha" 30000; then
@@ -198,11 +280,25 @@ process.stdin.on("end", () => {
   printf '%s\n' 'Dispatcherの安全判定がclearではありません。Slack ingressは停止したままにします。' >&2
   exit 1
 fi
+recovery_slack_attempted=1
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.slack-adapter.plist"
+slack_ready=0
+for attempt in {1..60}; do
+  if slack_health="$(curl --fail --silent --show-error --unix-socket "$dona_slack_socket" \
+    http://localhost/health/version 2>/dev/null)" &&
+     printf '%s' "$slack_health" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const v=JSON.parse(s);if(v.service!=="slack_adapter"||v.status!=="ready"||v.build_sha!==process.argv[1])process.exitCode=1})' "$target_sha"; then
+    slack_ready=1
+    break
+  fi
+  sleep 0.5
+done
+test "$slack_ready" -eq 1
+recovery_bootstrap_complete=1
+trap - EXIT
 ```
 
 `bootstrap`応答が曖昧なら再送せず、登録状態とversioned healthを照合する。対象releaseの読み取り・CLI準備が失敗した場合に古いpointerのままserviceを戻す手順と、pointer切替後のrollback手順を同じmaintenance記録に残す。
 
 新Dispatcherがhealthを満たさない場合はSlack/Dispatcherを停止し、両labelとsocketの停止を確認してから旧pointerへ戻す。DBを旧releaseが開けることをDBコピーとschemaで確認する。回復CLIがDBへ書いた後のbackup restoreは監査記録と通知状態を巻き戻すため、機械的には行わない。restoreが必要なら全service停止下でbackup integrity、失われる回復・通知・job変更を個別照合し、別のoperator判断を得る。pointer rollbackとDB restoreを同一操作と見なさない。
 
-対象releaseでDispatcherが起動し、危険状態が空になった後だけ、terminalでない更新planがないことを再確認して`--upgrade-control`を使う。これはstable Updater/policyを更新する別操作で、installer内のbackupとrollback・exact SHA healthを確認する。新しい通常self-update plan/applyはさらに別のexact plan承認を要する。対象SHAへpointerを先に切り替えた場合、同じSHAへのplan/applyで`dona-main`が再起動すると推測しない。main agentのrelease identityを揃える手段は別に確認する。
+対象releaseでDispatcherが起動し、危険状態が空になった後だけ、terminalでない更新planがないことを再確認して`--upgrade-control`を使う。現行installerのcontrol upgradeは既定のDispatcher socket pathを固定しているため、`dona_dispatcher_socket`が`$dona_base/run/dispatcher.sock`と異なる場合は実行を禁止し、その構成に対応するinstaller修正を先にreviewする。これはstable Updater/policyを更新する別操作で、installer内のbackupとrollback・exact SHA healthを確認する。新しい通常self-update plan/applyはさらに別のexact plan承認を要する。対象SHAへpointerを先に切り替えた場合、同じSHAへのplan/applyで`dona-main`が再起動すると推測しない。main agentのrelease identityを揃える手段は別に確認する。
