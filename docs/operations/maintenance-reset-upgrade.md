@@ -17,7 +17,7 @@ DB履歴を引き継がず、新しい世代を準備して3サービスを切�
   parse値とhashは同じbytesから作り、snapshot終了時にも設定とpointerを再照合します。
   prepare時と停止前で設定のhash・pointerを照合します。
 - canonical `hiragram/dona` のmainをGitHub APIとfetchの両方でexact SHAへ固定し、archiveを独立領域でbuildします。
-  prepareとexecute / 再開時に、既存policyのrequired checks（GitHub Actions・同SHA・最新run成功）と要求される署名検証を確認します。
+  prepareでは既存policyのrequired checksと署名要求を保持して検証し、target版のpolicy templateにあるrequired checksも同じSHAのGitHub Actions最新runで検証します。target版`loadPolicy`で生成policyの固定必須チェック集合を検証してからplanを公開します。execute / 再開時は旧policyと新世代policyの両方で再検証します。
 - 新世代は `~/.dona/g/<runから導いたID>` です。DB（Dispatcher、通知、進捗、Updater）、Result、socket、log、設定、pointerを分離します。
   Updaterの実行codeは新世代control領域へcopyし、通常release保持期限による削除から分離します。
   schedule履歴も新しいDispatcher DBで初期化されます。旧履歴から通知を再送しません。
