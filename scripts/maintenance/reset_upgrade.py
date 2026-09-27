@@ -65,6 +65,15 @@ def verify_trust(sha, policy):
     return {'sha': sha, 'checks': accepted, 'signature_required': policy['require_verified_signature'], 'checked_at': stamp()}
 
 
+def target_required_checks(release):
+    # target版のpolicy templateを使い、最終的な集合はtarget版loadPolicyでも検証する。
+    checks = read_json(Path(release)/'config/update-policy.example.json')['required_checks']
+    require(isinstance(checks, list) and bool(checks) and
+            all(isinstance(name, str) and name for name in checks) and
+            len(checks) == len(set(checks)), 'target_required_checks_invalid')
+    return checks
+
+
 def encode(value):
     return (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
 
@@ -344,11 +353,13 @@ def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
             staging_space(generation, inv['policy'], reserve=False)
         command([node, str(release/'scripts/write-release-manifest.mjs'), str(release), sha,
                  command([npm, '--version']), inv['policy']['policy_version']])
+        target_checks = target_required_checks(release)
+        target_trust = verify_trust(sha, dict(inv['policy'], required_checks=target_checks))
         for p in ('config', 'control', 'results', 'job-results', 'run', 'logs'):
             private_dir(generation/p)
         # updaterはcontrol_root/updater.sock固定なので長いUNIX socket pathを準備段階で拒否。
         require(len(str(generation/'control/updater.sock').encode()) < 104, 'socket_path_too_long')
-        plan = {'schema_version': 1, 'trust': trust, 'target_sha': sha, 'generation': str(generation), 'release': str(release),
+        plan = {'schema_version': 1, 'trust': trust, 'target_trust': target_trust, 'target_sha': sha, 'generation': str(generation), 'release': str(release),
                 'event_id': event_id, 'job_id': job_id, 'inventory_sha256': digest((run/'inventory.json').read_bytes()),
                 'runner_sha256': digest((run/'runner.py').read_bytes()),
                 'created_at': stamp(), 'strategy': 'isolated_generation', 'operator_assertion_required': True, 'snapshot_old_databases': snapshot_old_databases}
@@ -443,6 +454,7 @@ def render(run, plan, inv):
     compatibility = read_json(release/'config/release-compatibility.json')
     policy['compatibility'] = {k: v for k, v in compatibility.items() if k != 'schema_version'}
     policy['compatibility_transitions'] = read_json(release/'config/update-compatibility-transitions.json')['transitions']
+    policy['required_checks'] = target_required_checks(release)
     # stable updater自身を通常release retentionの削除対象へ置かない。
     shutil.copytree(release/'updater', g/'control/updater', symlinks=True)
     atomic(g/'control/policy.json', encode(policy))
@@ -1007,6 +1019,8 @@ class Runner:
             if phase in ('prepared', 'quiescing', 'stopping', 'backing_up', 'switching'):
                 require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
             verify_trust(self.plan['target_sha'], self.inv['policy'])
+            require(target_required_checks(self.plan['release']) == read_json(self.generation/'control/policy.json')['required_checks'], 'target_checks_drift')
+            verify_trust(self.plan['target_sha'], read_json(self.generation/'control/policy.json'))
             if phase == 'prepared':
                 validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv, self.database.read)
                 self.validate_source()

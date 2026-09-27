@@ -64,7 +64,11 @@ class RunnerTest(unittest.TestCase):
         self.g = m.private_dir(self.home/'new')
         for name in ['config','control/updater','runtime']:
             m.private_dir(self.g/name)
-        (self.g/'control/policy.json').write_text('{}')
+        checks = ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS']
+        release = m.private_dir(self.g/'runtime/releases/target')
+        m.private_dir(release/'config')
+        (release/'config/update-policy.example.json').write_text(json.dumps({'required_checks': checks}))
+        (self.g/'control/policy.json').write_text(json.dumps({'required_checks': checks}))
         (self.g/'control/dispatcher.token').write_text('fixture')
         with sqlite3.connect(self.old/'updater.sqlite3') as db:
             db.execute('CREATE TABLE update_requests(state TEXT)')
@@ -87,7 +91,7 @@ class RunnerTest(unittest.TestCase):
         m.atomic(self.run/'inventory.json', m.encode(inv))
         m.atomic(self.run/'runner.py', Path(m.__file__).read_bytes())
         m.atomic(self.run/'main_bridge.mjs',Path(m.__file__).with_name('main_bridge.mjs').read_bytes())
-        plan = {'runner_sha256': m.digest((self.run/'runner.py').read_bytes()), 'generation': str(self.g), 'target_sha': 'a'*40, 'event_id': 'event', 'job_id': 'job',
+        plan = {'runner_sha256': m.digest((self.run/'runner.py').read_bytes()), 'generation': str(self.g), 'release': str(release), 'target_sha': 'a'*40, 'event_id': 'event', 'job_id': 'job',
                 'inventory_sha256': m.digest((self.run/'inventory.json').read_bytes()),
                 'generation_seal': m.tree_seal(self.g), 'updater_launch_seal':m.static_seal(self.g,include_runtime=False), 'static_seal':m.static_seal(self.g), 'plists_seal': m.tree_seal(self.run/'plists')}
         m.atomic(self.run/'plan.json', m.encode(plan))
@@ -365,6 +369,7 @@ with Server(p,Handler) as server: server.serve_forever()
         m.private_dir(release/'config')
         (release/'config/release-compatibility.json').write_text('{"schema_version":1,"protocol":1}')
         (release/'config/update-compatibility-transitions.json').write_text('{"transitions":[]}')
+        (release/'config/update-policy.example.json').write_text(json.dumps({'required_checks': ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS']}))
         for directory in ['config','control','logs','run']:
             m.private_dir(self.g/directory)
         plan={'generation':str(self.g),'release':str(release),'target_sha':'a'*40}
@@ -501,6 +506,26 @@ with Server(p,Handler) as server: server.serve_forever()
                 if verified: self.assertEqual(REAL_TRUST('a'*40,dict(policy,require_verified_signature=True))['checks'][0]['id'],1)
                 else:
                     with self.assertRaisesRegex(RuntimeError,'signature_not_verified'): REAL_TRUST('a'*40,dict(policy,require_verified_signature=True))
+
+    def test_target_checks_extend_old_policy_only_after_target_trust(self):
+        release = self.home/'target'
+        m.private_dir(release/'config')
+        checks = ['Verify dispatcher', 'Verify sources/slack', 'Verify updater', 'Verify self-hosted macOS']
+        m.atomic(release/'config/update-policy.example.json', m.encode({'required_checks': checks}))
+        self.assertEqual(m.target_required_checks(release), checks)
+        old = {'executables': {'gh': 'fixture-gh'}, 'required_checks': checks[:3], 'require_verified_signature': False}
+        runs = [{'id': index, 'name': name, 'head_sha': 'a'*40, 'app': {'slug': 'github-actions'},
+                 'status': 'completed', 'conclusion': 'success'} for index, name in enumerate(checks, 1)]
+        with patch.object(m, 'command', return_value=json.dumps([{'check_runs': runs}])):
+            self.assertEqual(len(REAL_TRUST('a'*40, old)['checks']), 3)
+            self.assertEqual(len(REAL_TRUST('a'*40, dict(old, required_checks=checks))['checks']), 4)
+        runs[-1]['conclusion'] = 'failure'
+        with patch.object(m, 'command', return_value=json.dumps([{'check_runs': runs}])):
+            with self.assertRaisesRegex(RuntimeError, 'required_check_not_success'):
+                REAL_TRUST('a'*40, dict(old, required_checks=checks))
+        m.atomic(release/'config/update-policy.example.json', m.encode({'required_checks': checks[:3] + checks[:1]}))
+        with self.assertRaisesRegex(RuntimeError, 'target_required_checks_invalid'):
+            m.target_required_checks(release)
 
     def test_trust_regression_before_execute_never_stops_services(self):
         self.trust.side_effect=RuntimeError('required_check_not_success')
