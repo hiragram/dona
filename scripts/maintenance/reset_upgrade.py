@@ -12,7 +12,6 @@ import plistlib
 import re
 import shutil
 import socket
-import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -86,9 +85,33 @@ def regular(p):
     return p
 
 
-def sql_read(file, sql, args=()):
-    with sqlite3.connect(Path(file).as_uri() + '?mode=ro', uri=True, timeout=3) as db:
-        return db.execute(sql, args).fetchall()
+class NodeDatabase:
+    """Donaと同じSQLite/VFSでWALを読む。Python/macOSの別VFSを混在させない。"""
+    def __init__(self, node, module):
+        self.node, self.module = node, Path(module).as_uri()
+
+    def invoke(self, source, operation, args):
+        script = f'''import Database from {json.dumps(self.module)};
+const [source,operation,encoded]=process.argv.slice(1);
+const args=JSON.parse(encoded);
+const db=new Database(source,{{readonly:true,fileMustExist:true}});
+try {{
+  if(operation==='read') console.log(JSON.stringify(db.prepare(args.sql).raw().all(...args.values)));
+  else {{
+    const start=Date.now();
+    await db.backup(args.destination,{{progress:()=>{{if(Date.now()-start>60000)throw Error('backup_timeout');return 256;}}}});
+    const snapshot=new Database(args.destination,{{readonly:true,fileMustExist:true}});
+    try {{if(snapshot.pragma('integrity_check',{{simple:true}})!=='ok')throw Error('backup_integrity');}}finally{{snapshot.close();}}
+  }}
+}} finally {{db.close();}}
+'''
+        return command([self.node, '--input-type=module', '-e', script, str(source), operation, json.dumps(args)], timeout=75)
+
+    def read(self, file, sql, args=()):
+        return [tuple(row) for row in json.loads(self.invoke(file, 'read', {'sql': sql, 'values': args}))]
+
+    def backup(self, source, destination):
+        self.invoke(source, 'backup', {'destination': str(destination)})
 
 
 def http_unix(socket_path, route):
@@ -358,23 +381,23 @@ def migrate(plan, node):
     command([node, '--input-type=module', '-e', script], env=env)
 
 
-def validate_handoff(plan, plan_hash, receipt, inv):
+def validate_handoff(plan, plan_hash, receipt, inv, database_reader):
     require(receipt.get('schema_version') == 1 and receipt.get('plan_sha256') == plan_hash, 'handoff_plan_mismatch')
     require(receipt.get('event_id') == plan['event_id'] and receipt.get('job_id') == plan['job_id'], 'handoff_identity')
     require(receipt.get('operator_assertion') == {'exclusive_dona_session': True, 'residual_old_workers_accepted': True,
             'parent_handoff_complete': True}, 'operator_assertion_missing')
     # 署名されたmachine fenceではない。DBのterminalとoperator handoffの両方を必要とする。
     database = inv['databases'][0]
-    events = sql_read(database, 'SELECT status FROM events WHERE event_id=?', (plan['event_id'],))
-    jobs = sql_read(database, 'SELECT status,completion_event_id FROM jobs WHERE job_id=? AND source_event_id=?', (plan['job_id'], plan['event_id']))
+    events = database_reader(database, 'SELECT status FROM events WHERE event_id=?', (plan['event_id'],))
+    jobs = database_reader(database, 'SELECT status,completion_event_id FROM jobs WHERE job_id=? AND source_event_id=?', (plan['job_id'], plan['event_id']))
     require(events == [('completed',)] and len(jobs) == 1 and jobs[0][0] in TERMINAL, 'handoff_not_terminal')
     require(jobs[0][1] and receipt.get('handoff_event_id') == jobs[0][1], 'parent_notification_identity')
-    parent = sql_read(database, 'SELECT status FROM events WHERE event_id=?', (jobs[0][1],))
+    parent = database_reader(database, 'SELECT status FROM events WHERE event_id=?', (jobs[0][1],))
     require(parent == [('completed',)], 'parent_notification_not_terminal')
 
 
 class Runner:
-    def __init__(self, run, services=None):
+    def __init__(self, run, services=None, database=None):
         self.run = Path(run)
         self.plan = read_json(self.run/'plan.json')
         self.inv = read_json(self.run/'inventory.json')
@@ -384,6 +407,7 @@ class Runner:
         require(digest((self.run/'runner.py').read_bytes()) == self.plan['runner_sha256'], 'runner_changed')
         require(tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
         self.services = services or Launchd()
+        self.database = database or NodeDatabase(self.inv['policy']['executables']['node'], Path(self.plan['release'])/'updater/node_modules/better-sqlite3/lib/index.js')
         self.generation = Path(self.plan['generation'])
 
     def record(self, phase, **fields):
@@ -426,12 +450,9 @@ class Runner:
             temporary = destination.with_suffix('.tmp')
             if temporary.exists():
                 temporary.unlink()
-            with sqlite3.connect(source.as_uri()+'?mode=ro', uri=True) as src, sqlite3.connect(temporary) as dst:
-                deadline = time.monotonic() + 60
-                def progress(status, remaining, total):
-                    require(time.monotonic() < deadline, 'backup_timeout')
-                src.backup(dst, pages=256, progress=progress)
-                require(dst.execute('PRAGMA integrity_check').fetchone() == ('ok',), 'backup_integrity')
+            self.database.backup(source, temporary)
+            with open(temporary, 'rb') as snapshot:
+                os.fsync(snapshot.fileno())
             os.chmod(temporary, 0o600)
             os.replace(temporary, destination)
             manifest.append({'source': name, 'file': destination.name, 'sha256': digest(destination.read_bytes())})
@@ -496,7 +517,7 @@ class Runner:
             self.rollback()
             return
         if phase == 'prepared':
-            validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv)
+            validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv, self.database.read)
             self.validate_source()
             require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
             self.record('stopping', handoff_sha256=digest(encode(receipt)), residual_risk='operator_assertion_not_machine_stop_proof')

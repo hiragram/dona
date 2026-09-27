@@ -14,7 +14,7 @@ DB履歴を引き継がず、新しい世代を準備して3サービスを切�
 - canonical `hiragram/dona` のmainをGitHub APIとfetchの両方でexact SHAへ固定し、archiveを独立領域でbuildします。
 - 新世代は `~/.dona/g/<runから導いたID>` です。DB（Dispatcher、通知、進捗、Updater）、Result、socket、log、設定、pointerを分離します。
   schedule履歴も新しいDispatcher DBで初期化されます。旧履歴から通知を再送しません。
-- 元のDB・Result・release・pointer・設定はその場に保持し、SQLite backup APIでWAL込みの整合snapshotも独立journal側へ保存します。
+- 元のDB・Result・release・pointer・設定はその場に保持し、Donaと同じNode SQLiteのbackup APIでWAL込みの整合snapshotも独立journal側へ保存します。
   各DBは同じ旧世代のsnapshotですが、全DBの同一時刻transactionを保証するものではありません。
 - Git repository / worktree / 未commit成果、他Herdr session、他project、Slack / GitHub上の成果を削除・変更しません。
 - Slack認証（Keychainを含む）と外部連携設定を保持します。内部通知tokenだけ新世代でrotateします。
@@ -144,4 +144,5 @@ npm run test:skills
 health失敗・復元失敗、handoff未成立、設定drift、共通lock、未公開tempの再開を検証します。
 3つの実child processとUNIX HTTP socketによる起動・health・停止も通します。
 launchd adapterと本物のSlack接続は本番停止を伴うため、ここでは未実行です。
+UpdaterのCIではDonaと同じNode SQLiteでclose後DBのread-only照合とlive WALのbackupも検証します。
 通常self-update gate・Herdr・本番DBの変更はありません。

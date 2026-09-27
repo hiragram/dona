@@ -17,6 +17,17 @@ spec.loader.exec_module(m)
 REAL_HEALTH = m.Runner.health
 
 
+class FixtureDatabase:
+    def read(self, file, sql, args=()):
+        with sqlite3.connect(Path(file).as_uri()+'?mode=ro',uri=True) as db:
+            return db.execute(sql,args).fetchall()
+
+    def backup(self, source, destination):
+        with sqlite3.connect(Path(source).as_uri()+'?mode=ro',uri=True) as src, sqlite3.connect(destination) as dst:
+            src.backup(dst)
+
+
+
 class Services:
     def __init__(self):
         self.registered = set(m.LABELS)
@@ -86,7 +97,7 @@ class RunnerTest(unittest.TestCase):
         self.temp.cleanup()
 
     def runner(self):
-        return m.Runner(self.run, self.services)
+        return m.Runner(self.run, self.services, FixtureDatabase())
 
     def test_full_activation_and_old_writer_isolation(self):
         self.runner().execute(self.receipt)
@@ -95,7 +106,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.services.calls[-3:], [('start', l) for l in m.START])
         with sqlite3.connect(self.db) as db:
             db.execute("INSERT INTO events VALUES('late-old-worker','completed')")
-        self.assertEqual(m.sql_read(self.run/'backup/0.sqlite3', 'SELECT count(*) FROM events'), [(2,)])
+        self.assertEqual(FixtureDatabase().read(self.run/'backup/0.sqlite3', 'SELECT count(*) FROM events'), [(2,)])
         self.assertFalse((self.g/'dona.sqlite3').exists())
         self.assertEqual((self.old/'current').resolve(), self.old/'release')
         self.assertEqual(self.db.stat().st_ino, Path(m.read_json(self.run/'inventory.json')['databases'][0]).stat().st_ino)
@@ -242,7 +253,7 @@ with Server(p,Handler) as server: server.serve_forever()
                     self.children[label].terminate(); self.children[label].wait(timeout=5)
             def process(self,pid): return m.Launchd().process(pid)
         services=Processes()
-        runner=m.Runner(self.run,services)
+        runner=m.Runner(self.run,services,FixtureDatabase())
         runner.health=lambda: REAL_HEALTH(runner)
         try:
             runner.execute(self.receipt)
