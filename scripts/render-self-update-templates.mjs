@@ -87,7 +87,7 @@ const policy = {
   diagnostic_retention_days: 14,
   disk_floor_bytes: 2147483648,
   retain_successful: 2,
-  required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater"],
+  required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"],
   require_verified_signature: false,
   compatibility,
   compatibility_transitions: transitionFile.transitions,

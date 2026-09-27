@@ -48,7 +48,7 @@ export async function tempPolicy(): Promise<{ root: string; policy: UpdatePolicy
       diagnostic_retention_days: 14,
       disk_floor_bytes: 0,
       retain_successful: 2,
-      required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater"],
+      required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"],
       require_verified_signature: false,
       compatibility: {
         protocol: 1,
