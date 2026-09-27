@@ -499,7 +499,7 @@ export function createSlackMcpServer(
         reply_broadcast: z.boolean().optional().describe("Defaults to true for ordinary channel thread replies; false for DMs and job notifications"),
         mrkdwn: z.boolean().optional(),
         parse: z.literal("none").optional(),
-        event_id: z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i).optional().describe("Dona job通知時のcurrent event ID"),
+        event_id: z.string().regex(/^evt_[0-9a-hjkmnp-tv-z]{26}$/i).optional().describe("dona_job通知では必須の現在の通知event ID。元の委任source_event_idを渡さない"),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },

@@ -25,6 +25,13 @@ test("通常のSlack eventとdona_jobだけにスレッド開示方針と安全�
     assert.match(prompt, /実質的に安全な短い要約を同じスレッドへ1回だけ投稿/);
     assert.match(prompt, /安全な要約も拒否されたら繰り返さず失敗として記録/);
     assert.match(prompt, /送信結果が曖昧な場合やtimeoutでは再送せず/);
+    if (source === "dona_job") {
+      assert.match(prompt, /tool引数event_idには今回の通知event_id/);
+      assert.match(prompt, /source_event_idで代用しない/);
+      assert.match(prompt, /通常jobにschedule専用のauthorize_job_notificationを呼ばない/);
+    } else {
+      assert.doesNotMatch(prompt, /tool引数event_idには今回の通知event_id/);
+    }
   }
   for (const source of ["dona_schedule", "dona_update"] as const) {
     const prompt = buildEventPrompt("evt-1", "/tmp/result.json", { ...envelope, source });
@@ -39,4 +46,5 @@ test("通常のSlack eventとdona_jobだけにスレッド開示方針と安全�
   });
   assert.doesNotMatch(scheduledResult, /保存済みreply_targetと同じworkspace、channel、thread/);
   assert.doesNotMatch(scheduledResult, /automatic approvalで拒否された場合/);
+  assert.match(scheduledResult, /schedule ownerの通知だけはAGENTS.mdに定めた二段階認可/);
 });
