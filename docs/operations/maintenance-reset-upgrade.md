@@ -3,6 +3,8 @@
 `scripts/maintenance/reset_upgrade.py` はDona専用の保守経路です。通常の
 `plan_self_update` / exact plan承認 / `apply_self_update`、maintenance-fence検証は変更しません。
 DB履歴を引き継がず、新しい世代を準備して3サービスを切り替えます。
+実行前に通常self-updateの非terminal request（承認待ちを含む）がないことも確認します。
+残っている場合は親がDispatcherの通常cancel経路で整理し、再照合してください。保守runnerは通常updateを並行実行しません。
 本番実行には、委任job・元event・その完了通知eventのterminalと、親へのhandoff receiptが必要です。
 準備だけでは本番を停止しません。
 
@@ -13,6 +15,7 @@ DB履歴を引き継がず、新しい世代を準備して3サービスを切�
   prepare時と停止前で設定のhash・pointerを照合します。
 - canonical `hiragram/dona` のmainをGitHub APIとfetchの両方でexact SHAへ固定し、archiveを独立領域でbuildします。
 - 新世代は `~/.dona/g/<runから導いたID>` です。DB（Dispatcher、通知、進捗、Updater）、Result、socket、log、設定、pointerを分離します。
+  Updaterの実行codeは新世代control領域へcopyし、通常release保持期限による削除から分離します。
   schedule履歴も新しいDispatcher DBで初期化されます。旧履歴から通知を再送しません。
 - 元のDB・Result・release・pointer・設定はその場に保持し、Donaと同じNode SQLiteのbackup APIでWAL込みの整合snapshotも独立journal側へ保存します。
   各DBは同じ旧世代のsnapshotですが、全DBの同一時刻transactionを保証するものではありません。
@@ -92,12 +95,14 @@ nohup python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" execute 
 ```
 
 1. 全run共通のfile lockを取得し、receipt、元設定、準備成果を検証します。
-2. Slack新規受付、Dispatcher（schedulerとjob生成元を含む）、Updaterの順でbootoutします。
+2. Updater、Slack新規受付、Dispatcher（schedulerとjob生成元を含む）の順でbootoutします。
+   停止後に通常updateの非terminal requestと元pointer / 設定を再照合し、並行activationを検出します。
    service由来のPID・UID・command identityを記録し、未登録を連続観測し、元PIDが残存していないことを確認します。
    これは3サービスの観測であり、Herdr worker全体の停止証明ではありません。
 3. 旧DBのsnapshotを保存します。旧Resultはpathごと保持し、遅延writeも旧世代へ残します。
 4. LaunchAgent plistを新世代のrelease pointer / 設定へ切り替えます。
-5. Updater、Dispatcher、Slackを起動します。bootstrap応答が曖昧な場合は同writeを再送せず観測します。
+5. UpdaterとDispatcherを起動してcore healthを確認した後、ingress開始intentを永続化してSlackを起動します。
+   bootstrap応答が曖昧な場合は同writeを再送せず観測します。
 6. 3サービスの`/health/version`でexact SHA / readyを、Slackで`workspaces_ready`と`dispatcher_ready`を確認します。
    成功を独立journalへ記録します。
 
@@ -117,12 +122,25 @@ nohup python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" execute 
 同じ `execute` commandで再開します。phaseは副作用の前後でfsync + atomic renameします。
 DB・pointerを再初期化せず、途中のplist切替は同じ内容で収束させます。
 bootstrap済serviceは登録状態から照合し、terminal後の再実行は副作用を追加しません。
-未知のphase・変更されたplan / runner / plistは拒否します。
+未知のphase・変更されたplan / runner / plistは拒否します。未起動phaseでは全世代sealを、
+起動intent以後でもcode / 設定 / pointerの静的sealを再照合します。
 
-実行中の失敗では、新世代の3サービス停止を確認して元plistへ戻し、
+Slack ingress開始前の失敗では、新世代の3サービス停止を確認して元plistへ戻し、
 保持した旧DB・Result・releaseで起動し、旧SHAのhealthを確認します。
 旧DBのsnapshotを上書き復元しないため、退避後の旧worker writeも破壊しません。
 復元の停止確認・healthに失敗した場合は `rolling_back` のままです。成功と扱いません。
+Slack ingress開始intent以後の失敗は `forward_recovery` とし、新3サービスを停止して新世代DBを保持します。
+ACK済eventを旧DBへ取り残さないため、旧世代への自動・手動restoreを禁止します。
+同じexecuteで同じ新DBを使って起動・healthを再確認します。DBの破棄・event再送を自動で行いません。
+
+起動前のcrash後にseal driftを検出した場合は、新世代を起動せず停止します。
+Slack ingress開始前であることをjournalで確認できる場合だけ、明示的なrestoreも使えます。
+
+```sh
+python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" restore \
+  --run "$HOME/.dona-maintenance/reset-YYYYMMDD-unique"
+```
+
 元世代は既存の`needs_review`等を含むため、復元は旧状態へ戻ることであり、旧問題の修復ではありません。
 
 ```sh
@@ -130,7 +148,7 @@ python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" status \
   --run "$HOME/.dona-maintenance/reset-YYYYMMDD-unique"
 ```
 
-`prepared`、`succeeded`、`rolled_back`、`rolling_back`を区別してください。
+`prepared`、`succeeded`、`rolled_back`、`rolling_back`、`forward_recovery`を区別してください。
 `succeeded`は上記サービス切替・healthの範囲です。Slack投稿や新mainでのevent処理成功を意味しません。
 
 ## 検証

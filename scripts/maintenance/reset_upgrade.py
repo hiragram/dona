@@ -18,8 +18,8 @@ import tarfile
 import time
 import urllib.parse
 
-LABELS = ('dev.dona.slack-adapter', 'dev.dona.dispatcher', 'dev.dona.updater')
-START = tuple(reversed(LABELS))
+LABELS = ('dev.dona.updater', 'dev.dona.slack-adapter', 'dev.dona.dispatcher')
+START = ('dev.dona.updater', 'dev.dona.dispatcher', 'dev.dona.slack-adapter')
 TERMINAL = ('completed', 'failed', 'cancelled')
 REMOTE = 'https://github.com/hiragram/dona.git'
 
@@ -273,6 +273,7 @@ def prepare(run, repository, event_id, job_id):
     # staging成果全体をseal。node_modulesを含め、prepare後の変更を停止前に検知する。
     plan['generation_seal'] = tree_seal(generation)
     plan['plists_seal'] = tree_seal(run/'plists')
+    plan['static_seal'] = static_seal(generation)
     atomic(run/'plan.json', encode(plan))
     atomic(run/'journal.json', encode({'phase': 'prepared', 'plan_sha256': digest((run/'plan.json').read_bytes()), 'steps': []}))
     return plan
@@ -286,6 +287,20 @@ def tree_seal(root):
             h.update(b'L' + os.readlink(p).encode())
         elif p.is_file():
             h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def static_seal(generation):
+    h = hashlib.sha256()
+    for name in ('config', 'control/updater', 'control/policy.json', 'control/dispatcher.token', 'runtime'):
+        p = Path(generation)/name
+        h.update(name.encode())
+        if p.is_dir() and not p.is_symlink():
+            h.update(tree_seal(p).encode())
+        elif p.is_file() and not p.is_symlink():
+            h.update(p.read_bytes())
+        else:
+            raise RuntimeError('static_asset_missing')
     return h.hexdigest()
 
 
@@ -311,6 +326,8 @@ def render(run, plan, inv):
     compatibility = read_json(release/'config/release-compatibility.json')
     policy['compatibility'] = {k: v for k, v in compatibility.items() if k != 'schema_version'}
     policy['compatibility_transitions'] = read_json(release/'config/update-compatibility-transitions.json')['transitions']
+    # stable updater自身を通常release retentionの削除対象へ置かない。
+    shutil.copytree(release/'updater', g/'control/updater', symlinks=True)
     atomic(g/'control/policy.json', encode(policy))
     atomic(g/'control/dispatcher.token', (os.urandom(32).hex()+'\n').encode())
     overrides = {'DONA_DATABASE_PATH': str(g/'dona.sqlite3'), 'DONA_RESULTS_DIR': str(g/'results'),
@@ -342,8 +359,9 @@ def render(run, plan, inv):
             env.pop('DONA_BUILD_SHA', None)
             env['DOTENV_CONFIG_PATH'] = str(g/'config'/ (key+'.env'))
         plist['EnvironmentVariables'] = env
-        plist['ProgramArguments'] = [inv['policy']['executables']['node'], str(g/'runtime/current'/component/'dist'/entry)] + ([] if entry == 'index.js' else ['serve'])
-        plist['WorkingDirectory'] = str(g/'runtime/current'/component)
+        code_root = g/'control/updater' if label == 'dev.dona.updater' else g/'runtime/current'/component
+        plist['ProgramArguments'] = [inv['policy']['executables']['node'], str(code_root/'dist'/entry)] + ([] if entry == 'index.js' else ['serve'])
+        plist['WorkingDirectory'] = str(code_root)
         plist['StandardOutPath'] = str(g/'logs'/ (label+'.log'))
         plist['StandardErrorPath'] = str(g/'logs'/ (label+'.error.log'))
         atomic(run/'plists'/ (label+'.plist'), plistlib.dumps(plist))
@@ -407,7 +425,7 @@ class Runner:
         require(digest((self.run/'runner.py').read_bytes()) == self.plan['runner_sha256'], 'runner_changed')
         require(tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
         self.services = services or Launchd()
-        self.database = database or NodeDatabase(self.inv['policy']['executables']['node'], Path(self.plan['release'])/'updater/node_modules/better-sqlite3/lib/index.js')
+        self.database = database or NodeDatabase(self.inv['policy']['executables']['node'], Path(self.plan['generation'])/'control/updater/node_modules/better-sqlite3/lib/index.js')
         self.generation = Path(self.plan['generation'])
 
     def record(self, phase, **fields):
@@ -419,6 +437,11 @@ class Runner:
         for name, sha in self.inv['files'].items():
             require(digest(regular(name).read_bytes()) == sha, 'source_configuration_drift')
         require(str(Path(self.inv['policy']['current_pointer']).resolve()) == self.inv['old_pointer'], 'source_pointer_drift')
+
+    def assert_updater_idle(self):
+        source = Path(self.inv['policy']['control_root'])/'updater.sqlite3'
+        rows = self.database.read(source, "SELECT count(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled')")
+        require(rows == [(0,)], 'normal_update_in_progress')
 
     def stop_all(self):
         for label in LABELS:
@@ -463,12 +486,14 @@ class Runner:
         for label in LABELS:
             atomic(Path.home()/'Library/LaunchAgents'/ (label+'.plist'), (self.run/'plists'/ (label+'.plist')).read_bytes())
 
-    def start_all(self):
-        for label in START:
+    def start_all(self, include_slack=True):
+        for label in START if include_slack else START[:2]:
             self.services.start(label, Path.home()/'Library/LaunchAgents'/ (label+'.plist'))
 
-    def health(self):
-        targets = [('control/updater.sock', 'updater'), ('run/d.sock', 'dispatcher'), ('run/s.sock', 'slack_adapter')]
+    def health(self, include_slack=True):
+        targets = [('control/updater.sock', 'updater'), ('run/d.sock', 'dispatcher')]
+        if include_slack:
+            targets.append(('run/s.sock', 'slack_adapter'))
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             try:
@@ -508,38 +533,62 @@ class Runner:
         self.old_health()
         self.record('rolled_back', rollback_scope='original_plists_and_retained_old_generation')
 
+    def restore(self):
+        require(self.journal['phase'] in ('stopping', 'backing_up', 'switching', 'starting_core', 'rolling_back'), 'restore_after_ingress_forbidden')
+        self.rollback()
+
     def execute(self, receipt):
         phase = self.journal['phase']
-        require(phase in ('prepared', 'stopping', 'backing_up', 'switching', 'starting', 'rolling_back', 'rolled_back', 'succeeded'), 'journal_phase')
+        require(phase in ('prepared', 'stopping', 'backing_up', 'switching', 'starting_core', 'starting_ingress', 'forward_recovery', 'rolling_back', 'rolled_back', 'succeeded'), 'journal_phase')
         if phase in ('succeeded', 'rolled_back'):
             return
         if phase == 'rolling_back':
             self.rollback()
             return
+        # DB/log/socketは起動後mutable。code/config/pointerは全再開で照合する。
+        require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
+        if phase in ('prepared', 'stopping', 'backing_up', 'switching'):
+            require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
         if phase == 'prepared':
             validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv, self.database.read)
             self.validate_source()
-            require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
+            self.assert_updater_idle()
             self.record('stopping', handoff_sha256=digest(encode(receipt)), residual_risk='operator_assertion_not_machine_stop_proof')
         try:
             if self.journal['phase'] == 'stopping':
-                self.stop_all()
+                self.stop_all()  # Updaterを最初に止め、並行activationの生成元を除く。
+                self.assert_updater_idle()  # 最初のcheckと停止の間に承認されたrequestを検出。
+                self.validate_source()  # 停止中のpointer/config変更もbackup前に検出。
                 self.record('backing_up')
             if self.journal['phase'] == 'backing_up':
                 self.stop_all()
+                self.assert_updater_idle()
+                self.validate_source()
                 self.backup()
                 self.record('switching')
             if self.journal['phase'] == 'switching':
                 self.stop_all()
                 self.switch()
-                self.record('starting')
-            if self.journal['phase'] == 'starting':
-                self.start_all()
+                self.record('starting_core')
+            if self.journal['phase'] == 'starting_core':
+                self.start_all(include_slack=False)
+                self.health(include_slack=False)
+                # このintent以後はACK済eventがあり得る。旧DBへの自動rollbackは禁止。
+                self.record('starting_ingress')
+            if self.journal['phase'] in ('starting_ingress', 'forward_recovery'):
+                self.start_all(include_slack=False)
+                self.health(include_slack=False)
+                label = 'dev.dona.slack-adapter'
+                self.services.start(label, Path.home()/'Library/LaunchAgents'/(label+'.plist'))
                 self.health()
                 self.record('succeeded', target_sha=self.plan['target_sha'], slack_connected=True)
         except Exception:
-            self.record('rolling_back', failure='activation_failed')
-            self.rollback()
+            if self.journal['phase'] in ('starting_ingress', 'forward_recovery'):
+                self.record('forward_recovery', failure='ingress_may_have_accepted_events', old_generation_restore_forbidden=True)
+                self.stop_all()
+            else:
+                self.record('rolling_back', failure='activation_failed')
+                self.rollback()
             raise
 
 
@@ -565,6 +614,8 @@ def main():
     p = sub.add_parser('execute')
     p.add_argument('--run', type=Path, required=True)
     p.add_argument('--handoff', type=Path, required=True)
+    p = sub.add_parser('restore')
+    p.add_argument('--run', type=Path, required=True)
     p = sub.add_parser('status')
     p.add_argument('--run', type=Path, required=True)
     args = parser.parse_args()
@@ -575,6 +626,10 @@ def main():
     elif args.action == 'execute':
         with locked(args.run):
             Runner(args.run).execute(read_json(regular(args.handoff)))
+        print(json.dumps({'phase': read_json(args.run/'journal.json')['phase']}))
+    elif args.action == 'restore':
+        with locked(args.run):
+            Runner(args.run).restore()
         print(json.dumps({'phase': read_json(args.run/'journal.json')['phase']}))
     else:
         journal = read_json(args.run/'journal.json')

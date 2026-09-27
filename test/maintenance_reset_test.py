@@ -58,6 +58,12 @@ class RunnerTest(unittest.TestCase):
         self.run = m.private_dir(self.home/'maintenance')
         self.old = m.private_dir(self.home/'old')
         self.g = m.private_dir(self.home/'new')
+        for name in ['config','control/updater','runtime']:
+            m.private_dir(self.g/name)
+        (self.g/'control/policy.json').write_text('{}')
+        (self.g/'control/dispatcher.token').write_text('fixture')
+        with sqlite3.connect(self.old/'updater.sqlite3') as db:
+            db.execute('CREATE TABLE update_requests(state TEXT)')
         m.private_dir(self.home/'Library/LaunchAgents')
         m.private_dir(self.run/'plists')
         (self.old/'current').symlink_to(self.old/'release')
@@ -72,13 +78,13 @@ class RunnerTest(unittest.TestCase):
             f.write_bytes(plistlib.dumps(plist))
             self.files[str(f)] = m.digest(f.read_bytes())
             m.atomic(self.run/'plists'/f.name, plistlib.dumps(dict(plist, ProgramArguments=['node', '/new/'+label])))
-        inv = {'files': self.files, 'policy': {'current_pointer': str(self.old/'current')}, 'old_pointer': str(self.old/'release'),
+        inv = {'files': self.files, 'policy': {'current_pointer': str(self.old/'current'), 'control_root': str(self.old)}, 'old_pointer': str(self.old/'release'),
                'plists': self.plists, 'databases': [str(self.db)], 'old_results': [str(self.old/'results')]}
         m.atomic(self.run/'inventory.json', m.encode(inv))
         m.atomic(self.run/'runner.py', Path(m.__file__).read_bytes())
         plan = {'runner_sha256': m.digest((self.run/'runner.py').read_bytes()), 'generation': str(self.g), 'target_sha': 'a'*40, 'event_id': 'event', 'job_id': 'job',
                 'inventory_sha256': m.digest((self.run/'inventory.json').read_bytes()),
-                'generation_seal': m.tree_seal(self.g), 'plists_seal': m.tree_seal(self.run/'plists')}
+                'generation_seal': m.tree_seal(self.g), 'static_seal':m.static_seal(self.g), 'plists_seal': m.tree_seal(self.run/'plists')}
         m.atomic(self.run/'plan.json', m.encode(plan))
         plan_hash = m.digest((self.run/'plan.json').read_bytes())
         m.atomic(self.run/'journal.json', m.encode({'phase': 'prepared', 'plan_sha256': plan_hash, 'steps': []}))
@@ -180,8 +186,10 @@ class RunnerTest(unittest.TestCase):
 
     def test_crash_after_each_phase_resumes_without_terminal_receipt_reread(self):
         # crash後はDBを再初期化しない。journalがhandoff受理を保持する。
-        for phase in ['stopping', 'backing_up', 'switching', 'starting']:
+        for phase in ['stopping', 'backing_up', 'switching', 'starting_core', 'starting_ingress']:
             with self.subTest(phase=phase):
+                for label,plist in self.plists.items():
+                    (self.home/'Library/LaunchAgents'/(label+'.plist')).write_bytes(plistlib.dumps(plist))
                 runner = self.runner()
                 runner.record(phase)
                 runner.execute({})
@@ -227,13 +235,14 @@ with Server(p,Handler) as server: server.serve_forever()
 """)
         for name in ['run', 'control']:
             m.private_dir(self.g/name)
-        mapping = {m.LABELS[0]: ('run/s.sock', 'slack_adapter'), m.LABELS[1]: ('run/d.sock', 'dispatcher'), m.LABELS[2]: ('control/updater.sock', 'updater')}
+        mapping = {'dev.dona.slack-adapter': ('run/s.sock', 'slack_adapter'), 'dev.dona.dispatcher': ('run/d.sock', 'dispatcher'), 'dev.dona.updater': ('control/updater.sock', 'updater')}
         for label,(sock,service) in mapping.items():
             p=self.run/'plists'/(label+'.plist')
             p.write_bytes(plistlib.dumps({'Label':label,'ProgramArguments':[sys.executable,str(fixture)],'EnvironmentVariables':{'SHA':'a'*40,'SERVICE':service,'SOCKET':str(self.g/sock)}}))
         plan=m.read_json(self.run/'plan.json')
         plan['plists_seal']=m.tree_seal(self.run/'plists')
         plan['generation_seal']=m.tree_seal(self.g)
+        plan['static_seal']=m.static_seal(self.g)
         m.atomic(self.run/'plan.json',m.encode(plan))
         journal=m.read_json(self.run/'journal.json')
         journal['plan_sha256']=m.digest((self.run/'plan.json').read_bytes())
@@ -254,7 +263,7 @@ with Server(p,Handler) as server: server.serve_forever()
             def process(self,pid): return m.Launchd().process(pid)
         services=Processes()
         runner=m.Runner(self.run,services,FixtureDatabase())
-        runner.health=lambda: REAL_HEALTH(runner)
+        runner.health=lambda include_slack=True: REAL_HEALTH(runner, include_slack)
         try:
             runner.execute(self.receipt)
             self.assertEqual(runner.journal['phase'],'succeeded')
@@ -263,6 +272,91 @@ with Server(p,Handler) as server: server.serve_forever()
             self.assertTrue(all(services.observe(label) is None for label in m.LABELS))
         finally:
             for label in m.LABELS: services.stop(label)
+
+    def test_render_keeps_stable_updater_outside_release_retention(self):
+        release=m.private_dir(self.g/'runtime/releases'/('a'*40))
+        m.private_dir(release/'updater/dist')
+        (release/'updater/dist/cli.js').write_text('stable updater')
+        m.private_dir(release/'config')
+        (release/'config/release-compatibility.json').write_text('{"schema_version":1,"protocol":1}')
+        (release/'config/update-compatibility-transitions.json').write_text('{"transitions":[]}')
+        for directory in ['config','control','logs','run']:
+            m.private_dir(self.g/directory)
+        plan={'generation':str(self.g),'release':str(release),'target_sha':'a'*40}
+        inv={'policy':{'executables':{'node':sys.executable}},'plists':self.plists,
+             'configs':{key:{'values':{'SLACK_WORKSPACES':'test'}} for key in ['dispatcher','slack']}}
+        (self.g/'control/updater').rmdir()
+        m.render(self.run,plan,inv)
+        updater=plistlib.loads((self.run/'plists/dev.dona.updater.plist').read_bytes())
+        self.assertEqual(updater['WorkingDirectory'],str(self.g/'control/updater'))
+        self.assertEqual(updater['ProgramArguments'][1],str(self.g/'control/updater/dist/cli.js'))
+        self.assertEqual((self.g/'control/updater/dist/cli.js').read_text(),'stable updater')
+        self.assertFalse(Path(updater['WorkingDirectory']).is_relative_to(release.parent))
+        self.assertIn(str(self.g/'run/d.sock'),(self.g/'config/dispatcher.env').read_text())
+        self.assertIn(str(self.g/'job-results'),(self.g/'config/dispatcher.env').read_text())
+
+    def test_pending_self_update_rejects_before_any_stop(self):
+        with sqlite3.connect(self.old/'updater.sqlite3') as db:
+            db.execute("INSERT INTO update_requests VALUES('approved')")
+        with self.assertRaisesRegex(RuntimeError,'normal_update_in_progress'):
+            self.runner().execute(self.receipt)
+        self.assertEqual(self.services.calls,[])
+
+    def test_update_accepted_during_stop_prevents_generation_switch(self):
+        original=self.services.stop
+        def race(label):
+            original(label)
+            if label=='dev.dona.updater':
+                with sqlite3.connect(self.old/'updater.sqlite3') as db:
+                    db.execute("INSERT INTO update_requests VALUES('activating')")
+        self.services.stop=race
+        with self.assertRaisesRegex(RuntimeError,'normal_update_in_progress'):
+            self.runner().execute(self.receipt)
+        self.assertEqual(self.services.calls[0],('stop','dev.dona.updater'))
+        for name,sha in self.files.items(): self.assertEqual(m.digest(Path(name).read_bytes()),sha)
+
+    def test_restart_rechecks_unstarted_database_and_static_assets(self):
+        runner=self.runner();runner.record('backing_up')
+        (self.g/'dona.sqlite3').write_bytes(b'corrupt')
+        with self.assertRaisesRegex(RuntimeError,'prepared_generation_drift'):
+            self.runner().execute({})
+        (self.g/'dona.sqlite3').unlink()
+        runner.record('starting_core')
+        (self.g/'config/tampered.env').write_text('changed')
+        with self.assertRaisesRegex(RuntimeError,'static_generation_drift'):
+            self.runner().execute({})
+        self.assertEqual(self.services.calls,[])
+
+    def test_ingress_failure_retains_acked_events_and_resumes_same_generation(self):
+        def health(include_slack=True):
+            if include_slack:
+                with sqlite3.connect(self.g/'dona.sqlite3') as db:
+                    db.execute('CREATE TABLE accepted_events(id TEXT)')
+                    db.execute("INSERT INTO accepted_events VALUES('acked')")
+                raise RuntimeError('slack_health_failure_after_ack')
+        self.health.side_effect=health
+        with self.assertRaisesRegex(RuntimeError,'slack_health_failure_after_ack'):
+            self.runner().execute(self.receipt)
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'forward_recovery')
+        self.assertEqual(FixtureDatabase().read(self.g/'dona.sqlite3','SELECT id FROM accepted_events'),[('acked',)])
+        self.assertFalse(self.services.registered)
+        for label in m.LABELS:
+            target=self.home/'Library/LaunchAgents'/(label+'.plist')
+            self.assertEqual(target.read_bytes(),(self.run/'plists'/target.name).read_bytes())
+        self.health.side_effect=None
+        self.runner().execute({})
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'succeeded')
+        self.assertEqual(FixtureDatabase().read(self.g/'dona.sqlite3','SELECT id FROM accepted_events'),[('acked',)])
+
+    def test_explicit_restore_handles_static_drift_but_refuses_post_ingress(self):
+        runner=self.runner();runner.record('starting_core')
+        (self.g/'config/tampered.env').write_text('changed')
+        runner.restore()
+        self.assertEqual(runner.journal['phase'],'rolled_back')
+        runner.record('starting_ingress')
+        count=len(self.services.calls)
+        with self.assertRaisesRegex(RuntimeError,'restore_after_ingress_forbidden'): runner.restore()
+        self.assertEqual(len(self.services.calls),count)
 
     def test_atomic_crash_temporary_recovery(self):
         target=self.run/'status.json'
