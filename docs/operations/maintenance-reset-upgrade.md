@@ -3,8 +3,8 @@
 `scripts/maintenance/reset_upgrade.py` はDona専用の保守経路です。通常の
 `plan_self_update` / exact plan承認 / `apply_self_update`、maintenance-fence検証は変更しません。
 DB履歴を引き継がず、新しい世代を準備して3サービスを切り替えます。
-実行前に通常self-updateの非terminal request（承認待ちを含む）がないことも確認します。
-残っている場合は親がDispatcherの通常cancel経路で整理し、再照合してください。保守runnerは通常updateを並行実行しません。
+実行前後に通常self-updateの実行中requestがないことを確認します。承認待ちplanは切替条件にせず、旧世代と共に保持します。
+承認・activation中のrequestだけは並行実行を防ぐため拒否します。通常updateの承認契約は変えません。
 本番実行には、委任job・元event・その完了通知eventのterminalと、親へのhandoff receiptが必要です。
 準備だけでは本番を停止しません。
 
@@ -24,6 +24,7 @@ DB履歴を引き継がず、新しい世代を準備して3サービスを切�
   各DBは同じ旧世代のsnapshotですが、全DBの同一時刻transactionを保証するものではありません。
 - Git repository / worktree / 未commit成果、他Herdr session、他project、Slack / GitHub上の成果を削除・変更しません。
 - Slack認証（Keychainを含む）と外部連携設定を保持します。内部通知tokenだけ新世代でrotateします。
+- 新main用Codexは通常RuntimeのPATHから実在するbinaryへ解決し、version応答を検証してplanへ固定します。古いCask pathを新設定へ引き継いで起動不能にしません。旧mainの照合には元policyのpathを使います。
 
 ### 世代分離を選ぶ理由
 
@@ -90,6 +91,13 @@ execute / restore / arm / probe-mcpは準備領域のsealed `runner.py`自身か
 このreceiptはoperator assertionです。署名された機械停止証明ではありません。
 runnerは旧DBをread-onlyで照合し、元eventとjob完了通知eventが`completed`、
 指定jobが`completed / failed / cancelled`であることを確認します。
+今回の保守job自身だけが `needs_review / timeout` の場合は、旧DBを変更せず次の限定handoffを使えます。
+親は公開済みの最終Job Resultを読み、targetの正規schemaで `completed` と確認された同bytesのSHA-256を
+receiptの `job_result_sha256` へ追記します。`handoff_event_id`にはそのResultを受理する現在の親eventを指定します。
+runnerはplanに固定したdurable Result pathとhash、元eventと同じworkspace/channel/thread、
+Result公開時刻以後の親event完了を確認します。過去のtimeout通知eventで代用しません。
+これは保守用のoperator受理であり、worker停止証明や通常のlate-result reconciliationではありません。
+他の旧job・旧履歴のstatusは参照せず、書き換えません。
 親通知eventの処理中に起動すると、停止前に拒否されます。
 
 親はreceipt記録後、次の `arm` を呼び、登録結果を確認して自身のEvent Resultを公開します。
@@ -107,13 +115,15 @@ python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" arm \
 再開も `execute` です。armは停止・初期化の承認を追加要求しません。
 
 1. 全run共通のfile lockを取得し、receipt、元設定、準備成果を検証します。
-2. Updater、Slack新規受付、Dispatcher（schedulerとjob生成元を含む）の順でbootoutします。
+2. 旧Slackのquiesceを先に要求してSocket Mode受付を止め、通信中の処理がdrain済みになるまで確認します。
+   POST受理不明時はGETだけで照合し、再送しません。その後Updater、Slack、Dispatcher（schedulerとjob生成元を含む）の順でbootoutします。
    停止後に通常updateの非terminal requestと元pointer / 設定を再照合し、並行activationを検出します。
    service由来のPID・UID・command identityを記録し、未登録を連続観測し、元PIDが残存していないことを確認します。
    これは3サービスの観測であり、Herdr worker全体の停止証明ではありません。
+   quiesce以前に旧DBへ保存・ACKされたeventも初期化の対象です。旧37件を含むDB backlogを処理し切るgateは設けません。
 3. snapshotを明示選択した場合だけ、停止前とbackup前に容量floorを確認して旧DBのsnapshotを保存します。
    backup失敗時にはpartial snapshotとsidecarを削除してから復元します。旧Resultはpathごと保持し、遅延writeも旧世代へ残します。
-4. UpdaterとDispatcherのplistを新世代のrelease pointer / 設定へ切り替えます。
+4. backup後に元設定・pointerを再照合し、UpdaterとDispatcherのplistを新世代のrelease pointer / 設定へ切り替えます。
    Slackの新plistはmain確認後のingress開始intentまでinstallせず、旧plistを未登録のまま保持します。
 5. 起動直前に未起動世代のfull sealを再照合し、UpdaterとDispatcherを起動してcore healthを確認します。
    `awaiting_main`は中間phaseです。同じ実行で旧mainを停止し、新main起動・MCP確認を行います。
@@ -140,7 +150,7 @@ wrapperは新世代dotenvで継承envを上書きし、target MCPを起動しま
 mainとMCPのstart identityも記録します。Herdrにhost-wide atomic fenceがあるとは扱いません。
 
 `main-ready.json`はplanとprocess identityへ束縛した120秒のreceiptで、runner自身が生成します。
-人間がPIDやhandshake済flagを埋める `confirm-main` は不要です。Slack起動直前と成功記録前にも再照合します。
+人間がPIDやhandshake済flagを埋める `confirm-main` は不要です。Slack起動直前と成功記録前にもPIDだけでなくHerdr上のname / pane / session / releaseを再照合します。
 mainが起動できなければ `forward_recovery` となり、受付しません。親はjournalとoperator.logを確認し、
 同じ `execute` で記録済mainを照合・再開します。曖昧なstop/startを勝手に再送しないでください。
 
@@ -169,6 +179,8 @@ main handoff開始前の失敗では、新世代の3サービス停止を確認�
 保持した旧DB・Result・releaseで起動し、旧SHAのhealthを確認します。
 旧DBのsnapshotを上書き復元しないため、退避後の旧worker writeも破壊しません。
 復元の停止確認・healthに失敗した場合は `rolling_back` のままです。成功と扱いません。
+復元journalがI/O障害で書けなくても、確認済service停止・元plist復元・再起動を試み、journal障害は呼出元へ返します。
+plist自体の保存にも失敗した場合は完全復元できません。
 main handoff開始（`awaiting_main`）以後の失敗は `forward_recovery` とし、新3サービスを停止して新世代DBを保持します。
 新mainを旧DBへ誤接続したり、ACK済eventを旧DBへ取り残したりしないため、旧世代への自動・手動restoreを禁止します。
 同じexecuteで同じ新DBを使って起動・healthを再確認します。DBの破棄・event再送を自動で行いません。
@@ -204,7 +216,8 @@ health失敗・復元失敗、handoff未成立、設定drift、共通lock、未�
 CI失敗・署名不一致、install済plistの旧DB混入、ingress後のseal drift、内部通知protocol欠落、
 permission drift、backup hashのchunk計算、partial backup回収、容量不足、sealed entrypoint、
 main未準備時のingress停止、実process treeのmain / MCP対応、main起動応答喪失時のread-only再照合、
-one-shot armとparent terminal待機、成功journal失敗、backup中のgeneration変更も検証します。
+one-shot armとparent terminal待機、成功・復元journal失敗、backup中のgeneration / 元設定変更、
+Herdr mapping置換、quiesce応答喪失、timeout最終Resultのhash / scope / 時刻、Codex binary解決も検証します。
 通常Updater adapterを実際に通したbridgeの停止→起動とMCP overrideもfixture Herdrで検証します。
 launchd adapterと本物のSlack接続は本番停止を伴うため、ここでは未実行です。
 UpdaterのCIではDonaと同じNode SQLiteでclose後DBのread-only照合とlive WALのbackupも検証します。

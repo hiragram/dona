@@ -2,6 +2,7 @@
 """Dona専用の独立保守runner。通常self-updateの承認・停止証明とは別契約。"""
 import argparse
 import contextlib
+import datetime
 import fcntl
 import hashlib
 import http.client
@@ -141,15 +142,16 @@ try {{
         self.invoke(source, 'backup', {'destination': str(destination)})
 
 
-def http_unix(socket_path, route):
+def http_unix(socket_path, route, method='GET', payload=None):
     conn = http.client.HTTPConnection('localhost', timeout=3)
     conn.sock = socket.socket(socket.AF_UNIX)
     conn.sock.settimeout(3)
     try:
         conn.sock.connect(str(socket_path))
-        conn.request('GET', route)
+        conn.request(method, route, body=encode(payload) if payload is not None else None,
+                     headers={'content-type': 'application/json'} if payload is not None else {})
         response = conn.getresponse()
-        require(response.status == 200, 'health_not_ready')
+        require(response.status in (200, 202), 'health_not_ready')
         return json.loads(response.read(1024 * 1024))
     finally:
         conn.close()
@@ -265,6 +267,15 @@ def inventory():
             'old_results': [d['resultsDir'], d['jobResultsDir']], 'captured_at': stamp()}
 
 
+def installed_codex():
+    # RealRuntimeがHerdrへ渡すminimalEnvironmentと同じPATHで解決する。
+    executable = shutil.which('codex', path='/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin')
+    require(executable is not None, 'codex_not_installed')
+    executable = str(Path(executable).resolve())
+    require(os.access(executable, os.X_OK) and command([executable, '--version']).startswith('codex-cli '), 'codex_executable_invalid')
+    return executable
+
+
 def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
     require(re.fullmatch(r'evt_[0-9A-HJKMNP-TV-Z]{26}', event_id, re.I), 'event_id')
     require(re.fullmatch(r'job_[0-9a-hjkmnp-tv-z]{26}', job_id, re.I), 'job_id')
@@ -307,6 +318,11 @@ def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
             'event_id': event_id, 'job_id': job_id, 'inventory_sha256': digest((run/'inventory.json').read_bytes()),
             'runner_sha256': digest((run/'runner.py').read_bytes()),
             'created_at': stamp(), 'strategy': 'isolated_generation', 'operator_assertion_required': True, 'snapshot_old_databases': snapshot_old_databases}
+    plan['codex_executable'] = installed_codex()
+    state = NodeDatabase(node, release/'updater/node_modules/better-sqlite3/lib/index.js')
+    rows = state.read(Path(inv['databases'][0]), 'SELECT result_path FROM jobs WHERE job_id=? AND source_event_id=?', (job_id, event_id))
+    require(len(rows) == 1 and Path(rows[0][0]).is_absolute(), 'handoff_job_not_found')
+    plan['job_result_path'] = rows[0][0]
     render(run, plan, inv)
     validate_staging(run, plan, node)
     migrate(plan, node)
@@ -372,6 +388,7 @@ def render(run, plan, inv):
     g = Path(plan['generation'])
     release = Path(plan['release'])
     policy = dict(inv['policy'])
+    policy['executables'] = dict(policy['executables'], codex=plan.get('codex_executable', policy['executables']['codex']))
     policy.update(control_root=str(g/'control'), config_root=str(g/'config'), release_root=str(g/'runtime/releases'),
                   current_pointer=str(g/'runtime/current'), previous_pointer=str(g/'runtime/previous'),
                   dispatcher_socket=str(g/'run/d.sock'), slack_socket=str(g/'run/s.sock'),
@@ -384,7 +401,7 @@ def render(run, plan, inv):
     atomic(g/'control/policy.json', encode(policy))
     atomic(g/'config/main_bridge.mjs', (run/'main_bridge.mjs').read_bytes())
     atomic(g/'control/dispatcher.token', (os.urandom(32).hex()+'\n').encode())
-    overrides = {'DONA_DATABASE_PATH': str(g/'dona.sqlite3'), 'DONA_RESULTS_DIR': str(g/'results'),
+    overrides = {'DONA_CODEX_PATH': policy['executables']['codex'], 'DONA_DATABASE_PATH': str(g/'dona.sqlite3'), 'DONA_RESULTS_DIR': str(g/'results'),
                  'DONA_JOB_RESULTS_DIR': str(g/'job-results'), 'DONA_JOB_PROGRESS_DATABASE_PATH': str(g/'job-progress.sqlite3'),
                  'DONA_UPDATE_NOTIFICATION_DATABASE_PATH': str(g/'update-notifications.sqlite3'),
                  'DONA_SOCKET_PATH': policy['dispatcher_socket'], 'SLACK_HEALTH_SOCKET_PATH': policy['slack_socket'],
@@ -464,19 +481,50 @@ def migrate(plan, node):
     command([node, '--input-type=module', '-e', script], env=env)
 
 
+def final_job_result(plan, inv, expected_digest):
+    require(isinstance(expected_digest, str) and re.fullmatch('[0-9a-f]{64}', expected_digest), 'final_result_digest_required')
+    file = regular(plan['job_result_path'])
+    require(file.stat().st_size <= 1048576, 'final_result_too_large')
+    content = file.read_bytes()
+    require(digest(content) == expected_digest, 'final_result_changed')
+    # hashとschemaは同じbytesへ結び付ける。旧DBやResultは書き換えない。
+    module = (Path(plan['release'])/'dispatcher/dist/validation.js').as_uri()
+    script = f"import fs from 'node:fs';import {{parseJobResultEnvelope}} from {json.dumps(module)};const r=parseJobResultEnvelope(JSON.parse(fs.readFileSync(0,'utf8')),process.argv[1]);console.log(JSON.stringify({{status:r.status,completed_at:r.completed_at}}));"
+    result = json.loads(command([inv['policy']['executables']['node'], '--input-type=module', '-e', script, plan['job_id']], input=content))
+    require(result['status'] == 'completed', 'final_job_not_completed')
+    return result
+
+
 def validate_handoff(plan, plan_hash, receipt, inv, database_reader):
     require(receipt.get('schema_version') == 1 and receipt.get('plan_sha256') == plan_hash, 'handoff_plan_mismatch')
     require(receipt.get('event_id') == plan['event_id'] and receipt.get('job_id') == plan['job_id'], 'handoff_identity')
     require(receipt.get('operator_assertion') == {'exclusive_dona_session': True, 'residual_old_workers_accepted': True,
             'parent_handoff_complete': True}, 'operator_assertion_missing')
-    # 署名されたmachine fenceではない。DBのterminalとoperator handoffの両方を必要とする。
     database = inv['databases'][0]
     events = database_reader(database, 'SELECT status FROM events WHERE event_id=?', (plan['event_id'],))
-    jobs = database_reader(database, 'SELECT status,completion_event_id FROM jobs WHERE job_id=? AND source_event_id=?', (plan['job_id'], plan['event_id']))
-    require(events == [('completed',)] and len(jobs) == 1 and jobs[0][0] in TERMINAL, 'handoff_not_terminal')
-    require(jobs[0][1] and receipt.get('handoff_event_id') == jobs[0][1], 'parent_notification_identity')
-    parent = database_reader(database, 'SELECT status FROM events WHERE event_id=?', (jobs[0][1],))
-    require(parent == [('completed',)], 'parent_notification_not_terminal')
+    jobs = database_reader(database, 'SELECT status,completion_event_id,last_error_code,result_path FROM jobs WHERE job_id=? AND source_event_id=?', (plan['job_id'], plan['event_id']))
+    require(events == [('completed',)] and len(jobs) == 1, 'handoff_not_terminal')
+    job = jobs[0]
+    late = job[0] == 'needs_review' and job[2] == 'timeout'
+    require(job[0] in TERMINAL or late, 'handoff_not_terminal')
+    if late:
+        # この保守job自身の完了成果だけをoperatorが受理する経路。旧履歴のreconcileはしない。
+        require(job[3] == plan.get('job_result_path'), 'final_result_path_changed')
+        result = final_job_result(plan, inv, receipt.get('job_result_sha256'))
+        source = database_reader(database, 'SELECT subject_json,reply_target_json FROM events WHERE event_id=?', (plan['event_id'],))[0]
+        parent = database_reader(database, 'SELECT status,subject_json,reply_target_json,completed_at FROM events WHERE event_id=?', (receipt.get('handoff_event_id'),))
+        require(len(parent) == 1, 'parent_notification_identity')
+        original_subject, parent_subject = json.loads(source[0]), json.loads(parent[0][1])
+        require(all(original_subject.get(k) and original_subject[k] == parent_subject.get(k) for k in ('workspace_id','channel_id'))
+                and source[1] is not None and json.loads(source[1]) == json.loads(parent[0][2] or 'null'), 'parent_notification_scope')
+        require(parent[0][0] == 'completed', 'parent_notification_not_terminal')
+        completed = lambda value: datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        require(parent[0][3] and completed(parent[0][3]) >= completed(result['completed_at']), 'parent_handoff_predates_result')
+    else:
+        require(job[1] and receipt.get('handoff_event_id') == job[1], 'parent_notification_identity')
+        parent = database_reader(database, 'SELECT status FROM events WHERE event_id=?', (job[1],))
+        require(parent == [('completed',)], 'parent_notification_not_terminal')
+
 
 
 def read_process(pid):
@@ -492,7 +540,7 @@ def main_evidence(plan, inv, spec, observer=read_process):
     require(isinstance(spec.get('session_id'), str) and 0 < len(spec['session_id']) <= 512 and '\n' not in spec['session_id'], 'main_session_identity')
     ids = [spec.get(key) for key in ('main_pid', 'dispatcher_pid', 'slack_pid', 'previous_main_pid')]
     require(all(type(pid) is int and pid > 1 for pid in ids) and len(set(ids)) == 4, 'main_pid_identity')
-    expected = {'main': [inv['policy']['executables']['codex'], plan['release']],
+    expected = {'main': [plan.get('codex_executable', inv['policy']['executables']['codex']), plan['release']],
                 'dispatcher': [inv['policy']['executables']['node'], str(Path(plan['generation'])/'config/mcp-dispatcher.mjs')],
                 'slack': [inv['policy']['executables']['node'], str(Path(plan['generation'])/'config/mcp-slack.mjs')]}
     observations = []
@@ -540,10 +588,10 @@ class Runner:
 
     def assert_updater_idle(self):
         source = Path(self.inv['policy']['control_root'])/'updater.sqlite3'
-        rows = self.database.read(source, "SELECT count(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled')")
+        rows = self.database.read(source, "SELECT count(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled','awaiting_approval')")
         require(rows == [(0,)], 'normal_update_in_progress')
 
-    def stop_all(self):
+    def stop_all(self, tolerate_journal_failure=False):
         failures = []
         for label in LABELS:
             try:
@@ -557,7 +605,7 @@ class Runner:
                     try:
                         self.record(self.journal['phase'])
                     except OSError as error:
-                        failures.append(error)  # journal障害でも確認済serviceを止める。
+                        if not tolerate_journal_failure: failures.append(error)  # journal障害でも確認済serviceを止める。
                 self.services.stop(label)
             except Exception as error:
                 failures.append(error)  # 1serviceの失敗でSlackの停止までskipしない。
@@ -566,6 +614,26 @@ class Runner:
             require(current is None or digest(current.encode()) != item['identity'], 'service_pid_still_alive')
         if failures: raise failures[0]
         require(all(self.services.observe(label) is None for label in LABELS), 'service_recreated')
+
+    def quiesce_old_slack(self):
+        socket_path = self.inv['configs']['slack']['config']['healthSocketPath']
+        intent = self.run/'quiesce.json'
+        if not intent.exists():
+            atomic(intent, encode({'plan_sha256': self.journal['plan_sha256'], 'at': stamp()}))
+            try:
+                http_unix(socket_path, '/v1/admin/quiesce', 'POST', {'schema_version': 1, 'protocol': 1,
+                    'operation_id': 'upd_'+self.journal['plan_sha256'][:26], 'target_sha': self.plan['target_sha']})
+            except (OSError, http.client.HTTPException):
+                pass  # 受理不明のPOSTは再送せず、socket側の現在状態を読む。
+        require(read_json(intent)['plan_sha256'] == self.journal['plan_sha256'], 'quiesce_plan_changed')
+        deadline = time.monotonic() + 60
+        while True:
+            state = http_unix(socket_path, '/v1/admin/drain-status')
+            require(state.get('schema_version') == 1 and state.get('protocol') == 1 and state.get('service') == 'slack_adapter'
+                    and state.get('quiescing') is True, 'slack_quiesce_unconfirmed')
+            if state.get('drained') is True and state.get('in_flight') == 0: return
+            require(time.monotonic() < deadline, 'slack_drain_timeout')
+            time.sleep(.2)
 
     def arm(self, receipt_path, launcher=None):
         require(self.journal['phase'] == 'prepared', 'arm_phase')
@@ -615,7 +683,7 @@ class Runner:
 
     def find_main_pid(self, release):
         raw = command(['/bin/ps', '-ww', '-axo', 'pid=,command='])
-        executable = self.inv['policy']['executables']['codex']
+        executable = self.inv['policy']['executables']['codex'] if release == self.inv['old_pointer'] else self.plan.get('codex_executable', self.inv['policy']['executables']['codex'])
         candidates = []
         for line in raw.splitlines():
             pid, cmd = line.strip().split(maxsplit=1)
@@ -706,6 +774,11 @@ class Runner:
         issued = receipt.get('issued_at_unix')
         require(type(issued) in (int, float) and 0 <= time.time() - issued <= 120, 'main_receipt_expired')
         require(main_evidence(self.plan, self.inv, receipt['spec']) == receipt['observations'], 'main_receipt_stale')
+        state = read_json(self.run/'main-lifecycle.json')
+        observed = self.main_call(action='status', release=self.plan['release'])
+        require(observed.get('exists') and observed.get('name') == 'dona-main' and observed.get('kind') == 'codex'
+                and observed.get('pane_id') == state['old']['pane_id'] and observed.get('matches_release')
+                and observed.get('session_id') == receipt['spec']['session_id'], 'main_mapping_changed')
         return True
 
     def cleanup_partial_backups(self):
@@ -819,21 +892,26 @@ class Runner:
 
     def rollback(self):
         # 旧DB/Result/pointerは変更していない。旧世代への復帰前に新サービス停止を確認。
-        self.record('rolling_back')
-        self.stop_all()
+        journal_error = None
+        try:
+            self.record('rolling_back')
+        except OSError as error:
+            journal_error = error
+        self.stop_all(tolerate_journal_failure=True)
         for label in LABELS:
             atomic(Path.home()/'Library/LaunchAgents'/ (label+'.plist'), plistlib.dumps(self.inv['plists'][label]))
         self.start_all(original=True)
         self.old_health()
         self.record('rolled_back', rollback_scope='original_plists_and_retained_old_generation')
+        if journal_error: raise journal_error
 
     def restore(self):
-        require(self.journal['phase'] in ('stopping', 'backing_up', 'switching', 'starting_core', 'rolling_back'), 'restore_after_ingress_forbidden')
+        require(self.journal['phase'] in ('quiescing', 'stopping', 'backing_up', 'switching', 'starting_core', 'rolling_back'), 'restore_after_ingress_forbidden')
         self.rollback()
 
     def execute(self, receipt):
         phase = self.journal['phase']
-        require(phase in ('prepared', 'stopping', 'backing_up', 'switching', 'starting_core', 'awaiting_main', 'starting_ingress', 'forward_recovery', 'rolling_back', 'rolled_back', 'succeeded'), 'journal_phase')
+        require(phase in ('prepared', 'quiescing', 'stopping', 'backing_up', 'switching', 'starting_core', 'awaiting_main', 'starting_ingress', 'forward_recovery', 'rolling_back', 'rolled_back', 'succeeded'), 'journal_phase')
         if phase in ('succeeded', 'rolled_back'):
             return
         if phase in ('backing_up', 'rolling_back'):
@@ -845,7 +923,7 @@ class Runner:
             require(tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
             # DB/log/socketは起動後mutable。code/config/pointerは全再開で照合する。
             require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
-            if phase in ('prepared', 'stopping', 'backing_up', 'switching'):
+            if phase in ('prepared', 'quiescing', 'stopping', 'backing_up', 'switching'):
                 require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
             verify_trust(self.plan['target_sha'], self.inv['policy'])
             if phase == 'prepared':
@@ -853,7 +931,10 @@ class Runner:
                 self.validate_source()
                 self.assert_updater_idle()
                 self.preflight_space()
-                self.record('stopping', handoff_sha256=digest(encode(receipt)), residual_risk='operator_assertion_not_machine_stop_proof')
+                self.record('quiescing', handoff_sha256=digest(encode(receipt)), residual_risk='operator_assertion_not_machine_stop_proof')
+            if self.journal['phase'] == 'quiescing':
+                self.quiesce_old_slack()
+                self.record('stopping')
             if self.journal['phase'] == 'stopping':
                 self.stop_all()  # Updaterを最初に止め、並行activationの生成元を除く。
                 self.assert_updater_idle()  # 最初のcheckと停止の間に承認されたrequestを検出。
@@ -864,6 +945,7 @@ class Runner:
                 self.assert_updater_idle()
                 self.validate_source()
                 self.backup()
+                self.validate_source()
                 self.record('switching')
             if self.journal['phase'] == 'switching':
                 self.stop_all()
@@ -910,7 +992,6 @@ class Runner:
                 finally:
                     self.stop_all()
             else:
-                self.record('rolling_back', failure='activation_failed')
                 self.rollback()
             raise
 

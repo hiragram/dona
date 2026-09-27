@@ -18,6 +18,7 @@ REAL_HEALTH = m.Runner.health
 REAL_TRUST = m.verify_trust
 REAL_MAIN_READY = m.Runner.assert_main_ready
 REAL_ENSURE_MAIN = m.Runner.ensure_main
+REAL_QUIESCE = m.Runner.quiesce_old_slack
 
 
 class FixtureDatabase:
@@ -73,7 +74,7 @@ class RunnerTest(unittest.TestCase):
         (self.old/'release').mkdir()
         self.db = self.old/'dona.sqlite3'
         with sqlite3.connect(self.db) as db:
-            db.executescript("CREATE TABLE events(event_id TEXT,status TEXT); CREATE TABLE jobs(job_id TEXT,source_event_id TEXT,status TEXT,completion_event_id TEXT); INSERT INTO events VALUES('event','completed'),('notification','completed'); INSERT INTO jobs VALUES('job','event','completed','notification');")
+            db.executescript("CREATE TABLE events(event_id TEXT,status TEXT,subject_json TEXT,reply_target_json TEXT,completed_at TEXT); CREATE TABLE jobs(job_id TEXT,source_event_id TEXT,status TEXT,completion_event_id TEXT,last_error_code TEXT,result_path TEXT); INSERT INTO events(event_id,status) VALUES('event','completed'),('notification','completed'); INSERT INTO jobs(job_id,source_event_id,status,completion_event_id) VALUES('job','event','completed','notification');")
         self.plists = {label: {'Label': label, 'ProgramArguments': ['node', '/old/'+label], 'EnvironmentVariables': {}} for label in m.LABELS}
         self.files = {}
         for label, plist in self.plists.items():
@@ -97,6 +98,8 @@ class RunnerTest(unittest.TestCase):
         self.services = Services()
         self.health_patch = patch.object(m.Runner, 'health')
         self.health = self.health_patch.start()
+        self.quiesce_patch = patch.object(m.Runner, 'quiesce_old_slack')
+        self.quiesce = self.quiesce_patch.start()
         self.ensure_patch = patch.object(m.Runner, 'ensure_main')
         self.ensure = self.ensure_patch.start()
         self.main_patch = patch.object(m.Runner, 'assert_main_ready', return_value=True)
@@ -107,6 +110,7 @@ class RunnerTest(unittest.TestCase):
         self.old_health = self.rollback_patch.start()
 
     def tearDown(self):
+        self.quiesce_patch.stop()
         self.ensure_patch.stop()
         self.main_patch.stop()
         self.trust_patch.stop()
@@ -124,7 +128,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.services.calls[:3], [('stop', l) for l in m.LABELS])
         self.assertEqual(self.services.calls[-3:], [('start', l) for l in m.START])
         with sqlite3.connect(self.db) as db:
-            db.execute("INSERT INTO events VALUES('late-old-worker','completed')")
+            db.execute("INSERT INTO events(event_id,status) VALUES('late-old-worker','completed')")
         self.assertEqual(FixtureDatabase().read(self.run/'backup/0.sqlite3', 'SELECT count(*) FROM events'), [(2,)])
         self.assertFalse((self.g/'dona.sqlite3').exists())
         self.assertEqual((self.old/'current').resolve(), self.old/'release')
@@ -298,7 +302,7 @@ with Server(p,Handler) as server: server.serve_forever()
         for directory in ['config','control','logs','run']:
             m.private_dir(self.g/directory)
         plan={'generation':str(self.g),'release':str(release),'target_sha':'a'*40}
-        inv={'policy':{'executables':{'node':sys.executable}},'plists':self.plists,
+        inv={'policy':{'executables':{'node':sys.executable,'codex':sys.executable}},'plists':self.plists,
              'configs':{key:{'values':{'SLACK_WORKSPACES':'test'}} for key in ['dispatcher','slack']}}
         (self.g/'control/updater').rmdir()
         m.render(self.run,plan,inv)
@@ -539,7 +543,7 @@ with Server(p,Handler) as server: server.serve_forever()
             with patch.object(runner,'main_call',side_effect=[old,{'outcome':'stopped'},{'outcome':'started','observation':observed},observed]) as calls, patch.object(runner,'find_main_pid',side_effect=[os.getpid(),process.pid]):
                 REAL_ENSURE_MAIN(runner)
                 self.assertEqual([c.kwargs['action'] for c in calls.call_args_list],['status','stop','start','status'])
-            self.assertTrue(REAL_MAIN_READY(runner))
+            with patch.object(runner,'main_call',return_value=observed): self.assertTrue(REAL_MAIN_READY(runner))
             # start応答喪失後も同じmainと実childをread-only照合し、startを再送しない。
             state=m.read_json(self.run/'main-lifecycle.json');state['phase']='start_intent';state.pop('observation')
             m.atomic(self.run/'main-lifecycle.json',m.encode(state))
@@ -558,7 +562,9 @@ with Server(p,Handler) as server: server.serve_forever()
         runner=self.runner()
         receipt={'schema_version':1,'plan_sha256':runner.journal['plan_sha256'],'mapping_evidence':'updater_runtime_and_required_mcp','spec':{},'observations':[],'issued_at_unix':m.time.time()}
         m.atomic(self.run/'main-ready.json',m.encode(receipt))
-        with patch.object(m,'main_evidence',return_value=[]): self.assertTrue(REAL_MAIN_READY(runner))
+        receipt['spec']={'session_id':'new'};m.atomic(self.run/'main-ready.json',m.encode(receipt));runner.plan['release']='/release'
+        runner.main_step('started',old={'pane_id':'pane'})
+        with patch.object(m,'main_evidence',return_value=[]),patch.object(runner,'main_call',return_value={'exists':True,'name':'dona-main','kind':'codex','pane_id':'pane','matches_release':True,'session_id':'new'}): self.assertTrue(REAL_MAIN_READY(runner))
         receipt['issued_at_unix']-=121
         m.atomic(self.run/'main-ready.json',m.encode(receipt))
         with self.assertRaisesRegex(RuntimeError,'main_receipt_expired'): REAL_MAIN_READY(runner)
@@ -682,3 +688,74 @@ class RecoveryRegressionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'updater_stop_failure'): runner.execute({})
         self.assertNotIn('dev.dona.slack-adapter',self.services.registered)
         self.assertNotIn('dev.dona.dispatcher',self.services.registered)
+
+    def test_waiting_update_plan_is_not_a_reset_gate(self):
+        with sqlite3.connect(self.old/'updater.sqlite3') as db: db.execute("INSERT INTO update_requests VALUES('awaiting_approval')")
+        self.runner().execute(self.receipt)
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'succeeded')
+
+    def test_timeout_job_uses_exact_final_result_and_later_same_thread_handoff(self):
+        runner=self.runner();runner.plan['job_result_path']=str(self.run/'result.json')
+        subject=json.dumps({'workspace_id':'T1','channel_id':'C1'});target=json.dumps({'channel_id':'C1','thread_ts':'1.2'})
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE jobs SET status='needs_review',last_error_code='timeout',result_path=?",(runner.plan['job_result_path'],))
+            db.execute('UPDATE events SET subject_json=?,reply_target_json=?,completed_at=?',(subject,target,'2026-09-27T04:59:01Z'))
+        receipt=dict(self.receipt,job_result_sha256='a'*64)
+        with patch.object(m,'final_job_result',return_value={'status':'completed','completed_at':'2026-09-27T04:59:00Z'}) as result:
+            m.validate_handoff(runner.plan,runner.journal['plan_sha256'],receipt,runner.inv,runner.database.read)
+            self.assertEqual(result.call_args.args[2],'a'*64)
+            with sqlite3.connect(self.db) as db: db.execute("UPDATE events SET completed_at='2026-09-27T04:58:00Z' WHERE event_id='notification'")
+            with self.assertRaisesRegex(RuntimeError,'predates_result'): m.validate_handoff(runner.plan,runner.journal['plan_sha256'],receipt,runner.inv,runner.database.read)
+            with sqlite3.connect(self.db) as db: db.execute("UPDATE events SET subject_json=? WHERE event_id='notification'",(json.dumps({'workspace_id':'T1','channel_id':'other'}),))
+            with self.assertRaisesRegex(RuntimeError,'notification_scope'): m.validate_handoff(runner.plan,runner.journal['plan_sha256'],receipt,runner.inv,runner.database.read)
+        self.assertEqual(FixtureDatabase().read(self.db,'SELECT status,last_error_code FROM jobs'),[('needs_review','timeout')])
+
+    def test_final_result_digest_and_schema_share_one_read(self):
+        file=self.run/'result.json';content=b'{"status":"completed"}';file.write_bytes(content)
+        plan={'job_result_path':str(file),'release':'/release','job_id':'job'}
+        inv={'policy':{'executables':{'node':'/bin/node'}}}
+        def parse(argv,**options):
+            self.assertEqual(options['input'],content);file.write_bytes(b'changed')
+            return '{"status":"completed","completed_at":"2026-09-27T04:59:00Z"}'
+        with patch.object(m,'command',side_effect=parse): m.final_job_result(plan,inv,m.digest(content))
+        with self.assertRaisesRegex(RuntimeError,'final_result_changed'): m.final_job_result(plan,inv,m.digest(content))
+        with self.assertRaisesRegex(RuntimeError,'final_result_digest_required'): m.final_job_result(plan,inv,None)
+
+    def test_mapping_replacement_is_rejected_despite_same_live_pids(self):
+        runner=self.runner();runner.plan['release']='/release';runner.main_step('started',old={'pane_id':'pane'})
+        m.atomic(self.run/'main-ready.json',m.encode({'schema_version':1,'plan_sha256':runner.journal['plan_sha256'],'mapping_evidence':'updater_runtime_and_required_mcp','spec':{'session_id':'expected'},'observations':[],'issued_at_unix':m.time.time()}))
+        with patch.object(m,'main_evidence',return_value=[]),patch.object(runner,'main_call',return_value={'exists':True,'name':'dona-main','kind':'codex','pane_id':'pane','matches_release':True,'session_id':'replacement'}):
+            with self.assertRaisesRegex(RuntimeError,'main_mapping_changed'): REAL_MAIN_READY(runner)
+
+    def test_source_change_during_snapshot_is_detected_before_switch(self):
+        runner=self.runner();backup=runner.backup
+        def changed():
+            backup();(self.old/'current').unlink();(self.old/'current').symlink_to(self.old/'changed-release')
+        runner.backup=changed
+        with patch.object(runner,'switch') as switch:
+            with self.assertRaisesRegex(RuntimeError,'source_pointer_drift'): runner.execute(self.receipt)
+            switch.assert_not_called()
+
+    def test_rollback_journal_failure_still_restores_and_starts_original_services(self):
+        original=m.atomic
+        def failing(file,data):
+            if file==self.run/'journal.json' and json.loads(data).get('phase')=='rolling_back': raise OSError('journal_io_failure')
+            return original(file,data)
+        self.health.side_effect=RuntimeError('core_failure')
+        with patch.object(m,'atomic',side_effect=failing):
+            with self.assertRaisesRegex(OSError,'journal_io_failure'): self.runner().execute(self.receipt)
+        self.old_health.assert_called_once()
+        self.assertEqual(self.services.registered,set(m.LABELS))
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'rolled_back')
+
+    def test_quiesce_timeout_is_read_only_reconciled_without_resending(self):
+        runner=self.runner();runner.inv['configs']={'slack':{'config':{'healthSocketPath':'/fixture/socket'}}}
+        state={'schema_version':1,'protocol':1,'service':'slack_adapter','quiescing':True,'drained':True,'in_flight':0}
+        with patch.object(m,'http_unix',side_effect=[TimeoutError(),state,state]) as call:
+            REAL_QUIESCE(runner);REAL_QUIESCE(runner)
+            self.assertEqual([c.args[1] for c in call.call_args_list],['/v1/admin/quiesce','/v1/admin/drain-status','/v1/admin/drain-status'])
+
+    def test_installed_codex_is_resolved_like_runtime_not_stale_policy(self):
+        file=self.home/'codex';file.write_text('fixture');file.chmod(0o700)
+        with patch.object(m.shutil,'which',return_value=str(file)),patch.object(m,'command',return_value='codex-cli 0.157.1'):
+            self.assertEqual(m.installed_codex(),str(file.resolve()))
