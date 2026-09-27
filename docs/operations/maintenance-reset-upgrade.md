@@ -8,6 +8,8 @@ DB履歴を引き継がず、新しい世代を準備して3サービスを切�
 本番実行には、委任job・元event・その完了通知eventのterminalと、親へのhandoff receiptが必要です。
 準備だけでは本番を停止しません。
 
+準備時もproductionと同じvolumeの空き容量を消費します。snapshotの有無とは独立に、fetch前、各npm install/buildの前後、設定生成・copy・migration前後でpolicyのdisk floorと作業余裕を確認します。失敗時は今回だけの未公開世代をinode/所有者確認後に削除し、旧世代・worktree・他の準備成果は残します。容量予約やhost全体のquotaではないため、並行する無関係な書込みによる枯渇まで保証しません。
+
 ## 対象と保持するもの
 
 - 対象サービスは `dev.dona.slack-adapter`、`dev.dona.dispatcher`、`dev.dona.updater` のみです。
@@ -126,13 +128,13 @@ python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" arm \
    backup失敗時にはpartial snapshotとsidecarを削除してから復元します。旧Resultはpathごと保持し、遅延writeも旧世代へ残します。
 4. backup後に元設定・pointerを再照合し、UpdaterとDispatcherのplistを新世代のrelease pointer / 設定へ切り替えます。
    Slackの新plistはmain確認後のingress開始intentまでinstallせず、旧plistを未登録のまま保持します。
-5. 起動直前に未起動世代のfull sealを再照合し、UpdaterとDispatcherを起動してcore healthを確認します。
+5. 起動直前に未起動世代のfull sealを再照合し、Dispatcherを起動してcore healthを確認します。新Updaterはまだ起動しません。
    `awaiting_main`は中間phaseです。同じ実行で旧mainを停止し、新main起動・MCP確認を行います。
    main確認receipt生成後にingress開始intentを永続化し、Slack plistのinstallと起動を行います。
    bootstrap応答が曖昧な場合は同writeを再送せず観測します。
-6. 3サービスの`/health/version`でexact SHA / readyを、DispatcherとSlackで`update_notification_protocol == 1`を、
-   Slackで`workspaces_ready`と`dispatcher_ready`を確認します。
-   成功を独立journalへ記録します。
+6. DispatcherとSlackの`/health/version`でexact SHA / ready・`update_notification_protocol == 1`を、
+   Slackで`workspaces_ready`と`dispatcher_ready`を確認し、`activation_committed`を独立journalへ保存します。
+   その後だけUpdaterを起動し、exact SHA / ready確認後に`succeeded`を保存します。
 
 ### main agentの接続切替と受付barrier
 
@@ -205,7 +207,9 @@ python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" status \
   --run "$HOME/.dona-maintenance/reset-YYYYMMDD-unique"
 ```
 
-`prepared`、`awaiting_main`、`succeeded`、`rolled_back`、`rolling_back`、`forward_recovery`を区別してください。
+`prepared`、`awaiting_main`、`activation_committed`、`succeeded`、`rolled_back`、`rolling_back`、`forward_recovery`を区別してください。
+`activation_committed`は新main・MCP・Slackの確認をjournalへ保存した境界です。この後だけ新Updaterを起動し、そのhealthを確認して`succeeded`を保存します。Updaterが通常updateを受理し得るため、この境界以後はcoreの停止・pointer切替・旧世代rollbackを行いません。Updater起動・health・成功journalに失敗した場合もcoreを維持し、再開では固定されたUpdaterだけを照合・起動します。commitの書込み結果が不明な場合もcoreを止めず、Updaterは書込み成功後だけ起動します。
+
 `succeeded`は上記サービス切替・healthの範囲です。Slack投稿や新mainでのevent処理成功を意味しません。
 
 ## 検証

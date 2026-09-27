@@ -283,6 +283,25 @@ def installed_codex():
     return executable
 
 
+def staging_space(path, policy, reserve=True):
+    # npm/build/copyの各段階へ1GiBの作業余裕を取り、既存の稼働volume floorを残す。
+    required = policy.get('disk_floor_bytes', 0) + (1024**3 if reserve else 0)
+    require(shutil.disk_usage(path).free >= required, 'staging_disk_floor')
+
+
+def cleanup_unpublished_generation(generation, identity):
+    info = generation.lstat()
+    require(not generation.is_symlink() and generation.is_dir() and info.st_uid == os.getuid()
+            and (info.st_dev, info.st_ino) == identity, 'staging_cleanup_identity_changed')
+    # このprepareが空の状態から所有したdirectoryだけ。symlink先はchmodも削除もしない。
+    for root, dirs, files in os.walk(generation, followlinks=False):
+        os.chmod(root, 0o700)
+        for name in dirs:
+            child = Path(root)/name
+            if not child.is_symlink(): os.chmod(child, 0o700)
+    shutil.rmtree(generation)
+
+
 def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
     require(re.fullmatch(r'evt_[0-9A-HJKMNP-TV-Z]{26}', event_id, re.I), 'event_id')
     require(re.fullmatch(r'job_[0-9a-hjkmnp-tv-z]{26}', job_id, re.I), 'job_id')
@@ -293,6 +312,7 @@ def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
     atomic(run/'main_bridge.mjs', Path(__file__).with_name('main_bridge.mjs').read_bytes())
     inv = inventory()
     atomic(run/'inventory.json', encode(inv))
+    staging_space(run, inv['policy'])
     executables = inv['policy']['executables']
     sha = command([executables['gh'], 'api', 'repos/hiragram/dona/git/ref/heads/main', '--jq', '.object.sha'])
     require(re.fullmatch('[0-9a-f]{40}', sha), 'canonical_sha')
@@ -300,49 +320,68 @@ def prepare(run, repository, event_id, job_id, snapshot_old_databases=False):
     command([executables['git'], '-C', str(repository), 'fetch', 'origin', 'main'])
     require(command([executables['git'], '-C', str(repository), 'rev-parse', 'origin/main']) == sha, 'main_drift')
     trust = verify_trust(sha, inv['policy'])
+    staging_space(run, inv['policy'])
     generation = private_dir(Path.home()/'.dona/g'/digest(str(run).encode())[:12])
     require(not list(generation.iterdir()), 'generation_not_empty')
-    release = private_dir(generation/'runtime/releases'/sha)
-    archive = run/'source.tar'
-    command([executables['git'], '-C', str(repository), 'archive', '--format=tar', '-o', str(archive), sha])
-    with tarfile.open(archive) as tar:
-        for member in tar.getmembers():
-            require(not member.issym() and not member.islnk() and not member.name.startswith('/') and '..' not in Path(member.name).parts, 'archive_path')
-        tar.extractall(release)
-    archive.unlink()
-    npm = inv['policy']['executables']['npm']
-    node = inv['policy']['executables']['node']
-    for component in ('dispatcher', 'sources/slack', 'updater'):
-        command([npm, 'ci'], cwd=release/component, timeout=900)
-        command([npm, 'run', 'build'], cwd=release/component, timeout=180)
-    command([node, str(release/'scripts/write-release-manifest.mjs'), str(release), sha,
-             command([npm, '--version']), inv['policy']['policy_version']])
-    for p in ('config', 'control', 'results', 'job-results', 'run', 'logs'):
-        private_dir(generation/p)
-    # updaterはcontrol_root/updater.sock固定なので長いUNIX socket pathを準備段階で拒否。
-    require(len(str(generation/'control/updater.sock').encode()) < 104, 'socket_path_too_long')
-    plan = {'schema_version': 1, 'trust': trust, 'target_sha': sha, 'generation': str(generation), 'release': str(release),
-            'event_id': event_id, 'job_id': job_id, 'inventory_sha256': digest((run/'inventory.json').read_bytes()),
-            'runner_sha256': digest((run/'runner.py').read_bytes()),
-            'created_at': stamp(), 'strategy': 'isolated_generation', 'operator_assertion_required': True, 'snapshot_old_databases': snapshot_old_databases}
-    plan['codex_executable'] = installed_codex()
-    state = NodeDatabase(node, release/'updater/node_modules/better-sqlite3/lib/index.js')
-    rows = state.read(Path(inv['databases'][0]), 'SELECT result_path FROM jobs WHERE job_id=? AND source_event_id=?', (job_id, event_id))
-    require(len(rows) == 1 and Path(rows[0][0]).is_absolute(), 'handoff_job_not_found')
-    plan['job_result_path'] = rows[0][0]
-    render(run, plan, inv)
-    validate_staging(run, plan, node)
-    migrate(plan, node)
-    make_immutable(release)
-    make_immutable(generation/'control/updater')
-    # staging成果全体をseal。node_modulesを含め、prepare後の変更を停止前に検知する。
-    plan['generation_seal'] = tree_seal(generation)
-    plan['plists_seal'] = tree_seal(run/'plists')
-    plan['service_programs'] = {label: plistlib.loads((run/'plists'/(label+'.plist')).read_bytes())['ProgramArguments'][1] for label in LABELS}
-    plan['static_seal'] = static_seal(generation)
-    atomic(run/'plan.json', encode(plan))
-    atomic(run/'journal.json', encode({'phase': 'prepared', 'plan_sha256': digest((run/'plan.json').read_bytes()), 'steps': []}))
-    return plan
+    info = generation.stat()
+    identity = (info.st_dev, info.st_ino)
+    try:
+        release = private_dir(generation/'runtime/releases'/sha)
+        archive = run/'source.tar'
+        command([executables['git'], '-C', str(repository), 'archive', '--format=tar', '-o', str(archive), sha])
+        with tarfile.open(archive) as tar:
+            for member in tar.getmembers():
+                require(not member.issym() and not member.islnk() and not member.name.startswith('/') and '..' not in Path(member.name).parts, 'archive_path')
+            tar.extractall(release)
+        archive.unlink()
+        npm = inv['policy']['executables']['npm']
+        node = inv['policy']['executables']['node']
+        for component in ('dispatcher', 'sources/slack', 'updater'):
+            staging_space(generation, inv['policy'])
+            command([npm, 'ci'], cwd=release/component, timeout=900)
+            staging_space(generation, inv['policy'])
+            command([npm, 'run', 'build'], cwd=release/component, timeout=180)
+            staging_space(generation, inv['policy'], reserve=False)
+        command([node, str(release/'scripts/write-release-manifest.mjs'), str(release), sha,
+                 command([npm, '--version']), inv['policy']['policy_version']])
+        for p in ('config', 'control', 'results', 'job-results', 'run', 'logs'):
+            private_dir(generation/p)
+        # updaterはcontrol_root/updater.sock固定なので長いUNIX socket pathを準備段階で拒否。
+        require(len(str(generation/'control/updater.sock').encode()) < 104, 'socket_path_too_long')
+        plan = {'schema_version': 1, 'trust': trust, 'target_sha': sha, 'generation': str(generation), 'release': str(release),
+                'event_id': event_id, 'job_id': job_id, 'inventory_sha256': digest((run/'inventory.json').read_bytes()),
+                'runner_sha256': digest((run/'runner.py').read_bytes()),
+                'created_at': stamp(), 'strategy': 'isolated_generation', 'operator_assertion_required': True, 'snapshot_old_databases': snapshot_old_databases}
+        plan['codex_executable'] = installed_codex()
+        state = NodeDatabase(node, release/'updater/node_modules/better-sqlite3/lib/index.js')
+        rows = state.read(Path(inv['databases'][0]), 'SELECT result_path FROM jobs WHERE job_id=? AND source_event_id=?', (job_id, event_id))
+        require(len(rows) == 1 and Path(rows[0][0]).is_absolute(), 'handoff_job_not_found')
+        plan['job_result_path'] = rows[0][0]
+        staging_space(generation, inv['policy'])
+        render(run, plan, inv)
+        validate_staging(run, plan, node)
+        migrate(plan, node)
+        staging_space(generation, inv['policy'], reserve=False)
+        make_immutable(release)
+        make_immutable(generation/'control/updater')
+        # staging成果全体をseal。node_modulesを含め、prepare後の変更を停止前に検知する。
+        plan['generation_seal'] = tree_seal(generation)
+        plan['plists_seal'] = tree_seal(run/'plists')
+        plan['service_programs'] = {label: plistlib.loads((run/'plists'/(label+'.plist')).read_bytes())['ProgramArguments'][1] for label in LABELS}
+        plan['static_seal'] = static_seal(generation)
+        plan['updater_launch_seal'] = static_seal(generation, include_runtime=False)
+        atomic(run/'plan.json', encode(plan))
+        atomic(run/'journal.json', encode({'phase': 'prepared', 'plan_sha256': digest((run/'plan.json').read_bytes()), 'steps': []}))
+        return plan
+    except Exception:
+        cleanup_unpublished_generation(generation, identity)
+        archive = run/'source.tar'
+        if archive.is_file() and not archive.is_symlink(): archive.unlink()
+        try:
+            atomic(run/'journal.json', encode({'phase': 'prepare_failed', 'steps': []}))
+        except OSError:
+            pass
+        raise
 
 
 def make_immutable(root):
@@ -365,9 +404,10 @@ def tree_seal(root):
     return h.hexdigest()
 
 
-def static_seal(generation):
+def static_seal(generation, include_runtime=True):
     h = hashlib.sha256()
-    for name in ('config', 'control/updater', 'control/policy.json', 'control/dispatcher.token', 'runtime'):
+    names = ('config', 'control/updater', 'control/policy.json', 'control/dispatcher.token') + (('runtime',) if include_runtime else ())
+    for name in names:
         p = Path(generation)/name
         h.update(name.encode())
         h.update(str(p.lstat().st_mode & 0o777).encode() + b'\0')
@@ -876,12 +916,13 @@ class Runner:
     def start_all(self, include_slack=True, original=False):
         if not original: require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
         self.assert_installed(original)
-        for label in START if include_slack else START[:2]:
+        labels = START if original else (('dev.dona.dispatcher', 'dev.dona.slack-adapter') if include_slack else ('dev.dona.dispatcher',))
+        for label in labels:
             self.services.start(label, Path.home()/'Library/LaunchAgents'/ (label+'.plist'))
 
-    def health(self, include_slack=True):
-        targets = [('control/updater.sock', 'updater'), ('run/d.sock', 'dispatcher')]
-        if include_slack:
+    def health(self, include_slack=True, updater_only=False):
+        targets = [('control/updater.sock', 'updater')] if updater_only else [('run/d.sock', 'dispatcher')]
+        if include_slack and not updater_only:
             targets.append(('run/s.sock', 'slack_adapter'))
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
@@ -897,6 +938,18 @@ class Runner:
             except (OSError, RuntimeError, ValueError, http.client.HTTPException):
                 time.sleep(.5)
         raise RuntimeError('target_health_timeout')
+
+    def finish_updater(self):
+        # この境界より後は通常Updaterへ所有権を渡す。coreのstop/switchを二度と行わない。
+        require(self.journal['phase'] == 'activation_committed', 'updater_handoff_phase')
+        require(static_seal(self.generation, include_runtime=False) == self.plan['updater_launch_seal'], 'updater_launch_drift')
+        require(tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
+        label = 'dev.dona.updater'
+        plist = regular(Path.home()/'Library/LaunchAgents'/(label+'.plist'))
+        require(plist.read_bytes() == (self.run/'plists'/plist.name).read_bytes(), 'installed_plist_drift')
+        self.services.start(label, plist)
+        self.health(updater_only=True)
+        self.record('succeeded', updater_ready=True)
 
     def old_health(self):
         d = self.inv['configs']['dispatcher']['config']
@@ -935,14 +988,18 @@ class Runner:
 
     def execute(self, receipt):
         phase = self.journal['phase']
-        require(phase in ('prepared', 'quiescing', 'stopping', 'backing_up', 'switching', 'starting_core', 'awaiting_main', 'starting_ingress', 'forward_recovery', 'rolling_back', 'rolled_back', 'succeeded'), 'journal_phase')
+        require(phase in ('prepared', 'quiescing', 'stopping', 'backing_up', 'switching', 'starting_core', 'awaiting_main', 'starting_ingress', 'forward_recovery', 'rolling_back', 'rolled_back', 'activation_committed', 'succeeded'), 'journal_phase')
         if phase in ('succeeded', 'rolled_back'):
+            return
+        if phase == 'activation_committed':
+            self.finish_updater()
             return
         if phase in ('backing_up', 'rolling_back'):
             self.cleanup_partial_backups()  # crash後も容量確認やjournal writeより先に部分fileを回収。
         if phase == 'rolling_back':
             self.rollback()
             return
+        commit_attempted = False
         try:
             require(tree_seal(self.run/'plists') == self.plan['plists_seal'], 'staged_plists_changed')
             # DB/log/socketは起動後mutable。code/config/pointerは全再開で照合する。
@@ -1006,8 +1063,13 @@ class Runner:
                 self.services.start(label, Path.home()/'Library/LaunchAgents'/(label+'.plist'))
                 self.health()
                 require(self.assert_main_ready(), 'main_not_ready')
-                self.record('succeeded', target_sha=self.plan['target_sha'], slack_connected=True)
+                commit_attempted = True
+                self.record('activation_committed', target_sha=self.plan['target_sha'], slack_connected=True, updater_ready=False)
+                self.finish_updater()
         except Exception:
+            if commit_attempted or self.journal['phase'] == 'activation_committed':
+                # commitのfsync結果が不明でも、新API起動後でも、coreを巻き戻さない。
+                raise
             if self.journal['phase'] == 'prepared':
                 raise
             if self.journal['phase'] in ('awaiting_main', 'starting_ingress', 'forward_recovery', 'succeeded'):
@@ -1090,7 +1152,7 @@ def main():
         print(json.dumps({'phase': read_json(args.run/'journal.json')['phase']}))
     else:
         journal = read_json(args.run/'journal.json')
-        print(json.dumps({k: journal[k] for k in ('phase', 'updated_at', 'target_sha') if k in journal}))
+        print(json.dumps({k: journal[k] for k in ('phase', 'updated_at', 'target_sha', 'updater_ready') if k in journal}))
 
 
 if __name__ == '__main__':

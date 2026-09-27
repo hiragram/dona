@@ -89,7 +89,7 @@ class RunnerTest(unittest.TestCase):
         m.atomic(self.run/'main_bridge.mjs',Path(m.__file__).with_name('main_bridge.mjs').read_bytes())
         plan = {'runner_sha256': m.digest((self.run/'runner.py').read_bytes()), 'generation': str(self.g), 'target_sha': 'a'*40, 'event_id': 'event', 'job_id': 'job',
                 'inventory_sha256': m.digest((self.run/'inventory.json').read_bytes()),
-                'generation_seal': m.tree_seal(self.g), 'static_seal':m.static_seal(self.g), 'plists_seal': m.tree_seal(self.run/'plists')}
+                'generation_seal': m.tree_seal(self.g), 'updater_launch_seal':m.static_seal(self.g,include_runtime=False), 'static_seal':m.static_seal(self.g), 'plists_seal': m.tree_seal(self.run/'plists')}
         m.atomic(self.run/'plan.json', m.encode(plan))
         plan_hash = m.digest((self.run/'plan.json').read_bytes())
         m.atomic(self.run/'journal.json', m.encode({'phase': 'prepared', 'plan_sha256': plan_hash, 'steps': []}))
@@ -126,13 +126,78 @@ class RunnerTest(unittest.TestCase):
         self.runner().execute(self.receipt)
         self.assertEqual(m.read_json(self.run/'journal.json')['phase'], 'succeeded')
         self.assertEqual(self.services.calls[:3], [('stop', l) for l in m.LABELS])
-        self.assertEqual(self.services.calls[-3:], [('start', l) for l in m.START])
+        self.assertEqual(self.services.calls[-3:], [('start', l) for l in ('dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater')])
         with sqlite3.connect(self.db) as db:
             db.execute("INSERT INTO events(event_id,status) VALUES('late-old-worker','completed')")
         self.assertEqual(FixtureDatabase().read(self.run/'backup/0.sqlite3', 'SELECT count(*) FROM events'), [(2,)])
         self.assertFalse((self.g/'dona.sqlite3').exists())
         self.assertEqual((self.old/'current').resolve(), self.old/'release')
         self.assertEqual(self.db.stat().st_ino, Path(m.read_json(self.run/'inventory.json')['databases'][0]).stat().st_ino)
+
+    def test_updater_starts_only_after_durable_cutover_commit(self):
+        start=self.services.start
+        def observe(label, plist):
+            if label=='dev.dona.updater':
+                journal=m.read_json(self.run/'journal.json')
+                self.assertEqual(journal['phase'],'activation_committed')
+                self.assertTrue(journal['slack_connected'])
+                self.assertIn('dev.dona.slack-adapter',self.services.registered)
+            else:
+                self.assertNotIn('dev.dona.updater',self.services.registered)
+            start(label,plist)
+        self.services.start=observe
+        self.runner().execute(self.receipt)
+        self.assertTrue(m.read_json(self.run/'journal.json')['updater_ready'])
+
+    def test_updater_health_failure_resumes_without_touching_core(self):
+        def health(include_slack=True,updater_only=False):
+            if updater_only: raise RuntimeError('updater_unavailable')
+        self.health.side_effect=health
+        with self.assertRaisesRegex(RuntimeError,'updater_unavailable'): self.runner().execute(self.receipt)
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'activation_committed')
+        self.assertEqual(self.services.registered,set(m.LABELS))
+        # 通常Updaterの受理後にpointerが進んでも、保守runnerはcoreを巻き戻さない。
+        (self.g/'runtime/ordinary-update').write_text('new pointer')
+        self.health.side_effect=None;self.services.calls.clear()
+        self.runner().execute({})
+        self.assertEqual(self.services.calls,[('start','dev.dona.updater')])
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'succeeded')
+
+    def test_commit_write_failure_never_enables_updater_or_stops_ingress(self):
+        atomic=m.atomic
+        def failing(file,data):
+            if file==self.run/'journal.json' and json.loads(data).get('phase')=='activation_committed':
+                raise OSError('commit_disk_failure')
+            return atomic(file,data)
+        with patch.object(m,'atomic',side_effect=failing):
+            with self.assertRaisesRegex(OSError,'commit_disk_failure'): self.runner().execute(self.receipt)
+        self.assertEqual(self.services.registered,{'dev.dona.dispatcher','dev.dona.slack-adapter'})
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'starting_ingress')
+        self.assertNotIn(('start','dev.dona.updater'),self.services.calls)
+        self.runner().execute({})
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'succeeded')
+
+    def test_staging_disk_floor_is_independent_of_optional_backup(self):
+        from types import SimpleNamespace
+        with patch.object(m.shutil,'disk_usage',return_value=SimpleNamespace(free=1024**3+9)):
+            with self.assertRaisesRegex(RuntimeError,'staging_disk_floor'): m.staging_space(self.home,{'disk_floor_bytes':10})
+            m.staging_space(self.home,{'disk_floor_bytes':10},reserve=False)
+        with patch.object(m.shutil,'disk_usage',return_value=SimpleNamespace(free=9)):
+            with self.assertRaisesRegex(RuntimeError,'staging_disk_floor'): m.staging_space(self.home,{'disk_floor_bytes':10},reserve=False)
+
+    def test_unpublished_cleanup_keeps_other_generation_and_symlink_target(self):
+        staging=m.private_dir(self.home/'unpublished');child=m.private_dir(staging/'immutable')
+        (child/'asset').write_text('owned');(child/'outside').symlink_to(self.old,target_is_directory=True)
+        info=staging.stat();m.make_immutable(staging)
+        m.cleanup_unpublished_generation(staging,(info.st_dev,info.st_ino))
+        self.assertFalse(staging.exists());self.assertTrue(self.db.exists())
+        self.assertTrue(self.g.exists());self.assertEqual(self.old.stat().st_mode&0o777,0o700)
+
+    def test_unpublished_cleanup_refuses_replaced_identity(self):
+        info=self.g.stat()
+        with self.assertRaisesRegex(RuntimeError,'staging_cleanup_identity_changed'):
+            m.cleanup_unpublished_generation(self.g,(info.st_dev,info.st_ino+1))
+        self.assertTrue(self.g.exists())
 
     def test_missing_handoff_blocks_all_stop(self):
         for key in ['operator_assertion', 'plan_sha256', 'handoff_event_id']:
@@ -262,6 +327,7 @@ with Server(p,Handler) as server: server.serve_forever()
         plan['service_programs']={label:str(fixture) for label in m.LABELS}
         plan['generation_seal']=m.tree_seal(self.g)
         plan['static_seal']=m.static_seal(self.g)
+        plan['updater_launch_seal']=m.static_seal(self.g,include_runtime=False)
         m.atomic(self.run/'plan.json',m.encode(plan))
         journal=m.read_json(self.run/'journal.json')
         journal['plan_sha256']=m.digest((self.run/'plan.json').read_bytes())
@@ -282,7 +348,7 @@ with Server(p,Handler) as server: server.serve_forever()
             def process(self,pid): return m.Launchd().process(pid)
         services=Processes()
         runner=m.Runner(self.run,services,FixtureDatabase())
-        runner.health=lambda include_slack=True: REAL_HEALTH(runner, include_slack)
+        runner.health=lambda include_slack=True,updater_only=False: REAL_HEALTH(runner, include_slack,updater_only)
         try:
             runner.execute(self.receipt)
             self.assertEqual(runner.journal['phase'],'succeeded')
@@ -620,8 +686,8 @@ class RecoveryRegressionTest(unittest.TestCase):
             return original(file,data)
         with patch.object(m,'atomic',side_effect=failing):
             with self.assertRaisesRegex(OSError,'disk_failure'): self.runner().execute(self.receipt)
-        self.assertEqual(self.services.registered,set())
-        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'forward_recovery')
+        self.assertEqual(self.services.registered,set(m.LABELS))
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'activation_committed')
         self.old_health.assert_not_called()
 
     def test_backup_time_generation_change_is_rejected_before_bootstrap(self):
