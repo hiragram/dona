@@ -558,7 +558,7 @@ with Server(p,Handler) as server: server.serve_forever()
                 except ProcessLookupError: pass
             process.terminate();process.wait(timeout=5);process.stdout.close()
 
-    def test_main_receipt_is_plan_bound_and_expires(self):
+    def test_main_receipt_is_plan_bound_and_refreshes_after_live_validation(self):
         runner=self.runner()
         receipt={'schema_version':1,'plan_sha256':runner.journal['plan_sha256'],'mapping_evidence':'updater_runtime_and_required_mcp','spec':{},'observations':[],'issued_at_unix':m.time.time()}
         m.atomic(self.run/'main-ready.json',m.encode(receipt))
@@ -567,7 +567,8 @@ with Server(p,Handler) as server: server.serve_forever()
         with patch.object(m,'main_evidence',return_value=[]),patch.object(runner,'main_call',return_value={'exists':True,'name':'dona-main','kind':'codex','pane_id':'pane','matches_release':True,'session_id':'new'}): self.assertTrue(REAL_MAIN_READY(runner))
         receipt['issued_at_unix']-=121
         m.atomic(self.run/'main-ready.json',m.encode(receipt))
-        with self.assertRaisesRegex(RuntimeError,'main_receipt_expired'): REAL_MAIN_READY(runner)
+        with patch.object(m,'main_evidence',return_value=[]),patch.object(runner,'main_call',return_value={'exists':True,'name':'dona-main','kind':'codex','pane_id':'pane','matches_release':True,'session_id':'new'}): self.assertTrue(REAL_MAIN_READY(runner))
+        self.assertGreater(m.read_json(self.run/'main-ready.json')['issued_at_unix'],receipt['issued_at_unix'])
         receipt['plan_sha256']='other'
         m.atomic(self.run/'main-ready.json',m.encode(receipt))
         with self.assertRaisesRegex(RuntimeError,'main_receipt_binding'): REAL_MAIN_READY(runner)
@@ -759,3 +760,30 @@ class RecoveryRegressionTest(unittest.TestCase):
         file=self.home/'codex';file.write_text('fixture');file.chmod(0o700)
         with patch.object(m.shutil,'which',return_value=str(file)),patch.object(m,'command',return_value='codex-cli 0.157.1'):
             self.assertEqual(m.installed_codex(),str(file.resolve()))
+
+
+    def test_definite_bootstrap_rejection_can_rearm_but_unknown_cannot(self):
+        receipt=self.run/'handoff.json';m.atomic(receipt,m.encode(self.receipt))
+        runner=self.runner();start=self.services.start
+        with patch.object(self.services,'start',side_effect=m.LaunchdRejected('fixture_rejected')):
+            with self.assertRaises(m.LaunchdRejected): runner.arm(receipt,self.services)
+        self.assertEqual(m.read_json(self.run/'arm.json')['phase'],'bootstrap_rejected')
+        label=runner.arm(receipt,self.services)
+        self.assertIn(label,self.services.registered)
+        self.assertEqual(self.services.calls,[('start',label)])
+
+    def test_launchd_nonzero_unregistered_is_rejection_but_timeout_is_unknown(self):
+        launch=m.Launchd()
+        with patch.object(launch,'observe',return_value=None),patch.object(m.subprocess,'run',return_value=subprocess.CompletedProcess([],5,b'',b'')):
+            with self.assertRaises(m.LaunchdRejected): launch.start(m.LABELS[0],self.run/'fixture.plist')
+        with patch.object(launch,'observe',return_value=None),patch.object(m.subprocess,'run',side_effect=subprocess.TimeoutExpired([],35)):
+            with self.assertRaisesRegex(RuntimeError,'service_start_unconfirmed'): launch.start(m.LABELS[0],self.run/'fixture.plist')
+
+    def test_definite_main_stop_rejection_allows_fresh_observation_on_next_execute(self):
+        runner=self.runner()
+        old={'exists':True,'name':'dona-main','kind':'codex','matches_release':True,'pane_id':'w1:p1','session_id':'old','status':'idle'}
+        with patch.object(runner,'main_call',side_effect=[old,{'outcome':'rejected'},old,{'outcome':'rejected'}]) as call,patch.object(runner,'find_main_pid',return_value=999):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError,'main_stop_rejected'): REAL_ENSURE_MAIN(runner)
+                self.assertEqual(m.read_json(self.run/'main-lifecycle.json')['phase'],'stop_rejected')
+            self.assertEqual([c.kwargs['action'] for c in call.call_args_list],['status','stop','status','stop'])

@@ -157,6 +157,10 @@ def http_unix(socket_path, route, method='GET', payload=None):
         conn.close()
 
 
+class LaunchdRejected(RuntimeError):
+    pass
+
+
 class Launchd:
     def __init__(self, maintenance_label=None):
         self.maintenance_label = maintenance_label
@@ -187,13 +191,16 @@ class Launchd:
         raise RuntimeError('service_stop_unconfirmed')
 
     def start(self, label, plist):
+        if self.observe(label) is not None: return
+        result = None
+        try:
+            result = subprocess.run(['/bin/launchctl', 'bootstrap', self.domain, str(plist)], capture_output=True, timeout=35)
+        except subprocess.TimeoutExpired:
+            pass
         if self.observe(label) is None:
-            # 受理不明でも再送せずprint/healthにより照合する。
-            try:
-                subprocess.run(['/bin/launchctl', 'bootstrap', self.domain, str(plist)], capture_output=True, timeout=35)
-            except subprocess.TimeoutExpired:
-                pass
-        require(self.observe(label) is not None, 'service_start_unconfirmed')
+            if result is not None and result.returncode != 0:
+                raise LaunchdRejected('service_start_rejected')
+            raise RuntimeError('service_start_unconfirmed')
 
     def process(self, pid):
         r = subprocess.run(['/bin/ps', '-ww', '-p', str(pid), '-o', 'uid=', '-o', 'lstart=', '-o', 'command='], capture_output=True, timeout=5)
@@ -650,8 +657,10 @@ class Runner:
         launcher = launcher or Launchd(label)
         intent = self.run/'arm.json'
         if intent.exists():
-            require(read_json(intent).get('label') == label and launcher.observe(label) is not None, 'arm_acceptance_unknown')
-            return label  # 登録済みone-shotをkickstartしない。
+            prior = read_json(intent)
+            require(prior.get('label') == label, 'arm_identity_changed')
+            if launcher.observe(label) is not None: return label  # 登録済みone-shotをkickstartしない。
+            require(prior.get('phase') == 'bootstrap_rejected', 'arm_acceptance_unknown')
         require(launcher.observe(label) is None, 'maintenance_label_busy')
         plist = self.run/'maintenance.plist'
         atomic(plist, plistlib.dumps({'Label': label, 'RunAtLoad': True, 'KeepAlive': False,
@@ -661,7 +670,12 @@ class Runner:
             'StandardErrorPath': str(self.run/'operator.log'), 'Umask': 0o077}))
         atomic(intent, encode({'label': label, 'phase': 'bootstrap_intent', 'at': stamp(),
                               'handoff_sha256': digest(encode(receipt))}))
-        launcher.start(label, plist)
+        try:
+            launcher.start(label, plist)
+        except LaunchdRejected:
+            atomic(intent, encode({'label': label, 'phase': 'bootstrap_rejected', 'at': stamp(),
+                                  'handoff_sha256': digest(encode(receipt))}))
+            raise
         return label
 
     def wait_handoff(self, receipt, timeout=600):
@@ -702,7 +716,7 @@ class Runner:
         # main制御は通常UpdaterのRealRuntimeを再利用。旧jobの解決・worker操作は行わない。
         file = self.run/'main-lifecycle.json'
         state = read_json(file) if file.exists() else None
-        if state is None:
+        if state is None or state['phase'] == 'stop_rejected':
             deadline = time.monotonic() + 60
             while True:
                 old = self.main_call(action='status', release=self.inv['old_pointer'])
@@ -714,6 +728,9 @@ class Runner:
             previous_pid = self.find_main_pid(self.inv['old_pointer'])
             state = self.main_step('stop_intent', old=old, previous_pid=previous_pid)
             outcome = self.main_call(action='stop', expected=old)
+            if outcome.get('outcome') == 'rejected':
+                self.main_step('stop_rejected')
+                raise RuntimeError('main_stop_rejected')
             require(outcome.get('outcome') == 'stopped', 'main_stop_acceptance_unknown')
             state = self.main_step('stopped')
         if state['phase'] == 'stop_intent':
@@ -772,13 +789,17 @@ class Runner:
         require(receipt.get('schema_version') == 1 and receipt.get('plan_sha256') == self.journal['plan_sha256']
                 and receipt.get('mapping_evidence') == 'updater_runtime_and_required_mcp', 'main_receipt_binding')
         issued = receipt.get('issued_at_unix')
-        require(type(issued) in (int, float) and 0 <= time.time() - issued <= 120, 'main_receipt_expired')
+        require(type(issued) in (int, float) and 0 <= time.time() - issued, 'main_receipt_time_invalid')
         require(main_evidence(self.plan, self.inv, receipt['spec']) == receipt['observations'], 'main_receipt_stale')
         state = read_json(self.run/'main-lifecycle.json')
         observed = self.main_call(action='status', release=self.plan['release'])
         require(observed.get('exists') and observed.get('name') == 'dona-main' and observed.get('kind') == 'codex'
                 and observed.get('pane_id') == state['old']['pane_id'] and observed.get('matches_release')
                 and observed.get('session_id') == receipt['spec']['session_id'], 'main_mapping_changed')
+        # 保存時刻だけを根拠にせず、現在のprocessとHerdr mappingの一致後に更新する。
+        receipt['issued_at_unix'] = time.time()
+        receipt['last_verified_at'] = stamp()
+        atomic(file, encode(receipt))
         return True
 
     def cleanup_partial_backups(self):

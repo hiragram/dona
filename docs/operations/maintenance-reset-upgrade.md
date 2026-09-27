@@ -103,7 +103,8 @@ Result公開時刻以後の親event完了を確認します。過去のtimeout�
 親はreceipt記録後、次の `arm` を呼び、登録結果を確認して自身のEvent Resultを公開します。
 一度だけ動く独立LaunchAgentが最大10分terminalを待ち、3サービスや旧mainを止めても継続します。
 plistはrun領域に置くためlogin時には自動再実行されません。`KeepAlive=false`で、再度armしてもkickstartしません。
-登録応答が不明な場合はexact labelをread-only照合し、未登録なら再送せず `arm_acceptance_unknown` とします。
+登録応答が不明な場合はexact labelをread-only照合し、応答不明かつ未登録なら再送せず `arm_acceptance_unknown` とします。
+bootstrapの明確な非zero応答と未登録の両方を確認できた場合は `bootstrap_rejected` を記録し、次のarmで再照合後に再試行できます。
 
 ```sh
 python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" arm \
@@ -141,6 +142,7 @@ python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" arm \
 `main-lifecycle.json`へ記録し、応答喪失時に同writeを再送しません。start応答喪失後は
 新release・同pane・旧と異なるsession・interactive readyをread-only照合して回復できます。
 stop応答喪失は `main_stop_acceptance_unknown` とし、新サービスを停止したまま保ちます。
+停止write前の確定拒否は `stop_rejected` と区別し、次のexecuteで旧mainのidentityを新しく観測してから再試行できます。
 
 新mainはtarget releaseをworking directoryにし、両MCPにpolicy指定node、世代固有wrapper、
 `enabled=true` / `required=true` をCLI overrideします。MCP初期化失敗時にCodexの起動を失敗させる設定は
@@ -149,7 +151,8 @@ wrapperは新世代dotenvで継承envを上書きし、target MCPを起動しま
 通常adapterのREADY確認後、実Codex argvの必須設定と、同UIDの2つの固定wrapper childをOSから照合します。
 mainとMCPのstart identityも記録します。Herdrにhost-wide atomic fenceがあるとは扱いません。
 
-`main-ready.json`はplanとprocess identityへ束縛した120秒のreceiptで、runner自身が生成します。
+`main-ready.json`はplanとprocess identityへ束縛したreceiptで、runner自身が生成します。
+各barrierで現在のprocessとHerdr登録を再検証できた場合だけ確認時刻を更新するため、長いhealth待機でも保存時刻だけを理由に受付を停止しません。
 人間がPIDやhandshake済flagを埋める `confirm-main` は不要です。Slack起動直前と成功記録前にもPIDだけでなくHerdr上のname / pane / session / releaseを再照合します。
 mainが起動できなければ `forward_recovery` となり、受付しません。親はjournalとoperator.logを確認し、
 同じ `execute` で記録済mainを照合・再開します。曖昧なstop/startを勝手に再送しないでください。
