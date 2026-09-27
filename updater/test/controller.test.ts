@@ -317,6 +317,8 @@ class FakeRuntime implements RuntimePort {
   wrongTargetOnce = false;
   dispatcherWrongShaPersistent = false;
   dispatcherWrongShaAfterSlackStart = false;
+  dispatcherWrongShaDuringQuiesce = false;
+  slackWrongShaDuringQuiesce = false;
   wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
   mainWaitStatus: MainAgentObservation["status"] = "idle";
@@ -342,6 +344,7 @@ class FakeRuntime implements RuntimePort {
   private dispatcherLive = true;
   private slackLive = true;
   slackQuiescing = false;
+  slackStopsDuringQuiesce = false;
   dispatcherQuiescing = false;
   slackDrainStatusThrows = false;
   slackHealthUnreadyWhenQuiescing = false;
@@ -365,6 +368,10 @@ class FakeRuntime implements RuntimePort {
   }
   async quiesceSlack(): Promise<DrainSnapshot> {
     this.calls.push("quiesceSlack");
+    if (this.slackStopsDuringQuiesce) {
+      this.slackLive = false;
+      throw new Error("slack_socket_closed_during_quiesce");
+    }
     if (this.slackRestartedDuringDrain ||
         (this.slackRestartedDuringRollbackDrain && this.mainAgentSha === targetSha)) {
       this.slackQuiescing = false;
@@ -529,6 +536,9 @@ class FakeRuntime implements RuntimePort {
     }
     if (!this.dispatcherLive) return this.health("dispatcher", null, false, false);
     const current = (await this.store.observe()).current_sha;
+    if (this.dispatcherWrongShaDuringQuiesce && current === currentSha) {
+      return this.health("dispatcher", "f".repeat(40), false);
+    }
     if ((this.dispatcherWrongShaPersistent || (this.dispatcherWrongShaAfterSlackStart && this.slackLive)) && current === targetSha) {
       return this.health("dispatcher", "f".repeat(40), true);
     }
@@ -545,6 +555,9 @@ class FakeRuntime implements RuntimePort {
     }
     if (!this.slackLive) return { ...this.health("slack_adapter", null, false, false), workspaces_ready: false };
     const current = (await this.store.observe()).current_sha;
+    if (this.slackWrongShaDuringQuiesce && current === currentSha) {
+      return this.health("slack_adapter", "f".repeat(40), false);
+    }
     if (this.wrongSlackOnce && current === targetSha) {
       this.wrongSlackOnce = false;
       return { ...this.health("slack_adapter", "f".repeat(40), true), workspaces_ready: true };
@@ -889,6 +902,55 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.get(row.request_id)?.last_error_code, "active_worker_handoff_unavailable");
     f.database.close();
   });
+  test("reconciles a persisted Slack stop when its socket closes during re-quiesce", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stop-race" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    for (const [kind, service] of [["stop_slack", "slack_adapter"], ["stop_dispatcher", "dispatcher"]] as const) {
+      f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, currentSha, null);
+      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "accepted", null, { exit_code: 0 });
+    }
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.simulateSlackRestarted();
+    f.runtime.slackStopsDuringQuiesce = true;
+    f.runtime.activeWorkerCount = 1;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.runtimeOperation(row.request_id, "stop_slack")?.phase, "observed");
+    assert.equal(f.runtime.calls.includes("stopSlack"), false);
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "active_worker_handoff_unavailable");
+    f.database.close();
+  });
+  for (const service of ["slack_adapter", "dispatcher"] as const) {
+    test(`refuses to quiesce a live ${service} with a different SHA`, async () => {
+      const f = await fixture();
+      const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+      const plan = planned.plan as { plan_id: string; plan_hash: string };
+      f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+        plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: `human-approval-wrong-${service}` });
+      f.dispatcher.terminal = true;
+      if (service === "dispatcher") f.runtime.dispatcherWrongShaDuringQuiesce = true;
+      else f.runtime.slackWrongShaDuringQuiesce = true;
+      await f.controller.processNext();
+      assert.equal(f.database.get(planned.request_id as string)?.state, "needs_review");
+      assert.equal(f.database.get(planned.request_id as string)?.last_error_code,
+        `${service}_wrong_sha_during_quiesce`);
+      assert.equal((await f.store.observe()).current_sha, currentSha);
+      assert.equal(f.runtime.calls.includes(service === "dispatcher" ? "quiesceDispatcher" : "quiesceSlack"), false);
+      f.database.close();
+    });
+  }
   test("restores stopped current runtime when activation recovery has no restart intent", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

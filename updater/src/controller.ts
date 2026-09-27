@@ -579,9 +579,19 @@ export class UpdateController {
       const slackHealth = await this.runtime.slackHealth();
       this.assertLease(row);
       if (slackHealth.live) {
-        const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha);
+        if (slackHealth.build_sha !== row.current_sha) {
+          this.needsReview(row, "slack_adapter_wrong_sha_during_quiesce");
+          return;
+        }
+        const slackDrain = await this.runtime.quiesceSlack(row.request_id, row.target_sha).catch(async (error: unknown) => {
+          this.assertLease(row);
+          if (!persistedSlackStop || (await this.runtime.slackHealth()).live || await this.runtime.slackRegistered()) {
+            throw error;
+          }
+          return undefined;
+        });
         this.assertLease(row);
-        if (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0) {
+        if (slackDrain && (!slackDrain.quiescing || !slackDrain.drained || slackDrain.in_flight !== 0)) {
           await this.restoreQuiescedServices(row, "slack_adapter_drain_incomplete", false, slackDrain.quiescing);
           return;
         }
@@ -591,9 +601,20 @@ export class UpdateController {
       const dispatcherHealth = await this.runtime.dispatcherHealth();
       this.assertLease(row);
       if (dispatcherHealth.live) {
-        const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha);
+        if (dispatcherHealth.build_sha !== row.current_sha) {
+          this.needsReview(row, "dispatcher_wrong_sha_during_quiesce");
+          return;
+        }
+        const dispatcherDrain = await this.runtime.quiesceDispatcher(row.request_id, row.target_sha).catch(async (error: unknown) => {
+          this.assertLease(row);
+          if (!persistedDispatcherStop || (await this.runtime.dispatcherHealth()).live ||
+            await this.runtime.dispatcherRegistered()) {
+            throw error;
+          }
+          return undefined;
+        });
         this.assertLease(row);
-        if (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length) {
+        if (dispatcherDrain && (!dispatcherDrain.quiescing || !dispatcherDrain.drained || dispatcherDrain.unsafe_states.length)) {
           await this.restoreQuiescedServices(row, "dispatcher_drain_incomplete", dispatcherDrain.quiescing);
           return;
         }
