@@ -253,7 +253,7 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /expected SHAの未登録状態を確認しました/);
   assert.doesNotMatch(source, /launchctl bootstrap[^\n]*\|\| true/);
   const restoreRequired = source.indexOf("DISPATCHER_RESTORE_REQUIRED=1");
-  const quiesce = source.indexOf('quiesce-dispatcher "$BASE_DIR/run/dispatcher.sock"');
+  const quiesce = source.indexOf('quiesce-dispatcher "$DISPATCHER_SOCKET"');
   const bootout = source.indexOf('launchctl bootout "$DOMAIN/dev.dona.dispatcher"', quiesce);
   const waitUnregistered = source.indexOf("wait_dispatcher_unregistered", bootout);
   const plistSwap = source.indexOf('/bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist"', waitUnregistered);
@@ -435,5 +435,53 @@ test("failed install cleanup removes only the generated staging directory", asyn
     await assert.rejects(run("cleanup-staging", releaseRoot, sibling));
   } finally {
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("generation target validation rejects a mismatched installed updater before upgrade", async () => {
+  const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "dona-generation-target-")));
+  const root = path.join(home, ".dona", "g", "a".repeat(12));
+  const rendered = path.join(home, "rendered");
+  const launchAgents = path.join(home, "LaunchAgents");
+  const sha = "b".repeat(40);
+  const plist = (label: string, program: string, environment: Record<string, string>) =>
+    `<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>${label}</string>` +
+    `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>${program}</string><string>serve</string></array>` +
+    `<key>EnvironmentVariables</key><dict>${Object.entries(environment).map(([key, value]) => `<key>${key}</key><string>${value}</string>`).join("")}</dict></dict></plist>`;
+  try {
+    for (const suffix of ["control/updater", "runtime/releases", `runtime/releases/${sha}`, "config", "logs", "run"]) {
+      await fs.mkdir(path.join(root, suffix), { recursive: true });
+    }
+    await fs.mkdir(launchAgents);
+    await fs.symlink(path.join(root, "runtime/releases", sha), path.join(root, "runtime/current"));
+    await fs.writeFile(path.join(root, "control/updater.sqlite3"), "fixture");
+    await fs.writeFile(path.join(root, "control/policy.json"), JSON.stringify({
+      control_root: path.join(root, "control"), config_root: path.join(root, "config"),
+      release_root: path.join(root, "runtime/releases"), current_pointer: path.join(root, "runtime/current"),
+      dispatcher_socket: path.join(root, "run/d.sock"), slack_socket: path.join(root, "run/s.sock"),
+      dispatcher_internal_token_file: path.join(root, "control/dispatcher.token"),
+    }));
+    await fs.writeFile(path.join(launchAgents, "dev.dona.updater.plist"), plist("dev.dona.updater", path.join(root, "control/updater/dist/cli.js"), {
+      DONA_UPDATE_POLICY_PATH: path.join(root, "control/policy.json"), DONA_UPDATER_BUILD_SHA: sha,
+    }));
+    await fs.writeFile(path.join(launchAgents, "dev.dona.dispatcher.plist"), plist("dev.dona.dispatcher", path.join(root, "runtime/current/dispatcher/dist/cli.js"), {
+      DONA_UPDATER_SOCKET_PATH: path.join(root, "control/updater.sock"),
+      DONA_UPDATE_INTERNAL_TOKEN_PATH: path.join(root, "control/dispatcher.token"),
+      DONA_SOCKET_PATH: path.join(root, "run/d.sock"), SLACK_HEALTH_SOCKET_PATH: path.join(root, "run/s.sock"),
+      DONA_DATABASE_PATH: path.join(root, "dona.sqlite3"),
+      DONA_RELEASE_MANIFEST_PATH: path.join(root, "runtime/current/release-manifest.json"),
+      GENERATION_ONLY: "preserved",
+    }));
+    await execute(process.execPath, [fileURLToPath(new URL("../../scripts/render-self-update-templates.mjs", import.meta.url)), rendered, sha, root, "generation"]);
+    const helper = fileURLToPath(new URL("../../scripts/validate-generation-install-target.py", import.meta.url));
+    await execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } });
+    const updated = await fs.readFile(path.join(rendered, "dev.dona.dispatcher.plist"), "utf8");
+    assert.match(updated, /GENERATION_ONLY/);
+    await fs.writeFile(path.join(launchAgents, "dev.dona.updater.plist"), plist("dev.dona.updater", path.join(home, "other/updater/dist/cli.js"), {
+      DONA_UPDATE_POLICY_PATH: path.join(root, "control/policy.json"), DONA_UPDATER_BUILD_SHA: sha,
+    }));
+    await assert.rejects(execute("/usr/bin/python3", [helper, root, rendered, launchAgents], { env: { ...process.env, HOME: home } }));
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
   }
 });
