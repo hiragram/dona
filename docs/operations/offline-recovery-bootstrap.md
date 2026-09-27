@@ -62,11 +62,11 @@ ditto "$dona_base/results" "$backup_dir/results"
 
 `bootout`が非0やtimeoutでもblind retryしない。`launchctl print`、socket、PIDを照合し、停止が一意に確認できなければDB writeへ進まない。上記の`print`は未登録時に非0となることが期待値である。
 
-対象releaseのCLIを、`DOTENV_CONFIG_PATH`で既存Dispatcher設定、`DONA_RELEASE_MANIFEST_PATH`で**対象release自身のmanifest**へ固定して実行する。`DispatcherDatabase`のconstructorはschema/補助tableのmigrationを行うため、`inspect`もproduction DBへのwriteとして扱い、停止とbackupより前に実行しない。まず`DONA_DATABASE_PATH`をbackup DBへ明示固定して全対象の`inspect-operator-recovery`をdry runする。production DBの再読と回復writeには`DONA_DATABASE_PATH`を本番DBへ明示固定した別の呼び出しを使い、混同しない。
+対象releaseのCLIを、`DOTENV_CONFIG_PATH`で既存Dispatcher設定、`DONA_RELEASE_MANIFEST_PATH`で**対象release自身のmanifest**、`DONA_DATABASE_PATH`でproduction DBへ固定して実行する。`DispatcherDatabase`のconstructorはschema/補助tableのmigrationを行うため、`inspect`もwriteとして扱い、停止とbackupより前に実行しない。rollback用backup DBをCLIのdry runに使わない。DBコピーでも保存済みの絶対`result_path`がproductionを指し、routing migrationがResult fileを動かし得る。隔離試験を行うなら、rollback snapshotと異なる作業コピーを用い、全Result pathをコピー内の隔離先へ書き換え、production pathへ到達しないことを確認する。このmaintenance手順はその試験に依存しない。
 
 ```sh
 env DOTENV_CONFIG_PATH="$HOME/Library/Application Support/Dona/config/dispatcher.env" \
-  DONA_DATABASE_PATH="$backup_dir/dona.sqlite3" \
+  DONA_DATABASE_PATH="$HOME/Library/Application Support/Dona/dona.sqlite3" \
   DONA_RELEASE_MANIFEST_PATH="$HOME/Library/Application Support/Dona/runtime/releases/<target-sha>/release-manifest.json" \
   node "$HOME/Library/Application Support/Dona/runtime/releases/<target-sha>/dispatcher/dist/cli.js" \
   job inspect-operator-recovery <job_id>
@@ -90,9 +90,21 @@ test "$(readlink "$runtime_root/previous")" = "releases/$old_sha"
 ln -s "releases/$target_sha" "$runtime_root/.current.recovery.tmp"
 mv -fh "$runtime_root/.current.recovery.tmp" "$runtime_root/current"
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.dispatcher.plist"
-node scripts/self-update-install-preflight.mjs wait-dispatcher-sha "$HOME/Library/Application Support/Dona/run/dispatcher.sock" "$target_sha" 30000
-curl --fail --silent --show-error --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" \
-  http://localhost/v1/admin/update-safety | jq -e '.safe == true and .unsafe_states == []'
+if ! node scripts/self-update-install-preflight.mjs wait-dispatcher-sha \
+  "$HOME/Library/Application Support/Dona/run/dispatcher.sock" "$target_sha" 30000; then
+  printf '%s\n' 'Dispatcherのexact SHA healthを確認できません。Slack ingressは停止したままにします。' >&2
+  exit 1
+fi
+if ! safety_json="$(curl --fail --silent --show-error --unix-socket \
+  "$HOME/Library/Application Support/Dona/run/dispatcher.sock" \
+  http://localhost/v1/admin/update-safety)"; then
+  printf '%s\n' 'Dispatcherの安全状態を取得できません。Slack ingressは停止したままにします。' >&2
+  exit 1
+fi
+if ! printf '%s\n' "$safety_json" | jq -e '.safe == true and .unsafe_states == []' >/dev/null; then
+  printf '%s\n' 'Dispatcherの安全判定がclearではありません。Slack ingressは停止したままにします。' >&2
+  exit 1
+fi
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.slack-adapter.plist"
 ```
 
