@@ -249,7 +249,7 @@ if [[ "$MODE" == "--upgrade-control" && ! -d "$CONTROL_ROOT/updater" ]]; then
 fi
 umask 077
 if [[ "$MODE" == "--stage-recovery" ]]; then
-  [[ -d "$RELEASE_ROOT" ]] || { print -u2 "既存release rootを確認できません。"; exit 1; }
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || { print -u2 "既存release rootを確認できません。"; exit 1; }
   mkdir -p "$RELEASE_ROOT/.staging"
   chmod 700 "$RELEASE_ROOT/.staging"
 else
@@ -298,10 +298,9 @@ if [[ -e "$FINAL_RELEASE" ]]; then
 else
   /bin/mv "$STAGING_DIR" "$FINAL_RELEASE"
   STAGING_DIR=
-
-  find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
-  find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
 fi
+find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
+find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
 
 if [[ "$MODE" == "--stage-recovery" ]]; then
   print "検証済みimmutable release $INSTALL_SHA を配置しました。service、pointer、DB、Updaterは変更していません。"

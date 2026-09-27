@@ -29,10 +29,12 @@
 
 停止後にowner-only directoryへSQLite Online Backup APIで`dona.sqlite3`を保存する。WAL中のDB本体だけを`cp`しない。`job-results`とlegacy `results`、current/previous pointerの実体、両LaunchAgent plist、現行release manifest、control-plane receiptを同じ世代のbackup inventoryへ記録する。backupは0600、directoryは0700とし、DBの`integrity_check=ok`、`foreign_key_check`が空、`user_version=3`、主要table件数を照合する。backup pathとdigestを記録してから先へ進む。backup/Resultを公開場所へ置かない。
 
-次はoperatorが固定した値を代入した後に実行するコマンドの形である。`backup_dir`は新規のowner-only directoryとし、既存backupを上書きしない。
+次はoperatorが固定した値を代入した後に実行するコマンドの形である。`backup_dir`は毎回新規のowner-only directoryとし、既存backupを上書きしない。
 
 ```sh
 dona_base="$HOME/Library/Application Support/Dona"
+mkdir -p -m 700 "$dona_base/recovery-backups"
+backup_dir="$(mktemp -d "$dona_base/recovery-backups/attempt.XXXXXX")"
 launchctl bootout "gui/$UID/dev.dona.slack-adapter"
 launchctl bootout "gui/$UID/dev.dona.dispatcher"
 launchctl print "gui/$UID/dev.dona.slack-adapter" # 未登録であることを確認
@@ -41,6 +43,8 @@ node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_base/
 node scripts/self-update-install-preflight.mjs assert-socket-unused "$dona_base/run/slack-adapter.sock"
 python3 - "$dona_base/dona.sqlite3" "$backup_dir/dona.sqlite3" <<'PY'
 import os, sqlite3, sys
+descriptor = os.open(sys.argv[2], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+os.close(descriptor)
 source = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
 target = sqlite3.connect(sys.argv[2])
 source.backup(target)
@@ -58,10 +62,11 @@ ditto "$dona_base/results" "$backup_dir/results"
 
 `bootout`が非0やtimeoutでもblind retryしない。`launchctl print`、socket、PIDを照合し、停止が一意に確認できなければDB writeへ進まない。上記の`print`は未登録時に非0となることが期待値である。
 
-対象releaseのCLIを、`DOTENV_CONFIG_PATH`で既存Dispatcher設定、`DONA_RELEASE_MANIFEST_PATH`で**対象release自身のmanifest**へ固定して実行する。`DispatcherDatabase`のconstructorはschema/補助tableのmigrationを行うため、`inspect`もproduction DBへのwriteとして扱い、停止とbackupより前に実行しない。まずDBコピーで全対象の`inspect-operator-recovery`をdry runし、live DBでは各jobをwrite直前に再読する。
+対象releaseのCLIを、`DOTENV_CONFIG_PATH`で既存Dispatcher設定、`DONA_RELEASE_MANIFEST_PATH`で**対象release自身のmanifest**へ固定して実行する。`DispatcherDatabase`のconstructorはschema/補助tableのmigrationを行うため、`inspect`もproduction DBへのwriteとして扱い、停止とbackupより前に実行しない。まず`DONA_DATABASE_PATH`をbackup DBへ明示固定して全対象の`inspect-operator-recovery`をdry runする。production DBの再読と回復writeには`DONA_DATABASE_PATH`を本番DBへ明示固定した別の呼び出しを使い、混同しない。
 
 ```sh
 env DOTENV_CONFIG_PATH="$HOME/Library/Application Support/Dona/config/dispatcher.env" \
+  DONA_DATABASE_PATH="$backup_dir/dona.sqlite3" \
   DONA_RELEASE_MANIFEST_PATH="$HOME/Library/Application Support/Dona/runtime/releases/<target-sha>/release-manifest.json" \
   node "$HOME/Library/Application Support/Dona/runtime/releases/<target-sha>/dispatcher/dist/cli.js" \
   job inspect-operator-recovery <job_id>
@@ -71,15 +76,19 @@ env DOTENV_CONFIG_PATH="$HOME/Library/Application Support/Dona/config/dispatcher
 
 ## runtime bootstrapとrollback
 
-回復後、全対象のterminal statusと監査記録を確認する。残る危険状態の原因が一意に説明できなければ停止を維持する。`runtime/current`を対象releaseへの同一filesystem上の一時symlinkからrenameで切り替える。`runtime/previous`は旧SHAのまま保持する。Dispatcherだけを`launchctl bootstrap`し、versioned healthと`/v1/admin/update-safety`が対象SHA・`safe: true`・`unsafe_states: []`を示すまでSlack Adapterを起動しない。安全判定がclearでなければ停止下の個別確認へ戻る。Slack起動後に両serviceのhealth、DB schema 3、socket/PIDの新世代、通知重複なしを再読する。`dona-main`のcwd/sessionが旧releaseなら**完全なruntime更新とは報告しない**。この手順はHerdr agentの再作成権限を含まない。
+回復後、全対象のterminal statusと監査記録を確認する。残る危険状態の原因が一意に説明できなければ停止を維持する。現在の`runtime/current`の旧SHAを`runtime/previous`へ保存してから、`runtime/current`を対象releaseへ同一filesystem上の一時symlinkから切り替える。macOS `mv -f`はdestination symlinkをdirectoryとして追跡するため、`mv -fh`でsymlink自体を置換する。Dispatcherだけを`launchctl bootstrap`し、versioned healthと`/v1/admin/update-safety`が対象SHA・`safe: true`・`unsafe_states: []`を示すまでSlack Adapterを起動しない。安全判定がclearでなければ停止下の個別確認へ戻る。Slack起動後に両serviceのhealth、DB schema 3、socket/PIDの新世代、通知重複なしを再読する。`dona-main`のcwd/sessionが旧releaseなら**完全なruntime更新とは報告しない**。この手順はHerdr agentの再作成権限を含まない。
 
 ```sh
 runtime_root="$HOME/Library/Application Support/Dona/runtime"
 target_sha='<承認済みのexact SHA>'
-test "$(readlink "$runtime_root/current")" = "releases/<事前記録した旧SHA>"
+old_sha='<事前記録した旧currentのexact SHA>'
+test "$(readlink "$runtime_root/current")" = "releases/$old_sha"
 test -f "$runtime_root/releases/$target_sha/release-manifest.json"
+ln -s "releases/$old_sha" "$runtime_root/.previous.recovery.tmp"
+mv -fh "$runtime_root/.previous.recovery.tmp" "$runtime_root/previous"
+test "$(readlink "$runtime_root/previous")" = "releases/$old_sha"
 ln -s "releases/$target_sha" "$runtime_root/.current.recovery.tmp"
-mv -f "$runtime_root/.current.recovery.tmp" "$runtime_root/current"
+mv -fh "$runtime_root/.current.recovery.tmp" "$runtime_root/current"
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.dona.dispatcher.plist"
 node scripts/self-update-install-preflight.mjs wait-dispatcher-sha "$HOME/Library/Application Support/Dona/run/dispatcher.sock" "$target_sha" 30000
 curl --fail --silent --show-error --unix-socket "$HOME/Library/Application Support/Dona/run/dispatcher.sock" \
