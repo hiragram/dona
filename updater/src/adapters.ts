@@ -990,11 +990,22 @@ export class RealRuntime implements RuntimePort {
 
   private async health(socketPath: string, service: HealthSnapshot["service"]): Promise<HealthSnapshot> {
     try {
-      const response = parsedObject(await udsRequest(socketPath, "GET", "/health/version", undefined, this.policy.timeouts.health_ms));
+      const healthResponse = await udsRequest(socketPath, "GET", "/health/version", undefined, this.policy.timeouts.health_ms);
+      // A quiescing service answers 503 with a versioned not_ready body. It is
+      // still live, so its stop must not be inferred from the HTTP status.
+      const response = healthResponse.statusCode === 503
+        ? JSON.parse(healthResponse.body) as Record<string, unknown>
+        : parsedObject(healthResponse);
+      if (healthResponse.statusCode === 503 &&
+        (response.schema_version !== 1 || response.status !== "not_ready" || response.service !== service ||
+          typeof response.build_sha !== "string" || response.protocol !== 1)) {
+        throw new Error("Unverified service health response");
+      }
       return {
         service,
         observed: true,
-        live: response.status === "live" || response.status === "ready",
+        live: response.status === "live" || response.status === "ready" ||
+          (healthResponse.statusCode === 503 && response.status === "not_ready"),
         ready: response.status === "ready",
         build_sha: typeof response.build_sha === "string" ? response.build_sha : null,
         protocol: typeof response.protocol === "number" ? response.protocol : null,
