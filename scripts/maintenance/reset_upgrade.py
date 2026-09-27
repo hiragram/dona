@@ -37,6 +37,33 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def file_digest(file):
+    h = hashlib.sha256()
+    with open(file, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_trust(sha, policy):
+    require(re.fullmatch('[0-9a-f]{40}', sha), 'trust_sha')
+    gh = policy['executables']['gh']
+    route = 'repos/hiragram/dona/commits/' + sha
+    pages = json.loads(command([gh, 'api', '--method', 'GET', route+'/check-runs?per_page=100', '--paginate', '--slurp']))
+    runs = [run for page in pages for run in page['check_runs']]
+    accepted = []
+    for name in policy['required_checks']:
+        matches = [r for r in runs if r.get('name') == name and r.get('app', {}).get('slug') == 'github-actions' and r.get('head_sha') == sha]
+        require(bool(matches), 'required_check_missing')
+        latest = max(matches, key=lambda r: r['id'])
+        require(latest.get('status') == 'completed' and latest.get('conclusion') == 'success', 'required_check_not_success')
+        accepted.append({'name': name, 'id': latest['id']})
+    if policy['require_verified_signature']:
+        commit = json.loads(command([gh, 'api', '--method', 'GET', route]))
+        require(commit.get('sha') == sha and commit.get('commit', {}).get('verification', {}).get('verified') is True, 'signature_not_verified')
+    return {'sha': sha, 'checks': accepted, 'signature_required': policy['require_verified_signature'], 'checked_at': stamp()}
+
+
 def encode(value):
     return (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
 
@@ -242,6 +269,7 @@ def prepare(run, repository, event_id, job_id):
     require(command(['git', '-C', str(repository), 'remote', 'get-url', 'origin']) in (REMOTE, REMOTE[:-4]), 'remote_scope')
     command(['git', '-C', str(repository), 'fetch', 'origin', 'main'])
     require(command(['git', '-C', str(repository), 'rev-parse', 'origin/main']) == sha, 'main_drift')
+    trust = verify_trust(sha, inv['policy'])
     generation = private_dir(Path.home()/'.dona/g'/digest(str(run).encode())[:12])
     require(not list(generation.iterdir()), 'generation_not_empty')
     release = private_dir(generation/'runtime/releases'/sha)
@@ -263,7 +291,7 @@ def prepare(run, repository, event_id, job_id):
         private_dir(generation/p)
     # updaterはcontrol_root/updater.sock固定なので長いUNIX socket pathを準備段階で拒否。
     require(len(str(generation/'control/updater.sock').encode()) < 104, 'socket_path_too_long')
-    plan = {'schema_version': 1, 'target_sha': sha, 'generation': str(generation), 'release': str(release),
+    plan = {'schema_version': 1, 'trust': trust, 'target_sha': sha, 'generation': str(generation), 'release': str(release),
             'event_id': event_id, 'job_id': job_id, 'inventory_sha256': digest((run/'inventory.json').read_bytes()),
             'runner_sha256': digest((run/'runner.py').read_bytes()),
             'created_at': stamp(), 'strategy': 'isolated_generation', 'operator_assertion_required': True}
@@ -282,11 +310,12 @@ def prepare(run, repository, event_id, job_id):
 def tree_seal(root):
     h = hashlib.sha256()
     for p in sorted(Path(root).rglob('*')):
-        h.update(str(p.relative_to(root)).encode())
+        h.update(str(p.relative_to(root)).encode() + b'\0')
+        h.update(str(p.lstat().st_mode & 0o777).encode() + b'\0')
         if p.is_symlink():
             h.update(b'L' + os.readlink(p).encode())
         elif p.is_file():
-            h.update(p.read_bytes())
+            h.update(file_digest(p).encode())
     return h.hexdigest()
 
 
@@ -295,10 +324,11 @@ def static_seal(generation):
     for name in ('config', 'control/updater', 'control/policy.json', 'control/dispatcher.token', 'runtime'):
         p = Path(generation)/name
         h.update(name.encode())
+        h.update(str(p.lstat().st_mode & 0o777).encode() + b'\0')
         if p.is_dir() and not p.is_symlink():
             h.update(tree_seal(p).encode())
         elif p.is_file() and not p.is_symlink():
-            h.update(p.read_bytes())
+            h.update(file_digest(p).encode())
         else:
             raise RuntimeError('static_asset_missing')
     return h.hexdigest()
@@ -478,7 +508,7 @@ class Runner:
                 os.fsync(snapshot.fileno())
             os.chmod(temporary, 0o600)
             os.replace(temporary, destination)
-            manifest.append({'source': name, 'file': destination.name, 'sha256': digest(destination.read_bytes())})
+            manifest.append({'source': name, 'file': destination.name, 'sha256': file_digest(destination)})
         atomic(backup/'manifest.json', encode({'generation': 'old', 'snapshot_at': stamp(), 'databases': manifest,
             'results_retained_in_place': self.inv['old_results'], 'old_worker_writes_may_continue': True}))
 
@@ -486,7 +516,14 @@ class Runner:
         for label in LABELS:
             atomic(Path.home()/'Library/LaunchAgents'/ (label+'.plist'), (self.run/'plists'/ (label+'.plist')).read_bytes())
 
-    def start_all(self, include_slack=True):
+    def assert_installed(self, original=False):
+        for label in LABELS:
+            p = regular(Path.home()/'Library/LaunchAgents'/(label+'.plist'))
+            expected = plistlib.dumps(self.inv['plists'][label]) if original else (self.run/'plists'/p.name).read_bytes()
+            require(p.read_bytes() == expected, 'installed_plist_drift')
+
+    def start_all(self, include_slack=True, original=False):
+        self.assert_installed(original)
         for label in START if include_slack else START[:2]:
             self.services.start(label, Path.home()/'Library/LaunchAgents'/ (label+'.plist'))
 
@@ -500,6 +537,8 @@ class Runner:
                 for socket_name, service in targets:
                     h = http_unix(self.generation/socket_name, '/health/version')
                     require(h.get('status') == 'ready' and h.get('build_sha') == self.plan['target_sha'] and h.get('service') == service, 'target_health_mismatch')
+                    if service in ('dispatcher', 'slack_adapter'):
+                        require(h.get('update_notification_protocol') == 1, 'internal_notification_not_ready')
                     if service == 'slack_adapter':
                         require(h.get('workspaces_ready') is True and h.get('dispatcher_ready') is True, 'slack_not_connected')
                 return
@@ -529,7 +568,7 @@ class Runner:
         self.stop_all()
         for label in LABELS:
             atomic(Path.home()/'Library/LaunchAgents'/ (label+'.plist'), plistlib.dumps(self.inv['plists'][label]))
-        self.start_all()
+        self.start_all(original=True)
         self.old_health()
         self.record('rolled_back', rollback_scope='original_plists_and_retained_old_generation')
 
@@ -545,16 +584,17 @@ class Runner:
         if phase == 'rolling_back':
             self.rollback()
             return
-        # DB/log/socketは起動後mutable。code/config/pointerは全再開で照合する。
-        require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
-        if phase in ('prepared', 'stopping', 'backing_up', 'switching'):
-            require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
-        if phase == 'prepared':
-            validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv, self.database.read)
-            self.validate_source()
-            self.assert_updater_idle()
-            self.record('stopping', handoff_sha256=digest(encode(receipt)), residual_risk='operator_assertion_not_machine_stop_proof')
         try:
+            # DB/log/socketは起動後mutable。code/config/pointerは全再開で照合する。
+            require(static_seal(self.generation) == self.plan['static_seal'], 'static_generation_drift')
+            if phase in ('prepared', 'stopping', 'backing_up', 'switching'):
+                require(tree_seal(self.generation) == self.plan['generation_seal'], 'prepared_generation_drift')
+            verify_trust(self.plan['target_sha'], self.inv['policy'])
+            if phase == 'prepared':
+                validate_handoff(self.plan, self.journal['plan_sha256'], receipt, self.inv, self.database.read)
+                self.validate_source()
+                self.assert_updater_idle()
+                self.record('stopping', handoff_sha256=digest(encode(receipt)), residual_risk='operator_assertion_not_machine_stop_proof')
             if self.journal['phase'] == 'stopping':
                 self.stop_all()  # Updaterを最初に止め、並行activationの生成元を除く。
                 self.assert_updater_idle()  # 最初のcheckと停止の間に承認されたrequestを検出。
@@ -571,18 +611,24 @@ class Runner:
                 self.switch()
                 self.record('starting_core')
             if self.journal['phase'] == 'starting_core':
+                self.stop_all()  # 再開時も検証済plistから新しくbootstrapする。
                 self.start_all(include_slack=False)
                 self.health(include_slack=False)
                 # このintent以後はACK済eventがあり得る。旧DBへの自動rollbackは禁止。
                 self.record('starting_ingress')
             if self.journal['phase'] in ('starting_ingress', 'forward_recovery'):
+                if phase in ('starting_ingress', 'forward_recovery'):
+                    self.stop_all()
                 self.start_all(include_slack=False)
                 self.health(include_slack=False)
+                self.assert_installed()
                 label = 'dev.dona.slack-adapter'
                 self.services.start(label, Path.home()/'Library/LaunchAgents'/(label+'.plist'))
                 self.health()
                 self.record('succeeded', target_sha=self.plan['target_sha'], slack_connected=True)
         except Exception:
+            if self.journal['phase'] == 'prepared':
+                raise
             if self.journal['phase'] in ('starting_ingress', 'forward_recovery'):
                 self.record('forward_recovery', failure='ingress_may_have_accepted_events', old_generation_restore_forbidden=True)
                 self.stop_all()

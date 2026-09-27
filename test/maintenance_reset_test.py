@@ -15,6 +15,7 @@ spec = importlib.util.spec_from_file_location('maintenance', Path(__file__).pare
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 REAL_HEALTH = m.Runner.health
+REAL_TRUST = m.verify_trust
 
 
 class FixtureDatabase:
@@ -93,10 +94,13 @@ class RunnerTest(unittest.TestCase):
         self.services = Services()
         self.health_patch = patch.object(m.Runner, 'health')
         self.health = self.health_patch.start()
+        self.trust_patch = patch.object(m, 'verify_trust', return_value={})
+        self.trust = self.trust_patch.start()
         self.rollback_patch = patch.object(m.Runner, 'old_health')
         self.old_health = self.rollback_patch.start()
 
     def tearDown(self):
+        self.trust_patch.stop()
         self.rollback_patch.stop()
         self.health_patch.stop()
         self.home_patch.stop()
@@ -191,6 +195,7 @@ class RunnerTest(unittest.TestCase):
                 for label,plist in self.plists.items():
                     (self.home/'Library/LaunchAgents'/(label+'.plist')).write_bytes(plistlib.dumps(plist))
                 runner = self.runner()
+                if phase in ('starting_core','starting_ingress'): runner.switch()
                 runner.record(phase)
                 runner.execute({})
                 self.assertEqual(runner.journal['phase'], 'succeeded')
@@ -225,7 +230,7 @@ class RunnerTest(unittest.TestCase):
 class Server(socketserver.UnixStreamServer): pass
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
-  body=json.dumps({'status':'ready','build_sha':os.environ['SHA'],'service':os.environ['SERVICE'],'workspaces_ready':True,'dispatcher_ready':True}).encode()
+  body=json.dumps({'status':'ready','build_sha':os.environ['SHA'],'service':os.environ['SERVICE'],'workspaces_ready':True,'dispatcher_ready':True,'update_notification_protocol':1}).encode()
   self.send_response(200); self.end_headers(); self.wfile.write(body)
  def log_message(self,*args): pass
 p=os.environ['SOCKET']
@@ -325,7 +330,7 @@ with Server(p,Handler) as server: server.serve_forever()
         (self.g/'config/tampered.env').write_text('changed')
         with self.assertRaisesRegex(RuntimeError,'static_generation_drift'):
             self.runner().execute({})
-        self.assertEqual(self.services.calls,[])
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'rolled_back')
 
     def test_ingress_failure_retains_acked_events_and_resumes_same_generation(self):
         def health(include_slack=True):
@@ -357,6 +362,70 @@ with Server(p,Handler) as server: server.serve_forever()
         count=len(self.services.calls)
         with self.assertRaisesRegex(RuntimeError,'restore_after_ingress_forbidden'): runner.restore()
         self.assertEqual(len(self.services.calls),count)
+
+    def test_post_ingress_static_drift_stops_ingress_and_preserves_generation(self):
+        runner=self.runner();runner.switch();runner.record('starting_ingress')
+        (self.g/'config/tampered.env').write_text('changed')
+        with self.assertRaisesRegex(RuntimeError,'static_generation_drift'):
+            self.runner().execute({})
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'forward_recovery')
+        self.assertFalse(self.services.registered)
+        for label in m.LABELS:
+            p=self.home/'Library/LaunchAgents'/(label+'.plist')
+            self.assertEqual(p.read_bytes(),(self.run/'plists'/p.name).read_bytes())
+
+    def test_installed_plist_drift_cannot_bootstrap_wrong_database(self):
+        runner=self.runner();runner.switch();runner.record('starting_core')
+        p=self.home/'Library/LaunchAgents/dev.dona.dispatcher.plist'
+        data=plistlib.loads(p.read_bytes());data['EnvironmentVariables']['DONA_DATABASE_PATH']=str(self.db)
+        p.write_bytes(plistlib.dumps(data))
+        with self.assertRaisesRegex(RuntimeError,'installed_plist_drift'):
+            self.runner().execute({})
+        self.assertEqual(m.read_json(self.run/'journal.json')['phase'],'rolled_back')
+        for name,sha in self.files.items(): self.assertEqual(m.digest(Path(name).read_bytes()),sha)
+
+    def test_token_permission_change_invalidates_seal(self):
+        os.chmod(self.g/'control/dispatcher.token',0o666)
+        with self.assertRaisesRegex(RuntimeError,'static_generation_drift'):
+            self.runner().execute(self.receipt)
+        self.assertEqual(self.services.calls,[])
+
+    def test_missing_notification_protocol_never_passes_health(self):
+        runner=self.runner()
+        for missing in ('dispatcher','slack_adapter'):
+            def health(socket_path,route):
+                service={'updater.sock':'updater','d.sock':'dispatcher','s.sock':'slack_adapter'}[Path(socket_path).name]
+                result={'status':'ready','service':service,'build_sha':'a'*40,'workspaces_ready':True,'dispatcher_ready':True,'update_notification_protocol':1}
+                if service==missing: result.pop('update_notification_protocol')
+                return result
+            with patch.object(m,'http_unix',side_effect=health), patch.object(m.time,'monotonic',side_effect=[0,1,91]), patch.object(m.time,'sleep'):
+                with self.assertRaisesRegex(RuntimeError,'target_health_timeout'): REAL_HEALTH(runner)
+
+    def test_backup_hash_does_not_read_entire_file_into_memory(self):
+        runner=self.runner()
+        with patch.object(m.Path,'read_bytes',side_effect=AssertionError('whole file read')):
+            runner.backup()
+        manifest=m.read_json(self.run/'backup/manifest.json')
+        self.assertEqual(manifest['databases'][0]['sha256'],m.file_digest(self.run/'backup/0.sqlite3'))
+
+    def test_trust_rejects_failed_pending_wrong_app_sha_and_signature(self):
+        policy={'executables':{'gh':'fixture-gh'},'required_checks':['required'],'require_verified_signature':False}
+        good={'id':1,'name':'required','head_sha':'a'*40,'app':{'slug':'github-actions'},'status':'completed','conclusion':'success'}
+        for changed in ({'conclusion':'failure'},{'status':'in_progress'},{'app':{'slug':'other'}},{'head_sha':'b'*40}):
+            with patch.object(m,'command',return_value=json.dumps([{'check_runs':[dict(good,**changed)]}])):
+                with self.assertRaises(RuntimeError): REAL_TRUST('a'*40,policy)
+        with patch.object(m,'command',return_value=json.dumps([{'check_runs':[good,dict(good,id=2,status='queued')]}])):
+            with self.assertRaisesRegex(RuntimeError,'required_check_not_success'): REAL_TRUST('a'*40,policy)
+        for verified in (False,True):
+            with patch.object(m,'command',side_effect=[json.dumps([{'check_runs':[good]}]),json.dumps({'sha':'a'*40,'commit':{'verification':{'verified':verified}}})]):
+                if verified: self.assertEqual(REAL_TRUST('a'*40,dict(policy,require_verified_signature=True))['checks'][0]['id'],1)
+                else:
+                    with self.assertRaisesRegex(RuntimeError,'signature_not_verified'): REAL_TRUST('a'*40,dict(policy,require_verified_signature=True))
+
+    def test_trust_regression_before_execute_never_stops_services(self):
+        self.trust.side_effect=RuntimeError('required_check_not_success')
+        with self.assertRaisesRegex(RuntimeError,'required_check_not_success'): self.runner().execute(self.receipt)
+        self.assertEqual(self.services.calls,[])
 
     def test_atomic_crash_temporary_recovery(self):
         target=self.run/'status.json'

@@ -14,6 +14,7 @@ DB履歴を引き継がず、新しい世代を準備して3サービスを切�
 - 元のlaunchd plist、dotenv、Updater policyから実際のDB、Result、socket、release、設定を取得します。
   prepare時と停止前で設定のhash・pointerを照合します。
 - canonical `hiragram/dona` のmainをGitHub APIとfetchの両方でexact SHAへ固定し、archiveを独立領域でbuildします。
+  prepareとexecute / 再開時に、既存policyのrequired checks（GitHub Actions・同SHA・最新run成功）と要求される署名検証を確認します。
 - 新世代は `~/.dona/g/<runから導いたID>` です。DB（Dispatcher、通知、進捗、Updater）、Result、socket、log、設定、pointerを分離します。
   Updaterの実行codeは新世代control領域へcopyし、通常release保持期限による削除から分離します。
   schedule履歴も新しいDispatcher DBで初期化されます。旧履歴から通知を再送しません。
@@ -103,7 +104,8 @@ nohup python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" execute 
 4. LaunchAgent plistを新世代のrelease pointer / 設定へ切り替えます。
 5. UpdaterとDispatcherを起動してcore healthを確認した後、ingress開始intentを永続化してSlackを起動します。
    bootstrap応答が曖昧な場合は同writeを再送せず観測します。
-6. 3サービスの`/health/version`でexact SHA / readyを、Slackで`workspaces_ready`と`dispatcher_ready`を確認します。
+6. 3サービスの`/health/version`でexact SHA / readyを、DispatcherとSlackで`update_notification_protocol == 1`を、
+   Slackで`workspaces_ready`と`dispatcher_ready`を確認します。
    成功を独立journalへ記録します。
 
 ### main agentの接続切替
@@ -123,7 +125,9 @@ nohup python3 "$HOME/.dona-maintenance/reset-YYYYMMDD-unique/runner.py" execute 
 DB・pointerを再初期化せず、途中のplist切替は同じ内容で収束させます。
 bootstrap済serviceは登録状態から照合し、terminal後の再実行は副作用を追加しません。
 未知のphase・変更されたplan / runner / plistは拒否します。未起動phaseでは全世代sealを、
-起動intent以後でもcode / 設定 / pointerの静的sealを再照合します。
+起動intent以後でもcode / 設定 / pointerとpermissionの静的sealを再照合します。
+起動直前にinstall済みplistとstaged bytesも比較し、再開時は既存登録を停止して検証済plistからbootstrapします。
+seal照合失敗もphaseに応じた復元・停止の対象で、ingress後なら新世代を保持して停止します。
 
 Slack ingress開始前の失敗では、新世代の3サービス停止を確認して元plistへ戻し、
 保持した旧DB・Result・releaseで起動し、旧SHAのhealthを確認します。
@@ -161,6 +165,8 @@ npm run test:skills
 一時directoryで実SQLite backup、古いwriterの後続write、phase途中再開、部分plist切替、
 health失敗・復元失敗、handoff未成立、設定drift、共通lock、未公開tempの再開を検証します。
 3つの実child processとUNIX HTTP socketによる起動・health・停止も通します。
+CI失敗・署名不一致、install済plistの旧DB混入、ingress後のseal drift、内部通知protocol欠落、
+permission drift、backup hashのchunk計算も検証します。
 launchd adapterと本物のSlack接続は本番停止を伴うため、ここでは未実行です。
 UpdaterのCIではDonaと同じNode SQLiteでclose後DBのread-only照合とlive WALのbackupも検証します。
 通常self-update gate・Herdr・本番DBの変更はありません。
