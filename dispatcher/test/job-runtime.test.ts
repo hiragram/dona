@@ -48,6 +48,28 @@ process.stdout.write(JSON.stringify({ result: { agent_status: "working" } }));
     assert.equal(args.includes("77"), false);
   });
 
+  test("steer submission omits the worker state wait while the initial prompt retains it", async () => {
+    const { root, config: baseConfig } = await tempConfig(); roots.push(root);
+    const capturePath = path.join(root, "argv.json");
+    const fakeHerdrPath = path.join(root, "herdr.mjs");
+    await fs.writeFile(fakeHerdrPath, `#!/usr/bin/env node
+import fs from "node:fs";
+const args = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args));
+if (args.includes("--wait")) process.exit(2);
+process.stdout.write(JSON.stringify({result:{agent_status:"idle"}}));
+`, { mode: 0o700 });
+    const runtime = new HerdrJobAgentRuntime({ ...baseConfig, herdrPath: fakeHerdrPath });
+    const submitted = await runtime.prompt("job_123", "追加条件", undefined, undefined, true);
+    assert.equal(submitted.ok, true);
+    assert.equal(submitted.agentStatus, "idle");
+    const args = JSON.parse(await fs.readFile(capturePath, "utf8")) as string[];
+    assert.deepEqual(args.slice(0, 6), ["--session", baseConfig.herdrSession, "agent", "prompt", "job_123", "追加条件"]);
+    assert.equal(args.includes("--wait"), false);
+    assert.equal((await runtime.prompt("job_123", "初回")).ok, false);
+    assert.equal((JSON.parse(await fs.readFile(capturePath, "utf8")) as string[]).includes("--wait"), true);
+  });
+
   test("omits the progress directory and prompt contract when progress is disabled", async () => {
     const { root, config } = await tempConfig(); roots.push(root);
     const database = new DispatcherDatabase(config.databasePath);

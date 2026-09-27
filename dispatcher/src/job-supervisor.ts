@@ -326,7 +326,8 @@ export class JobSupervisor {
       }
       const begun = this.database.beginJobSteer(jobId, sourceEventId);
       if (begun.duplicate) return begun;
-      const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal);
+      // Steer acceptance is the CLI submission response, not a later worker state change.
+      const prompted = await this.runtime.prompt(begun.row.agent_name, instruction, this.abortController.signal, undefined, true);
       if (prompted.ok) {
         this.database.markJobSteerAccepted(jobId, sourceEventId);
         return { row: this.database.getJob(jobId)!, duplicate: false };
