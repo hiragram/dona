@@ -34,7 +34,7 @@ function usage(): never {
   dona-dispatcher event reconcile-notification <event_id> not_sent [--resume]
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
-  dona-dispatcher job artifact-inventory [--cursor JOB_ID] [--limit 1-20]
+  dona-dispatcher job artifact-inventory [--cursor ROW_CURSOR] [--limit 1-20]
   dona-dispatcher job show <job_id> [--live-session | --live-session-receipt <receipt_id>]
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
@@ -87,7 +87,7 @@ async function main(): Promise<void> {
     const budget = { entries: 0, deadline: performance.now() + 3_000 };
     for (const row of selected) artifacts.push(await inventoryJobArtifacts(row, config, budget));
     console.log(JSON.stringify({ schema_version: 1, dry_run: true, artifacts,
-      next_cursor: rows.length > limit ? selected.at(-1)?.job_id : null,
+      next_cursor: rows.length > limit ? String(selected.at(-1)?.artifact_cursor) : null,
       size_is_complete: inventorySizeIsComplete(artifacts),
     }, null, 2));
     return;

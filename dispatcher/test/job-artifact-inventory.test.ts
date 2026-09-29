@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { mock, test } from "node:test";
+import { test } from "node:test";
 import Database from "better-sqlite3";
 
 import { inventoryJobArtifacts, inventorySizeIsComplete, readJobArtifactInventoryPage } from "../src/job-artifact-inventory.js";
@@ -26,44 +26,27 @@ test("job artifact inventory measures only contract paths and reports unsafe ent
     await fs.writeFile(result_path, "{}");
     const first = await inventoryJobArtifacts(row, config);
     assert.deepEqual(first.protection_reasons, ["notification_unverified", "retention_expiry_unverified"]);
-    assert.equal(first.artifacts[0]?.cleanup_state, "present");
+    assert.equal(first.artifacts[0]?.cleanup_state, "unmeasured_directory");
     assert.equal(first.artifacts[1]?.cleanup_state, "missing");
     assert.equal(first.artifacts[2]?.cleanup_state, "present");
-    assert.equal(typeof first.artifacts[0]?.allocated_bytes, "number");
+    assert.equal(first.artifacts[0]?.allocated_bytes, null);
+    assert.equal(typeof first.artifacts[2]?.allocated_bytes, "number");
     assert.equal(inventorySizeIsComplete([first]), false);
     const legacyResult = path.join(config.jobResultsDir, `${job_id}.json`);
     await fs.writeFile(legacyResult, "{}");
     const legacy = await inventoryJobArtifacts({ ...row, result_path: legacyResult }, config);
     assert.equal(legacy.artifacts[2]?.cleanup_state, "present");
-    await fs.symlink(root, path.join(workspace_path, "escape"));
+    await fs.unlink(result_path);
+    await fs.symlink(path.join(root, "outside"), result_path);
     const unsafe = await inventoryJobArtifacts(row, config);
-    assert.equal(unsafe.artifacts[0]?.cleanup_state, "unsafe");
-    assert.equal(unsafe.artifacts[0]?.allocated_bytes, null);
+    assert.equal(unsafe.artifacts[2]?.cleanup_state, "unsafe");
+    assert.equal(unsafe.artifacts[2]?.allocated_bytes, null);
     const mismatch = await inventoryJobArtifacts({ ...row, result_path: path.join(root, "outside") }, config);
     assert.equal(mismatch.artifacts[2]?.cleanup_state, "contract_mismatch");
     const malformed = await inventoryJobArtifacts({ ...row, workspace_json: "{" }, config);
     assert.ok(malformed.artifacts.every((artifact) => artifact.cleanup_state === "contract_mismatch"));
     const invalidId = await inventoryJobArtifacts({ ...row, job_id: "../outside" }, config);
     assert.ok(invalidId.artifacts.every((artifact) => artifact.cleanup_state === "contract_mismatch"));
-    await fs.unlink(path.join(workspace_path, "escape"));
-    const outside = path.join(root, "outside-tree");
-    await fs.mkdir(outside);
-    await fs.writeFile(path.join(outside, "private"), "outside");
-    const opendir = fs.opendir.bind(fs);
-    let replaced = false;
-    mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
-      if (!replaced && args[0] === workspace_path) {
-        replaced = true;
-        await fs.rename(workspace_path, path.join(root, "moved-worktree"));
-        await fs.symlink(outside, workspace_path);
-      }
-      return opendir(...args);
-    });
-    try {
-      const raced = await inventoryJobArtifacts(row, config);
-      assert.equal(raced.artifacts[0]?.cleanup_state, "unsafe");
-      assert.equal(raced.artifacts[0]?.allocated_bytes, null);
-    } finally { mock.restoreAll(); }
     await fs.rename(config.jobsWorkspaceRoot, path.join(root, "moved-workspaces"));
     await fs.symlink(path.join(root, "moved-workspaces"), config.jobsWorkspaceRoot);
     const redirected = await inventoryJobArtifacts(row, config);
@@ -79,12 +62,15 @@ test("artifact inventory pages jobs through a read-only database handle", async 
     const db = new Database(databasePath);
     db.exec("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, workspace_json TEXT, workspace_path TEXT, result_path TEXT, status TEXT, created_at TEXT, completed_at TEXT)");
     const insert = db.prepare("INSERT INTO jobs VALUES(?,?,?,?,?,?,?)");
-    for (const jobId of ["job_01m3p6jrm2g3rsjbadbmpzmend", "job_01m3p6jrm2g3rsjbadbmpzmenf"])
+    for (const jobId of ["../malformed", "job_01m3p6jrm2g3rsjbadbmpzmend", "job_01m3p6jrm2g3rsjbadbmpzmenf"])
       insert.run(jobId, '{"kind":"scratch"}', "workspace", "result", "completed", "2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z");
     db.close();
     const first = readJobArtifactInventoryPage(databasePath, "", 1);
     assert.equal(first.length, 1);
-    assert.equal(readJobArtifactInventoryPage(databasePath, first[0]!.job_id, 1)[0]?.job_id,
+    assert.equal(first[0]?.job_id, "../malformed");
+    const second = readJobArtifactInventoryPage(databasePath, String(first[0]!.artifact_cursor), 1);
+    assert.equal(second[0]?.job_id, "job_01m3p6jrm2g3rsjbadbmpzmend");
+    assert.equal(readJobArtifactInventoryPage(databasePath, String(second[0]!.artifact_cursor), 1)[0]?.job_id,
       "job_01m3p6jrm2g3rsjbadbmpzmenf");
     assert.throws(() => readJobArtifactInventoryPage(databasePath, "invalid", 1), /cursor_or_limit_invalid/);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
