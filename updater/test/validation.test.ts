@@ -28,6 +28,7 @@ describe("fixed self-update surface", () => {
       await fs.readFile(new URL("../../config/update-compatibility-transitions.json", import.meta.url), "utf8"),
     ) as { transitions: unknown };
     assert.deepEqual(examplePolicy.compatibility_transitions, transitionFile.transitions);
+    assert.deepEqual(parsePolicy(examplePolicy).compatibility_transitions,transitionFile.transitions);
   });
 
   test("does not accept repository, ref, path, command, npm flags, launchctl args, or environment", () => {
@@ -68,6 +69,8 @@ describe("fixed self-update surface", () => {
         required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
       };
       assert.deepEqual(parsePolicy({ ...policy, compatibility_transitions: [transition] }).compatibility_transitions, [transition]);
+      const forwardOnly={...transition,to:{...transition.to,rollback_safe:false}};
+      assert.deepEqual(parsePolicy({ ...policy, compatibility_transitions: [forwardOnly] }).compatibility_transitions,[forwardOnly]);
       assert.throws(() => parsePolicy({ ...policy, compatibility_transitions: [transition, transition] }), /duplicates/);
       assert.throws(() => parsePolicy({
         ...policy,

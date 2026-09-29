@@ -105,7 +105,7 @@ test("非互換transitionはrollback不可と提示しtarget異常時に旧runti
     app_schema_write: 2, rollback_safe: true,
   };
   const targetCompatibility: Compatibility = {
-    ...sourceCompatibility, app_schema_read_max: 3, app_schema_write: 3,
+    ...sourceCompatibility, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: false,
   };
   f.policy.compatibility = sourceCompatibility;
   f.policy.compatibility_transitions = [{

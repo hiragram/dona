@@ -17,7 +17,7 @@
         "app_schema_read_min": 2,
         "app_schema_read_max": 3,
         "app_schema_write": 3,
-        "rollback_safe": true
+        "rollback_safe": false
       },
       "previous_release_contract": "release-compatibility.production-v2.json",
       "required_control_plane_capability": "dispatcher_v2_to_v3_online_backup_v1"
