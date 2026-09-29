@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
 const phases = ["prepared", "updater_stop_intent", "updater_stopped", "backup_verified", "dispatcher_stop_intent", "dispatcher_stopped", "dispatcher_start_intent", "dispatcher_started", "control_swapped", "updater_start_intent", "updater_started", "verified", "restore_required", "restored", "needs_review"];
@@ -108,7 +109,7 @@ export function verifyAttemptArtifacts(directory, policy, plist, backup, rehears
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   const [command, ...args] = process.argv.slice(2);
   try {
     if (command === "create" && args.length === 8) createAttempt(...args);

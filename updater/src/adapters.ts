@@ -821,7 +821,8 @@ export class RealRuntime implements RuntimePort {
       };
       const currentArtifactsMatch =
         await artifactDigest(path.join(this.policy.control_root, "policy.json")) === attempt.new_policy_sha256 &&
-        await artifactDigest(path.join(os.homedir(), "Library/LaunchAgents/dev.dona.updater.plist")) === attempt.new_plist_sha256;
+        await artifactDigest(path.join(os.homedir(), "Library/LaunchAgents/dev.dona.updater.plist")) === attempt.new_plist_sha256 &&
+        await artifactDigest(path.join(attemptDirectory, "updater.previous.sqlite3")) === attempt.db_backup_sha256;
       const releaseRoot = path.join(this.policy.release_root, buildSha);
       const releaseHash = createHash("sha256");
       const visitRelease = async (directory: string, relativeDirectory = ""): Promise<void> => {

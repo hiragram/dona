@@ -48,6 +48,8 @@ test("control capability requires a verified attempt ledger bound to the exact r
     const agents = path.join(root, "Library/LaunchAgents");
     await fs.mkdir(agents, { recursive: true });
     await fs.writeFile(path.join(agents, "dev.dona.updater.plist"), artifact, { mode: 0o600 });
+    const controlBackup = path.join(attemptDir, "updater.previous.sqlite3");
+    await fs.writeFile(controlBackup, artifact, { mode: 0o600 });
     const rehearsal = { schema_version: 1, backup_sha256: digest, old_schema: 7, new_schema: 8,
       rollback: "restore_backup_required", old_binary_restored_backup_readable: true };
     const rehearsalBytes = Buffer.from(`${JSON.stringify(rehearsal)}\n`);
@@ -67,6 +69,9 @@ test("control capability requires a verified attempt ledger bound to the exact r
     await fs.writeFile(receiptPath, JSON.stringify(receipt), { mode: 0o600 });
     const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
     assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: true, build_sha: targetSha });
+    await fs.writeFile(controlBackup, "tampered", { mode: 0o600 });
+    assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });
+    await fs.writeFile(controlBackup, artifact, { mode: 0o600 });
     await fs.chmod(releaseDir, 0o700);
     await fs.chmod(path.join(releaseDir, "control.txt"), 0o600);
     await fs.writeFile(path.join(releaseDir, "control.txt"), "tampered");

@@ -417,7 +417,7 @@ test("old control restore rehearsal opens only a backup copy and fails closed on
     await fs.writeFile(path.join(newDir, "package.json"), '{"type":"module"}');
     await fs.writeFile(modulePath, 'import fs from "node:fs"; export class UpdateDatabase { constructor(file) { if (fs.readFileSync(file).readUInt32BE(60) !== 7) throw new Error("unreadable"); } close() {} }', { mode: 0o600 });
     await fs.writeFile(newModulePath, 'import fs from "node:fs"; export class UpdateDatabase { constructor(file) { const bytes=fs.readFileSync(file); bytes.writeUInt32BE(8,60); fs.writeFileSync(file,bytes); } close() {} }', { mode: 0o600 });
-    await execute("python3", ["-c", "import sqlite3,sys,os; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE update_requests(id TEXT PRIMARY KEY)'); c.execute('PRAGMA user_version=7'); c.commit(); c.close(); os.chmod(sys.argv[1],0o600)", backup]);
+    await execute("python3", ["-c", "import sqlite3,sys,os; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE update_requests(id TEXT PRIMARY KEY)'); c.execute(\"INSERT INTO update_requests VALUES ('one')\"); c.execute('PRAGMA user_version=7'); c.commit(); c.close(); os.chmod(sys.argv[1],0o600)", backup]);
     const original = await fs.readFile(backup);
     await execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]);
     assert.deepEqual(await fs.readFile(backup), original);
@@ -429,6 +429,13 @@ test("old control restore rehearsal opens only a backup copy and fails closed on
     await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
     await fs.rm(receipt);
     await fs.writeFile(modulePath, 'export class UpdateDatabase { constructor() { throw new Error("old binary rejects backup"); } close() {} }');
+    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
+    await assert.rejects(fs.stat(receipt), { code: "ENOENT" });
+    assert.deepEqual(await fs.readFile(backup), original);
+    await fs.writeFile(newModulePath, `import { execFileSync } from "node:child_process";
+      export class UpdateDatabase { constructor(file) {
+        execFileSync("/usr/bin/python3", ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('DELETE FROM update_requests'); c.execute('PRAGMA user_version=8'); c.commit(); c.close()", file]);
+      } close() {} }`);
     await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
     await assert.rejects(fs.stat(receipt), { code: "ENOENT" });
     assert.deepEqual(await fs.readFile(backup), original);
@@ -458,6 +465,15 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await fs.writeFile(rehearsal, "rehearsal");
     const create = () => execute(process.execPath, [controlLedger, "create", attempt,
       "1".repeat(40), "2".repeat(40), oldPolicy, newPolicy, oldPlist, newPlist, "f".repeat(64)]);
+    const spacedCheckout = path.join(root, "checkout with spaces");
+    await fs.mkdir(spacedCheckout);
+    const spacedLedger = path.join(spacedCheckout, "control-attempt-ledger.mjs");
+    await fs.copyFile(controlLedger, spacedLedger);
+    const spacedAttempt = path.join(root, `${"2".repeat(40)}.SPACE`);
+    await fs.mkdir(spacedAttempt, { mode: 0o700 });
+    await execute(process.execPath, [spacedLedger, "create", spacedAttempt,
+      "1".repeat(40), "2".repeat(40), oldPolicy, newPolicy, oldPlist, newPlist, "f".repeat(64)]);
+    assert.equal(JSON.parse(await fs.readFile(path.join(spacedAttempt, "attempt.json"), "utf8")).phase, "prepared");
     const advance = (phase: string, operation = "none", database?: string) =>
       execute(process.execPath, [controlLedger, "advance", attempt, phase, operation, ...(database ? [database] : [])]);
     await create();
