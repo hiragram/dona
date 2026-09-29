@@ -196,6 +196,7 @@ export class ReleaseStore {
   }> {
     await this.ensureRoots();
     const pointers = await this.observe();
+    if (!pointers.current_sha) throw new Error("retention_current_pointer_missing");
     if (pointers.receipt && !pointers.previous_sha) throw new Error("retention_previous_pointer_missing");
     const candidates: Array<{ sha: string; mtime: number }> = [];
     const rootScanDeadline = performance.now() + 3_000;
@@ -254,13 +255,14 @@ export class ReleaseStore {
         await this.readManifest(releasePath);
         await this.scanTree(releasePath, releasePath, { deadline: performance.now() + 3_000, entries: 0 });
         const pointers = await this.observe();
+        if (!pointers.current_sha) throw new Error("retention_current_pointer_missing");
         if (pointers.receipt && !pointers.previous_sha) throw new Error("retention_previous_pointer_missing");
         if (protectedShas.has(sha) || pointers.current_sha === sha || pointers.previous_sha === sha) continue;
         await this.makeMutableForRemoval(releasePath);
         await this.removeGeneratedTree(this.policy.release_root, releasePath);
         removed.push(sha);
       } catch (error) {
-        if (error instanceof Error && error.message === "retention_previous_pointer_missing") throw error;
+        if (error instanceof Error && ["retention_current_pointer_missing", "retention_previous_pointer_missing"].includes(error.message)) throw error;
         // A single corrupt or replaced candidate cannot block other releases.
         errors.push(`${sha}:${error instanceof Error ? error.message : "cleanup_failed"}`);
       }

@@ -114,6 +114,19 @@ describe("ReleaseStore", () => {
     assert.equal((await fs.lstat(path.join(policy.release_root, currentSha))).isDirectory(), true);
   });
 
+  test("stops cleanup when the current pointer is missing", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidateSha = "b".repeat(40);
+    const candidate = await installRelease(policy, candidateSha);
+    await fs.unlink(policy.current_pointer);
+    const store = new ReleaseStore(policy);
+    await assert.rejects(store.cleanupPlan(new Set()), /retention_current_pointer_missing/);
+    await assert.rejects(store.cleanup(new Set()), /retention_current_pointer_missing/);
+    assert.equal((await fs.lstat(candidate)).isDirectory(), true);
+  });
+
   test("rejects a staging tree that exceeds the cleanup scan deadline before publish", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
