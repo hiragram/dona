@@ -472,7 +472,8 @@ export class ReleaseStore {
     let manifest: ReleaseManifest;
     try {
       const stats = await handle.stat();
-      if (!stats.isFile() || stats.size > 65_536) throw new Error("release_manifest_size_or_type_invalid");
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o022) !== 0 || stats.size > 65_536) throw new Error("release_manifest_size_or_type_invalid");
       manifest = parseReleaseManifest(JSON.parse(await handle.readFile("utf8")));
     } finally {
       await handle.close();

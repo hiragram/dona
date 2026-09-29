@@ -948,21 +948,28 @@ export class UpdateDatabase {
     // Count only observed system uptime; a reboot can delay expiry, never
     // advance it. Legacy records start their clock at first observation.
     if (!Number.isSafeInteger(uptimeMs) || uptimeMs < 0) throw new Error("retention_uptime_invalid");
-    const rows = this.db.prepare(`SELECT request_id,current_sha,target_sha,previous_sha,state,completed_at,
+    const retentionMs = 30 * 86_400_000;
+    const clockAvailable = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='update_retention_uptime'").get() !== undefined;
+    const clockColumns = clockAvailable ? "c.elapsed_ms AS clock_elapsed_ms,c.observed_uptime_ms AS clock_uptime_ms"
+      : "NULL AS clock_elapsed_ms,NULL AS clock_uptime_ms";
+    const clockJoin = clockAvailable ? "LEFT JOIN update_retention_uptime c ON c.request_id=r.request_id" : "";
+    const terminalFilter = clockAvailable
+      ? `r.state IN ('failed','cancelled','rolled_back') AND (c.request_id IS NULL OR c.elapsed_ms < ${retentionMs})`
+      : "r.state IN ('failed','cancelled','rolled_back')";
+    const rows = this.db.prepare(`SELECT r.request_id,r.current_sha,r.target_sha,r.previous_sha,r.state,r.completed_at,
+      ${clockColumns},
       EXISTS (
         SELECT 1 FROM update_outbox o WHERE o.request_id=r.request_id
           AND o.outbox_id=(SELECT newest.outbox_id FROM update_outbox newest
             WHERE newest.request_id=r.request_id ORDER BY newest.rowid DESC LIMIT 1)
           AND o.superseded_by_outbox_id IS NULL
           AND (o.status <> 'delivered' OR o.slack_reported_at IS NULL)) AS notification_pending
-      FROM update_requests r WHERE r.completed_at IS NULL OR r.state IN ('needs_review','failed','cancelled','rolled_back')
+      FROM update_requests r ${clockJoin} WHERE r.completed_at IS NULL OR r.state='needs_review' OR (${terminalFilter})
         OR EXISTS (SELECT 1 FROM update_outbox o WHERE o.request_id=r.request_id AND o.superseded_by_outbox_id IS NULL
           AND (o.status <> 'delivered' OR o.slack_reported_at IS NULL))`)
       .all() as Array<{request_id:string;current_sha:string;target_sha:string;previous_sha:string|null;
-        state:string;completed_at:string|null;notification_pending:number}>;
-    const clockAvailable = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='update_retention_uptime'").get() !== undefined;
-    const readClock = clockAvailable
-      ? this.db.prepare("SELECT elapsed_ms,observed_uptime_ms FROM update_retention_uptime WHERE request_id=?") : undefined;
+        state:string;completed_at:string|null;notification_pending:number;
+        clock_elapsed_ms:number|null;clock_uptime_ms:number|null}>;
     const writeClock = !this.readonlyMode && clockAvailable ? this.db.prepare(`INSERT INTO update_retention_uptime(request_id,elapsed_ms,observed_uptime_ms)
       VALUES(?,?,?) ON CONFLICT(request_id) DO UPDATE SET elapsed_ms=excluded.elapsed_ms,
       observed_uptime_ms=excluded.observed_uptime_ms`) : undefined;
@@ -971,13 +978,14 @@ export class UpdateDatabase {
       for (const row of rows) {
         let retain = row.completed_at === null || row.state === "needs_review" || row.notification_pending === 1;
         if (["failed", "cancelled", "rolled_back"].includes(row.state) && row.completed_at !== null) {
-          const prior = readClock?.get(row.request_id) as {elapsed_ms:number;observed_uptime_ms:number}|undefined;
-          const elapsed = prior?.elapsed_ms !== undefined && prior.elapsed_ms >= 30 * 86_400_000
+          const prior = row.clock_elapsed_ms === null || row.clock_uptime_ms === null ? undefined
+            : {elapsed_ms:row.clock_elapsed_ms,observed_uptime_ms:row.clock_uptime_ms};
+          const elapsed = prior?.elapsed_ms !== undefined && prior.elapsed_ms >= retentionMs
             ? prior.elapsed_ms : prior ? prior.elapsed_ms + Math.max(0, uptimeMs - prior.observed_uptime_ms) : 0;
-          if (elapsed < 30 * 86_400_000 || (prior && prior.elapsed_ms < 30 * 86_400_000)) {
-            writeClock?.run(row.request_id, Math.min(elapsed, 30 * 86_400_000), uptimeMs);
+          if (elapsed < retentionMs || (prior && prior.elapsed_ms < retentionMs)) {
+            writeClock?.run(row.request_id, Math.min(elapsed, retentionMs), uptimeMs);
           }
-          retain ||= elapsed < 30 * 86_400_000;
+          retain ||= elapsed < retentionMs;
         }
         if (retain) for (const sha of [row.current_sha,row.target_sha,row.previous_sha]) if (sha) protectedShas.add(sha);
       }

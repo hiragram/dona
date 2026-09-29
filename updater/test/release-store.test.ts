@@ -193,6 +193,21 @@ describe("ReleaseStore", () => {
     assert.equal((await fs.lstat(candidate)).isDirectory(), true);
   });
 
+  test("rejects mutable or externally linked pointer manifests during cleanup", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidate = await installRelease(policy, "b".repeat(40));
+    const store = new ReleaseStore(policy);
+    const manifestPath = path.join(policy.release_root, currentSha, "release-manifest.json");
+    await fs.chmod(manifestPath, 0o660);
+    await assert.rejects(store.cleanup(new Set()), /retention_pointer_manifest_invalid/);
+    await fs.chmod(manifestPath, 0o400);
+    await fs.link(manifestPath, path.join(root, "external-manifest-link"));
+    await assert.rejects(store.cleanup(new Set()), /retention_pointer_manifest_invalid/);
+    assert.equal((await fs.lstat(candidate)).isDirectory(), true);
+  });
+
   test("serializes activation with a cleanup already removing its target release", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

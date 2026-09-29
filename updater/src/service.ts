@@ -58,10 +58,17 @@ export class UpdateService {
         this.controller.maintainDiagnostics();
         await this.controller.processNext();
         await this.controller.deliverOutbox();
-        await this.controller.maintainReleaseRetention();
       } catch (error) {
         this.logger.error("Updater service iteration failed", {
           error_code: "service_iteration_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      try {
+        await this.controller.maintainReleaseRetention();
+      } catch (error) {
+        this.logger.error("Updater release retention iteration failed", {
+          error_code: "release_retention_iteration_failed",
           error_message: error instanceof Error ? error.message : String(error),
         });
       }
