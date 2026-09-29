@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import { controlUpdaterTreeDigest } from "./control-updater-tree.mjs";
 import { releaseTreeDigest } from "./self-update-install-preflight.mjs";
 
@@ -98,6 +99,31 @@ export async function verifyInstallContract(controlRoot, agentsRoot, releaseRoot
   }
 }
 
+export async function verifyBootstrapTargets(controlRoot, agentsRoot, releaseRoot, sha) {
+  await verifyInstallContract(controlRoot, agentsRoot, releaseRoot, sha);
+  const runtimeRoot = path.dirname(releaseRoot);
+  await privateDirectory(runtimeRoot);
+  const current = path.join(runtimeRoot, "current");
+  const pointer = await fs.lstat(current);
+  if (!pointer.isSymbolicLink() || pointer.uid !== process.getuid() ||
+      await fs.readlink(current) !== `releases/${sha}` ||
+      await fs.realpath(current) !== await fs.realpath(path.join(releaseRoot, sha))) {
+    throw new Error("current pointer differs from the verified release");
+  }
+  const manifest = JSON.parse((await privateFile(path.join(releaseRoot, sha, "release-manifest.json"))).toString("utf8"));
+  if (manifest.sha !== sha || typeof manifest.node_version !== "string") {
+    throw new Error("release toolchain identity is invalid");
+  }
+  for (const name of names) {
+    const plist = path.join(agentsRoot, name);
+    const nodePath = execFileSync("/usr/libexec/PlistBuddy", ["-c", "Print :ProgramArguments:0", plist],
+      { encoding: "utf8", timeout: 5000 }).trim();
+    if (!path.isAbsolute(nodePath) || !nodePath.startsWith("/")) throw new Error("installed Node path is invalid");
+    const version = execFileSync(nodePath, ["--version"], { encoding: "utf8", timeout: 5000 }).trim();
+    if (version !== `v${manifest.node_version}`) throw new Error("installed Node differs from the build toolchain");
+  }
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [, , mode, controlRoot, agentsRoot, releaseRoot, sha, renderedRoot, stagedRoot] = process.argv;
   try {
@@ -106,6 +132,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     } else if (process.argv.length !== 7) throw new Error("install contract arguments are invalid");
     else if (mode === "record") await recordInstallContract(controlRoot, agentsRoot, releaseRoot, sha);
     else if (mode === "verify") await verifyInstallContract(controlRoot, agentsRoot, releaseRoot, sha);
+    else if (mode === "bootstrap-verify") await verifyBootstrapTargets(controlRoot, agentsRoot, releaseRoot, sha);
     else throw new Error("install contract mode is invalid");
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

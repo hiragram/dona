@@ -314,7 +314,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   fi
   $NODE_PATH -e 'const fs=require("node:fs");const manifest=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(manifest.sha!==process.argv[2])process.exit(1)' \
     "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/release-manifest.json" "$BOOTSTRAP_UPDATER_SHA"
-  $NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA"
+  $NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" bootstrap-verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA"
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$CONTROL_ROOT/updater/dist/cli.js"
   if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"

@@ -66,7 +66,7 @@ test("bootstrap resume checks the install-time files independently of the curren
     await assert.rejects(execute(process.execPath, [installContract, "verify", control, agents, releases, sha]));
     await assert.rejects(execute(process.execPath, [installContract, "record", control, agents, releases, sha]));
     const source = await fs.readFile(installer, "utf8");
-    assert.match(source, /bootstrap-install-contract\.mjs" verify/);
+    assert.match(source, /bootstrap-install-contract\.mjs" bootstrap-verify/);
     assert.match(source, /bootstrap-install-contract\.mjs" record/);
     assert.doesNotMatch(source, /cmp -s "\$INSTALL_TMP\/rendered\/dev\.dona\.(?:dispatcher|slack-adapter)\.plist"/);
   } finally {
@@ -115,6 +115,51 @@ test("an interrupted install contract is recovered only from the same verified b
   } finally {
     await fs.chmod(installedRelease, 0o700).catch(() => undefined);
     await fs.chmod(path.join(installedRelease, "updater"), 0o700).catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap binds current pointer and installed Node to the verified release", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-bootstrap-targets-"));
+  const control = path.join(root, "control");
+  const agents = path.join(root, "agents");
+  const runtime = path.join(root, "runtime");
+  const releases = path.join(runtime, "releases");
+  const sha = "a".repeat(40);
+  const release = path.join(releases, sha);
+  try {
+    for (const directory of [control, agents, runtime, releases, release, path.join(control, "updater")]) {
+      await fs.mkdir(directory, { mode: 0o700 });
+    }
+    await fs.writeFile(path.join(control, "updater", "cli.js"), "updater", { mode: 0o400 });
+    await fs.writeFile(path.join(control, "policy.json"), "policy", { mode: 0o600 });
+    const plist = `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>ProgramArguments</key><array><string>${process.execPath}</string></array></dict></plist>`;
+    for (const name of ["dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"]) {
+      await fs.writeFile(path.join(agents, name), plist, { mode: 0o600 });
+    }
+    const manifest = path.join(release, "release-manifest.json");
+    await fs.writeFile(manifest, JSON.stringify({ sha, node_version: process.versions.node, built_at: "2026-09-29T00:00:00Z" }), { mode: 0o400 });
+    await fs.symlink(`releases/${sha}`, path.join(runtime, "current"));
+    await fs.chmod(release, 0o500);
+    const record = () => execute(process.execPath, [installContract, "record", control, agents, releases, sha]);
+    const verify = () => execute(process.execPath, [installContract, "bootstrap-verify", control, agents, releases, sha]);
+    await record();
+    await verify();
+    await fs.unlink(path.join(runtime, "current"));
+    await fs.symlink(`elsewhere/${sha}`, path.join(runtime, "current"));
+    await assert.rejects(verify(), /current pointer/);
+    await fs.unlink(path.join(runtime, "current"));
+    await fs.symlink(`releases/${sha}`, path.join(runtime, "current"));
+    await fs.unlink(path.join(control, "bootstrap-install-contract.json"));
+    await fs.chmod(release, 0o700);
+    await fs.chmod(manifest, 0o600);
+    await fs.writeFile(manifest, JSON.stringify({ sha, node_version: "0.0.0", built_at: "2026-09-29T00:00:00Z" }));
+    await fs.chmod(manifest, 0o400);
+    await fs.chmod(release, 0o500);
+    await record();
+    await assert.rejects(verify(), /Node differs/);
+  } finally {
+    await fs.chmod(release, 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });
