@@ -948,9 +948,12 @@ export class UpdateDatabase {
     return new Set(rows.flatMap((row) => [row.current_sha,row.target_sha,...(row.previous_sha?[row.previous_sha]:[])]));
   }
 
-  recentSuccessfulReleaseShas(limit = 2): Set<string> {
-    const rows = this.db.prepare(`SELECT target_sha FROM update_requests WHERE state='succeeded'
-      ORDER BY completed_at DESC,request_id DESC LIMIT ?`).all(limit) as Array<{target_sha:string}>;
+  recentSuccessfulReleaseShas(limit = 2, excludedShas: ReadonlySet<string> = new Set()): Set<string> {
+    const excluded = [...excludedShas];
+    const exclusion = excluded.length ? `AND target_sha NOT IN (${excluded.map(() => "?").join(",")})` : "";
+    const rows = this.db.prepare(`SELECT target_sha FROM update_requests WHERE state='succeeded' ${exclusion}
+      GROUP BY target_sha ORDER BY MAX(completed_at) DESC,target_sha DESC LIMIT ?`)
+      .all(...excluded,limit) as Array<{target_sha:string}>;
     return new Set(rows.map((row) => row.target_sha));
   }
 

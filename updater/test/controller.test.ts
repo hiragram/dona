@@ -2126,7 +2126,7 @@ describe("UpdateController isolated end-to-end", () => {
     f.database.close();
   });
 
-  test("periodic release maintenance advances beyond invalid candidates without an update", async () => {
+  test("periodic release maintenance advances beyond invalid candidates after clock reversal", async () => {
     const f = await fixture();
     for (let index = 1; index <= 17; index++) {
       const sha = index.toString(16).padStart(40, "0");
@@ -2140,11 +2140,20 @@ describe("UpdateController isolated end-to-end", () => {
     await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
     await f.controller.maintainReleaseRetention();
     assert.equal((await fs.lstat(safe)).isDirectory(), true);
-    f.advance(60_000);
+    f.advance(-60_000);
     await f.controller.maintainReleaseRetention();
     await assert.rejects(fs.lstat(safe), { code: "ENOENT" });
     assert.equal((await f.store.observe()).current_sha, currentSha);
     assert.equal((await f.store.observe()).previous_sha, olderSha);
+    f.database.close();
+  });
+
+  test("release maintenance stops when current pointer is missing", async () => {
+    const f = await fixture();
+    const candidate = await installRelease(f.policy, "d".repeat(40));
+    await fs.unlink(f.policy.current_pointer);
+    await f.controller.maintainReleaseRetention();
+    assert.equal((await fs.lstat(candidate)).isDirectory(), true);
     f.database.close();
   });
 
