@@ -341,13 +341,20 @@ export class ReleaseStore {
     const file = path.join(this.policy.control_root, "release-cleanup-cursor.json");
     let handle: fs.FileHandle;
     try { handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      if ((error as NodeJS.ErrnoException).code !== "ELOOP") throw error;
+      const entry = await fs.lstat(file);
+      if (!entry.isSymbolicLink()) throw error;
+      await this.quarantineCleanupCursor(file, entry);
+      return null;
+    }
     try {
       const stats = await handle.stat();
-      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
-        (stats.mode & 0o022) !== 0) throw new Error("release_cleanup_cursor_type_invalid");
       let value: unknown;
       try {
+        if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+          (stats.mode & 0o022) !== 0) throw new Error("release_cleanup_cursor_type_invalid");
         if (stats.size > 256) throw new Error("release_cleanup_cursor_invalid");
         value = JSON.parse(await handle.readFile("utf8"));
         if (!value || typeof value !== "object" || Array.isArray(value) ||
@@ -357,22 +364,24 @@ export class ReleaseStore {
           typeof cursor.mtime !== "number" || !Number.isFinite(cursor.mtime)) throw new Error("release_cleanup_cursor_invalid");
         return cursor as { sha: string; mtime: number };
       } catch (error) {
-        if (error instanceof Error && error.message !== "release_cleanup_cursor_invalid" &&
+        if (error instanceof Error && !["release_cleanup_cursor_invalid", "release_cleanup_cursor_type_invalid"].includes(error.message) &&
           !(error instanceof SyntaxError)) throw error;
         // The cursor is only a scan hint. Keep the damaged bytes for diagnosis
         // and restart at the beginning, where every candidate is revalidated.
-        const current = await fs.lstat(file);
-        if (!current.isFile() || current.dev !== stats.dev || current.ino !== stats.ino) {
-          throw new Error("release_cleanup_cursor_changed");
-        }
-        const quarantined = `${file}.invalid.${randomUUID()}`;
-        await fs.rename(file, quarantined);
-        const moved = await fs.lstat(quarantined);
-        if (moved.dev !== stats.dev || moved.ino !== stats.ino) throw new Error("release_cleanup_cursor_changed");
-        await fsyncDirectory(this.policy.control_root);
+        await this.quarantineCleanupCursor(file, stats);
         return null;
       }
     } finally { await handle.close(); }
+  }
+
+  private async quarantineCleanupCursor(file: string, observed: { dev: number; ino: number }): Promise<void> {
+    const current = await fs.lstat(file);
+    if (current.dev !== observed.dev || current.ino !== observed.ino) throw new Error("release_cleanup_cursor_changed");
+    const quarantined = `${file}.invalid.${randomUUID()}`;
+    await fs.rename(file, quarantined);
+    const moved = await fs.lstat(quarantined);
+    if (moved.dev !== observed.dev || moved.ino !== observed.ino) throw new Error("release_cleanup_cursor_changed");
+    await fsyncDirectory(this.policy.control_root);
   }
 
   private async validateReleasePath(releasePath: string, expectedSha?: string): Promise<string> {

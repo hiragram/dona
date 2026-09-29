@@ -101,6 +101,29 @@ describe("ReleaseStore", () => {
     assert.ok((await fs.readdir(policy.control_root)).some((entry) => entry.startsWith("release-cleanup-cursor.json.invalid.")));
   });
 
+  test("quarantines cursor entries with unsafe mode, hardlink, or symlink attributes", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidateSha = "a".repeat(40);
+    await installRelease(policy, candidateSha);
+    await fs.mkdir(policy.control_root, { recursive: true });
+    const cursor = path.join(policy.control_root, "release-cleanup-cursor.json");
+    const store = new ReleaseStore(policy);
+    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    await fs.writeFile(cursor, "{}", { mode: 0o600 });
+    await fs.chmod(cursor, 0o666);
+    assert.ok((await store.cleanupPlan(protectedShas)).includes(candidateSha));
+    await fs.writeFile(cursor, "{}", { mode: 0o600 });
+    const outsideLink = path.join(root, "outside-cursor-link");
+    await fs.link(cursor, outsideLink);
+    assert.ok((await store.cleanupPlan(protectedShas)).includes(candidateSha));
+    assert.equal((await fs.lstat(outsideLink)).isFile(), true);
+    await fs.symlink("/tmp", cursor);
+    assert.ok((await store.cleanupPlan(protectedShas)).includes(candidateSha));
+    assert.equal((await fs.readdir(policy.control_root)).filter((entry) => entry.startsWith("release-cleanup-cursor.json.invalid.")).length, 3);
+  });
+
   test("stops cleanup when an activation receipt expects a missing previous pointer", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
