@@ -970,6 +970,11 @@ test("failed install cleanup removes only the generated staging directory", asyn
     ]);
     await Promise.all([fs.chmod(releaseRoot, 0o700), fs.chmod(path.join(releaseRoot, ".staging"), 0o700),
       fs.chmod(stagingDir, 0o700)]);
+    const sealedChild = path.join(stagingDir, "updater", "dist");
+    await fs.mkdir(sealedChild, { recursive: true });
+    await fs.writeFile(path.join(sealedChild, "cli.js"), "sealed", { mode: 0o400 });
+    await fs.chmod(sealedChild, 0o500);
+    await fs.chmod(path.dirname(sealedChild), 0o500);
     await run("cleanup-staging", releaseRoot, stagingDir);
     await assert.rejects(fs.stat(stagingDir), { code: "ENOENT" });
     assert.equal((await fs.stat(sibling)).isDirectory(), true);
