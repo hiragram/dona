@@ -1313,6 +1313,36 @@ describe("DispatcherDatabase", () => {
     restarted.close();
   });
 
+  test("sealing an old fully terminal group records its all-terminal candidate", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-old-unsealed-group")).row;
+    database.beginDispatch(source.event_id,`${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const job=database.createJob({source_event_id:source.event_id,job_key:"old",
+      objective:"完了",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    database.beginJobPreparation(job.job_id);
+    database.setJobRuntime(job.job_id,"workspace-old","pane-old");
+    database.beginJobDispatch(job.job_id);
+    database.markJobRunning(job.job_id);
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",
+      summary:"完了",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+    const raw=new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET created_at='2026-09-03T00:00:00.000Z' WHERE job_id=?").run(job.job_id);
+    raw.close();
+    assert.equal(database.notificationReconciliationPreview().candidates.some(row=>row.job_id===job.job_id),false);
+    database.saveCompleted(source.event_id,{schema_version:1,event_id:source.event_id,status:"completed",
+      completed_at:"2026-09-05T00:02:00.000Z"},`${config.resultsDir}/${source.event_id}.json`);
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    assert.equal(database.notificationReconciliationPreview().candidates.some(row=>
+      row.job_id===job.job_id && row.group_transition==="all_terminal" && row.decision==="held"),true);
+    database.close();
+    const restarted=new DispatcherDatabase(config.databasePath);
+    assert.equal(restarted.notificationReconciliationPreview().candidates.filter(row=>
+      row.job_id===job.job_id && row.group_transition==="all_terminal").length,1);
+    restarted.close();
+  });
+
   test("keeps grouped snapshots bounded and redacts job content", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

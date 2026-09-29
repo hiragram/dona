@@ -899,8 +899,8 @@ export class DispatcherDatabase {
         const epoch=this.db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
           .get() as {started_at:string};
         const groups=this.db.prepare(`SELECT g.source_event_id,g.attention_event_id FROM job_groups g
-          WHERE g.notification_mode='grouped' AND g.attention_event_id IS NOT NULL
-            AND g.all_terminal_event_id IS NULL`).all() as Array<{source_event_id:string;attention_event_id:string}>;
+          WHERE g.notification_mode='grouped' AND g.sealed_at IS NOT NULL
+            AND g.all_terminal_event_id IS NULL`).all() as Array<{source_event_id:string;attention_event_id:string|null}>;
         for(const row of groups) this.recordHistoricalAllTerminalIfReady(row.source_event_id,row.attention_event_id,epoch.started_at);
       }).immediate();
     } catch (error) {
@@ -3764,14 +3764,20 @@ export class DispatcherDatabase {
     return true;
   }
 
-  private recordHistoricalAllTerminalIfReady(sourceEventId: string, attentionEventId: string, epochStartedAt?: string): void {
+  private recordHistoricalAllTerminalIfReady(sourceEventId: string, attentionEventId?: string | null, epochStartedAt?: string): void {
     const group=this.getJobGroup(sourceEventId);
-    if(group?.attention_event_id!==attentionEventId || !this.groupCanClaimAllTerminal(sourceEventId,group)) return;
-    const payload=JSON.parse(this.getRequired(attentionEventId).payload_json) as {job_id?:string};
-    if(!payload.job_id) return;
-    const job=this.getJob(payload.job_id);
+    if(!group || (attentionEventId!==undefined && group.attention_event_id!==attentionEventId) ||
+      !this.groupCanClaimAllTerminal(sourceEventId,group)) return;
     const startedAt=epochStartedAt??(this.db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
       .get() as {started_at:string}).started_at;
+    const attentionJobId=group.attention_event_id
+      ? (JSON.parse(this.getRequired(group.attention_event_id).payload_json) as {job_id?:string}).job_id
+      : undefined;
+    const attentionJob=attentionJobId?this.getJob(attentionJobId):undefined;
+    const fallback=this.db.prepare(`SELECT job_id FROM jobs WHERE source_event_id=? AND created_at<?
+      ORDER BY created_at,job_id LIMIT 1`).get(sourceEventId,startedAt) as {job_id:string}|undefined;
+    const job=attentionJob && attentionJob.created_at<startedAt
+      ? attentionJob : fallback?this.getJob(fallback.job_id):undefined;
     if(job?.source_event_id===sourceEventId && job.created_at<startedAt &&
       readEventJobBinding(this.db,sourceEventId)?.owner.kind==="slack_thread")
       recordHeldGroupTransitionCandidate(this.db,job.job_id,"all_terminal");
@@ -3890,10 +3896,12 @@ export class DispatcherDatabase {
   }
 
   private sealJobGroupIfPresent(sourceEventId: string, timestamp: string): number {
-    return this.db.prepare(`
+    const changed=this.db.prepare(`
       UPDATE job_groups SET sealed_at = ?, updated_at = ?
       WHERE source_event_id = ? AND sealed_at IS NULL
     `).run(timestamp, timestamp, sourceEventId).changes;
+    if(changed>0) this.recordHistoricalAllTerminalIfReady(sourceEventId);
+    return changed;
   }
 
   private updateJob(
