@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import http from "node:http";
@@ -18,6 +19,9 @@ const execute = promisify(execFile);
 const preflight = fileURLToPath(new URL("../../scripts/self-update-install-preflight.mjs", import.meta.url));
 const installer = fileURLToPath(new URL("../../scripts/install-self-update.sh", import.meta.url));
 const developerInstaller = fileURLToPath(new URL("../../scripts/install-launchd.sh", import.meta.url));
+const controlLedger = fileURLToPath(new URL("../../scripts/control-attempt-ledger.mjs", import.meta.url));
+const controlBackup = fileURLToPath(new URL("../../scripts/backup-control-db.py", import.meta.url));
+const controlReceipt = fileURLToPath(new URL("../../scripts/write-control-receipt.mjs", import.meta.url));
 type WaitForLaunchdServiceAbsent = (
   domain: string,
   label: string,
@@ -30,10 +34,16 @@ type WaitForLaunchdServiceAbsent = (
     settledObservations?: number;
   },
 ) => Promise<void>;
+type WaitForLaunchdUpdaterSha = (
+  domain: string, sha: string, timeoutMs: number,
+  options?: { observe?: (target: string, timeoutMs: number) => Promise<string | null>;
+    sleep?: (milliseconds: number) => Promise<void>; now?: () => number },
+) => Promise<void>;
 const preflightModule = await import(pathToFileURL(preflight).href) as {
   waitForLaunchdServiceAbsent: WaitForLaunchdServiceAbsent;
+  waitForLaunchdUpdaterSha: WaitForLaunchdUpdaterSha;
 };
-const { waitForLaunchdServiceAbsent } = preflightModule;
+const { waitForLaunchdServiceAbsent, waitForLaunchdUpdaterSha } = preflightModule;
 
 test("developer installer atomically creates and shares the access receipt key",async()=>{
   const source=await fs.readFile(developerInstaller,"utf8");
@@ -188,6 +198,23 @@ test("launchdの登録観測自体が応答しない場合もdeadlineで失敗�
   );
 });
 
+test("Updaterのbootstrap応答喪失はexact SHAを安定観測し、別SHAとtimeoutは再送せず拒否する", async () => {
+  const sha = "a".repeat(40);
+  const other = "b".repeat(40);
+  let count = 0;
+  await waitForLaunchdUpdaterSha("gui/501", sha, 1_000, {
+    observe: async () => (++count === 1 ? null : `DONA_UPDATER_BUILD_SHA => ${sha}`),
+    sleep: async () => undefined,
+  });
+  assert.equal(count, 4);
+  await assert.rejects(waitForLaunchdUpdaterSha("gui/501", sha, 1_000, {
+    observe: async () => `DONA_UPDATER_BUILD_SHA => ${other}`,
+  }), /different updater SHA/);
+  await assert.rejects(waitForLaunchdUpdaterSha("gui/501", sha, 10, {
+    observe: async () => new Promise(() => undefined),
+  }), /timed out/);
+});
+
 test("macOS preserves hardened descendants when renaming a reopened staged updater", {
   skip: process.platform !== "darwin",
 }, async () => {
@@ -222,9 +249,11 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /assert-control-upgrade-safe/);
   assert.match(source, /wait-updater-sha/);
   assert.match(source, /control-plane-receipt\.json/);
+  assert.match(source, /control-plane-receipt\.previous\.json/);
+  assert.match(source, /control-plane-receipt\.was-absent/);
   assert.doesNotMatch(source, /\.control-plane-receipt\.json\.tmp/);
   assert.match(source, /control-plane-receipt\.json\.\$\$\.\$RANDOM\.tmp/);
-  assert.match(source, /dispatcher_v2_to_v3_online_backup_v1/);
+  assert.match(await fs.readFile(controlReceipt, "utf8"), /dispatcher_v2_to_v3_online_backup_v1/);
   assert.match(source, /updater\.previous\.sqlite3/);
   assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
   assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);
@@ -240,7 +269,7 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録"/);
   assert.match(source, /wait-launchd-unregistered/);
   assert.match(source, /updater\.database-was-absent/);
-  assert.match(source, /PRAGMA integrity_check/);
+  assert.match(source, /backup-control-db\.py/);
   assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
   assert.match(source, /stable updaterを停止しません/);
   assert.match(source, /updater\.next" -type f -exec chmod 400/);
@@ -248,9 +277,13 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /旧stable updaterをlaunchdへ再登録できません/);
   assert.match(source, /旧stable updaterの復旧healthを確認できません/);
   assert.match(source, /bootstrap_updater_reconciled/);
-  assert.match(source, /DONA_UPDATER_BUILD_SHA => \$\{expected_sha\}/);
+  assert.match(source, /wait-launchd-updater-sha/);
   assert.match(source, /exact SHAの登録済み状態を確認しました/);
-  assert.match(source, /expected SHAの未登録状態を確認しました/);
+  assert.match(source, /再送せず照合が必要です/);
+  assert.doesNotMatch(source, /for attempt in 1 2/);
+  assert.match(source, /control-attempt-ledger\.mjs" create/);
+  assert.match(source, /record_control_phase updater_stop_intent bootout_updater/);
+  assert.match(source, /record_control_phase updater_start_intent bootstrap_updater/);
   assert.doesNotMatch(source, /launchctl bootstrap[^\n]*\|\| true/);
   const restoreRequired = source.indexOf("DISPATCHER_RESTORE_REQUIRED=1");
   const quiesce = source.indexOf('quiesce-dispatcher "$DISPATCHER_SOCKET"');
@@ -269,6 +302,92 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   const installRename = source.indexOf('/bin/mv "$CONTROL_ROOT/updater.next" "$CONTROL_ROOT/updater"');
   assert.ok(writableInstallRoot >= 0 && writableInstallRoot < installRename);
   if (process.platform === "darwin") await execute("/bin/zsh", ["-n", installer]);
+});
+
+test("control receipt backup accepts only an owner-private regular file", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-private-receipt-"));
+  const receipt = path.join(root, "receipt.json");
+  try {
+    await fs.writeFile(receipt, "{}", { mode: 0o600 });
+    await run("assert-private-file", receipt);
+    await fs.chmod(receipt, 0o644);
+    await assert.rejects(run("assert-private-file", receipt), /identity/);
+    await fs.rm(receipt);
+    await fs.symlink(path.join(root, "absent"), receipt);
+    await assert.rejects(run("assert-private-file", receipt), /identity/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("control DB backup opens and checks an independent SQLite copy", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-backup-"));
+  const source = path.join(root, "source.sqlite3");
+  const target = path.join(root, "backup.sqlite3");
+  try {
+    await execute("python3", ["-c", "import sqlite3,sys,os; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE update_requests(id TEXT PRIMARY KEY)'); c.execute(\"INSERT INTO update_requests VALUES ('one')\"); c.commit(); c.close(); os.chmod(sys.argv[1],0o600)", source]);
+    await execute("python3", [controlBackup, source, target]);
+    assert.equal((await fs.stat(target)).mode & 0o777, 0o600);
+    const { stdout } = await execute("python3", ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT COUNT(*) FROM update_requests').fetchone()[0])", target]);
+    assert.equal(stdout.trim(), "1");
+    await assert.rejects(execute("python3", [controlBackup, source, target]));
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("control attempt ledger preserves exact identities and rejects duplicate or out-of-order writes", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-ledger-"));
+  const oldPolicy = path.join(root, "old-policy.json");
+  const newPolicy = path.join(root, "new-policy.json");
+  const oldPlist = path.join(root, "old.plist");
+  const newPlist = path.join(root, "new.plist");
+  const backup = path.join(root, "backup.sqlite3");
+  const attempt = path.join(root, `${"2".repeat(40)}.ABC123`);
+  try {
+    await fs.mkdir(attempt, { mode: 0o700 });
+    await Promise.all([fs.writeFile(oldPolicy, "old"), fs.writeFile(newPolicy, "new"),
+      fs.writeFile(oldPlist, "old plist"), fs.writeFile(newPlist, "new plist"), fs.writeFile(backup, "backup")]);
+    const create = () => execute(process.execPath, [controlLedger, "create", attempt,
+      "1".repeat(40), "2".repeat(40), oldPolicy, newPolicy, oldPlist, newPlist]);
+    const advance = (phase: string, operation = "none", database?: string) =>
+      execute(process.execPath, [controlLedger, "advance", attempt, phase, operation, ...(database ? [database] : [])]);
+    await create();
+    await assert.rejects(create(), /already exists/);
+    await assert.rejects(advance("verified"), /out of order/);
+    await advance("updater_stop_intent", "bootout_updater");
+    await advance("updater_stopped");
+    await advance("backup_verified", "none", backup);
+    const snapshot = JSON.parse(await fs.readFile(path.join(attempt, "attempt.json"), "utf8"));
+    assert.equal(snapshot.sequence, 4);
+    assert.equal(snapshot.old_build_sha, "1".repeat(40));
+    assert.equal(snapshot.new_build_sha, "2".repeat(40));
+    assert.match(snapshot.db_backup_sha256, /^[0-9a-f]{64}$/);
+    assert.deepEqual(snapshot.launchd_operations, [{ sequence: 2, operation: "bootout_updater" }]);
+    for (const [phase, operation] of [["dispatcher_stop_intent", "bootout_dispatcher"],
+      ["dispatcher_stopped", "none"], ["dispatcher_start_intent", "bootstrap_dispatcher"],
+      ["dispatcher_started", "none"], ["control_swapped", "none"],
+      ["updater_start_intent", "bootstrap_updater"], ["updater_started", "none"]] as const) await advance(phase, operation);
+    const verify = () => execute(process.execPath, [controlLedger, "verify", attempt, newPolicy, newPlist, backup]);
+    await verify();
+    await fs.writeFile(newPolicy, "tampered");
+    await assert.rejects(verify(), /do not match/);
+    await fs.writeFile(newPolicy, "new");
+    await advance("verified");
+    const receiptPath = path.join(root, "control-receipt.tmp");
+    await execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40)]);
+    const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8"));
+    assert.equal(receipt.attempt_id, path.basename(attempt));
+    assert.match(receipt.attempt_sha256, /^[0-9a-f]{64}$/);
+    await assert.rejects(execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40)]));
+    await advance("restore_required");
+    await advance("restored");
+    await assert.rejects(advance("verified"), /terminal/);
+    await fs.writeFile(path.join(attempt, "attempt.json.tmp"), "partial");
+    await assert.rejects(advance("needs_review"), /ambiguous/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("an existing immutable release is reusable only with the exact control-plane contract", async () => {
@@ -291,6 +410,11 @@ test("an existing immutable release is reusable only with the exact control-plan
       rollback_safe: true,
     },
   };
+  const hardenExisting = async () => {
+    await Promise.all([fs.chmod(existingRelease, 0o500), fs.chmod(path.join(existingRelease, "updater"), 0o500),
+      fs.chmod(path.join(existingRelease, "updater", "dist"), 0o500),
+      fs.chmod(path.join(existingRelease, "updater", "dist", "cli.js"), 0o400), fs.chmod(manifestPath, 0o400)]);
+  };
   try {
     await Promise.all([
       fs.mkdir(path.join(existingRelease, "updater", "dist"), { recursive: true }),
@@ -302,28 +426,102 @@ test("an existing immutable release is reusable only with the exact control-plan
     ]);
     await fs.writeFile(manifestPath, JSON.stringify(manifest));
     await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
+    await Promise.all([fs.chmod(stagedRelease, 0o700), fs.chmod(path.join(stagedRelease, "updater"), 0o700),
+      fs.chmod(path.join(stagedRelease, "updater", "dist"), 0o700),
+      fs.chmod(path.join(stagedRelease, "updater", "dist", "cli.js"), 0o600),
+      fs.chmod(path.join(stagedRelease, "release-manifest.json"), 0o600)]);
+    await hardenExisting();
     await run("validate-existing-release", existingRelease, stagedRelease, sha);
     await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, compatibility: { ...manifest.compatibility, rollback_safe: false } }));
-    await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /compatibility does not match/);
+    await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /identity does not match/);
     await fs.writeFile(path.join(stagedRelease, "release-manifest.json"), JSON.stringify({ ...manifest, built_at: "different" }));
+    await fs.chmod(path.join(existingRelease, "updater", "dist", "cli.js"), 0o600);
     await fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "tampered\n");
+    await hardenExisting();
     await assert.rejects(
       run("validate-existing-release", existingRelease, stagedRelease, sha),
       /tree does not match/,
     );
+    await fs.chmod(path.join(existingRelease, "updater", "dist", "cli.js"), 0o600);
     await fs.writeFile(path.join(existingRelease, "updater", "dist", "cli.js"), "export {};\n");
+    await fs.chmod(manifestPath, 0o600);
     await fs.writeFile(manifestPath, JSON.stringify({
       ...manifest,
       compatibility: { ...manifest.compatibility, app_schema_write: 2 },
     }));
+    await hardenExisting();
     await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /does not match/);
     await assert.rejects(
       run("validate-existing-release", existingRelease, stagedRelease, "3".repeat(40)),
       /arguments are invalid/,
     );
+    await fs.chmod(manifestPath, 0o600);
     await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, policy_version: "2026-09-03.1" }));
+    await hardenExisting();
     await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /does not match/);
+    await fs.chmod(manifestPath, 0o600);
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await hardenExisting();
+    await fs.chmod(path.join(existingRelease, "updater", "dist", "cli.js"), 0o600);
+    await assert.rejects(run("validate-existing-release", existingRelease, stagedRelease, sha), /mode/);
   } finally {
+    await fs.chmod(existingRelease, 0o700).catch(() => undefined);
+    await fs.chmod(path.join(existingRelease, "updater"), 0o700).catch(() => undefined);
+    await fs.chmod(path.join(existingRelease, "updater", "dist"), 0o700).catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("staging requires complete builds and matching lockfiles before immutable publication", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-staged-release-"));
+  const sha = "c".repeat(40);
+  const release = path.join(root, sha);
+  const components = ["dispatcher", "sources/slack", "updater"];
+  try {
+    for (const component of components) {
+      const dir = path.join(release, component);
+      await fs.mkdir(path.join(dir, "dist"), { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(dir, "package-lock.json"), `${component}\n`, { mode: 0o600 });
+      await fs.writeFile(path.join(dir, "dist", component === "sources/slack" ? "index.js" : "cli.js"), "export {};\n", { mode: 0o600 });
+      await fs.chmod(dir, 0o700);
+    }
+    await fs.chmod(release, 0o700);
+    await fs.chmod(path.join(release, "sources"), 0o700);
+    const lockHashes = Object.fromEntries(components.map(component => [component,
+      createHash("sha256").update(`${component}\n`).digest("hex")]));
+    const manifest = { schema_version: 1, sha, repository: "hiragram/dona", policy_version: "2026-09-03.2",
+      lock_hashes: lockHashes, node_version: process.versions.node, npm_version: "11.0.0",
+      built_at: new Date().toISOString(), compatibility: { protocol: 1, config: 1,
+        app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: true } };
+    await fs.writeFile(path.join(release, "release-manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
+    const { stdout } = await execute(process.execPath, [preflight, "validate-staged-release", release, sha]);
+    const digest = stdout.trim();
+    assert.match(digest, /^[0-9a-f]{64}$/);
+    await fs.writeFile(path.join(release, "updater", "package-lock.json"), "different\n");
+    await assert.rejects(run("validate-staged-release", release, sha), /lockfile identity/);
+    await fs.writeFile(path.join(release, "updater", "package-lock.json"), "updater\n");
+    await fs.rm(path.join(release, "updater", "dist", "cli.js"));
+    await assert.rejects(run("validate-staged-release", release, sha), /ENOENT/);
+    await fs.writeFile(path.join(release, "updater", "dist", "cli.js"), "export {};\n", { mode: 0o600 });
+    for (const component of components) {
+      await fs.chmod(path.join(release, component, "dist", component === "sources/slack" ? "index.js" : "cli.js"), 0o400);
+      await fs.chmod(path.join(release, component, "package-lock.json"), 0o400);
+      await fs.chmod(path.join(release, component, "dist"), 0o500);
+      await fs.chmod(path.join(release, component), 0o500);
+    }
+    await fs.chmod(path.join(release, "sources"), 0o500);
+    await fs.chmod(path.join(release, "release-manifest.json"), 0o400);
+    await fs.chmod(release, 0o500);
+    await run("validate-published-release", release, sha, digest);
+    await fs.chmod(path.join(release, "updater", "dist", "cli.js"), 0o600);
+    await assert.rejects(run("validate-published-release", release, sha, digest), /mode/);
+  } finally {
+    await fs.chmod(release, 0o700).catch(() => undefined);
+    for (const component of components) {
+      await fs.chmod(path.join(release, component), 0o700).catch(() => undefined);
+      await fs.chmod(path.join(release, component, "dist"), 0o700).catch(() => undefined);
+    }
+    await fs.chmod(path.join(release, "sources"), 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -429,10 +627,17 @@ test("failed install cleanup removes only the generated staging directory", asyn
       fs.mkdir(stagingDir, { recursive: true }),
       fs.mkdir(sibling, { recursive: true }),
     ]);
+    await Promise.all([fs.chmod(releaseRoot, 0o700), fs.chmod(path.join(releaseRoot, ".staging"), 0o700),
+      fs.chmod(stagingDir, 0o700)]);
     await run("cleanup-staging", releaseRoot, stagingDir);
     await assert.rejects(fs.stat(stagingDir), { code: "ENOENT" });
     assert.equal((await fs.stat(sibling)).isDirectory(), true);
     await assert.rejects(run("cleanup-staging", releaseRoot, sibling));
+    const outside = path.join(root, "outside");
+    await fs.mkdir(outside);
+    await fs.symlink(outside, stagingDir);
+    await assert.rejects(run("cleanup-staging", releaseRoot, stagingDir));
+    assert.equal((await fs.stat(outside)).isDirectory(), true);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
@@ -21,6 +22,41 @@ class RecordingRunner {
     return this.result;
   }
 }
+
+test("control capability requires a verified attempt ledger bound to the exact receipt", async () => {
+  const { root, policy } = await tempPolicy();
+  const previousSha = process.env.DONA_UPDATER_BUILD_SHA;
+  const attemptId = `${targetSha}.ABC123`;
+  const attemptDir = path.join(policy.control_root, "control-backups", attemptId);
+  try {
+    process.env.DONA_UPDATER_BUILD_SHA = targetSha;
+    await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+    await fs.writeFile(path.join(path.dirname(policy.config_root), "dona.sqlite3"), "database", { mode: 0o600 });
+    await fs.mkdir(attemptDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(attemptDir, 0o700);
+    const digest = "a".repeat(64);
+    const attempt = { schema_version: 1, phase: "verified", old_build_sha: "b".repeat(40),
+      new_build_sha: targetSha, new_policy_sha256: digest, new_plist_sha256: digest,
+      db_backup_sha256: digest };
+    const attemptBytes = Buffer.from(`${JSON.stringify(attempt)}\n`);
+    await fs.writeFile(path.join(attemptDir, "attempt.json"), attemptBytes, { mode: 0o600 });
+    const receipt = { schema_version: 1, build_sha: targetSha,
+      schema_migration_capability: "dispatcher_v2_to_v3_online_backup_v1", attempt_id: attemptId,
+      attempt_sha256: createHash("sha256").update(attemptBytes).digest("hex"),
+      old_build_sha: attempt.old_build_sha, policy_sha256: digest, plist_sha256: digest, db_backup_sha256: digest };
+    const receiptPath = path.join(policy.control_root, "control-plane-receipt.json");
+    await fs.writeFile(receiptPath, JSON.stringify(receipt), { mode: 0o600 });
+    const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+    assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: true, build_sha: targetSha });
+    await fs.writeFile(path.join(attemptDir, "attempt.json"), `${JSON.stringify({ ...attempt, phase: "restore_required" })}\n`);
+    assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });
+  } finally {
+    if (previousSha === undefined) delete process.env.DONA_UPDATER_BUILD_SHA;
+    else process.env.DONA_UPDATER_BUILD_SHA = previousSha;
+    await removeTree(root);
+  }
+});
 
 test("Dispatcher registration read distinguishes bootout from an ambiguous launchctl failure", async () => {
   const { root, policy } = await tempPolicy();

@@ -33,32 +33,30 @@ CONTROL_SWAPPED=0
 DISPATCHER_PLIST_SWAPPED=0
 DISPATCHER_RESTORE_REQUIRED=0
 CONTROL_BACKUP_ROOT=""
+CONTROL_LEDGER_DIR=""
+
+record_control_phase() {
+  [[ -n "$CONTROL_LEDGER_DIR" ]] || return 0
+  $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" advance "$CONTROL_LEDGER_DIR" "$@"
+}
 
 bootstrap_updater_reconciled() {
   local context=$1
   local expected_sha=$2
   local output=""
-  local observed=""
   local exit_code=0
-  integer attempt
-  integer observation
-  for attempt in 1 2; do
-    if output=$(/bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 2>&1); then
-      return 0
-    else
-      exit_code=$?
-    fi
-    for observation in {1..20}; do
-      observed=$(/bin/launchctl print "$DOMAIN/dev.dona.updater" 2>/dev/null) || observed=""
-      if [[ "$observed" == *"DONA_UPDATER_BUILD_SHA => ${expected_sha}"* ]]; then
-        print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの登録済み状態を確認しました。"
-        return 0
-      fi
-      /bin/sleep 0.1
-    done
-    print -u2 -- "${context}のlaunchctl bootstrap attempt ${attempt}はexit ${exit_code}で拒否され、expected SHAの未登録状態を確認しました。"
-    if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
-  done
+  if output=$(/bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 2>&1); then
+    return 0
+  else
+    exit_code=$?
+  fi
+  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-launchd-updater-sha \
+    "$DOMAIN" "$expected_sha" 30000; then
+    print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの登録済み状態を確認しました。"
+    return 0
+  fi
+  print -u2 -- "${context}のlaunchctl bootstrapはexit ${exit_code}で、登録状態を確定できません。再送せず照合が必要です。"
+  if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
   return 1
 }
 
@@ -89,7 +87,14 @@ bootstrap_dispatcher_reconciled() {
 
 restore_control_plane() {
   if [[ "$CONTROL_UPGRADE_ACTIVE" != "1" || -z "$CONTROL_BACKUP_ROOT" ]]; then return 0; fi
-  if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
+  local updater_registration=""
+  updater_registration=$(/bin/launchctl print "$DOMAIN/dev.dona.updater" 2>/dev/null) || updater_registration=""
+  if [[ -n "$updater_registration" ]]; then
+    if [[ "$updater_registration" != *"DONA_UPDATER_BUILD_SHA => ${INSTALL_SHA}"* &&
+          "$updater_registration" != *"DONA_UPDATER_BUILD_SHA => ${OLD_UPDATER_SHA}"* ]]; then
+      print -u2 "control-plane復旧前にUpdaterの登録identityを確認できません。"
+      return 1
+    fi
     /bin/launchctl bootout "$DOMAIN/dev.dona.updater" >/dev/null 2>&1 || true
   fi
   if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
@@ -115,6 +120,15 @@ restore_control_plane() {
       chmod 600 "$CONTROL_ROOT/updater.sqlite3"
     elif [[ -f "$CONTROL_BACKUP_ROOT/updater.database-was-absent" ]]; then
       /bin/rm -f "$CONTROL_ROOT/updater.sqlite3" "$CONTROL_ROOT/updater.sqlite3-wal" "$CONTROL_ROOT/updater.sqlite3-shm"
+    fi
+    if [[ -f "$CONTROL_BACKUP_ROOT/control-plane-receipt.previous.json" ]]; then
+      /bin/cp "$CONTROL_BACKUP_ROOT/control-plane-receipt.previous.json" "$CONTROL_ROOT/control-plane-receipt.json"
+      chmod 600 "$CONTROL_ROOT/control-plane-receipt.json"
+    elif [[ -f "$CONTROL_BACKUP_ROOT/control-plane-receipt.was-absent" ]]; then
+      /bin/rm -f "$CONTROL_ROOT/control-plane-receipt.json"
+    else
+      print -u2 "control-plane receiptの復元元を確認できません。"
+      return 1
     fi
   fi
   if ! bootstrap_updater_reconciled "旧stable updaterの復旧" "$OLD_UPDATER_SHA"; then
@@ -178,7 +192,14 @@ INSTALL_SHA=$($GIT_PATH -C "$REPOSITORY_DIR" rev-parse HEAD^{commit})
 INSTALL_TMP=$(mktemp -d "${TMPDIR:-/tmp}/dona-self-update-install.XXXXXX")
 
 cleanup_temp() {
-  restore_control_plane || true
+  if [[ "$CONTROL_UPGRADE_ACTIVE" == "1" ]]; then
+    record_control_phase restore_required || print -u2 "control attemptの復旧intentを記録できません。手動照合が必要です。"
+    if restore_control_plane; then
+      record_control_phase restored || print -u2 "control attemptの復旧結果を記録できません。手動照合が必要です。"
+    else
+      record_control_phase needs_review || print -u2 "control attemptの要確認状態を記録できません。手動照合が必要です。"
+    fi
+  fi
   if [[ -n "${STAGING_DIR:-}" ]]; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" cleanup-staging "$RELEASE_ROOT" "$STAGING_DIR" || \
       print -u2 "staging directoryのcleanupに失敗しました。"
@@ -305,6 +326,7 @@ for component in dispatcher sources/slack updater; do
 done
 NPM_VERSION=$($NPM_PATH --version)
 $NODE_PATH "$SCRIPT_DIR/write-release-manifest.mjs" "$STAGING_DIR" "$INSTALL_SHA" "$NPM_VERSION" "2026-09-03.2"
+STAGED_DIGEST=$($NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-staged-release "$STAGING_DIR" "$INSTALL_SHA")
 FINAL_RELEASE="$RELEASE_ROOT/$INSTALL_SHA"
 if [[ -e "$FINAL_RELEASE" ]]; then
   if [[ "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]] || \
@@ -322,6 +344,8 @@ else
 fi
 find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
 find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
+$NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-published-release \
+  "$FINAL_RELEASE" "$INSTALL_SHA" "$STAGED_DIGEST"
 
 if [[ "$MODE" == "--stage-recovery" ]]; then
   print "検証済みimmutable release $INSTALL_SHA を配置しました。service、pointer、DB、Updaterは変更していません。"
@@ -361,16 +385,32 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/cp "$INSTALL_TMP/rendered/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.next.plist"
   /bin/cp "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" "$BACKUP_ROOT/dev.dona.dispatcher.next.plist"
   chmod 600 "$BACKUP_ROOT/policy.next.json" "$BACKUP_ROOT/dev.dona.updater.next.plist" "$BACKUP_ROOT/dev.dona.dispatcher.next.plist"
+  if [[ -e "$CONTROL_ROOT/control-plane-receipt.json" || -L "$CONTROL_ROOT/control-plane-receipt.json" ]]; then
+    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$CONTROL_ROOT/control-plane-receipt.json"
+    /bin/cp "$CONTROL_ROOT/control-plane-receipt.json" "$BACKUP_ROOT/control-plane-receipt.previous.json"
+    chmod 600 "$BACKUP_ROOT/control-plane-receipt.previous.json"
+  else
+    /usr/bin/touch "$BACKUP_ROOT/control-plane-receipt.was-absent"
+    chmod 600 "$BACKUP_ROOT/control-plane-receipt.was-absent"
+  fi
+
+  $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" create "$BACKUP_ROOT" \
+    "$OLD_UPDATER_SHA" "$INSTALL_SHA" "$CONTROL_ROOT/policy.json" "$BACKUP_ROOT/policy.next.json" \
+    "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.next.plist"
+  CONTROL_LEDGER_DIR="$BACKUP_ROOT"
 
   CONTROL_UPGRADE_ACTIVE=1
+  record_control_phase updater_stop_intent bootout_updater
   if ! /bin/launchctl bootout "$DOMAIN/dev.dona.updater"; then
     if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
       print -u2 "stable updaterの停止受理を確認できません。fileは切り替えていません。"
       CONTROL_UPGRADE_ACTIVE=0
+      record_control_phase needs_review
       exit 1
     fi
   fi
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$UPDATER_SOCKET"
+  record_control_phase updater_stopped
   if [[ ! -f "$CONTROL_ROOT/updater.sqlite3" ]]; then
     print -u2 "停止後のupdater databaseを確認できないため、control-planeを更新しません。"
     exit 1
@@ -386,14 +426,9 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/cp "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.previous.plist"
   /bin/cp "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" "$BACKUP_ROOT/dev.dona.dispatcher.previous.plist"
   if [[ -f "$CONTROL_ROOT/updater.sqlite3" ]]; then
-    /usr/bin/sqlite3 "$CONTROL_ROOT/updater.sqlite3" "PRAGMA wal_checkpoint(TRUNCATE);"
-    /bin/cp "$CONTROL_ROOT/updater.sqlite3" "$BACKUP_ROOT/updater.previous.sqlite3"
-    SQLITE_INTEGRITY=$(/usr/bin/sqlite3 "$BACKUP_ROOT/updater.previous.sqlite3" "PRAGMA integrity_check;")
-    if [[ "$SQLITE_INTEGRITY" != "ok" ]]; then
-      print -u2 "updater database backupのintegrity checkに失敗しました。"
-      exit 1
-    fi
-    chmod 600 "$BACKUP_ROOT/updater.previous.sqlite3"
+    /usr/bin/python3 "$SCRIPT_DIR/backup-control-db.py" \
+      "$CONTROL_ROOT/updater.sqlite3" "$BACKUP_ROOT/updater.previous.sqlite3"
+    record_control_phase backup_verified none "$BACKUP_ROOT/updater.previous.sqlite3"
   else
     /usr/bin/touch "$BACKUP_ROOT/updater.database-was-absent"
     chmod 600 "$BACKUP_ROOT/updater.database-was-absent"
@@ -406,6 +441,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   fi
   DISPATCHER_RESTORE_REQUIRED=1
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$DISPATCHER_SOCKET" "$INSTALL_SHA"
+  record_control_phase dispatcher_stop_intent bootout_dispatcher
   if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
     if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
       print -u2 "Dispatcherの停止受理を確認できないため、plistを更新しません。"
@@ -416,32 +452,34 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     print -u2 "Dispatcherの登録解除完了を確認できないため、plistを更新しません。"
     exit 1
   fi
+  record_control_phase dispatcher_stopped
   /bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
   DISPATCHER_PLIST_SWAPPED=1
+  record_control_phase dispatcher_start_intent bootstrap_dispatcher
   if ! bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録" "$ACTIVE_DISPATCHER_SHA"; then
     print -u2 "新しいDispatcher plistをlaunchdへ登録できないため、control-planeを復旧します。"
     exit 1
   fi
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" 30000
+  record_control_phase dispatcher_started
   /bin/mv "$CONTROL_ROOT/updater" "$BACKUP_ROOT/updater.previous"
   /bin/mv "$BACKUP_ROOT/updater.next" "$CONTROL_ROOT/updater"
   /bin/mv "$BACKUP_ROOT/policy.next.json" "$CONTROL_ROOT/policy.json"
   /bin/mv "$BACKUP_ROOT/dev.dona.updater.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
+  record_control_phase control_swapped
 
+  record_control_phase updater_start_intent bootstrap_updater
   if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" 30000 && \
     bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
+    record_control_phase updater_started
+    $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" verify "$BACKUP_ROOT" \
+      "$CONTROL_ROOT/policy.json" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/updater.previous.sqlite3"
+    record_control_phase verified
     CONTROL_RECEIPT_TMP="$CONTROL_ROOT/.control-plane-receipt.json.$$.$RANDOM.tmp"
-    $NODE_PATH -e '
-const fs = require("node:fs");
-const [target, sha] = process.argv.slice(1);
-fs.writeFileSync(target, `${JSON.stringify({
-  schema_version: 1,
-  build_sha: sha,
-  schema_migration_capability: "dispatcher_v2_to_v3_online_backup_v1",
-  verified_at: new Date().toISOString(),
-})}\n`, { flag: "wx", mode: 0o600 });
-' "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA"
+    $NODE_PATH "$SCRIPT_DIR/write-control-receipt.mjs" "$BACKUP_ROOT" "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA"
     /bin/mv "$CONTROL_RECEIPT_TMP" "$CONTROL_ROOT/control-plane-receipt.json"
+    $NODE_PATH -e 'const fs=require("node:fs");const fd=fs.openSync(process.argv[1],"r");try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}' "$CONTROL_ROOT"
     CONTROL_UPGRADE_ACTIVE=0
     print "stable updaterとpolicyを${INSTALL_SHA}へ更新し、version healthを確認しました。"
     print "次に通常updateをplan/applyして、DispatcherとSlack Adapterを同じreleaseへ切り替えてください。"
@@ -449,12 +487,15 @@ fs.writeFileSync(target, `${JSON.stringify({
   fi
 
   print -u2 "新しいstable updaterのversion healthを確認できないため、control-planeを復旧します。"
+  record_control_phase restore_required
   if ! restore_control_plane; then
     CONTROL_UPGRADE_ACTIVE=0
+    record_control_phase needs_review
     print -u2 "control-planeの自動復旧を安全に完了できません。backup: $BACKUP_ROOT"
     exit 1
   fi
   CONTROL_UPGRADE_ACTIVE=0
+  record_control_phase restored
   print -u2 "control-plane updateをロールバックし、旧stable updaterの復旧を確認しました。"
   exit 1
 fi

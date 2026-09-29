@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { parse as parseDotenv } from "dotenv";
 import Database from "better-sqlite3";
@@ -646,14 +647,35 @@ export class RealRuntime implements RuntimePort {
       const receiptPath = path.join(this.policy.control_root, "control-plane-receipt.json");
       const stats = await fs.lstat(receiptPath);
       const uid = process.getuid?.();
-      if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+      if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
         return { ready: false, build_sha: buildSha };
       }
       const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as Record<string, unknown>;
       this.dispatcherDatabasePath();
+      const attemptId = receipt.attempt_id;
+      if (typeof attemptId !== "string" || !/^[0-9a-f]{40}\.[A-Za-z0-9]+$/.test(attemptId) ||
+          typeof receipt.attempt_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(receipt.attempt_sha256)) {
+        return { ready: false, build_sha: buildSha };
+      }
+      const attemptDirectory = path.join(this.policy.control_root, "control-backups", attemptId);
+      const attemptDirectoryStats = await fs.lstat(attemptDirectory);
+      const attemptPath = path.join(attemptDirectory, "attempt.json");
+      const attemptStats = await fs.lstat(attemptPath);
+      if (!attemptDirectoryStats.isDirectory() || attemptDirectoryStats.isSymbolicLink() ||
+          attemptDirectoryStats.uid !== uid || (attemptDirectoryStats.mode & 0o077) !== 0 ||
+          !attemptStats.isFile() || attemptStats.isSymbolicLink() || attemptStats.uid !== uid ||
+          attemptStats.nlink !== 1 || (attemptStats.mode & 0o077) !== 0) {
+        return { ready: false, build_sha: buildSha };
+      }
+      const attemptBytes = await fs.readFile(attemptPath);
+      const attempt = JSON.parse(attemptBytes.toString("utf8")) as Record<string, unknown>;
+      const matchingAttempt = createHash("sha256").update(attemptBytes).digest("hex") === receipt.attempt_sha256 &&
+        attempt.schema_version === 1 && attempt.phase === "verified" && attempt.new_build_sha === buildSha &&
+        attempt.old_build_sha === receipt.old_build_sha && attempt.new_policy_sha256 === receipt.policy_sha256 &&
+        attempt.new_plist_sha256 === receipt.plist_sha256 && attempt.db_backup_sha256 === receipt.db_backup_sha256;
       return {
         ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
-          receipt.schema_migration_capability === capability,
+          receipt.schema_migration_capability === capability && matchingAttempt,
         build_sha: buildSha,
       };
     } catch {

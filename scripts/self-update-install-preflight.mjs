@@ -40,6 +40,15 @@ export function normalizeCanonicalRemote(remote) {
   return canonicalRemote;
 }
 
+export async function assertPrivateFile(file) {
+  if (!path.isAbsolute(file)) throw new Error("private file path is invalid");
+  const stats = await fs.lstat(file);
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== process.getuid() ||
+      stats.nlink !== 1 || (stats.mode & 0o077) !== 0) {
+    throw new Error("private file identity is invalid");
+  }
+}
+
 export function socketIsListening(socketPath, timeoutMs = 500) {
   return new Promise((resolve) => {
     let settled = false;
@@ -64,6 +73,11 @@ export async function cleanupInstallStaging(releaseRoot, stagingDir) {
     !/^install\.[A-Za-z0-9]+$/.test(path.basename(stagingDir))
   ) {
     throw new Error("Refusing to clean an invalid staging directory");
+  }
+  for (const directory of [releaseRoot, stagingRoot, stagingDir]) {
+    const stats = await fs.lstat(directory);
+    if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid() ||
+      (stats.mode & 0o077) !== 0) throw new Error("Refusing to clean an unsafe staging directory");
   }
   await fs.rm(stagingDir, { recursive: true, force: true });
 }
@@ -201,9 +215,39 @@ export async function waitForLaunchdServiceAbsent(domain,label,timeoutMs,options
   throw new Error(`${label} remained registered after bootout timeout`);
 }
 
-async function releaseTreeDigest(root) {
+export async function waitForLaunchdUpdaterSha(domain, expectedSha, timeoutMs, options = {}) {
+  if (!/^gui\/[1-9][0-9]*$/.test(domain) || !/^[0-9a-f]{40}$/.test(expectedSha) ||
+    !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("wait-launchd-updater-sha arguments are invalid");
+  const observe = options.observe ?? (async (target, remainingMs) => {
+    try {
+      const result = await execute("/bin/launchctl", ["print", target], { timeout: remainingMs, killSignal: "SIGKILL" });
+      return result.stdout;
+    } catch (error) {
+      if (error && typeof error === "object" && error.code === 113) return null;
+      throw new Error("launchd updater registration observation failed");
+    }
+  });
+  const sleep = options.sleep ?? ((milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds)));
+  const now = options.now ?? Date.now;
+  const deadline = now() + timeoutMs;
+  let matches = 0;
+  do {
+    const output = await observeBeforeDeadline(observe, `${domain}/dev.dona.updater`, Math.max(1, deadline - now()));
+    if (output !== null && typeof output !== "string") throw new Error("launchd updater registration is invalid");
+    const observedSha = output?.match(/DONA_UPDATER_BUILD_SHA => ([0-9a-f]{40})/)?.[1];
+    if (observedSha && observedSha !== expectedSha) throw new Error("a different updater SHA is registered");
+    matches = observedSha === expectedSha ? matches + 1 : 0;
+    if (matches >= 3) return;
+    await sleep(100);
+  } while (now() < deadline);
+  throw new Error("updater registration could not be reconciled to the exact SHA");
+}
+
+async function releaseTreeDigest(root, immutable = false) {
   const rootStats = await fs.lstat(root);
   if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) throw new Error("release comparison root is invalid");
+  if (rootStats.uid !== process.getuid() || (rootStats.mode & 0o077) !== 0 ||
+    (immutable && (rootStats.mode & 0o777) !== 0o500)) throw new Error("release comparison root ownership or mode is invalid");
   const hash = createHash("sha256");
   const visit = async (directory, relativeDirectory = "") => {
     const entries = await fs.readdir(directory, { withFileTypes: true });
@@ -213,6 +257,12 @@ async function releaseTreeDigest(root) {
       if (relativeDirectory === "" && [".git", "release-manifest.json"].includes(entry.name)) continue;
       const fullPath = path.join(directory, entry.name);
       const stats = await fs.lstat(fullPath);
+      if (stats.uid !== process.getuid() || (!stats.isSymbolicLink() && (stats.mode & 0o077) !== 0) ||
+        (immutable && ((stats.isDirectory() && (stats.mode & 0o777) !== 0o500) ||
+          (stats.isFile() && (stats.mode & 0o777) !== 0o400))) ||
+        (stats.isFile() && stats.nlink !== 1)) {
+        throw new Error("release comparison ownership, mode, or hardlink is invalid");
+      }
       if (stats.isDirectory() && !stats.isSymbolicLink()) {
         hash.update(`d\0${relative}\0`);
         await visit(fullPath, relative);
@@ -236,13 +286,72 @@ async function releaseTreeDigest(root) {
   return hash.digest("hex");
 }
 
+export async function validateStagedRelease(stagingPath, expectedSha) {
+  if (!path.isAbsolute(stagingPath) || !/^[0-9a-f]{40}$/.test(expectedSha)) {
+    throw new Error("staged release validation arguments are invalid");
+  }
+  const manifestPath = path.join(stagingPath, "release-manifest.json");
+  const manifestStats = await fs.lstat(manifestPath);
+  if (!manifestStats.isFile() || manifestStats.isSymbolicLink() || manifestStats.uid !== process.getuid() ||
+      manifestStats.nlink !== 1 || (manifestStats.mode & 0o077) !== 0) {
+    throw new Error("staged release manifest is invalid");
+  }
+  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+  const expectedManifestKeys = ["schema_version", "sha", "repository", "policy_version", "lock_hashes", "node_version", "npm_version", "built_at", "compatibility"];
+  if (!isDeepStrictEqual(Object.keys(manifest).sort(), expectedManifestKeys.sort()) ||
+      !isDeepStrictEqual(Object.keys(manifest.lock_hashes ?? {}).sort(), ["dispatcher", "sources/slack", "updater"].sort()) ||
+      typeof manifest.built_at !== "string" || Number.isNaN(Date.parse(manifest.built_at))) {
+    throw new Error("staged release manifest shape is invalid");
+  }
+  if (manifest.schema_version !== 1 || manifest.sha !== expectedSha || manifest.repository !== "hiragram/dona" ||
+      manifest.policy_version !== "2026-09-03.2" || manifest.node_version !== process.versions.node ||
+      typeof manifest.npm_version !== "string" || !/^\d+\.\d+\.\d+/.test(manifest.npm_version) ||
+      !manifest.lock_hashes || typeof manifest.lock_hashes !== "object" ||
+      manifest.compatibility?.protocol !== 1 || manifest.compatibility?.config !== 1 ||
+      manifest.compatibility?.app_schema_read_min !== 2 || manifest.compatibility?.app_schema_read_max !== 3 ||
+      manifest.compatibility?.app_schema_write !== 3 || manifest.compatibility?.rollback_safe !== true) {
+    throw new Error("staged release manifest contract is invalid");
+  }
+  for (const [component, relative] of [["dispatcher", "dispatcher"], ["sources/slack", "sources/slack"], ["updater", "updater"]]) {
+    const lock = await fs.readFile(path.join(stagingPath, relative, "package-lock.json"));
+    if (manifest.lock_hashes[component] !== createHash("sha256").update(lock).digest("hex")) {
+      throw new Error("staged release lockfile identity is invalid");
+    }
+  }
+  for (const relative of ["dispatcher/dist/cli.js", "sources/slack/dist/index.js", "updater/dist/cli.js"]) {
+    const stats = await fs.lstat(path.join(stagingPath, relative));
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== process.getuid() || stats.nlink !== 1) {
+      throw new Error("staged release build is incomplete");
+    }
+  }
+  return releaseTreeDigest(stagingPath);
+}
+
+export async function validatePublishedRelease(releasePath, expectedSha, expectedDigest) {
+  if (path.basename(releasePath) !== expectedSha || !/^[0-9a-f]{64}$/.test(expectedDigest ?? "")) {
+    throw new Error("published release validation arguments are invalid");
+  }
+  await validateStagedRelease(releasePath, expectedSha);
+  const digest = await releaseTreeDigest(releasePath, true);
+  if (digest !== expectedDigest) throw new Error("published release differs from completed staging");
+}
+
 export async function validateExistingRelease(existingRelease, stagedRelease, expectedSha) {
   if (!path.isAbsolute(existingRelease) || !path.isAbsolute(stagedRelease) ||
     !/^[0-9a-f]{40}$/.test(expectedSha) || path.basename(existingRelease) !== expectedSha) {
     throw new Error("existing release validation arguments are invalid");
   }
-  const manifest = JSON.parse(await fs.readFile(path.join(existingRelease, "release-manifest.json"), "utf8"));
-  const stagedManifest = JSON.parse(await fs.readFile(path.join(stagedRelease, "release-manifest.json"), "utf8"));
+  const existingManifestPath = path.join(existingRelease, "release-manifest.json");
+  const stagedManifestPath = path.join(stagedRelease, "release-manifest.json");
+  for (const [file, immutable] of [[existingManifestPath, true], [stagedManifestPath, false]]) {
+    const stats = await fs.lstat(file);
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== process.getuid() || stats.nlink !== 1 ||
+      (stats.mode & 0o077) !== 0 || (immutable && (stats.mode & 0o777) !== 0o400)) {
+      throw new Error("release manifest ownership, mode, or hardlink is invalid");
+    }
+  }
+  const manifest = JSON.parse(await fs.readFile(existingManifestPath, "utf8"));
+  const stagedManifest = JSON.parse(await fs.readFile(stagedManifestPath, "utf8"));
   const compatibility = manifest?.compatibility;
   if (manifest?.schema_version !== 1 || manifest.sha !== expectedSha ||
     manifest.repository !== "hiragram/dona" || manifest.policy_version !== "2026-09-03.2" ||
@@ -251,11 +360,12 @@ export async function validateExistingRelease(existingRelease, stagedRelease, ex
     compatibility?.app_schema_write !== 3 || compatibility?.rollback_safe !== true) {
     throw new Error("existing release manifest does not match the control-plane contract");
   }
-  if (!isDeepStrictEqual(manifest.compatibility, stagedManifest?.compatibility)) {
-    throw new Error("existing release compatibility does not match the freshly verified staging manifest");
+  const identity = ({ built_at: _builtAt, ...rest }) => rest;
+  if (!isDeepStrictEqual(identity(manifest), identity(stagedManifest))) {
+    throw new Error("existing release identity does not match the freshly verified staging manifest");
   }
   const [existingDigest, stagedDigest] = await Promise.all([
-    releaseTreeDigest(existingRelease),
+    releaseTreeDigest(existingRelease, true),
     releaseTreeDigest(stagedRelease),
   ]);
   if (existingDigest !== stagedDigest) {
@@ -272,6 +382,18 @@ async function main() {
     return 2;
   }
   if (mode === "validate-remote") return normalizeCanonicalRemote(value) ? 0 : 1;
+  if (mode === "assert-private-file") {
+    try { await assertPrivateFile(value); return 0; }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
+  }
+  if (mode === "validate-staged-release" && secondValue) {
+    try { console.log(await validateStagedRelease(value, secondValue)); return 0; }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
+  }
+  if (mode === "validate-published-release" && secondValue && process.argv[5]) {
+    try { await validatePublishedRelease(value, secondValue, process.argv[5]); return 0; }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
+  }
   if (mode === "assert-socket-unused") {
     if (await socketIsListening(value)) {
       console.error("指定したsocketでprocessが応答中です。管理対象processの停止状態を確認してください。");
@@ -304,6 +426,10 @@ async function main() {
   if(mode==="wait-launchd-unregistered"&&secondValue&&process.argv[5]) {
     try { await waitForLaunchdServiceAbsent(value,secondValue,Number(process.argv[5])); return 0; }
     catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
+  }
+  if (mode === "wait-launchd-updater-sha" && secondValue && process.argv[5]) {
+    try { await waitForLaunchdUpdaterSha(value, secondValue, Number(process.argv[5])); return 0; }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
   }
   if (mode === "wait-updater-sha" && secondValue && process.argv[5]) {
     try {

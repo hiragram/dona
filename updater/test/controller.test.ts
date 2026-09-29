@@ -1926,8 +1926,12 @@ describe("UpdateController isolated end-to-end", () => {
     }, new Date("2026-09-02T00:00:00.000Z"));
 
     f.controller.maintainDiagnostics();
-    assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "complete");
-    f.advance(40 * 86_400_000);
+    const retained = f.database.diagnosticLogs(requestId)[0];
+    assert.ok(retained);
+    assert.equal(retained.capture_state, "complete");
+    assert.ok(retained.finalized_at);
+    f.advance(Date.parse(retained.finalized_at) - Date.parse("2026-09-02T00:00:00.000Z") +
+      (f.policy.diagnostic_retention_days + 1) * 86_400_000);
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "purged");
     f.database.close();
