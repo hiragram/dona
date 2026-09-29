@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { controlUpdaterTreeDigest } from "./control-updater-tree.mjs";
 
 const phases = ["prepared", "updater_stop_intent", "updater_stopped", "backup_verified", "dispatcher_stop_intent", "dispatcher_stopped", "dispatcher_start_intent", "dispatcher_started", "control_swapped", "updater_start_intent", "updater_started", "verified", "restore_required", "restored", "needs_review"];
 const nextPhase = new Map([
@@ -15,6 +16,10 @@ const nextPhase = new Map([
 ]);
 const sha = (value) => /^[0-9a-f]{40}$/.test(value ?? "");
 const digest = (file) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+const entryExists = (file) => {
+  try { fs.lstatSync(file); return true; }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+};
 
 function assertPrivateDirectory(directory) {
   const stats = fs.lstatSync(directory);
@@ -47,21 +52,84 @@ function publish(file, value, writeFile = fs.writeFileSync) {
   try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
 }
 
-export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, oldPlist, newPlist, releaseDigest) {
+export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, oldPlist, newPlist,
+  releaseDigest, oldUpdaterTree, oldDispatcherPlist, oldReceipt) {
   assertPrivateDirectory(directory);
   if (!sha(oldSha) || !sha(newSha) || !/^[0-9a-f]{64}$/.test(releaseDigest ?? "")) {
     throw new Error("control attempt SHA or release digest is invalid");
   }
   const file = path.join(directory, "attempt.json");
   if (fs.existsSync(file) || fs.existsSync(`${file}.tmp`)) throw new Error("control attempt already exists or publish is ambiguous");
+  assertPrivateFile(oldPolicy);
+  assertPrivateFile(oldPlist);
+  assertPrivateFile(oldDispatcherPlist);
+  if (oldReceipt !== "-") assertPrivateFile(oldReceipt);
   publish(file, {
     schema_version: 1, old_build_sha: oldSha, new_build_sha: newSha,
     release_tree_sha256: releaseDigest,
     old_policy_sha256: digest(oldPolicy), new_policy_sha256: digest(newPolicy),
     old_plist_sha256: digest(oldPlist), new_plist_sha256: digest(newPlist),
+    old_updater_tree_sha256: controlUpdaterTreeDigest(oldUpdaterTree),
+    old_dispatcher_plist_sha256: digest(oldDispatcherPlist),
+    old_receipt_sha256: oldReceipt === "-" ? null : digest(oldReceipt),
     phase: "prepared", sequence: 1, db_backup_sha256: null, restore_rehearsal_sha256: null, launchd_operations: [],
     updated_at: new Date().toISOString(),
   });
+}
+
+export function verifyRestoredControl(directory, policy, plist, updaterTree, database, receipt) {
+  assertPrivateDirectory(directory);
+  assertPrivateFile(path.join(directory, "attempt.json"));
+  const attempt = JSON.parse(fs.readFileSync(path.join(directory, "attempt.json"), "utf8"));
+  if (attempt.phase !== "restore_required" || !/^[0-9a-f]{64}$/.test(attempt.old_updater_tree_sha256 ?? "") ||
+      !/^[0-9a-f]{64}$/.test(attempt.old_dispatcher_plist_sha256 ?? "")) {
+    throw new Error("control restore identity is unavailable");
+  }
+  assertPrivateFile(policy);
+  assertPrivateFile(plist);
+  if (digest(policy) !== attempt.old_policy_sha256 || digest(plist) !== attempt.old_plist_sha256 ||
+      controlUpdaterTreeDigest(updaterTree) !== attempt.old_updater_tree_sha256) {
+    throw new Error("restored control artifacts differ from the saved attempt");
+  }
+  if (attempt.db_backup_sha256 !== null) {
+    const backup = path.join(directory, "updater.previous.sqlite3");
+    assertPrivateFile(backup);
+    assertPrivateFile(database);
+    if (digest(backup) !== attempt.db_backup_sha256 || digest(database) !== attempt.db_backup_sha256) {
+      throw new Error("restored control database differs from the verified backup");
+    }
+    const rehearsal = path.join(directory, "restore-rehearsal.json");
+    assertPrivateFile(rehearsal);
+    if (digest(rehearsal) !== attempt.restore_rehearsal_sha256) {
+      throw new Error("control restore rehearsal differs from the saved attempt");
+    }
+  }
+  if (attempt.old_receipt_sha256 === null) {
+    if (entryExists(receipt) || entryExists(path.join(directory, "control-plane-receipt.previous.json"))) {
+      throw new Error("restored control receipt differs from the saved absence");
+    }
+  } else {
+    const backupReceipt = path.join(directory, "control-plane-receipt.previous.json");
+    assertPrivateFile(backupReceipt);
+    assertPrivateFile(receipt);
+    if (digest(backupReceipt) !== attempt.old_receipt_sha256 || digest(receipt) !== attempt.old_receipt_sha256) {
+      throw new Error("restored control receipt differs from the saved attempt");
+    }
+  }
+}
+
+export function verifyRestoredDispatcher(directory, plist) {
+  assertPrivateDirectory(directory);
+  assertPrivateFile(path.join(directory, "attempt.json"));
+  const attempt = JSON.parse(fs.readFileSync(path.join(directory, "attempt.json"), "utf8"));
+  const backup = path.join(directory, "dev.dona.dispatcher.previous.plist");
+  assertPrivateFile(plist);
+  if (entryExists(backup)) assertPrivateFile(backup);
+  if (attempt.phase !== "restore_required" || !/^[0-9a-f]{64}$/.test(attempt.old_dispatcher_plist_sha256 ?? "") ||
+      (entryExists(backup) && digest(backup) !== attempt.old_dispatcher_plist_sha256) ||
+      digest(plist) !== attempt.old_dispatcher_plist_sha256) {
+    throw new Error("restored Dispatcher plist differs from the saved attempt");
+  }
 }
 
 export function advanceAttempt(directory, phase, operation = "none", backup = undefined, rehearsal = undefined, options = {}) {
@@ -112,9 +180,11 @@ export function verifyAttemptArtifacts(directory, policy, plist, backup, rehears
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   const [command, ...args] = process.argv.slice(2);
   try {
-    if (command === "create" && args.length === 8) createAttempt(...args);
+    if (command === "create" && args.length === 11) createAttempt(...args);
     else if (command === "advance" && args.length >= 2 && args.length <= 5) advanceAttempt(...args);
     else if (command === "verify" && args.length === 5) verifyAttemptArtifacts(...args);
+    else if (command === "verify-restore-control" && args.length === 6) verifyRestoredControl(...args);
+    else if (command === "verify-restore-dispatcher" && args.length === 2) verifyRestoredDispatcher(...args);
     else throw new Error("invalid control attempt command");
   } catch (error) {
     console.error(error.message);

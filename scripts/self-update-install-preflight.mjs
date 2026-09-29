@@ -234,15 +234,26 @@ export async function waitForUpdaterIdentity(socketPath, expectedSha, domain, ti
   throw new Error("updater process identity was not observed before timeout");
 }
 
-export async function waitForDispatcherSha(socketPath,expectedSha,timeoutMs) {
-  if(!/^[0-9a-f]{40}$/.test(expectedSha)||!Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("wait-dispatcher-sha arguments are invalid");
-  const deadline=Date.now()+timeoutMs;
+export async function waitForDispatcherSha(socketPath, expectedSha, domain, timeoutMs, options = {}) {
+  if (!path.isAbsolute(socketPath) || !/^[0-9a-f]{40}$/.test(expectedSha) ||
+      !/^gui\/[1-9][0-9]*$/.test(domain) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("wait-dispatcher-sha arguments are invalid");
+  }
+  const healthRead = options.healthRead ?? (() => udsJson(socketPath, "/health/version", 2_000));
+  const registrationRead = options.registrationRead ?? (async () =>
+    (await execute("/bin/launchctl", ["print", `${domain}/dev.dona.dispatcher`],
+      { timeout: 2_000, killSignal: "SIGKILL" })).stdout);
+  const deadline = Date.now() + timeoutMs;
   do {
-    try { const health=await udsJson(socketPath,"/health/version",Math.min(2_000,timeoutMs)); if(health.status==="ready"&&health.service==="dispatcher"&&health.build_sha===expectedSha)return; }
-    catch { /* launchd activation and UDS publication are observed until the bounded deadline. */ }
-    await new Promise(resolve=>setTimeout(resolve,100));
-  } while(Date.now()<deadline);
-  throw new Error(`dispatcher ${expectedSha} was not observed ready`);
+    try {
+      const [health, registration] = await Promise.all([healthRead(), registrationRead()]);
+      const registeredPid = Number(registration.match(/\bpid = ([0-9]+)/)?.[1]);
+      if (health?.status === "ready" && health.service === "dispatcher" &&
+          health.build_sha === expectedSha && Number.isSafeInteger(registeredPid) && registeredPid > 0) return;
+    } catch { /* launchd activation and UDS publication are observed until the bounded deadline. */ }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  throw new Error(`dispatcher ${expectedSha} was not observed under its fixed launchd label`);
 }
 
 export async function waitForSlackSha(socketPath, expectedSha, domain, timeoutMs, options = {}) {
@@ -593,8 +604,8 @@ async function main() {
     }
     catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
   }
-  if(mode==="wait-dispatcher-sha"&&secondValue&&process.argv[5]) {
-    try { await waitForDispatcherSha(value,secondValue,Number(process.argv[5])); return 0; }
+  if(mode==="wait-dispatcher-sha"&&secondValue&&process.argv[5]&&process.argv[6]) {
+    try { await waitForDispatcherSha(value,secondValue,process.argv[5],Number(process.argv[6])); return 0; }
     catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
   if (mode === "wait-slack-sha" && secondValue && process.argv[5] && process.argv[6]) {
