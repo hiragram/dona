@@ -545,6 +545,8 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.doesNotMatch(restoreBranch.slice(0, restoreBootout), /launchctl print "\$DOMAIN\/dev\.dona\.dispatcher"/);
   assert.match(source, /bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録"/);
   assert.match(source, /wait-launchd-unregistered/);
+  const updaterRestore = source.slice(source.indexOf("restore_control_plane()"), source.indexOf("if [[ \"$MODE\" != \"--check\""));
+  assert.match(updaterRestore, /launchctl_once bootout "\$DOMAIN" dev\.dona\.updater 30000[\s\S]*wait-launchd-unregistered[\s\S]*assert-socket-unused/);
   assert.match(source, /updater\.database-was-absent/);
   assert.match(source, /backup-control-db\.py/);
   assert.match(source, /PRESTOP_NONTERMINAL_COUNT/);
@@ -657,7 +659,17 @@ test("old control restore rehearsal opens only a backup copy and fails closed on
   const newModulePath = path.join(newDir, "dist", "database.js");
   const backup = path.join(root, "updater.previous.sqlite3");
   const receipt = path.join(root, "restore-rehearsal.json");
+  const oldNodePlist = path.join(root, "old-updater.plist");
+  const newNodePlist = path.join(root, "new-updater.plist");
   try {
+    const nodeLog = path.join(root, "node-invocations.log");
+    const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const nodePlist = (executable: string) => `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>ProgramArguments</key><array><string>${executable}</string></array></dict></plist>`;
+    for (const label of ["old", "new"]) {
+      const wrapper = path.join(root, `${label}-node`);
+      await fs.writeFile(wrapper, `#!/bin/sh\nprintf '${label}\\n' >> ${shellQuote(nodeLog)}\nexec ${shellQuote(process.execPath)} "$@"\n`, { mode: 0o700 });
+      await fs.writeFile(label === "old" ? oldNodePlist : newNodePlist, nodePlist(wrapper), { mode: 0o600 });
+    }
     await fs.mkdir(path.dirname(modulePath), { recursive: true });
     await fs.mkdir(path.dirname(newModulePath), { recursive: true });
     await fs.writeFile(path.join(oldDir, "package.json"), '{"type":"module"}');
@@ -666,29 +678,30 @@ test("old control restore rehearsal opens only a backup copy and fails closed on
     await fs.writeFile(newModulePath, 'import fs from "node:fs"; export class UpdateDatabase { constructor(file) { const bytes=fs.readFileSync(file); bytes.writeUInt32BE(8,60); fs.writeFileSync(file,bytes); } close() {} }', { mode: 0o600 });
     await execute("python3", ["-c", "import sqlite3,sys,os; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE update_requests(id TEXT PRIMARY KEY)'); c.execute(\"INSERT INTO update_requests VALUES ('one')\"); c.execute('PRAGMA user_version=7'); c.commit(); c.close(); os.chmod(sys.argv[1],0o600)", backup]);
     const original = await fs.readFile(backup);
-    await execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]);
+    await execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt, oldNodePlist, newNodePlist]);
+    assert.equal(await fs.readFile(nodeLog, "utf8"), "new\nold\n");
     assert.deepEqual(await fs.readFile(backup), original);
     const rehearsal = JSON.parse(await fs.readFile(receipt, "utf8"));
     assert.equal(rehearsal.old_binary_restored_backup_readable, true);
     assert.equal(rehearsal.old_schema, 7);
     assert.equal(rehearsal.new_schema, 8);
     assert.equal(rehearsal.rollback, "restore_backup_required");
-    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
+    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt, oldNodePlist, newNodePlist]));
     await fs.rm(receipt);
     await fs.writeFile(modulePath, 'export class UpdateDatabase { constructor() { throw new Error("old binary rejects backup"); } close() {} }');
-    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
+    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt, oldNodePlist, newNodePlist]));
     await assert.rejects(fs.stat(receipt), { code: "ENOENT" });
     assert.deepEqual(await fs.readFile(backup), original);
     await fs.writeFile(newModulePath, `import { execFileSync } from "node:child_process";
       export class UpdateDatabase { constructor(file) {
         execFileSync("/usr/bin/python3", ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('DELETE FROM update_requests'); c.execute('PRAGMA user_version=8'); c.commit(); c.close()", file]);
       } close() {} }`);
-    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
+    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt, oldNodePlist, newNodePlist]));
     await assert.rejects(fs.stat(receipt), { code: "ENOENT" });
     assert.deepEqual(await fs.readFile(backup), original);
     await fs.writeFile(modulePath, 'export class UpdateDatabase { constructor() {} close() {} }');
     await fs.writeFile(newModulePath, 'export class UpdateDatabase { constructor() { throw new Error("migration failed"); } close() {} }');
-    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
+    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt, oldNodePlist, newNodePlist]));
     await assert.rejects(fs.stat(receipt), { code: "ENOENT" });
     assert.deepEqual(await fs.readFile(backup), original);
   } finally {

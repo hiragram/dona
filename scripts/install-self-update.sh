@@ -158,8 +158,9 @@ restore_control_plane() {
     fi
     launchctl_once bootout "$DOMAIN" dev.dona.updater 30000 >/dev/null 2>&1 || true
   fi
-  if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
-    print -u2 "control-plane復旧前に新しいupdaterの停止を確認できません。backup: $CONTROL_BACKUP_ROOT"
+  if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-launchd-unregistered \
+      "$DOMAIN" dev.dona.updater 30000; then
+    print -u2 "control-plane復旧前にUpdaterの登録解除を安定確認できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
   fi
   if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$CONTROL_ROOT/updater.sock"; then
@@ -555,7 +556,8 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
       "$CONTROL_ROOT/updater.sqlite3" "$BACKUP_ROOT/updater.previous.sqlite3"
     $NODE_PATH "$SCRIPT_DIR/rehearse-control-restore.mjs" \
       "$CONTROL_ROOT/updater/dist/database.js" "$FINAL_RELEASE/updater/dist/database.js" \
-      "$BACKUP_ROOT/updater.previous.sqlite3" "$BACKUP_ROOT/restore-rehearsal.json"
+      "$BACKUP_ROOT/updater.previous.sqlite3" "$BACKUP_ROOT/restore-rehearsal.json" \
+      "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$INSTALL_TMP/rendered/dev.dona.updater.plist"
     record_control_phase backup_verified none "$BACKUP_ROOT/updater.previous.sqlite3" "$BACKUP_ROOT/restore-rehearsal.json"
   else
     /usr/bin/touch "$BACKUP_ROOT/updater.database-was-absent"

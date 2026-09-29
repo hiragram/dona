@@ -6,18 +6,29 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-const [oldDatabaseModule, newDatabaseModule, backup, receiptPath] = process.argv.slice(2);
-if (![oldDatabaseModule, newDatabaseModule, backup, receiptPath].every(value => path.isAbsolute(value ?? "")) ||
+const [oldDatabaseModule, newDatabaseModule, backup, receiptPath, oldPlist, newPlist] = process.argv.slice(2);
+if (process.argv.length !== 8 ||
+    ![oldDatabaseModule, newDatabaseModule, backup, receiptPath, oldPlist, newPlist].every(value => path.isAbsolute(value ?? "")) ||
     path.basename(oldDatabaseModule) !== "database.js" || path.basename(newDatabaseModule) !== "database.js" ||
     path.basename(backup) !== "updater.previous.sqlite3" ||
     path.basename(receiptPath) !== "restore-rehearsal.json") {
   throw new Error("restore rehearsal arguments are invalid");
 }
-for (const file of [oldDatabaseModule, newDatabaseModule, backup]) {
+for (const file of [oldDatabaseModule, newDatabaseModule, backup, oldPlist, newPlist]) {
   const stats = fs.lstatSync(file);
   if (!stats.isFile() || stats.isSymbolicLink() || stats.uid !== process.getuid() || stats.nlink !== 1 ||
       (stats.mode & 0o077) !== 0) throw new Error("restore rehearsal input identity is invalid");
 }
+const plistNode = (plist) => {
+  const executable = execFileSync("/usr/libexec/PlistBuddy", ["-c", "Print :ProgramArguments:0", plist],
+    { encoding: "utf8", timeout: 5000 }).trim();
+  if (!path.isAbsolute(executable)) throw new Error("rehearsal Node path is invalid");
+  const stat = fs.statSync(executable);
+  if (!stat.isFile() || (stat.mode & 0o022) !== 0) throw new Error("rehearsal Node identity is invalid");
+  return executable;
+};
+const oldNode = plistNode(oldPlist);
+const newNode = plistNode(newPlist);
 if (fs.existsSync(receiptPath)) throw new Error("restore rehearsal already exists");
 const backupHash = createHash("sha256").update(fs.readFileSync(backup)).digest("hex");
 const temporaryDirectory = fs.mkdtempSync(path.join(path.dirname(backup), "restore-rehearsal."));
@@ -35,10 +46,10 @@ try:
  print(json.dumps({'tables':tables,'rows':{name:c.execute('SELECT COUNT(*) FROM "'+name.replace('"','""')+'"').fetchone()[0] for name in tables}}))
 finally: c.close()
 `, file], { encoding: "utf8", timeout: 30_000 }));
-const openModule = (modulePath, file, readonly) => {
+const openModule = (node, modulePath, file, readonly) => {
   const moduleUrl = pathToFileURL(modulePath).href;
   const code = `import { UpdateDatabase } from ${JSON.stringify(moduleUrl)}; const db = new UpdateDatabase(process.argv[1], ${readonly ? "{ readonly: true }" : "{}"}); db.close();`;
-  execFileSync(process.execPath, ["--input-type=module", "-e", code, file], {
+  execFileSync(node, ["--input-type=module", "-e", code, file], {
     timeout: 30_000, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: os.homedir() },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -49,7 +60,7 @@ try {
   const forward = path.join(temporaryDirectory, "forward.sqlite3");
   fs.copyFileSync(backup, forward);
   fs.chmodSync(forward, 0o600);
-  openModule(newDatabaseModule, forward, false);
+  openModule(newNode, newDatabaseModule, forward, false);
   const newSchema = readVersion(forward);
   const forwardInventory = inventory(forward);
   if (!Number.isSafeInteger(oldSchema) || !Number.isSafeInteger(newSchema) || newSchema < oldSchema) {
@@ -63,7 +74,7 @@ try {
   const restored = path.join(temporaryDirectory, "updater.sqlite3");
   fs.copyFileSync(backup, restored);
   fs.chmodSync(restored, 0o600);
-  openModule(oldDatabaseModule, restored, true);
+  openModule(oldNode, oldDatabaseModule, restored, true);
   if (readVersion(restored) !== oldSchema) throw new Error("restored control schema changed during rehearsal");
   if (JSON.stringify(inventory(restored)) !== JSON.stringify(originalInventory)) {
     throw new Error("restored control inventory differs from backup");
