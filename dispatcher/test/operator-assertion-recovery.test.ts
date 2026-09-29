@@ -219,8 +219,9 @@ test("旧Result pathの再openはCASを動かさず別CLI起動で回復でき�
   createdDb.sealJobGroup(source.event_id);
   createdDb.close();
   const raw=new Database(config.databasePath);
-  try {raw.prepare("UPDATE jobs SET result_path=? WHERE job_id=?")
-    .run(path.join(path.dirname(path.dirname(created.result_path)),`${created.job_id}.json`),created.job_id);}
+  try {raw.prepare("UPDATE jobs SET result_path=?,created_at=? WHERE job_id=?")
+    .run(path.join(path.dirname(path.dirname(created.result_path)),`${created.job_id}.json`),
+      "2026-09-01T00:00:00.000Z",created.job_id);}
   finally {raw.close();}
   const first=new DispatcherDatabase(config.databasePath);
   const migrated=first.getJob(created.job_id)!;
@@ -242,6 +243,10 @@ test("旧Result pathの再openはCASを動かさず別CLI起動で回復でき�
       sideEffectsEvidenceSha256:digest("reviewed"),notificationEvidenceSha256:preview.notification_evidence_sha256,
       residualRisksAccepted:true});
     assert.equal(row.status,"failed");
+    assert.equal(row.completion_event_id,null);
+    assert.ok(recover.operatorAssertionRecoveryRecord(created.job_id));
+    assert.equal(recover.notificationReconciliationPreview().candidates.some(candidate=>
+      candidate.job_id===created.job_id&&candidate.job_status==="failed"&&candidate.decision==="held"),true);
   } finally {recover.close();}
 });
 

@@ -2112,7 +2112,7 @@ describe("UpdateController isolated end-to-end", () => {
     const capture = diagnostics.start({ request_id: requestId, attempt: claimed.attempt, step: "updater:npm-test" },
       new Date("2026-09-02T00:00:00.000Z"));
     capture.write("stderr", Buffer.from("failure"));
-    capture.finish(true);
+    const finalized = capture.finish(true)!;
     f.database.terminal(requestId, claimed.fence, "failed", "pre_activation_failed", {
       last_error_code: "pre_activation_failed",
       last_error_message: "test failed",
@@ -2120,7 +2120,9 @@ describe("UpdateController isolated end-to-end", () => {
 
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "complete");
-    f.advance(60 * 86_400_000);
+    f.advance(Math.max(60 * 86_400_000,
+      Date.parse(finalized.finalized_at!) - Date.parse("2026-09-02T00:00:00.000Z") +
+        (f.policy.diagnostic_retention_days + 1) * 86_400_000));
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "purged");
     f.database.close();

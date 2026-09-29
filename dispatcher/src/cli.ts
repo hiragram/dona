@@ -36,6 +36,7 @@ function usage(): never {
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
   dona-dispatcher job legacy-notification <job_id>
+  dona-dispatcher job notification-preview [--cursor <candidate_id>] [--limit <1-100>]
   dona-dispatcher job reconcile-legacy-notification <job_id> <expected_job_updated_at> <expected_classified_at> <evidence_sha256> --notification-reviewed --no-post-confirmed
   dona-dispatcher job resolve-invalid-result <job_id> <receipt_id> <expected_updated_at> --worker-stopped-reviewed --side-effects-reviewed
   dona-dispatcher job inspect-late-result <job_id>
@@ -136,6 +137,13 @@ async function main(): Promise<void> {
         const marker=database.legacyNotificationMigration(eventIdAt(args,2));
         if(!marker)throw new Error("legacy_notification_marker_not_found");
         console.log(JSON.stringify(marker,null,2));return;
+      }
+      if(command==="notification-preview") {
+        const cursorIndex=args.indexOf("--cursor"),limitIndex=args.indexOf("--limit");
+        const cursor=cursorIndex<0?0:Number(args[cursorIndex+1]);
+        const limit=limitIndex<0?100:Number(args[limitIndex+1]);
+        if(args.length!==2+(cursorIndex<0?0:2)+(limitIndex<0?0:2))usage();
+        console.log(JSON.stringify(database.notificationReconciliationPreview(cursor,limit),null,2));return;
       }
       if(command==="reconcile-legacy-notification") {
         if(args.length!==8 || args[6]!=="--notification-reviewed" || args[7]!=="--no-post-confirmed")usage();

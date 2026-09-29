@@ -204,8 +204,9 @@ describe("DispatcherDatabase", () => {
       summary: "完了",
       completed_at: completionTime,
     }, running.result_path);
-    database.enqueueJobNotification("job-running", new Date(completionTime));
-    assert.equal(database.getJobGroup("evt-source-running")?.notification_mode, "legacy");
+    assert.throws(() => database.enqueueJobNotification("job-running", new Date(completionTime)),
+      /historical_notification_requires_reconciliation/);
+    assert.equal(database.getJob("job-running")?.completion_event_id, null);
     database.close();
 
     const restarted = new DispatcherDatabase(config.databasePath);
@@ -393,11 +394,53 @@ describe("DispatcherDatabase", () => {
     for (let pass = 0; pass < 2; pass++) {
       const database = new DispatcherDatabase(config.databasePath);
       assert.deepEqual(database.listJobsNeedingNotification(), []);
-      assert.throws(() => database.enqueueJobNotification("job-blocked"), /legacy_notification_acceptance_unknown/);
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /historical_notification_requires_reconciliation/);
       database.close();
     }
     const checked = new Database(config.databasePath);
     assert.equal((checked.prepare("SELECT COUNT(*) AS count FROM events WHERE source='dona_job'").get() as {count:number}).count, 1);
+    checked.close();
+  });
+
+  test("redacted historical seven-event shape stays held across restart and previews over 100 candidates", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const raw=new Database(config.databasePath);
+    raw.pragma("foreign_keys = ON");
+    const event=raw.prepare("SELECT * FROM events WHERE event_id='evt-source-blocked'").get() as Record<string,unknown>;
+    const job=raw.prepare("SELECT * FROM jobs WHERE job_id='job-blocked'").get() as Record<string,unknown>;
+    const copy=(table:string,row:Record<string,unknown>)=>{
+      const columns=Object.keys(row).filter(name=>name!=="sequence");
+      raw.prepare(`INSERT INTO ${table} (${columns.join(",")}) VALUES (${columns.map(()=>"?").join(",")})`)
+        .run(...columns.map(name=>row[name]));
+    };
+    for(let index=0;index<105;index++) {
+      const id=`historical-${String(index).padStart(3,"0")}`;
+      copy("events",{...event,event_id:`evt-${id}`,external_event_id:`external-${id}`,
+        result_json:null,created_at:"2026-09-20T12:00:00.000Z"});
+      copy("jobs",{...job,job_id:`job-${id}`,source_event_id:`evt-${id}`,
+        agent_name:`agent-${id}`,completion_event_id:null,
+        result_path:`/private/${id}.json`,created_at:"2026-09-20T12:00:00.000Z",
+        updated_at:"2026-09-20T12:52:00.000Z"});
+    }
+    raw.close();
+    for(let restart=0;restart<2;restart++) {
+      const database=new DispatcherDatabase(config.databasePath);
+      const first=database.notificationReconciliationPreview(0,100);
+      assert.equal(first.dry_run,true);
+      assert.equal(first.total_held>=105,true);
+      assert.equal(first.candidates.length,100);
+      assert.ok(first.next_cursor);
+      const second=database.notificationReconciliationPreview(first.next_cursor!,100);
+      assert.equal(second.candidates.length>=5,true);
+      assert.equal(second.next_cursor,null);
+      assert.equal(first.candidates.some(row=>row.reason==="pre_policy_missing_event"),true);
+      assert.equal(database.listJobsNeedingNotification().some(row=>row.job_id==="job-historical-000"),false);
+      assert.throws(()=>database.enqueueJobNotification("job-historical-000"),/historical_notification_requires_reconciliation/);
+      database.close();
+    }
+    const checked=new Database(config.databasePath);
+    assert.equal((checked.prepare("SELECT COUNT(*) AS count FROM events WHERE source='dona_job'").get() as {count:number}).count,1);
     checked.close();
   });
 
@@ -436,7 +479,7 @@ describe("DispatcherDatabase", () => {
     checked.close();
   });
 
-  test("legacy notification classification keeps uncertain evidence isolated and queues proven unsent once", async () => {
+  test("legacy notification classification keeps uncertain and historical no-post evidence isolated", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -454,14 +497,13 @@ describe("DispatcherDatabase", () => {
     assert.equal((state.get("job-cancelled") as {state:string}).state, "acceptance_unknown");
     raw.close();
     const database = new DispatcherDatabase(config.databasePath);
-    assert.deepEqual(database.listJobsNeedingNotification().map(row => row.job_id), ["job-blocked"]);
-    const first = database.enqueueJobNotification("job-blocked");
-    assert.equal(first.duplicate, false);
+    assert.deepEqual(database.listJobsNeedingNotification(), []);
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /historical_notification_requires_reconciliation/);
     database.close();
     const restarted = new DispatcherDatabase(config.databasePath);
     assert.deepEqual(restarted.listJobsNeedingNotification(), []);
-    assert.equal(restarted.enqueueJobNotification("job-blocked").row.event_id, first.row.event_id);
-    assert.throws(() => restarted.enqueueJobNotification("job-cancelled"), /legacy_notification_acceptance_unknown/);
+    assert.throws(() => restarted.enqueueJobNotification("job-blocked"), /historical_notification_requires_reconciliation/);
+    assert.throws(() => restarted.enqueueJobNotification("job-cancelled"), /historical_notification_requires_reconciliation/);
     restarted.close();
   });
 
@@ -515,7 +557,7 @@ describe("DispatcherDatabase", () => {
     }
   });
 
-  test("two notification scanners converge on one legacy event", async () => {
+  test("two notification scanners both hold a historical legacy candidate", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -530,17 +572,15 @@ describe("DispatcherDatabase", () => {
     raw.close();
     const first = new DispatcherDatabase(config.databasePath);
     const second = new DispatcherDatabase(config.databasePath);
-    assert.equal(first.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
-    assert.equal(second.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
-    const a = first.enqueueJobNotification("job-blocked");
-    const b = second.enqueueJobNotification("job-blocked");
-    assert.equal(a.row.event_id, b.row.event_id);
-    assert.equal(b.duplicate, true);
+    assert.equal(first.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    assert.equal(second.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    assert.throws(() => first.enqueueJobNotification("job-blocked"), /historical_notification_requires_reconciliation/);
+    assert.throws(() => second.enqueueJobNotification("job-blocked"), /historical_notification_requires_reconciliation/);
     first.close();
     second.close();
   });
 
-  test("a later cancellation is not suppressed by an earlier blocked migration marker", async () => {
+  test("a later historical cancellation is held even when its migration marker describes blocked", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -553,12 +593,12 @@ describe("DispatcherDatabase", () => {
       .run("2026-09-03T00:10:00.000Z","2026-09-03T00:10:00.000Z");
     raw.close();
     const database = new DispatcherDatabase(config.databasePath);
-    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
-    assert.equal(database.enqueueJobNotification("job-blocked").duplicate, false);
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /historical_notification_requires_reconciliation/);
     database.close();
   });
 
-  test("a new legacy sandbox reason is not hidden by an old needs_review marker", async () => {
+  test("a new legacy sandbox reason remains held despite a prior migration marker", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -575,15 +615,15 @@ describe("DispatcherDatabase", () => {
     raw.close();
     const database = new DispatcherDatabase(config.databasePath);
     assert.equal(database.getJob("job-needs_review")?.last_error_code, "legacy_agent_sandbox_unknown");
-    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-needs_review"), true);
-    assert.equal(database.enqueueJobNotification("job-needs_review").duplicate, false);
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-needs_review"), false);
+    assert.throws(() => database.enqueueJobNotification("job-needs_review"), /historical_notification_requires_reconciliation/);
     database.close();
     const checked = new Database(config.databasePath);
     assert.deepEqual(checked.prepare("SELECT job_status,last_error_code,state,classified_at FROM job_legacy_notification_migration WHERE job_id='job-needs_review'").get(), marker);
     checked.close();
   });
 
-  test("operator-confirmed no-post resolution is audited and allows one normal enqueue", async () => {
+  test("operator-confirmed no-post resolution is audited without authorizing old-thread enqueue", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
     await createSchemaV2Fixture(config.databasePath);
@@ -603,13 +643,12 @@ describe("DispatcherDatabase", () => {
       String(marker.job_updated_at),String(marker.classified_at),"a".repeat(64));
     assert.equal(resolved.state, "not_sent");
     assert.equal(database.legacyNotificationMigration("job-blocked")?.evidence_sha256, "a".repeat(64));
-    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), true);
-    const first = database.enqueueJobNotification("job-blocked");
-    assert.equal(first.duplicate, false);
+    assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
+    assert.throws(() => database.enqueueJobNotification("job-blocked"), /historical_notification_requires_reconciliation/);
     database.close();
     const restarted = new DispatcherDatabase(config.databasePath);
     assert.equal(restarted.listJobsNeedingNotification().some(row => row.job_id === "job-blocked"), false);
-    assert.equal(restarted.enqueueJobNotification("job-blocked").row.event_id, first.row.event_id);
+    assert.throws(() => restarted.enqueueJobNotification("job-blocked"), /historical_notification_requires_reconciliation/);
     restarted.close();
   });
 
