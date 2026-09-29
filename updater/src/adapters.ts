@@ -556,12 +556,12 @@ export class RealRuntime implements RuntimePort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner(),
     private readonly launchAgentsRoot = path.join(os.homedir(), "Library", "LaunchAgents")) {}
 
-  async runtimeInventory(excludedControlEventIds: readonly string[] = []): Promise<RuntimeInventory> {
-    try { return await this.readRuntimeInventory(excludedControlEventIds); }
+  async runtimeInventory(excludedControlEventIds: readonly string[] = [], afterStop = false): Promise<RuntimeInventory> {
+    try { return await this.readRuntimeInventory(excludedControlEventIds, afterStop); }
     catch { throw new Error("runtime_inventory_unavailable"); }
   }
 
-  private async readRuntimeInventory(excludedControlEventIds: readonly string[]): Promise<RuntimeInventory> {
+  private async readRuntimeInventory(excludedControlEventIds: readonly string[], afterStop: boolean): Promise<RuntimeInventory> {
     if (excludedControlEventIds.length > 2 || new Set(excludedControlEventIds).size !== excludedControlEventIds.length ||
       excludedControlEventIds.some((id) => !/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(id))) {
       throw new Error("inventory_control_event_identity_invalid");
@@ -632,7 +632,9 @@ export class RealRuntime implements RuntimePort {
       throw new Error("inventory_control_plane_unverified");
     }
     const [dispatcherRegistered, slackRegistered] = await Promise.all([this.dispatcherRegistered(), this.slackRegistered()]);
-    if (!dispatcherRegistered || !slackRegistered) throw new Error("inventory_launchd_identity_unverified");
+    if (afterStop ? (dispatcherRegistered || slackRegistered) : (!dispatcherRegistered || !slackRegistered)) {
+      throw new Error("inventory_launchd_identity_unverified");
+    }
     const identity = createHash("sha256");
     for (const label of [this.policy.launchd.dispatcher_label, this.policy.launchd.slack_label]) {
       const plist = path.join(this.launchAgentsRoot, `${label}.plist`);
@@ -643,7 +645,10 @@ export class RealRuntime implements RuntimePort {
       schema_version: 1, control_plane_build_sha: buildSha,
       dispatcher_schema: state.dispatcher_schema, app_schema: app.user_version,
       dispatcher_protocol: 1, policy_version: this.policy.policy_version,
-      launchd: { dispatcher_registered: dispatcherRegistered, slack_registered: slackRegistered,
+      // Both services must be observably stopped after quiesce. Preserve the
+      // planned registration identity in the comparison projection; plist bytes
+      // and every durable workload class are still read again.
+      launchd: { dispatcher_registered: afterStop || dispatcherRegistered, slack_registered: afterStop || slackRegistered,
         identity_digest: identity.digest("hex") },
       workers: state.workers, pending: state.pending,
     };

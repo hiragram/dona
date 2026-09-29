@@ -721,6 +721,28 @@ describe("UpdateController isolated end-to-end", () => {
     applying.database.close();
   });
 
+  test("service停止後のinventory変化はpointer操作前に旧runtimeを復旧する", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "approval-after-stop" });
+    f.dispatcher.terminal = true;
+    f.runtime.inventoryChangesOnCall = f.runtime.inventoryCalls + 5;
+    await f.controller.processNext();
+    const row = f.database.get(planned.request_id as string)!;
+    assert.equal(row.state, "quiescing");
+    assert.equal(row.last_error_code, "rollback_main_agent_start_acceptance_unknown");
+    assert.equal(JSON.parse(f.database.runtimeOperation(planned.request_id as string, "restart_current_dispatcher")!.evidence_json)
+      .cause_code, "inventory_replan_required");
+    assert.equal(row.activation_generation, 0);
+    assert.equal(f.runtime.calls.includes("stopDispatcher"), true);
+    assert.equal(f.runtime.calls.includes("startDispatcher"), true);
+    assert.equal(f.runtime.calls.includes("startSlack"), true);
+    assert.equal(f.runtime.calls.some((call) => call.includes("activate")), false);
+    f.database.close();
+  });
+
   test("apply requires Dispatcher proof for the persisted approval event", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });

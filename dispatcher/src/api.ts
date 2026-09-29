@@ -627,6 +627,7 @@ export class DispatcherApi {
   private verifySelfUpdateApprovalEvent(eventId: string, originalEventId: string, plan: Record<string, unknown>,
     replyTarget: Record<string, unknown>, allowExpiredReplay = false): string {
     const event = this.updateEventContext(eventId);
+    const original = this.updateEventContext(originalEventId);
     if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(originalEventId) || originalEventId === event.event_id ||
       !/^plan_[0-9a-hjkmnp-tv-z]{26}$/.test(String(plan.plan_id)) ||
       !/^[0-9a-f]{64}$/.test(String(plan.plan_hash)) ||
@@ -636,15 +637,19 @@ export class DispatcherApi {
       !Number.isFinite(Date.parse(plan.created_at)) || !Number.isFinite(Date.parse(plan.expires_at)) ||
       Date.parse(event.occurred_at) <= Date.parse(plan.created_at) ||
       (Date.now() >= Date.parse(plan.expires_at) && !allowExpiredReplay) ||
-      stableStringify(JSON.parse(event.reply_target_json!)) !== stableStringify(replyTarget)) {
+      stableStringify(JSON.parse(event.reply_target_json!)) !== stableStringify(replyTarget) ||
+      stableStringify(JSON.parse(original.reply_target_json!)) !== stableStringify(replyTarget) ||
+      Date.parse(original.occurred_at) > Date.parse(plan.created_at)) {
       throw new ApiRequestError(409, "exact_plan_approval_mismatch", "Approval event does not match the current exact plan");
     }
     const subject = JSON.parse(event.subject_json) as Record<string, unknown>;
+    const originalSubject = JSON.parse(original.subject_json) as Record<string, unknown>;
     const payload = JSON.parse(event.payload_json) as Record<string, unknown>;
     const actor = subject.actor_id;
     const confirmation = `承認 plan_id=${plan.plan_id} plan_hash=${plan.plan_hash} target_sha=${plan.target_sha} inventory_revision=${plan.inventory_revision}`;
     const message = typeof payload.text === "string" ? payload.text.trim().replace(/^<@[A-Z0-9]+>\s+/, "") : "";
-    if (!/^[UW][A-Z0-9_-]{1,63}$/.test(String(actor)) || payload.bot_id !== undefined || payload.subtype !== undefined ||
+    if (!/^[UW][A-Z0-9_-]{1,63}$/.test(String(actor)) || actor !== originalSubject.actor_id ||
+      payload.bot_id !== undefined || payload.subtype !== undefined ||
       !["message", "app_mention"].includes(event.event_type) ||
       message !== confirmation) {
       throw new ApiRequestError(403, "explicit_approval_required", "The persisted Slack event is not an exact plan approval");

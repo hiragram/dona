@@ -74,11 +74,17 @@ test("runtime inventory hashes live classes without exposing identifiers or payl
     await fs.chmod(dbPath, 0o600);
     const runner = new RecordingRunner();
     let schemaVersion = 2;
+    let servicesRegistered = true;
     runner.run = async (_executable, args, _options) => args[0]?.endsWith("app-schema-inspect-cli.js")
       ? { ...ok, stdout: JSON.stringify({ schema_version: 1, user_version: schemaVersion, integrity_ok: true, foreign_key_violations: 0 }) }
-      : ok;
+      : !servicesRegistered && args[0] === "print" ? { ...ok, exit_code: 113, stderr: "Could not find service" } : ok;
     const runtime = new RealRuntime(policy, runner as unknown as ProcessRunner, agents);
     const inventory = await runtime.runtimeInventory();
+    servicesRegistered = false;
+    assert.deepEqual(await runtime.runtimeInventory([], true), inventory);
+    await assert.rejects(runtime.runtimeInventory(), /runtime_inventory_unavailable/);
+    servicesRegistered = true;
+    await assert.rejects(runtime.runtimeInventory([], true), /runtime_inventory_unavailable/);
     assert.equal(inventory.pending.events, 1);
     assert.equal((await runtime.runtimeInventory([controlEventId])).pending.events, 0);
     assert.equal(inventory.pending.jobs, 1);

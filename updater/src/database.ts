@@ -900,11 +900,15 @@ export class UpdateDatabase {
   expireAwaitingApproval(at = new Date()): number {
     return this.db.transaction(() => {
       const rows = this.db.prepare(`SELECT * FROM update_requests
-        WHERE state = 'awaiting_approval' AND approval_expires_at <= ?`).all(at.toISOString()) as UpdateRow[];
+        WHERE state = 'awaiting_approval' AND (approval_expires_at IS NULL OR approval_expires_at <= ?)`)
+        .all(at.toISOString()) as UpdateRow[];
       for (const row of rows) {
-        this.completeInternal(row, "failed", "exact_plan_expired", {
-          last_error_code: "exact_plan_expired",
-          last_error_message: "Approval window expired before an update was started",
+        const missingSnapshot = !row.approval_expires_at;
+        const code = missingSnapshot ? "exact_plan_inventory_unavailable" : "exact_plan_expired";
+        this.completeInternal(row, "failed", code, {
+          last_error_code: code,
+          last_error_message: missingSnapshot ? "Legacy approval plan has no verifiable inventory snapshot" :
+            "Approval window expired before an update was started",
         }, at);
       }
       return rows.length;

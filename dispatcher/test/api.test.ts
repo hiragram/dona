@@ -596,6 +596,14 @@ describe("DispatcherApi", () => {
         event_ts: "1756722030.123457" } };
     const approvalAccepted = await request(config.socketPath, "POST", "/v1/events", approvalEnvelope);
     const approvalEventId = approvalAccepted.body.event_id as string;
+    const otherActorApproval = await request(config.socketPath, "POST", "/v1/events", {
+      ...approvalEnvelope, external_event_id: "Ev-update-approval-other-actor",
+      subject: { ...approvalEnvelope.subject, actor_id: "U_OTHER" },
+    });
+    assert.equal((await request(config.socketPath, "POST", "/v1/self-update/apply", {
+      source_event_id: otherActorApproval.body.event_id, plan_id: "plan_01m1es03xy5cf8d9pm5cwx4srw",
+      plan_hash: "a".repeat(64), target_sha: "2".repeat(40), inventory_revision: "b".repeat(64),
+    })).status, 403);
     assert.equal((await request(config.socketPath, "POST", "/v1/self-update/apply", {
       source_event_id: approvalEventId,
       plan_id: "plan_01m1es03xy5cf8d9pm5cwx4srw",

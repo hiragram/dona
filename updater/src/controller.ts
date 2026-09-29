@@ -725,6 +725,15 @@ export class UpdateController {
           workerAfterStop.error_code ?? "active_worker_handoff_unavailable");
         return;
       }
+      try {
+        await this.assertApprovedInventory(row, true);
+        this.assertLease(row);
+      } catch (error) {
+        this.assertLease(row);
+        await this.restoreQuiescedServices(row,
+          error instanceof InventoryPreflightError ? error.code : "inventory_read_unavailable");
+        return;
+      }
       const previousManifest = await this.releases.readCurrentManifest();
       const previousCompatibility = previousManifest.compatibility;
       if (previousCompatibility.app_schema_write === 2 && targetCompatibility.app_schema_write === 3) {
@@ -908,7 +917,7 @@ export class UpdateController {
     }
   }
 
-  private async assertApprovedInventory(row: UpdateRow): Promise<void> {
+  private async assertApprovedInventory(row: UpdateRow, afterStop = false): Promise<void> {
     if (!row.inventory_json || !row.inventory_revision || !row.approval_expires_at ||
       sha256(row.inventory_json) !== row.inventory_revision) throw new InventoryPreflightError("inventory_snapshot_unverified");
     if (this.clock.now().toISOString() >= row.approval_expires_at) throw new InventoryPreflightError("approved_plan_expired");
@@ -919,8 +928,8 @@ export class UpdateController {
     try {
       if (!row.approval_event_id) throw new InventoryPreflightError("inventory_snapshot_unverified");
       const excluded = [row.source_event_id, row.approval_event_id];
-      current = this.completeRuntimeInventory(await this.runtime.runtimeInventory(excluded), row.request_id);
-      const confirmed = this.completeRuntimeInventory(await this.runtime.runtimeInventory(excluded), row.request_id);
+      current = this.completeRuntimeInventory(await this.runtime.runtimeInventory(excluded, afterStop), row.request_id);
+      const confirmed = this.completeRuntimeInventory(await this.runtime.runtimeInventory(excluded, afterStop), row.request_id);
       if (canonicalJson(confirmed) !== canonicalJson(current)) throw new InventoryPreflightError("inventory_replan_required");
     }
     catch (error) {

@@ -66,6 +66,26 @@ describe("UpdateDatabase", () => {
     db.close();
   });
 
+  test("旧schema由来でinventory期限がない承認待ちplanをterminal化する", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const databasePath = path.join(policy.control_root, "updater.sqlite3");
+    const db = new UpdateDatabase(databasePath);
+    const created = db.createPlan({ source_event_id: sourceEventId, reply_target: replyTarget }, {
+      current_sha: currentSha, target_sha: targetSha, previous_sha: null,
+      policy_version: policy.policy_version, compatibility, rollback_compatible: true, inventory,
+    }, new Date("2026-09-02T00:00:00.000Z"));
+    const raw = new Database(databasePath);
+    raw.prepare("UPDATE update_requests SET inventory_json = NULL, inventory_revision = NULL, approval_expires_at = NULL WHERE request_id = ?")
+      .run(created.row.request_id);
+    raw.close();
+    assert.equal(db.expireAwaitingApproval(new Date("2026-09-02T00:00:01.000Z")), 1);
+    assert.equal(db.get(created.row.request_id)?.last_error_code, "exact_plan_inventory_unavailable");
+    assert.equal(db.nonTerminalCount(), 0);
+    assert.equal(db.outboxFor(created.row.request_id)?.status, "pending");
+    db.close();
+  });
+
   test("emits a fence-zero terminal event when an awaiting plan is cancelled before claim", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
