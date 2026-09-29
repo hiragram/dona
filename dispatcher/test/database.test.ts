@@ -463,6 +463,24 @@ describe("DispatcherDatabase", () => {
     database.close();
   });
 
+  test("startup stale recovery records old dispatching jobs before returning", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    await createSchemaV2Fixture(config.databasePath);
+    const raw=new Database(config.databasePath);
+    raw.pragma("foreign_keys = ON");
+    migrateDispatcherDatabase(raw,()=>{},false,3);
+    raw.prepare("UPDATE jobs SET status='dispatching' WHERE job_id='job-running'").run();
+    raw.close();
+    const database=new DispatcherDatabase(config.databasePath);
+    assert.equal(database.notificationReconciliationPreview().candidates.some(row=>row.job_id==="job-running"),false);
+    const recovered=database.recoverStaleJobs();
+    assert.equal(recovered.needsReview>=1,true);
+    assert.equal(database.getJob("job-running")?.status,"needs_review");
+    assert.equal(database.notificationReconciliationPreview().candidates.some(row=>
+      row.job_id==="job-running" && row.job_status==="needs_review" && row.decision==="held"),true);
+    database.close();
+  });
+
   test("restart classifies a pre-existing v3 legacy job that has no migration marker", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);
@@ -1259,6 +1277,39 @@ describe("DispatcherDatabase", () => {
     assert.equal(restarted.notificationReconciliationPreview().candidates.filter(row=>
       row.job_id===job.job_id && row.group_transition==="all_terminal").length,1);
     assert.equal(restarted.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    restarted.close();
+  });
+
+  test("an all-terminal event covers an old sibling without a completion event link", async () => {
+    const {root,config}=await tempConfig(); roots.push(root);
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-covered-sibling")).row;
+    database.beginDispatch(source.event_id,`${config.resultsDir}/${source.event_id}.json`);
+    database.markWaiting(source.event_id);
+    const jobs=["first","second"].map(key=>database.createJob({source_event_id:source.event_id,
+      job_key:key,objective:key,workspace:{kind:"scratch"}},
+      config.jobsWorkspaceRoot,config.jobResultsDir).row);
+    for(const job of jobs) {
+      database.beginJobPreparation(job.job_id);
+      database.setJobRuntime(job.job_id,`workspace-${job.job_key}`,`pane-${job.job_key}`);
+      database.beginJobDispatch(job.job_id);
+      database.markJobRunning(job.job_id);
+      database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"completed",
+        summary:"完了",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+    }
+    database.saveCompleted(source.event_id,{schema_version:1,event_id:source.event_id,status:"completed",
+      completed_at:"2026-09-05T00:02:00.000Z"},`${config.resultsDir}/${source.event_id}.json`);
+    const allTerminal=database.enqueueJobNotification(jobs[0]!.job_id).row;
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,allTerminal.event_id);
+    assert.equal(database.getJob(jobs[1]!.job_id)?.completion_event_id,null);
+    const raw=new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET created_at='2026-09-03T00:00:00.000Z' WHERE job_id=?")
+      .run(jobs[1]!.job_id);
+    raw.close();
+    database.close();
+    const restarted=new DispatcherDatabase(config.databasePath);
+    assert.equal(restarted.notificationReconciliationPreview().candidates.some(row=>
+      row.job_id===jobs[1]!.job_id),false);
     restarted.close();
   });
 

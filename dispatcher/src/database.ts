@@ -471,6 +471,7 @@ function snapshotNotificationCandidates(db: Database.Database, jobId?: string): 
     WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
       AND json_extract(b.owner_json,'$.kind')='slack_thread'
       AND j.completion_event_id IS NULL
+      AND g.all_terminal_event_id IS NULL
       AND (? IS NULL OR j.job_id=?)`)
     .run(detectedAt,epoch.started_at,epoch.started_at,detectedAt,jobId??null,jobId??null);
 }
@@ -1598,22 +1599,25 @@ export class DispatcherDatabase {
   }
 
   recoverStaleJobs(at = new Date()): { retryable: number; needsReview: number } {
-    const timestamp = at.toISOString();
-    const retryable = this.db.prepare(`
+    return this.db.transaction(() => {
+      const timestamp = at.toISOString();
+      const retryable = this.db.prepare(`
       UPDATE jobs SET status = 'retryable_failed', available_at = ?,
         last_error_code = 'stale_preparing',
         last_error_message = 'Dispatcher restarted before the job prompt was attempted', updated_at = ?
       WHERE status = 'preparing'
-    `).run(timestamp, timestamp).changes;
-    const needsReview = this.db.prepare(`
+      `).run(timestamp, timestamp).changes;
+      const needsReview = this.db.prepare(`
       UPDATE jobs SET status = 'needs_review',
         last_error_code = CASE WHEN status='cancelling' THEN 'ambiguous_cancel_acceptance'
           WHEN status='dispatching' THEN 'ambiguous_prompt_acceptance' ELSE 'ambiguous_steer_acceptance' END,
         last_error_message = 'Dispatcher restarted while job prompt, steer, or cancellation acceptance was unknown',
         steer_state = NULL, updated_at = ?
       WHERE status IN ('dispatching', 'cancelling') OR steer_state = 'dispatching'
-    `).run(timestamp).changes;
-    return { retryable, needsReview };
+      `).run(timestamp).changes;
+      if(needsReview>0) snapshotNotificationCandidates(this.db);
+      return { retryable, needsReview };
+    }).immediate();
   }
 
   beginJobPreparation(jobId: string, at = new Date()): JobRow {
