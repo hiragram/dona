@@ -3,6 +3,12 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+
+const dispatcherProcessStart = execFileSync("/bin/ps", ["-p", String(process.pid), "-o", "lstart="], {
+  encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+}).trim();
+if (!dispatcherProcessStart) throw new Error("dispatcher process start identity unavailable");
 
 import type { DispatcherConfig } from "./config.js";
 import { dispatcherSchemaCompatibility, JobCreationError, ScheduledJobCreationError, type DispatcherDatabase } from "./database.js";
@@ -250,6 +256,8 @@ export class DispatcherApi {
           status: health.ready ? "ready" : "not_ready",
           service: "dispatcher",
           build_sha: this.config.buildSha,
+          pid: process.pid,
+          process_start: dispatcherProcessStart,
           protocol: 1,
           app_schema: appSchema.actual,
           app_schema_read_min: appSchema.read_min,

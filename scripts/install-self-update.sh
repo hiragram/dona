@@ -94,6 +94,9 @@ wait_dispatcher_unregistered() {
 bootstrap_dispatcher_reconciled() {
   local context=$1
   local expected_sha=$2
+  local identity_mode=${3:-}
+  local -a identity_args=()
+  if [[ -n "$identity_mode" ]]; then identity_args=("$identity_mode"); fi
   local output=""
   local exit_code=0
   if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"; then
@@ -102,14 +105,14 @@ bootstrap_dispatcher_reconciled() {
   fi
   if output=$(launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" 30000 2>&1); then
     if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
-      "$DISPATCHER_SOCKET" "$expected_sha" "$DOMAIN" 30000; then return 0; fi
+      "$DISPATCHER_SOCKET" "$expected_sha" "$DOMAIN" 30000 "${identity_args[@]}"; then return 0; fi
     print -u2 -- "${context}のDispatcher healthを確定できません。"
     return 1
   else
     exit_code=$?
   fi
   if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
-    "$DISPATCHER_SOCKET" "$expected_sha" "$DOMAIN" 30000; then
+    "$DISPATCHER_SOCKET" "$expected_sha" "$DOMAIN" 30000 "${identity_args[@]}"; then
     print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの起動済み状態を確認しました。"
     return 0
   fi
@@ -145,6 +148,7 @@ bootstrap_slack_reconciled() {
 restore_control_plane() {
   if [[ "$CONTROL_UPGRADE_ACTIVE" != "1" || -z "$CONTROL_BACKUP_ROOT" ]]; then return 0; fi
   local updater_registration=""
+  local restored_database_mode="live"
   updater_registration=$(/bin/launchctl print "$DOMAIN/dev.dona.updater" 2>/dev/null) || updater_registration=""
   if [[ -n "$updater_registration" ]]; then
     if [[ "$updater_registration" != *"DONA_UPDATER_BUILD_SHA => ${INSTALL_SHA}"* &&
@@ -175,6 +179,7 @@ restore_control_plane() {
       /bin/rm -f "$CONTROL_ROOT/updater.sqlite3" "$CONTROL_ROOT/updater.sqlite3-wal" "$CONTROL_ROOT/updater.sqlite3-shm"
       /bin/cp "$CONTROL_BACKUP_ROOT/updater.previous.sqlite3" "$CONTROL_ROOT/updater.sqlite3"
       chmod 600 "$CONTROL_ROOT/updater.sqlite3"
+      restored_database_mode="copied"
     elif [[ -f "$CONTROL_BACKUP_ROOT/updater.database-was-absent" ]]; then
       /bin/rm -f "$CONTROL_ROOT/updater.sqlite3" "$CONTROL_ROOT/updater.sqlite3-wal" "$CONTROL_ROOT/updater.sqlite3-shm"
     fi
@@ -190,7 +195,8 @@ restore_control_plane() {
   fi
   $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" verify-restore-control "$CONTROL_BACKUP_ROOT" \
     "$CONTROL_ROOT/policy.json" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" \
-    "$CONTROL_ROOT/updater" "$CONTROL_ROOT/updater.sqlite3" "$CONTROL_ROOT/control-plane-receipt.json" || return 1
+    "$CONTROL_ROOT/updater" "$CONTROL_ROOT/updater.sqlite3" "$CONTROL_ROOT/control-plane-receipt.json" \
+    "$restored_database_mode" || return 1
   if ! bootstrap_updater_reconciled "旧stable updaterの復旧" "$OLD_UPDATER_SHA" legacy-health; then
     print -u2 "旧stable updaterをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
@@ -205,7 +211,7 @@ restore_control_plane() {
     local dispatcher_bootout_exit=0
     if [[ "$DISPATCHER_PLIST_SWAPPED" != "1" ]] && [[ -n "${ACTIVE_DISPATCHER_SHA:-}" ]] && \
       $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
-        "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 2000; then
+        "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 2000 legacy-health; then
       DISPATCHER_RESTORE_REQUIRED=0
       $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" verify-restore-dispatcher \
         "$CONTROL_BACKUP_ROOT" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" || return 1
@@ -222,13 +228,13 @@ restore_control_plane() {
     if [[ "$DISPATCHER_PLIST_SWAPPED" == "1" ]]; then
       /bin/cp "$CONTROL_BACKUP_ROOT/dev.dona.dispatcher.previous.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
     fi
-    if ! bootstrap_dispatcher_reconciled "旧Updaterの復旧後の旧Dispatcher再登録" "$ACTIVE_DISPATCHER_SHA"; then
+    if ! bootstrap_dispatcher_reconciled "旧Updaterの復旧後の旧Dispatcher再登録" "$ACTIVE_DISPATCHER_SHA" legacy-health; then
       print -u2 "旧Updaterの復旧後に旧Dispatcher plistをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
       return 1
     fi
     if [[ -z "${ACTIVE_DISPATCHER_SHA:-}" ]] || \
       ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
-        "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000; then
+        "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000 legacy-health; then
       print -u2 "旧Dispatcherの復旧healthを確認できません。backup: $CONTROL_BACKUP_ROOT"
       return 1
     fi
@@ -308,6 +314,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   fi
   $NODE_PATH -e 'const fs=require("node:fs");const manifest=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(manifest.sha!==process.argv[2])process.exit(1)' \
     "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/release-manifest.json" "$BOOTSTRAP_UPDATER_SHA"
+  $NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$BOOTSTRAP_UPDATER_SHA"
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$CONTROL_ROOT/updater/dist/cli.js"
   if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
@@ -322,8 +329,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   fi
   if [[ "$dispatcher_registered" == "1" ]]; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
-    if ! /usr/bin/cmp -s "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" ||
-       ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
+    if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
          "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000; then
       print -u2 "登録済みDispatcherのplistと起動状態を今回のinstallに照合できません。"
       exit 1
@@ -331,8 +337,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   fi
   if [[ "$slack_registered" == "1" ]]; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist"
-    if ! /usr/bin/cmp -s "$INSTALL_TMP/rendered/dev.dona.slack-adapter.plist" "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist" ||
-       ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-slack-sha \
+    if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-slack-sha \
          "$SLACK_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000; then
       print -u2 "登録済みSlack Adapterのplistと起動状態を今回のinstallに照合できません。"
       exit 1
@@ -569,11 +574,11 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
   DISPATCHER_PLIST_SWAPPED=1
   record_control_phase dispatcher_start_intent bootstrap_dispatcher
-  if ! bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録" "$ACTIVE_DISPATCHER_SHA"; then
+  if ! bootstrap_dispatcher_reconciled "新しいDispatcher plistの登録" "$ACTIVE_DISPATCHER_SHA" legacy-health; then
     print -u2 "新しいDispatcher plistをlaunchdへ登録できないため、control-planeを復旧します。"
     exit 1
   fi
-  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000 legacy-health
   record_control_phase dispatcher_started
   assert_control_targets
   /bin/mv "$CONTROL_ROOT/updater" "$BACKUP_ROOT/updater.previous"
@@ -585,7 +590,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-published-release \
     "$FINAL_RELEASE" "$INSTALL_SHA" "$STAGED_DIGEST"
   record_control_phase updater_start_intent bootstrap_updater
-  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000 && \
+  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000 legacy-health && \
     bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3 && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-identity "$UPDATER_SOCKET" "$INSTALL_SHA" "$DOMAIN" 30000; then
@@ -651,6 +656,7 @@ for plist in dev.dona.updater dev.dona.dispatcher dev.dona.slack-adapter; do
   chmod 600 "$LAUNCH_AGENTS_DIR/.$plist.plist.tmp"
   /bin/mv "$LAUNCH_AGENTS_DIR/.$plist.plist.tmp" "$LAUNCH_AGENTS_DIR/$plist.plist"
 done
+$NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" record "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$INSTALL_SHA"
 
 print "immutable release、stable updater、policy、plistを配置しました。processは開始していません。"
 print "設定を確認後、明示的に '$0 --bootstrap' を実行してください。"
