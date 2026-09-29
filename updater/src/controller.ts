@@ -933,20 +933,6 @@ export class UpdateController {
         observed_active_sha: row.target_sha,
       }, this.clock.now());
       this.logger.info("Update succeeded", { request_id: row.request_id, target_sha: row.target_sha, fence: row.fence });
-      try {
-        const protectedShas = this.database.retentionProtectedReleaseShas(this.clock.now());
-        for (const sha of this.database.recentSuccessfulReleaseShas(this.policy.retain_successful,
-          new Set([row.target_sha,row.current_sha]))) protectedShas.add(sha);
-        protectedShas.add(row.target_sha);
-        protectedShas.add(row.current_sha);
-        await this.releases.cleanup(protectedShas);
-      } catch (error) {
-        this.logger.warn("Release retention cleanup failed after successful activation", {
-          request_id: row.request_id,
-          error_code: "retention_cleanup_failed",
-          error_message: error instanceof Error ? error.message : String(error),
-        });
-      }
     }
   }
 

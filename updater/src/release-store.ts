@@ -2,6 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { ActivationReceipt, ReleaseManifest, UpdateRow } from "./types.js";
@@ -39,6 +40,7 @@ async function writeAtomic(filePath: string, body: string, mode = 0o600): Promis
 
 export class ReleaseStore {
   private cleanupCursorForWrite: { sha: string; mtime: number } | null = null;
+  private plannedCleanupCandidates: Array<{ sha: string; mtime: number }> = [];
   constructor(private readonly policy: UpdatePolicy) {}
 
   async preflight(): Promise<{ free_bytes: number; disk_floor_bytes: number; same_filesystem: true }> {
@@ -190,7 +192,13 @@ export class ReleaseStore {
     await this.ensureRoots();
     const pointers = await this.observe();
     const candidates: Array<{ sha: string; mtime: number }> = [];
-    for (const name of await fs.readdir(this.policy.release_root)) {
+    const rootScanDeadline = performance.now() + 3_000;
+    let rootEntries = 0;
+    for await (const entry of await fs.opendir(this.policy.release_root)) {
+      if (++rootEntries > 10_000 || performance.now() > rootScanDeadline) {
+        throw new Error("cleanup_root_scan_budget_exceeded");
+      }
+      const name = entry.name;
       if (!/^[0-9a-f]{40}$/.test(name) || protectedShas.has(name) ||
         name === pointers.current_sha || name === pointers.previous_sha) continue;
       const releasePath = path.join(this.policy.release_root, name);
@@ -213,13 +221,15 @@ export class ReleaseStore {
     // Deep validation is bounded even if the release root has accumulated
     // many candidates. A later maintenance pass can pick up the remainder.
     this.cleanupCursorForWrite = null;
+    this.plannedCleanupCandidates = [];
     for (const candidate of window) {
       const { sha } = candidate;
       this.cleanupCursorForWrite = candidate;
       const releasePath = path.join(this.policy.release_root, sha);
       try {
-        await this.scanTree(releasePath, releasePath, { deadline: Date.now() + 3_000, entries: 0 });
+        await this.scanTree(releasePath, releasePath, { deadline: performance.now() + 3_000, entries: 0 });
         planned.push(sha);
+        this.plannedCleanupCandidates.push(candidate);
       } catch {
         // Invalid candidates remain untouched for operator inspection.
       }
@@ -230,18 +240,16 @@ export class ReleaseStore {
 
   async cleanup(protectedShas: ReadonlySet<string>): Promise<string[]> {
     const planned = await this.cleanupPlan(protectedShas);
-    if (this.cleanupCursorForWrite) await writeAtomic(
-      path.join(this.policy.control_root, "release-cleanup-cursor.json"),
-      `${JSON.stringify(this.cleanupCursorForWrite)}\n`,
-    );
+    const lastScanned = this.cleanupCursorForWrite;
+    const plannedCandidates = [...this.plannedCleanupCandidates];
     const removed: string[] = [];
     const errors: string[] = [];
-    for (const sha of planned) {
+    for (const [index,sha] of planned.entries()) {
       const releasePath = path.join(this.policy.release_root, sha);
       try {
         await this.validateReleasePath(releasePath, sha);
         await this.readManifest(releasePath);
-        await this.scanTree(releasePath, releasePath, { deadline: Date.now() + 3_000, entries: 0 });
+        await this.scanTree(releasePath, releasePath, { deadline: performance.now() + 3_000, entries: 0 });
         const pointers = await this.observe();
         if (protectedShas.has(sha) || pointers.current_sha === sha || pointers.previous_sha === sha) continue;
         await this.makeMutableForRemoval(releasePath);
@@ -251,6 +259,12 @@ export class ReleaseStore {
         // A single corrupt or replaced candidate cannot block other releases.
         errors.push(`${sha}:${error instanceof Error ? error.message : "cleanup_failed"}`);
       }
+      await writeAtomic(path.join(this.policy.control_root, "release-cleanup-cursor.json"),
+        `${JSON.stringify(plannedCandidates[index])}\n`);
+    }
+    if (lastScanned && lastScanned.sha !== plannedCandidates.at(-1)?.sha) {
+      await writeAtomic(path.join(this.policy.control_root, "release-cleanup-cursor.json"),
+        `${JSON.stringify(lastScanned)}\n`);
     }
     if (errors.length) throw new Error(`release_cleanup_candidates_failed: ${errors.join(",")}`);
     return removed;
@@ -372,7 +386,7 @@ export class ReleaseStore {
     hardlinks: Map<string, { expectedLinks: number; paths: string[] }>,
     budget?: { deadline: number; entries: number },
   ): Promise<void> {
-    if (budget && (++budget.entries > 100_000 || Date.now() > budget.deadline)) {
+    if (budget && (++budget.entries > 100_000 || performance.now() > budget.deadline)) {
       throw new Error("cleanup_tree_scan_budget_exceeded");
     }
     const stats = await fs.lstat(current);
@@ -388,7 +402,7 @@ export class ReleaseStore {
     if (stats.isDirectory()) {
       let childCount = 0;
       for await (const child of await fs.opendir(current)) {
-        if (budget && Date.now() > budget.deadline) throw new Error("cleanup_tree_scan_budget_exceeded");
+        if (budget && performance.now() > budget.deadline) throw new Error("cleanup_tree_scan_budget_exceeded");
         childCount++;
         await this.scanTreeEntry(root, path.join(current, child.name), hardlinks, budget);
       }
