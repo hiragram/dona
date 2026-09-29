@@ -1,5 +1,11 @@
 # legacy job の通知移行
 
+## 起動時の歴史的通知 gate
+
+通知 policy 導入前に作成された job は、元 Result から `not_sent` と分類されても、起動時の notification scan で新しい `dona_job` event を生成しない。`not_sent` は Result 内に投稿 action がないことだけを示し、旧 thread への再投稿許可ではない。既存 `completion_event_id` は再利用できるが、この gate は新しい group transition event を推測で生成しない。
+
+`job notification-preview [--cursor <candidate_id>] [--limit <1-100>]` は保存済み候補の件数、元 terminal 期間、reason と最大100件の page を返す dry-run である。`next_cursor` がある間は次の page を取得する。候補 ledger は追記のみで、旧 thread への投稿や承認はこの command では行わない。現在の実装には旧 thread 投稿の承認・access 再検証・外部 receipt 照合を伴う batch write がないため、保留候補は隔離したままとする。既存の `reconcile-legacy-notification` で `not_sent` を確認しても、この gate は解除されない。
+
 schema v2 から v3 への移行では、terminal な旧 Slack job の元 event Result を読み、通知を `notified`、`not_sent`、`acceptance_unknown` に分類する。結果は `job_legacy_notification_migration` に job ごとに保存される。分類と schema 更新は同じ transaction で確定する。既に v3 の DB でも、起動時に marker が欠けた旧 job を同じ規則で分類する。
 
 - `notified`: 元 event の同じ job に対する委任 action と、job ID・投稿本文 hash・固定 workspace、channel、thread に束縛された `dona_slack.post_message` の成功 receipt がある。投稿後に job status に対応する Agent Session の最終 `active` / `suspended` 更新も成功している。message timestamp は job の terminal 時刻以降かつ元 Result の完了時刻以前とする。旧形式に本文 hash、job ID、最終 session status がなければ既送信と断定しない。新しい `dona_job` event は作らない。
