@@ -9,7 +9,7 @@ import { inventoryJobArtifacts, inventorySizeIsComplete, readJobArtifactInventor
 import type { DispatcherConfig } from "../src/config.js";
 import type { JobRow } from "../src/types.js";
 
-test("job artifact inventory measures only contract paths and reports unsafe entries", async () => {
+test("job artifact inventory observes only contract paths and reports unsafe entries", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-artifact-inventory-"));
   try {
     const job_id = "job_01m3p6jrm2g3rsjbadbmpzmend";
@@ -28,14 +28,14 @@ test("job artifact inventory measures only contract paths and reports unsafe ent
     assert.deepEqual(first.protection_reasons, ["notification_unverified", "retention_expiry_unverified"]);
     assert.equal(first.artifacts[0]?.cleanup_state, "unmeasured_directory");
     assert.equal(first.artifacts[1]?.cleanup_state, "missing");
-    assert.equal(first.artifacts[2]?.cleanup_state, "present");
+    assert.equal(first.artifacts[2]?.cleanup_state, "unmeasured_file");
     assert.equal(first.artifacts[0]?.allocated_bytes, null);
-    assert.equal(typeof first.artifacts[2]?.allocated_bytes, "number");
+    assert.equal(first.artifacts[2]?.allocated_bytes, null);
     assert.equal(inventorySizeIsComplete([first]), false);
     const legacyResult = path.join(config.jobResultsDir, `${job_id}.json`);
     await fs.writeFile(legacyResult, "{}");
     const legacy = await inventoryJobArtifacts({ ...row, result_path: legacyResult }, config);
-    assert.equal(legacy.artifacts[2]?.cleanup_state, "present");
+    assert.equal(legacy.artifacts[2]?.cleanup_state, "unmeasured_file");
     await fs.unlink(result_path);
     await fs.symlink(path.join(root, "outside"), result_path);
     const unsafe = await inventoryJobArtifacts(row, config);

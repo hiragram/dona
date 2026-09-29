@@ -1,4 +1,3 @@
-import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -8,7 +7,7 @@ import type { DispatcherConfig } from "./config.js";
 import { jobProgressPath, workspaceFromJob } from "./job-prompt.js";
 import type { JobRow } from "./types.js";
 
-type ScanState = "present" | "missing" | "unsafe" | "budget_exceeded" | "contract_mismatch" | "unmeasured_directory";
+type ScanState = "missing" | "unsafe" | "budget_exceeded" | "contract_mismatch" | "unmeasured_directory" | "unmeasured_file";
 interface ArtifactObservation {
   kind: "worktree" | "progress" | "result";
   cleanup_state: ScanState;
@@ -55,20 +54,10 @@ async function scanArtifact(root: string, trustedRoot: string,
   }
   if (stats.isSymbolicLink() || (!stats.isDirectory() && !stats.isFile()) || stats.uid !== process.getuid?.())
     return { cleanup_state: "unsafe", allocated_bytes: null };
-  // Node's public fs API cannot enumerate children relative to a held directory handle.
-  // Avoid path-based recursion while a worker may rename or replace the directory.
+  // Node's public fs API cannot inspect children relative to a held directory handle.
+  // Do not open a file through ancestors that a running worker may replace.
   if (stats.isDirectory()) return { cleanup_state: "unmeasured_directory", allocated_bytes: null };
-  let handle: fs.FileHandle;
-  try { handle = await fs.open(root, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
-  catch { return { cleanup_state: "unsafe", allocated_bytes: null }; }
-  try {
-    const opened = await handle.stat();
-    if (!opened.isFile() || opened.dev !== stats.dev || opened.ino !== stats.ino ||
-      opened.birthtimeMs !== stats.birthtimeMs || opened.uid !== process.getuid?.() || opened.nlink !== 1)
-      return { cleanup_state: "unsafe", allocated_bytes: null };
-    return { cleanup_state: "present", allocated_bytes: opened.blocks * 512 };
-  } catch { return { cleanup_state: "unsafe", allocated_bytes: null }; }
-  finally { await handle.close(); }
+  return { cleanup_state: "unmeasured_file", allocated_bytes: null };
 }
 
 export async function inventoryJobArtifacts(row: JobRow, config: DispatcherConfig,
@@ -114,6 +103,5 @@ export async function inventoryJobArtifacts(row: JobRow, config: DispatcherConfi
 }
 
 export function inventorySizeIsComplete(jobs: ReadonlyArray<{ artifacts: ReadonlyArray<ArtifactObservation> }>): boolean {
-  return jobs.every((job) => job.artifacts.every((artifact) =>
-    artifact.cleanup_state === "present" && artifact.allocated_bytes !== null));
+  return jobs.every((job) => job.artifacts.every((artifact) => artifact.allocated_bytes !== null));
 }
