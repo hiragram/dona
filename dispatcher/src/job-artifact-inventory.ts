@@ -28,7 +28,7 @@ export function readJobArtifactInventoryPage(databasePath: string, afterCursor: 
   } finally { database.close(); }
 }
 
-async function scanArtifact(root: string, trustedRoot: string,
+async function scanArtifact(root: string, trustedRoot: string, expectedType: "file" | "directory",
   budget: { entries: number; deadline: number }): Promise<Omit<ArtifactObservation, "kind">> {
   const relative = path.relative(trustedRoot, root);
   if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
@@ -54,6 +54,8 @@ async function scanArtifact(root: string, trustedRoot: string,
   }
   if (stats.isSymbolicLink() || (!stats.isDirectory() && !stats.isFile()) || stats.uid !== process.getuid?.())
     return { cleanup_state: "unsafe", allocated_bytes: null };
+  if (expectedType === "directory" ? !stats.isDirectory() : !stats.isFile())
+    return { cleanup_state: "contract_mismatch", allocated_bytes: null };
   // Node's public fs API cannot inspect children relative to a held directory handle.
   // Do not open a file through ancestors that a running worker may replace.
   if (stats.isDirectory()) return { cleanup_state: "unmeasured_directory", allocated_bytes: null };
@@ -85,17 +87,17 @@ export async function inventoryJobArtifacts(row: JobRow, config: DispatcherConfi
   const expectedProgress = path.join(path.dirname(expectedWorkspace), ".dona-progress", row.job_id, "progress.json");
   const candidates = [
     { kind: "worktree", actual: row.workspace_path, expected: expectedWorkspace, root: expectedWorkspace,
-      trustedRoot: config.jobsWorkspaceRoot },
+      trustedRoot: config.jobsWorkspaceRoot, expectedType: "directory" },
     { kind: "progress", actual: jobProgressPath(row), expected: expectedProgress, root: path.dirname(expectedProgress),
-      trustedRoot: config.jobsWorkspaceRoot },
+      trustedRoot: config.jobsWorkspaceRoot, expectedType: "directory" },
     { kind: "result", actual: row.result_path, expected: expectedResult,
-      root: expectedResult,
-      trustedRoot: config.jobResultsDir },
+      root: expectedResult === legacyResult ? legacyResult : path.dirname(expectedResult),
+      trustedRoot: config.jobResultsDir, expectedType: expectedResult === legacyResult ? "file" : "directory" },
   ] as const;
   const artifacts: ArtifactObservation[] = [];
   for (const candidate of candidates) {
     const observation = candidate.actual === candidate.expected
-      ? await scanArtifact(candidate.root, candidate.trustedRoot, budget)
+      ? await scanArtifact(candidate.root, candidate.trustedRoot, candidate.expectedType, budget)
       : { cleanup_state: "contract_mismatch" as const, allocated_bytes: null };
     artifacts.push({ kind: candidate.kind, ...observation });
   }
