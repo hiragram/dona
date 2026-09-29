@@ -105,6 +105,8 @@ function rolloutMatchesTargetCompatibility(
 
 export class UpdateController {
   private nextDiagnosticRetentionAt = 0;
+  private nextReleaseRetentionAt = 0;
+  private lastReleaseRetentionAt = 0;
   constructor(
     private readonly database: UpdateDatabase,
     private readonly policy: UpdatePolicy,
@@ -302,6 +304,28 @@ export class UpdateController {
     }
   }
 
+  async maintainReleaseRetention(): Promise<void> {
+    const now = this.clock.now();
+    if (now.getTime() >= this.lastReleaseRetentionAt && now.getTime() < this.nextReleaseRetentionAt) return;
+    this.lastReleaseRetentionAt = now.getTime();
+    this.nextReleaseRetentionAt = now.getTime() + 60_000;
+    try {
+      const observed = await this.releases.observe();
+      if (!observed.current_sha) throw new Error("retention_current_pointer_missing");
+      const protectedShas = this.database.retentionProtectedReleaseShas(now);
+      const pointerShas = new Set([observed.current_sha,...(observed.previous_sha ? [observed.previous_sha] : [])]);
+      for (const sha of this.database.recentSuccessfulReleaseShas(this.policy.retain_successful,pointerShas)) protectedShas.add(sha);
+      if (observed.current_sha) protectedShas.add(observed.current_sha);
+      if (observed.previous_sha) protectedShas.add(observed.previous_sha);
+      await this.releases.cleanup(protectedShas);
+    } catch (error) {
+      this.logger.warn("Release retention sweep failed", {
+        error_code: "retention_cleanup_failed",
+        error_message: redactText(error instanceof Error ? error.message : String(error), 500),
+      });
+    }
+  }
+
   async doctor(): Promise<Record<string, unknown>> {
     const current = await this.releases.readCurrentManifest();
     const previous = await this.releases.readPreviousManifest();
@@ -309,7 +333,11 @@ export class UpdateController {
       this.git.refresh(current.sha),
       this.runtime.mainAgentStatus(path.join(this.policy.release_root, current.sha)),
     ]);
-    const protectedShas = new Set([current.sha, ...(previous ? [previous.sha] : [])]);
+    const protectedShas = this.database.retentionProtectedReleaseShas(this.clock.now());
+    for (const sha of this.database.recentSuccessfulReleaseShas(this.policy.retain_successful,
+      new Set([current.sha,...(previous ? [previous.sha] : [])]))) protectedShas.add(sha);
+    protectedShas.add(current.sha);
+    if (previous) protectedShas.add(previous.sha);
     return {
       schema_version: 1,
       policy_version: this.policy.policy_version,
@@ -905,15 +933,6 @@ export class UpdateController {
         observed_active_sha: row.target_sha,
       }, this.clock.now());
       this.logger.info("Update succeeded", { request_id: row.request_id, target_sha: row.target_sha, fence: row.fence });
-      try {
-        await this.releases.cleanup(new Set([row.target_sha, row.current_sha]));
-      } catch (error) {
-        this.logger.warn("Release retention cleanup failed after successful activation", {
-          request_id: row.request_id,
-          error_code: "retention_cleanup_failed",
-          error_message: error instanceof Error ? error.message : String(error),
-        });
-      }
     }
   }
 

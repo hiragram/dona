@@ -64,6 +64,14 @@ export class UpdateService {
           error_message: error instanceof Error ? error.message : String(error),
         });
       }
+      try {
+        await this.controller.maintainReleaseRetention();
+      } catch (error) {
+        this.logger.error("Updater release retention iteration failed", {
+          error_code: "release_retention_iteration_failed",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+      }
       if (this.running) await this.wakeSignal.wait(this.pollMs);
     }
   }
