@@ -127,6 +127,21 @@ describe("ReleaseStore", () => {
     assert.equal((await fs.lstat(candidate)).isDirectory(), true);
   });
 
+  test("stops cleanup when an activation receipt and pointer pair disagree", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const target = await installRelease(policy, targetSha);
+    const store = new ReleaseStore(policy);
+    await store.activate(row(), target);
+    await fs.unlink(policy.previous_pointer);
+    await fs.symlink(path.relative(path.dirname(policy.previous_pointer),
+      path.join(policy.release_root, "0".repeat(40))), policy.previous_pointer, "dir");
+    await assert.rejects(store.cleanupPlan(new Set([targetSha])), /retention_pointer_receipt_mismatch/);
+    await assert.rejects(store.cleanup(new Set([targetSha])), /retention_pointer_receipt_mismatch/);
+    assert.equal((await fs.lstat(path.join(policy.release_root, currentSha))).isDirectory(), true);
+  });
+
   test("rejects a staging tree that exceeds the cleanup scan deadline before publish", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
