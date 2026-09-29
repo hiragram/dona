@@ -441,11 +441,12 @@ if [[ -e "$FINAL_RELEASE" ]]; then
   STAGING_DIR=
   print "既存の検証済みimmutable release $INSTALL_SHA をcontrol-plane更新に再利用します。"
 else
+  find "$STAGING_DIR" -type f -exec chmod 400 {} +
+  find "$STAGING_DIR" -mindepth 1 -type d -exec chmod 500 {} +
   /bin/mv "$STAGING_DIR" "$FINAL_RELEASE"
   STAGING_DIR=
+  chmod 500 "$FINAL_RELEASE"
 fi
-find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
-find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
 $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-published-release \
   "$FINAL_RELEASE" "$INSTALL_SHA" "$STAGED_DIGEST"
 
