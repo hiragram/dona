@@ -1,5 +1,8 @@
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { ActivationReceipt, ReleaseManifest, UpdateRow } from "./types.js";
@@ -19,21 +22,39 @@ function inside(root: string, candidate: string): boolean {
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
+interface CleanupTombstone { sha: string; dev: string; ino: string; birthtime_ns: string; }
+class CleanupTombstonePendingError extends Error {
+  constructor() { super("release_cleanup_tombstone_pending"); }
+}
+
 async function writeAtomic(filePath: string, body: string, mode = 0o600): Promise<void> {
-  const temporary = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.tmp`);
+  const temporary = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
   const handle = await fs.open(temporary, "wx", mode);
   try {
     await handle.writeFile(body, "utf8");
     await handle.sync();
-  } finally {
     await handle.close();
+    await fs.rename(temporary, filePath);
+    await fsyncDirectory(path.dirname(filePath));
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await fs.unlink(temporary).catch(() => {});
+    throw error;
   }
-  await fs.rename(temporary, filePath);
-  await fsyncDirectory(path.dirname(filePath));
 }
 
 export class ReleaseStore {
+  private mutationTail: Promise<void> = Promise.resolve();
   constructor(private readonly policy: UpdatePolicy) {}
+
+  private async serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const prior = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => { release = resolve; });
+    await prior;
+    try { return await operation(); }
+    finally { release(); }
+  }
 
   async preflight(): Promise<{ free_bytes: number; disk_floor_bytes: number; same_filesystem: true }> {
     const [releaseStats, pointerParentStats, filesystem] = await Promise.all([
@@ -86,17 +107,21 @@ export class ReleaseStore {
   }
 
   async publish(stagingPath: string, manifest: ReleaseManifest): Promise<string> {
+    return this.serializeMutation(() => this.publishLocked(stagingPath, manifest));
+  }
+
+  private async publishLocked(stagingPath: string, manifest: ReleaseManifest): Promise<string> {
     fullSha(manifest.sha, "manifest.sha");
     const stagingRoot = path.join(this.policy.release_root, ".staging");
     await this.assertGeneratedPath(stagingRoot, stagingPath);
-    await this.scanTree(stagingPath, stagingPath);
+    await this.scanTree(stagingPath, stagingPath, { deadline: performance.now() + 3_000, entries: 0 });
     const releasePath = path.join(this.policy.release_root, manifest.sha);
     await this.assertGeneratedPath(this.policy.release_root, releasePath);
     const stageDevice = (await fs.stat(stagingPath)).dev;
     const releaseDevice = (await fs.stat(this.policy.release_root)).dev;
     if (stageDevice !== releaseDevice) throw new Error("cross_filesystem_release_publish");
     await writeAtomic(path.join(stagingPath, "release-manifest.json"), `${canonicalJson(manifest)}\n`);
-    await this.scanTree(stagingPath, stagingPath);
+    await this.scanTree(stagingPath, stagingPath, { deadline: performance.now() + 3_000, entries: 0 });
     try {
       await fs.rename(stagingPath, releasePath);
     } catch (error) {
@@ -113,6 +138,10 @@ export class ReleaseStore {
   }
 
   async activate(request: UpdateRow, releasePath: string): Promise<ActivationReceipt> {
+    return this.serializeMutation(() => this.activateLocked(request, releasePath));
+  }
+
+  private async activateLocked(request: UpdateRow, releasePath: string): Promise<ActivationReceipt> {
     const target = await this.validateReleasePath(releasePath, request.target_sha);
     const current = await this.resolvePointer(this.policy.current_pointer, true);
     if (!current || path.basename(current) !== request.current_sha) throw new Error("current_pointer_cas_mismatch");
@@ -132,6 +161,10 @@ export class ReleaseStore {
   }
 
   async rollback(request: UpdateRow): Promise<ActivationReceipt> {
+    return this.serializeMutation(() => this.rollbackLocked(request));
+  }
+
+  private async rollbackLocked(request: UpdateRow): Promise<ActivationReceipt> {
     const current = await this.resolvePointer(this.policy.current_pointer, true);
     const previous = await this.resolvePointer(this.policy.previous_pointer, true);
     const activationReceipt = await this.readReceipt();
@@ -181,34 +214,203 @@ export class ReleaseStore {
   }
 
   async cleanupPlan(protectedShas: ReadonlySet<string>): Promise<string[]> {
+    return (await this.planCleanup(protectedShas)).planned.map((candidate) => candidate.sha);
+  }
+
+  private async planCleanup(protectedShas: ReadonlySet<string>): Promise<{
+    planned: Array<{ sha: string; mtime: number }>;
+    lastScanned: { sha: string; mtime: number } | null;
+  }> {
     await this.ensureRoots();
+    const pointers = await this.observe();
+    if (!pointers.current_sha) throw new Error("retention_current_pointer_missing");
+    if (pointers.receipt && !pointers.previous_sha) throw new Error("retention_previous_pointer_missing");
+    if (pointers.receipt && (pointers.receipt.to_sha !== pointers.current_sha ||
+      pointers.receipt.from_sha !== pointers.previous_sha)) throw new Error("retention_pointer_receipt_mismatch");
+    await this.assertCleanupPointerManifests(pointers);
     const candidates: Array<{ sha: string; mtime: number }> = [];
-    for (const name of await fs.readdir(this.policy.release_root)) {
-      if (!/^[0-9a-f]{40}$/.test(name) || protectedShas.has(name)) continue;
+    const rootScanDeadline = performance.now() + 3_000;
+    let rootEntries = 0;
+    for await (const entry of await fs.opendir(this.policy.release_root)) {
+      if (++rootEntries > 10_000 || performance.now() > rootScanDeadline) {
+        throw new Error("cleanup_root_scan_budget_exceeded");
+      }
+      const name = entry.name;
+      if (!/^[0-9a-f]{40}$/.test(name) || protectedShas.has(name) ||
+        name === pointers.current_sha || name === pointers.previous_sha) continue;
       const releasePath = path.join(this.policy.release_root, name);
-      await this.validateReleasePath(releasePath, name);
-      candidates.push({ sha: name, mtime: (await fs.stat(releasePath)).mtimeMs });
+      try {
+        await this.validateReleasePath(releasePath, name);
+        await this.readManifest(releasePath);
+        candidates.push({ sha: name, mtime: (await fs.stat(releasePath)).mtimeMs });
+      } catch {
+        // An invalid release is quarantined by omission. It must not prevent
+        // safe candidates from being reported, or count toward retention.
+      }
     }
-    candidates.sort((left, right) => right.mtime - left.mtime);
-    return candidates.slice(this.policy.retain_successful).map(({ sha }) => sha);
+    candidates.sort((left, right) => right.mtime - left.mtime || left.sha.localeCompare(right.sha));
+    const eligible = candidates;
+    const cursor = await this.readCleanupCursor();
+    const start = cursor ? eligible.findIndex((candidate) => candidate.mtime < cursor.mtime ||
+      (candidate.mtime === cursor.mtime && candidate.sha > cursor.sha)) : 0;
+    const window = eligible.slice(start < 0 ? 0 : start, (start < 0 ? 0 : start) + 16);
+    const planned: Array<{ sha: string; mtime: number }> = [];
+    // Deep validation is bounded even if the release root has accumulated
+    // many candidates. A later maintenance pass can pick up the remainder.
+    let lastScanned: { sha: string; mtime: number } | null = null;
+    for (const candidate of window) {
+      const { sha } = candidate;
+      lastScanned = candidate;
+      const releasePath = path.join(this.policy.release_root, sha);
+      try {
+        await this.scanTree(releasePath, releasePath, { deadline: performance.now() + 3_000, entries: 0 });
+        planned.push(candidate);
+      } catch {
+        // Invalid candidates remain untouched for operator inspection.
+      }
+      if (planned.length === 8) break;
+    }
+    return { planned, lastScanned };
   }
 
   async cleanup(protectedShas: ReadonlySet<string>): Promise<string[]> {
-    const planned = await this.cleanupPlan(protectedShas);
-    for (const sha of planned) {
+    return this.serializeMutation(() => this.cleanupLocked(protectedShas));
+  }
+
+  private async cleanupLocked(protectedShas: ReadonlySet<string>): Promise<string[]> {
+    await this.ensureRoots();
+    const recovered = await this.recoverCleanupTombstone();
+    const protectedForSweep = new Set(protectedShas);
+    if (recovered) protectedForSweep.add(recovered);
+    const { planned, lastScanned } = await this.planCleanup(protectedForSweep);
+    const removed: string[] = recovered ? [recovered] : [];
+    const errors: string[] = [];
+    for (const candidate of planned) {
+      const { sha } = candidate;
       const releasePath = path.join(this.policy.release_root, sha);
-      await this.validateReleasePath(releasePath, sha);
-      await this.makeMutableForRemoval(releasePath);
-      await this.removeGeneratedTree(this.policy.release_root, releasePath);
+      try {
+        await this.validateReleasePath(releasePath, sha);
+        await this.readManifest(releasePath);
+        await this.scanTree(releasePath, releasePath, { deadline: performance.now() + 3_000, entries: 0 });
+        const pointers = await this.observe();
+        if (!pointers.current_sha) throw new Error("retention_current_pointer_missing");
+        if (pointers.receipt && !pointers.previous_sha) throw new Error("retention_previous_pointer_missing");
+        if (pointers.receipt && (pointers.receipt.to_sha !== pointers.current_sha ||
+          pointers.receipt.from_sha !== pointers.previous_sha)) throw new Error("retention_pointer_receipt_mismatch");
+        await this.assertCleanupPointerManifests(pointers);
+        if (protectedForSweep.has(sha) || pointers.current_sha === sha || pointers.previous_sha === sha) continue;
+        await this.removeReleaseWithTombstone(releasePath, sha);
+        removed.push(sha);
+      } catch (error) {
+        if (error instanceof CleanupTombstonePendingError) throw error;
+        if (error instanceof Error && ["retention_current_pointer_missing", "retention_previous_pointer_missing",
+          "retention_pointer_receipt_mismatch", "retention_pointer_manifest_invalid"].includes(error.message)) throw error;
+        // A single corrupt or replaced candidate cannot block other releases.
+        errors.push(`${sha}:${error instanceof Error ? error.message : "cleanup_failed"}`);
+      }
+      await writeAtomic(path.join(this.policy.control_root, "release-cleanup-cursor.json"),
+        `${JSON.stringify(candidate)}\n`);
     }
-    return planned;
+    if (lastScanned && lastScanned.sha !== planned.at(-1)?.sha) {
+      await writeAtomic(path.join(this.policy.control_root, "release-cleanup-cursor.json"),
+        `${JSON.stringify(lastScanned)}\n`);
+    }
+    if (errors.length) throw new Error(`release_cleanup_candidates_failed: ${errors.join(",")}`);
+    return removed;
+  }
+
+  private cleanupTombstonePath(sha: string): string {
+    fullSha(sha);
+    return path.join(this.policy.release_root, `.cleanup-${sha}`);
+  }
+
+  private cleanupTombstoneReceiptPath(): string {
+    return path.join(this.policy.control_root, "release-cleanup-tombstone.json");
+  }
+
+  private async readCleanupTombstone(): Promise<CleanupTombstone | null> {
+    let handle: fs.FileHandle;
+    try { handle = await fs.open(this.cleanupTombstoneReceiptPath(), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o077) !== 0 || stats.size > 512) throw new Error("release_cleanup_tombstone_receipt_invalid");
+      const value: unknown = JSON.parse(await handle.readFile("utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value) ||
+        Object.keys(value).sort().join(",") !== "birthtime_ns,dev,ino,sha") throw new Error("release_cleanup_tombstone_receipt_invalid");
+      const record = value as Record<string, unknown>;
+      if (typeof record.sha !== "string" || !/^[0-9a-f]{40}$/.test(record.sha) ||
+        ![record.dev,record.ino,record.birthtime_ns].every((part) => typeof part === "string" && /^\d{1,30}$/.test(part)) ||
+        record.birthtime_ns === "0") throw new Error("release_cleanup_tombstone_receipt_invalid");
+      return record as unknown as CleanupTombstone;
+    } finally { await handle.close(); }
+  }
+
+  private async clearCleanupTombstone(): Promise<void> {
+    await fs.unlink(this.cleanupTombstoneReceiptPath());
+    await fsyncDirectory(this.policy.control_root);
+  }
+
+  private async recoverCleanupTombstone(): Promise<string | null> {
+    const receipt = await this.readCleanupTombstone();
+    if (!receipt) return null;
+    const tombstone = this.cleanupTombstonePath(receipt.sha);
+    let stats: Awaited<ReturnType<typeof fs.lstat>>;
+    try { stats = await fs.lstat(tombstone, { bigint: true }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // The crash preceded rename, or followed complete deletion. Replan any
+      // still-present original release under current protection rules.
+      await this.clearCleanupTombstone();
+      return null;
+    }
+    if (!stats.isDirectory() || stats.isSymbolicLink() || stats.dev.toString() !== receipt.dev ||
+      stats.ino.toString() !== receipt.ino || stats.birthtimeNs.toString() !== receipt.birthtime_ns ||
+      stats.uid !== BigInt(process.getuid?.() ?? -1) || (stats.mode & 0o022n) !== 0n) {
+      throw new Error("release_cleanup_tombstone_identity_mismatch");
+    }
+    const pointers = await this.observe();
+    if (!pointers.current_sha || (pointers.receipt &&
+      (pointers.receipt.to_sha !== pointers.current_sha || pointers.receipt.from_sha !== pointers.previous_sha))) {
+      throw new Error("release_cleanup_tombstone_pointer_unsafe");
+    }
+    await this.assertCleanupPointerManifests(pointers);
+    if (!await this.removeTombstoneChunk(tombstone)) throw new CleanupTombstonePendingError();
+    await this.clearCleanupTombstone();
+    return receipt.sha;
+  }
+
+  private async removeReleaseWithTombstone(releasePath: string, sha: string): Promise<void> {
+    const stats = await fs.lstat(releasePath, { bigint: true });
+    if (stats.birthtimeNs <= 0n) throw new Error("release_cleanup_birthtime_unavailable");
+    const receipt: CleanupTombstone = { sha, dev: stats.dev.toString(), ino: stats.ino.toString(),
+      birthtime_ns: stats.birthtimeNs.toString() };
+    const tombstone = this.cleanupTombstonePath(sha);
+    try { await fs.lstat(tombstone); throw new Error("release_cleanup_tombstone_exists"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    await writeAtomic(this.cleanupTombstoneReceiptPath(), `${JSON.stringify(receipt)}\n`);
+    try {
+      await fs.rename(releasePath, tombstone);
+      const moved = await fs.lstat(tombstone, { bigint: true });
+      if (!moved.isDirectory() || moved.dev.toString() !== receipt.dev || moved.ino.toString() !== receipt.ino ||
+        moved.birthtimeNs.toString() !== receipt.birthtime_ns) {
+        throw new Error("release_cleanup_tombstone_identity_mismatch");
+      }
+      await fsyncDirectory(this.policy.release_root);
+      if (!await this.removeTombstoneChunk(tombstone)) throw new CleanupTombstonePendingError();
+      await this.clearCleanupTombstone();
+    } catch { throw new CleanupTombstonePendingError(); }
   }
 
   private async ensureRoots(): Promise<void> {
     await fs.mkdir(this.policy.control_root, { recursive: true, mode: 0o700 });
     await fs.mkdir(this.policy.release_root, { recursive: true, mode: 0o700 });
-    await fs.chmod(this.policy.control_root, 0o700);
-    await fs.chmod(this.policy.release_root, 0o700);
+    for (const root of [this.policy.control_root, this.policy.release_root]) {
+      const stats = await fs.lstat(root);
+      if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o022) !== 0) throw new Error("release_root_owner_or_permissions_invalid");
+    }
     if ((await fs.stat(this.policy.control_root)).dev === (await fs.stat(this.policy.release_root)).dev) {
       // Separate directories are intentional; sharing a filesystem is safe and simplifies durable rename.
     }
@@ -220,13 +422,36 @@ export class ReleaseStore {
   }
 
   private async readReceipt(): Promise<ActivationReceipt | null> {
+    let handle: fs.FileHandle;
     try {
-      const body = await fs.readFile(path.join(this.policy.control_root, "activation-receipt.json"), "utf8");
-      return parseActivationReceipt(JSON.parse(body));
+      handle = await fs.open(path.join(this.policy.control_root, "activation-receipt.json"),
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o077) !== 0 || stats.size > 4_096) throw new Error("activation_receipt_type_or_size_invalid");
+      const buffer = Buffer.alloc(4_097);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      if (bytesRead > 4_096) throw new Error("activation_receipt_type_or_size_invalid");
+      return parseActivationReceipt(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
+    } finally { await handle.close(); }
+  }
+
+  private async assertCleanupPointerManifests(pointers: {
+    current_sha: string | null; previous_sha: string | null;
+  }): Promise<void> {
+    try {
+      const current = await this.readCurrentManifest();
+      if (current.sha !== pointers.current_sha) throw new Error("pointer_changed");
+      if (pointers.previous_sha) {
+        const previous = await this.readPreviousManifest();
+        if (previous?.sha !== pointers.previous_sha) throw new Error("pointer_changed");
+      }
+    } catch { throw new Error("retention_pointer_manifest_invalid"); }
   }
 
   private async resolvePointer(pointer: string, required: boolean): Promise<string | null> {
@@ -243,11 +468,65 @@ export class ReleaseStore {
 
   private async readManifest(releasePath: string): Promise<ReleaseManifest> {
     const manifestPath = path.join(releasePath, "release-manifest.json");
-    const stats = await fs.lstat(manifestPath);
-    if (!stats.isFile() || stats.isSymbolicLink()) throw new Error("release manifest is not a regular file");
-    const manifest = parseReleaseManifest(JSON.parse(await fs.readFile(manifestPath, "utf8")));
+    const handle = await fs.open(manifestPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    let manifest: ReleaseManifest;
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o022) !== 0 || stats.size > 65_536) throw new Error("release_manifest_size_or_type_invalid");
+      manifest = parseReleaseManifest(JSON.parse(await handle.readFile("utf8")));
+    } finally {
+      await handle.close();
+    }
     if (path.basename(releasePath) !== manifest.sha) throw new Error("release manifest SHA does not match its directory");
     return manifest;
+  }
+
+  private async readCleanupCursor(): Promise<{ sha: string; mtime: number } | null> {
+    const file = path.join(this.policy.control_root, "release-cleanup-cursor.json");
+    let handle: fs.FileHandle;
+    try { handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      if ((error as NodeJS.ErrnoException).code !== "ELOOP") throw error;
+      const entry = await fs.lstat(file);
+      if (!entry.isSymbolicLink()) throw error;
+      await this.quarantineCleanupCursor(file, entry);
+      return null;
+    }
+    try {
+      const stats = await handle.stat();
+      let value: unknown;
+      try {
+        if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+          (stats.mode & 0o022) !== 0) throw new Error("release_cleanup_cursor_type_invalid");
+        if (stats.size > 256) throw new Error("release_cleanup_cursor_invalid");
+        value = JSON.parse(await handle.readFile("utf8"));
+        if (!value || typeof value !== "object" || Array.isArray(value) ||
+          Object.keys(value).sort().join(",") !== "mtime,sha") throw new Error("release_cleanup_cursor_invalid");
+        const cursor = value as { sha: unknown; mtime: unknown };
+        if (typeof cursor.sha !== "string" || !/^[0-9a-f]{40}$/.test(cursor.sha) ||
+          typeof cursor.mtime !== "number" || !Number.isFinite(cursor.mtime)) throw new Error("release_cleanup_cursor_invalid");
+        return cursor as { sha: string; mtime: number };
+      } catch (error) {
+        if (error instanceof Error && !["release_cleanup_cursor_invalid", "release_cleanup_cursor_type_invalid"].includes(error.message) &&
+          !(error instanceof SyntaxError)) throw error;
+        // The cursor is only a scan hint. Keep the damaged bytes for diagnosis
+        // and restart at the beginning, where every candidate is revalidated.
+        await this.quarantineCleanupCursor(file, stats);
+        return null;
+      }
+    } finally { await handle.close(); }
+  }
+
+  private async quarantineCleanupCursor(file: string, observed: { dev: number; ino: number }): Promise<void> {
+    const current = await fs.lstat(file);
+    if (current.dev !== observed.dev || current.ino !== observed.ino) throw new Error("release_cleanup_cursor_changed");
+    const quarantined = `${file}.invalid.${randomUUID()}`;
+    await fs.rename(file, quarantined);
+    const moved = await fs.lstat(quarantined);
+    if (moved.dev !== observed.dev || moved.ino !== observed.ino) throw new Error("release_cleanup_cursor_changed");
+    await fsyncDirectory(this.policy.control_root);
   }
 
   private async validateReleasePath(releasePath: string, expectedSha?: string): Promise<string> {
@@ -271,14 +550,16 @@ export class ReleaseStore {
     }
   }
 
-  private async scanTree(root: string, current: string): Promise<void> {
+  private async scanTree(root: string, current: string, budget?: { deadline: number; entries: number }): Promise<void> {
     const hardlinks = new Map<string, { expectedLinks: number; paths: string[] }>();
-    await this.scanTreeEntry(root, current, hardlinks);
+    await this.scanTreeEntry(root, current, hardlinks, budget);
     for (const [inode, observation] of hardlinks) {
+      if (budget && performance.now() > budget.deadline) throw new Error("cleanup_tree_scan_budget_exceeded");
       if (observation.paths.length !== observation.expectedLinks) {
         throw new Error("staging_owner_permissions_or_hardlink_invalid");
       }
       for (const candidate of observation.paths) {
+        if (budget && performance.now() > budget.deadline) throw new Error("cleanup_tree_scan_budget_exceeded");
         const stats = await fs.lstat(candidate);
         if (!stats.isFile() || `${stats.dev}:${stats.ino}` !== inode || stats.nlink !== observation.paths.length ||
           stats.uid !== process.getuid?.() || (stats.mode & 0o022) !== 0) {
@@ -292,7 +573,11 @@ export class ReleaseStore {
     root: string,
     current: string,
     hardlinks: Map<string, { expectedLinks: number; paths: string[] }>,
+    budget?: { deadline: number; entries: number },
   ): Promise<void> {
+    if (budget && (++budget.entries > 100_000 || performance.now() > budget.deadline)) {
+      throw new Error("cleanup_tree_scan_budget_exceeded");
+    }
     const stats = await fs.lstat(current);
     if (stats.isSymbolicLink()) {
       const resolved = await fs.realpath(current);
@@ -304,9 +589,13 @@ export class ReleaseStore {
       throw new Error("staging_owner_permissions_or_hardlink_invalid");
     }
     if (stats.isDirectory()) {
-      const children = await fs.readdir(current);
-      if (stats.nlink > 2 + children.length) throw new Error("staging_owner_permissions_or_hardlink_invalid");
-      for (const child of children) await this.scanTreeEntry(root, path.join(current, child), hardlinks);
+      let childCount = 0;
+      for await (const child of await fs.opendir(current)) {
+        if (budget && performance.now() > budget.deadline) throw new Error("cleanup_tree_scan_budget_exceeded");
+        childCount++;
+        await this.scanTreeEntry(root, path.join(current, child.name), hardlinks, budget);
+      }
+      if (stats.nlink > 2 + childCount) throw new Error("staging_owner_permissions_or_hardlink_invalid");
       return;
     }
     if (!stats.isFile() || stats.nlink < 1) throw new Error("staging_owner_permissions_or_hardlink_invalid");
@@ -361,14 +650,27 @@ export class ReleaseStore {
   }
 
 
-  private async makeMutableForRemoval(current: string): Promise<void> {
-    const stats = await fs.lstat(current);
-    if (stats.isSymbolicLink()) throw new Error("cleanup_symlink_rejected");
-    if (stats.isDirectory()) {
-      await fs.chmod(current, 0o700);
-      for (const child of await fs.readdir(current)) await this.makeMutableForRemoval(path.join(current, child));
-    } else {
-      await fs.chmod(current, 0o600);
-    }
+  private async removeTombstoneChunk(tombstone: string): Promise<boolean> {
+    await this.assertGeneratedPath(this.policy.release_root, tombstone);
+    const budget = { remaining: 4_096, deadline: performance.now() + 250 };
+    const remove = async (current: string): Promise<boolean> => {
+      if (--budget.remaining < 0 || performance.now() > budget.deadline) return false;
+      const stats = await fs.lstat(current);
+      if (stats.isDirectory() && !stats.isSymbolicLink()) {
+        await fs.chmod(current, 0o700);
+        for await (const child of await fs.opendir(current)) {
+          if (!await remove(path.join(current, child.name))) return false;
+        }
+        await fs.rmdir(current);
+      } else {
+        if (!stats.isFile() && !stats.isSymbolicLink()) throw new Error("cleanup_target_invalid");
+        await fs.unlink(current);
+      }
+      return true;
+    };
+    const complete = await remove(tombstone);
+    await fsyncDirectory(this.policy.release_root);
+    return complete;
   }
+
 }

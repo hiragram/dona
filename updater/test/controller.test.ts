@@ -20,7 +20,7 @@ import type {
   SchemaRollout,
   UpdateRow,
 } from "../src/types.js";
-import { currentSha, fixtureInventory, installPointers, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
+import { currentSha, fixtureInventory, installPointers, installRelease, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
@@ -2112,7 +2112,7 @@ describe("UpdateController isolated end-to-end", () => {
     const capture = diagnostics.start({ request_id: requestId, attempt: claimed.attempt, step: "updater:npm-test" },
       new Date("2026-09-02T00:00:00.000Z"));
     capture.write("stderr", Buffer.from("failure"));
-    capture.finish(true);
+    const finalized = capture.finish(true)!;
     f.database.terminal(requestId, claimed.fence, "failed", "pre_activation_failed", {
       last_error_code: "pre_activation_failed",
       last_error_message: "test failed",
@@ -2120,9 +2120,42 @@ describe("UpdateController isolated end-to-end", () => {
 
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "complete");
-    f.advance(60 * 86_400_000);
+    f.advance(Math.max(60 * 86_400_000,
+      Date.parse(finalized.finalized_at!) - Date.parse("2026-09-02T00:00:00.000Z") +
+        (f.policy.diagnostic_retention_days + 1) * 86_400_000));
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "purged");
+    f.database.close();
+  });
+
+  test("periodic release maintenance advances beyond invalid candidates after clock reversal", async () => {
+    const f = await fixture();
+    for (let index = 1; index <= 17; index++) {
+      const sha = index.toString(16).padStart(40, "0");
+      const candidate = await installRelease(f.policy, sha);
+      await fs.symlink("/tmp", path.join(candidate, "outside"));
+      const date = new Date(Date.UTC(2020, 0, index));
+      await fs.utimes(candidate, date, date);
+    }
+    const safe = await installRelease(f.policy, "d".repeat(40));
+    await fs.utimes(safe, new Date("2019-01-01"), new Date("2019-01-01"));
+    await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    await f.controller.maintainReleaseRetention();
+    assert.equal((await fs.lstat(safe)).isDirectory(), true);
+    f.advance(-60_000);
+    await f.controller.maintainReleaseRetention();
+    await assert.rejects(fs.lstat(safe), { code: "ENOENT" });
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.equal((await f.store.observe()).previous_sha, olderSha);
+    f.database.close();
+  });
+
+  test("release maintenance stops when current pointer is missing", async () => {
+    const f = await fixture();
+    const candidate = await installRelease(f.policy, "d".repeat(40));
+    await fs.unlink(f.policy.current_pointer);
+    await f.controller.maintainReleaseRetention();
+    assert.equal((await fs.lstat(candidate)).isDirectory(), true);
     f.database.close();
   });
 
@@ -2659,6 +2692,9 @@ describe("UpdateController isolated end-to-end", () => {
     git.refresh=async current=>({current_sha:current,target_sha:targetSha,target_reachable:true,ci_trusted:true,target_rollout:git.targetRollout,target_compatibility:{...policy.compatibility,rollback_safe:false}});
     const controller=new UpdateController(database,policy,git,new FakeBuild(),store,runtime,dispatcher,logger);
     await assert.rejects(controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/target_compatibility_does_not_match_the_approved_policy_version/);
+    policy.compatibility={...policy.compatibility,rollback_safe:false};
+    await assert.rejects(controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/target_is_not_rollback_compatible_with_current_release/);
+    assert.equal(database.list().length,0);
     database.close();
   });
 
