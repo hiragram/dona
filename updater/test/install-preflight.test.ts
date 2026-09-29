@@ -22,6 +22,7 @@ const developerInstaller = fileURLToPath(new URL("../../scripts/install-launchd.
 const controlLedger = fileURLToPath(new URL("../../scripts/control-attempt-ledger.mjs", import.meta.url));
 const controlBackup = fileURLToPath(new URL("../../scripts/backup-control-db.py", import.meta.url));
 const controlReceipt = fileURLToPath(new URL("../../scripts/write-control-receipt.mjs", import.meta.url));
+const controlRehearsal = fileURLToPath(new URL("../../scripts/rehearse-control-restore.mjs", import.meta.url));
 type WaitForLaunchdServiceAbsent = (
   domain: string,
   label: string,
@@ -39,11 +40,20 @@ type WaitForLaunchdUpdaterSha = (
   options?: { observe?: (target: string, timeoutMs: number) => Promise<string | null>;
     sleep?: (milliseconds: number) => Promise<void>; now?: () => number },
 ) => Promise<void>;
+type WaitForUpdaterIdentity = (
+  socketPath: string, sha: string, domain: string, timeoutMs: number,
+  options?: { healthRead?: () => Promise<unknown>; registrationRead?: () => Promise<string>;
+    processStartRead?: (pid: number) => Promise<string>; lockRead?: () => Promise<unknown> },
+) => Promise<void>;
+type LaunchctlOnce = (operation: string, domain: string, target: string, timeoutMs: number,
+  options?: { run?: (args: string[]) => Promise<unknown> }) => Promise<void>;
 const preflightModule = await import(pathToFileURL(preflight).href) as {
   waitForLaunchdServiceAbsent: WaitForLaunchdServiceAbsent;
   waitForLaunchdUpdaterSha: WaitForLaunchdUpdaterSha;
+  waitForUpdaterIdentity: WaitForUpdaterIdentity;
+  launchctlOnce: LaunchctlOnce;
 };
-const { waitForLaunchdServiceAbsent, waitForLaunchdUpdaterSha } = preflightModule;
+const { waitForLaunchdServiceAbsent, waitForLaunchdUpdaterSha, waitForUpdaterIdentity, launchctlOnce } = preflightModule;
 
 test("developer installer atomically creates and shares the access receipt key",async()=>{
   const source=await fs.readFile(developerInstaller,"utf8");
@@ -215,6 +225,33 @@ test("Updaterのbootstrap応答喪失はexact SHAを安定観測し、別SHAとt
   }), /timed out/);
 });
 
+test("Updater healthのPIDとstart identityをsocket lock・launchd・process観測へ束縛する", async () => {
+  const sha = "a".repeat(40);
+  const processStart = "Tue Sep 29 03:00:00 2026";
+  const health = { status: "ready", service: "updater", build_sha: sha, pid: 123, process_start: processStart };
+  const options = { healthRead: async () => health,
+    registrationRead: async () => `DONA_UPDATER_BUILD_SHA => ${sha}\npid = 123\n`,
+    processStartRead: async () => processStart,
+    lockRead: async () => ({ pid: 123, process_start: processStart }) };
+  await waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500, options);
+  await assert.rejects(waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500,
+    { ...options, registrationRead: async () => `DONA_UPDATER_BUILD_SHA => ${sha}\npid = 124\n` }), /disagree/);
+  await assert.rejects(waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500,
+    { ...options, processStartRead: async () => "older process" }), /disagree/);
+  await assert.rejects(waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500,
+    { ...options, healthRead: async () => ({ ...health, pid: null }) }), /invalid/);
+});
+
+test("launchctl timeoutを単一writeで止め、targetを固定する", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(launchctlOnce("bootout", "gui/501", "dev.dona.updater", 100,
+    { run: async args => { calls.push(args); throw new Error("timed out"); } }), /timed out/);
+  assert.deepEqual(calls, [["bootout", "gui/501/dev.dona.updater"]]);
+  await assert.rejects(launchctlOnce("bootout", "gui/501", "dev.dona.unknown", 100,
+    { run: async args => { calls.push(args); } }), /target is invalid/);
+  assert.equal(calls.length, 1);
+});
+
 test("macOS preserves hardened descendants when renaming a reopened staged updater", {
   skip: process.platform !== "darwin",
 }, async () => {
@@ -257,12 +294,12 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /updater\.previous\.sqlite3/);
   assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
   assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);
-  assert.match(source, /launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher"/);
+  assert.match(source, /launchctl_once bootout "\$DOMAIN" dev\.dona\.dispatcher 30000/);
   assert.match(source,/DISPATCHER_RESTORE_REQUIRED=1[\s\S]*wait_dispatcher_unregistered[\s\S]*\/bin\/mv "\$BACKUP_ROOT\/dev\.dona\.dispatcher\.next\.plist"/);
   assert.match(source,/if \[\[ "\$DISPATCHER_RESTORE_REQUIRED" == "1"[\s\S]*wait_dispatcher_unregistered[\s\S]*bootstrap_dispatcher_reconciled "旧Updaterの復旧後の旧Dispatcher再登録"/);
-  assert.match(source,/launchctl bootout "\$DOMAIN\/dev\.dona\.dispatcher" \|\| dispatcher_bootout_exit=\$\?[\s\S]*wait_dispatcher_unregistered/);
+  assert.match(source,/launchctl_once bootout "\$DOMAIN" dev\.dona\.dispatcher 30000 \|\| dispatcher_bootout_exit=\$\?[\s\S]*wait_dispatcher_unregistered/);
   const restoreBranch = source.slice(source.indexOf('if [[ "$DISPATCHER_RESTORE_REQUIRED" == "1"'));
-  const restoreBootout = restoreBranch.indexOf('launchctl bootout "$DOMAIN/dev.dona.dispatcher" || dispatcher_bootout_exit=$?');
+  const restoreBootout = restoreBranch.indexOf('launchctl_once bootout "$DOMAIN" dev.dona.dispatcher 30000 || dispatcher_bootout_exit=$?');
   const restoreWait = restoreBranch.indexOf("wait_dispatcher_unregistered", restoreBootout);
   assert.ok(restoreBootout >= 0 && restoreBootout < restoreWait);
   assert.doesNotMatch(restoreBranch.slice(0, restoreBootout), /launchctl print "\$DOMAIN\/dev\.dona\.dispatcher"/);
@@ -287,7 +324,7 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.doesNotMatch(source, /launchctl bootstrap[^\n]*\|\| true/);
   const restoreRequired = source.indexOf("DISPATCHER_RESTORE_REQUIRED=1");
   const quiesce = source.indexOf('quiesce-dispatcher "$DISPATCHER_SOCKET"');
-  const bootout = source.indexOf('launchctl bootout "$DOMAIN/dev.dona.dispatcher"', quiesce);
+  const bootout = source.indexOf('launchctl_once bootout "$DOMAIN" dev.dona.dispatcher 30000', quiesce);
   const waitUnregistered = source.indexOf("wait_dispatcher_unregistered", bootout);
   const plistSwap = source.indexOf('/bin/mv "$BACKUP_ROOT/dev.dona.dispatcher.next.plist"', waitUnregistered);
   assert.ok(restoreRequired >= 0 && restoreRequired < quiesce);
@@ -320,8 +357,37 @@ test("control receipt backup accepts only an owner-private regular file", async 
   }
 });
 
+test("control target preflight rejects symlink and hardlink substitution before a service write", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-target-"));
+  const control = path.join(root, "control");
+  const releases = path.join(root, "releases");
+  const agents = path.join(root, "LaunchAgents");
+  const backup = path.join(control, "control-backups", `${"a".repeat(40)}.ABC123`);
+  const policy = path.join(control, "policy.json");
+  const db = path.join(control, "updater.sqlite3");
+  try {
+    await Promise.all([fs.mkdir(path.join(control, "updater"), { recursive: true, mode: 0o700 }),
+      fs.mkdir(releases, { mode: 0o700 }), fs.mkdir(agents, { mode: 0o700 }),
+      fs.mkdir(backup, { recursive: true, mode: 0o700 })]);
+    for (const dir of [control, path.join(control, "control-backups"), backup]) await fs.chmod(dir, 0o700);
+    for (const file of [policy, db, path.join(agents, "dev.dona.updater.plist"),
+      path.join(agents, "dev.dona.dispatcher.plist")]) await fs.writeFile(file, "x", { mode: 0o600 });
+    const verify = () => run("assert-control-target-paths", control, releases, agents, backup);
+    await verify();
+    await fs.rm(policy);
+    await fs.symlink(path.join(root, "absent"), policy);
+    await assert.rejects(verify());
+    await fs.rm(policy);
+    await fs.writeFile(policy, "x", { mode: 0o600 });
+    await fs.link(db, path.join(root, "db-hardlink"));
+    await assert.rejects(verify());
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("control DB backup opens and checks an independent SQLite copy", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-backup-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona control backup "));
   const source = path.join(root, "source.sqlite3");
   const target = path.join(root, "backup.sqlite3");
   try {
@@ -336,6 +402,46 @@ test("control DB backup opens and checks an independent SQLite copy", async () =
   }
 });
 
+test("old control restore rehearsal opens only a backup copy and fails closed on old binary rejection", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona control restore "));
+  const oldDir = path.join(root, "old");
+  const newDir = path.join(root, "new");
+  const modulePath = path.join(oldDir, "dist", "database.js");
+  const newModulePath = path.join(newDir, "dist", "database.js");
+  const backup = path.join(root, "updater.previous.sqlite3");
+  const receipt = path.join(root, "restore-rehearsal.json");
+  try {
+    await fs.mkdir(path.dirname(modulePath), { recursive: true });
+    await fs.mkdir(path.dirname(newModulePath), { recursive: true });
+    await fs.writeFile(path.join(oldDir, "package.json"), '{"type":"module"}');
+    await fs.writeFile(path.join(newDir, "package.json"), '{"type":"module"}');
+    await fs.writeFile(modulePath, 'import fs from "node:fs"; export class UpdateDatabase { constructor(file) { if (fs.readFileSync(file).readUInt32BE(60) !== 7) throw new Error("unreadable"); } close() {} }', { mode: 0o600 });
+    await fs.writeFile(newModulePath, 'import fs from "node:fs"; export class UpdateDatabase { constructor(file) { const bytes=fs.readFileSync(file); bytes.writeUInt32BE(8,60); fs.writeFileSync(file,bytes); } close() {} }', { mode: 0o600 });
+    await execute("python3", ["-c", "import sqlite3,sys,os; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE update_requests(id TEXT PRIMARY KEY)'); c.execute('PRAGMA user_version=7'); c.commit(); c.close(); os.chmod(sys.argv[1],0o600)", backup]);
+    const original = await fs.readFile(backup);
+    await execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]);
+    assert.deepEqual(await fs.readFile(backup), original);
+    const rehearsal = JSON.parse(await fs.readFile(receipt, "utf8"));
+    assert.equal(rehearsal.old_binary_restored_backup_readable, true);
+    assert.equal(rehearsal.old_schema, 7);
+    assert.equal(rehearsal.new_schema, 8);
+    assert.equal(rehearsal.rollback, "restore_backup_required");
+    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
+    await fs.rm(receipt);
+    await fs.writeFile(modulePath, 'export class UpdateDatabase { constructor() { throw new Error("old binary rejects backup"); } close() {} }');
+    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
+    await assert.rejects(fs.stat(receipt), { code: "ENOENT" });
+    assert.deepEqual(await fs.readFile(backup), original);
+    await fs.writeFile(modulePath, 'export class UpdateDatabase { constructor() {} close() {} }');
+    await fs.writeFile(newModulePath, 'export class UpdateDatabase { constructor() { throw new Error("migration failed"); } close() {} }');
+    await assert.rejects(execute(process.execPath, [controlRehearsal, modulePath, newModulePath, backup, receipt]));
+    await assert.rejects(fs.stat(receipt), { code: "ENOENT" });
+    assert.deepEqual(await fs.readFile(backup), original);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("control attempt ledger preserves exact identities and rejects duplicate or out-of-order writes", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-ledger-"));
   const oldPolicy = path.join(root, "old-policy.json");
@@ -343,13 +449,15 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
   const oldPlist = path.join(root, "old.plist");
   const newPlist = path.join(root, "new.plist");
   const backup = path.join(root, "backup.sqlite3");
+  const rehearsal = path.join(root, "restore-rehearsal.json");
   const attempt = path.join(root, `${"2".repeat(40)}.ABC123`);
   try {
     await fs.mkdir(attempt, { mode: 0o700 });
     await Promise.all([fs.writeFile(oldPolicy, "old"), fs.writeFile(newPolicy, "new"),
       fs.writeFile(oldPlist, "old plist"), fs.writeFile(newPlist, "new plist"), fs.writeFile(backup, "backup")]);
+    await fs.writeFile(rehearsal, "rehearsal");
     const create = () => execute(process.execPath, [controlLedger, "create", attempt,
-      "1".repeat(40), "2".repeat(40), oldPolicy, newPolicy, oldPlist, newPlist]);
+      "1".repeat(40), "2".repeat(40), oldPolicy, newPolicy, oldPlist, newPlist, "f".repeat(64)]);
     const advance = (phase: string, operation = "none", database?: string) =>
       execute(process.execPath, [controlLedger, "advance", attempt, phase, operation, ...(database ? [database] : [])]);
     await create();
@@ -357,18 +465,19 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await assert.rejects(advance("verified"), /out of order/);
     await advance("updater_stop_intent", "bootout_updater");
     await advance("updater_stopped");
-    await advance("backup_verified", "none", backup);
+    await execute(process.execPath, [controlLedger, "advance", attempt, "backup_verified", "none", backup, rehearsal]);
     const snapshot = JSON.parse(await fs.readFile(path.join(attempt, "attempt.json"), "utf8"));
     assert.equal(snapshot.sequence, 4);
     assert.equal(snapshot.old_build_sha, "1".repeat(40));
     assert.equal(snapshot.new_build_sha, "2".repeat(40));
+    assert.equal(snapshot.release_tree_sha256, "f".repeat(64));
     assert.match(snapshot.db_backup_sha256, /^[0-9a-f]{64}$/);
     assert.deepEqual(snapshot.launchd_operations, [{ sequence: 2, operation: "bootout_updater" }]);
     for (const [phase, operation] of [["dispatcher_stop_intent", "bootout_dispatcher"],
       ["dispatcher_stopped", "none"], ["dispatcher_start_intent", "bootstrap_dispatcher"],
       ["dispatcher_started", "none"], ["control_swapped", "none"],
       ["updater_start_intent", "bootstrap_updater"], ["updater_started", "none"]] as const) await advance(phase, operation);
-    const verify = () => execute(process.execPath, [controlLedger, "verify", attempt, newPolicy, newPlist, backup]);
+    const verify = () => execute(process.execPath, [controlLedger, "verify", attempt, newPolicy, newPlist, backup, rehearsal]);
     await verify();
     await fs.writeFile(newPolicy, "tampered");
     await assert.rejects(verify(), /do not match/);
@@ -379,12 +488,35 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8"));
     assert.equal(receipt.attempt_id, path.basename(attempt));
     assert.match(receipt.attempt_sha256, /^[0-9a-f]{64}$/);
+    assert.match(receipt.restore_rehearsal_sha256, /^[0-9a-f]{64}$/);
     await assert.rejects(execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40)]));
     await advance("restore_required");
     await advance("restored");
     await assert.rejects(advance("verified"), /terminal/);
     await fs.writeFile(path.join(attempt, "attempt.json.tmp"), "partial");
     await assert.rejects(advance("needs_review"), /ambiguous/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("control attempt disk-full write keeps the prior state and blocks a blind retry", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-control-full-"));
+  const attempt = path.join(root, "attempt");
+  const file = path.join(root, "identity");
+  try {
+    await fs.mkdir(attempt, { mode: 0o700 });
+    await fs.writeFile(file, "identity");
+    const ledger = await import(pathToFileURL(controlLedger).href) as {
+      createAttempt: (...args: string[]) => void;
+      advanceAttempt: (...args: unknown[]) => void;
+    };
+    ledger.createAttempt(attempt, "1".repeat(40), "2".repeat(40), file, file, file, file, "f".repeat(64));
+    assert.throws(() => ledger.advanceAttempt(attempt, "updater_stop_intent", "none", undefined, undefined,
+      { writeFileSync: () => { throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); } }), /disk full/);
+    assert.equal(JSON.parse(await fs.readFile(path.join(attempt, "attempt.json"), "utf8")).phase, "prepared");
+    await assert.rejects(execute(process.execPath,
+      [controlLedger, "advance", attempt, "updater_stop_intent"]), /ambiguous/);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

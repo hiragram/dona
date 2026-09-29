@@ -49,6 +49,33 @@ export async function assertPrivateFile(file) {
   }
 }
 
+export async function assertControlTargetPaths(controlRoot, releaseRoot, launchAgentsDir, backupRoot) {
+  if (![controlRoot, releaseRoot, launchAgentsDir, backupRoot].every(path.isAbsolute) ||
+      path.dirname(backupRoot) !== path.join(controlRoot, "control-backups")) {
+    throw new Error("control target paths are invalid");
+  }
+  for (const directory of [controlRoot, releaseRoot, launchAgentsDir, path.dirname(backupRoot), backupRoot]) {
+    const stats = await fs.lstat(directory);
+    if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid() ||
+        (stats.mode & 0o022) !== 0 ||
+        (directory !== launchAgentsDir && (stats.mode & 0o077) !== 0)) {
+      throw new Error("control target directory identity is invalid");
+    }
+  }
+  const realControlRoot = await fs.realpath(controlRoot);
+  const realBackup = await fs.realpath(backupRoot);
+  if (!realBackup.startsWith(`${realControlRoot}${path.sep}`)) {
+    throw new Error("control backup escaped its root");
+  }
+  const updater = await fs.lstat(path.join(controlRoot, "updater"));
+  if (!updater.isDirectory() || updater.isSymbolicLink() || updater.uid !== process.getuid() ||
+      (updater.mode & 0o077) !== 0) throw new Error("stable updater identity is invalid");
+  for (const file of [path.join(controlRoot, "policy.json"), path.join(controlRoot, "updater.sqlite3"),
+    path.join(launchAgentsDir, "dev.dona.updater.plist"), path.join(launchAgentsDir, "dev.dona.dispatcher.plist")]) {
+    await assertPrivateFile(file);
+  }
+}
+
 export function socketIsListening(socketPath, timeoutMs = 500) {
   return new Promise((resolve) => {
     let settled = false;
@@ -153,6 +180,57 @@ export async function waitForUpdaterSha(socketPath, expectedSha, timeoutMs, expe
   throw new Error(`updater ${expectedSha} was not observed ready`);
 }
 
+export async function waitForUpdaterIdentity(socketPath, expectedSha, domain, timeoutMs, options = {}) {
+  if (!path.isAbsolute(socketPath) || !/^[0-9a-f]{40}$/.test(expectedSha) ||
+      !/^gui\/[1-9][0-9]*$/.test(domain) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("wait-updater-identity arguments are invalid");
+  }
+  const healthRead = options.healthRead ?? (() => udsJson(socketPath, "/health/version"));
+  const registrationRead = options.registrationRead ?? (async () =>
+    (await execute("/bin/launchctl", ["print", `${domain}/dev.dona.updater`],
+      { timeout: 2_000, killSignal: "SIGKILL" })).stdout);
+  const processStartRead = options.processStartRead ?? (async (pid) =>
+    (await execute("/bin/ps", ["-p", String(pid), "-o", "lstart="],
+      { timeout: 2_000, killSignal: "SIGKILL" })).stdout.trim());
+  const lockRead = options.lockRead ?? (async () => {
+    const lockPath = path.join(path.dirname(socketPath), "updater.start.lock");
+    await assertPrivateFile(lockPath);
+    return JSON.parse(await fs.readFile(lockPath, "utf8"));
+  });
+  const deadline = Date.now() + timeoutMs;
+  do {
+    let health;
+    try { health = await healthRead(); }
+    catch { await new Promise(resolve => setTimeout(resolve, 100)); continue; }
+    if (health?.status !== "ready" || health.service !== "updater" || health.build_sha !== expectedSha) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      continue;
+    }
+    const pid = health.pid;
+    const processStart = health.process_start;
+    if (!Number.isSafeInteger(pid) || pid <= 0 || typeof processStart !== "string" || !processStart) {
+      throw new Error("updater health process identity is invalid");
+    }
+    let lock, registration, observedStart;
+    try {
+      [lock, registration, observedStart] = await Promise.all([
+        lockRead(), registrationRead(), processStartRead(pid),
+      ]);
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      continue;
+    }
+    const registrationSha = registration.match(/DONA_UPDATER_BUILD_SHA => ([0-9a-f]{40})/)?.[1];
+    const registrationPid = Number(registration.match(/\bpid = ([0-9]+)/)?.[1]);
+    if (lock.pid !== pid || lock.process_start !== processStart || observedStart !== processStart ||
+        registrationSha !== expectedSha || registrationPid !== pid) {
+      throw new Error("updater socket, PID, start identity, and launchd registration disagree");
+    }
+    return;
+  } while (Date.now() < deadline);
+  throw new Error("updater process identity was not observed before timeout");
+}
+
 export async function waitForDispatcherSha(socketPath,expectedSha,timeoutMs) {
   if(!/^[0-9a-f]{40}$/.test(expectedSha)||!Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("wait-dispatcher-sha arguments are invalid");
   const deadline=Date.now()+timeoutMs;
@@ -241,6 +319,25 @@ export async function waitForLaunchdUpdaterSha(domain, expectedSha, timeoutMs, o
     await sleep(100);
   } while (now() < deadline);
   throw new Error("updater registration could not be reconciled to the exact SHA");
+}
+
+export async function launchctlOnce(operation, domain, target, timeoutMs, options = {}) {
+  if (!/^gui\/[1-9][0-9]*$/.test(domain) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 ||
+      !["bootout", "bootstrap"].includes(operation)) throw new Error("launchctl operation arguments are invalid");
+  let arguments_;
+  if (operation === "bootout" &&
+      ["dev.dona.updater", "dev.dona.dispatcher", "dev.dona.slack-adapter"].includes(target)) {
+    arguments_ = ["bootout", `${domain}/${target}`];
+  } else if (operation === "bootstrap" &&
+      ["dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"].includes(path.basename(target)) &&
+      path.dirname(target) === path.join(process.env.HOME ?? "", "Library", "LaunchAgents")) {
+    arguments_ = ["bootstrap", domain, target];
+  } else {
+    throw new Error("launchctl target is invalid");
+  }
+  const run = options.run ?? ((args) => execute("/bin/launchctl", args,
+    { timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 64 * 1024 }));
+  await run(arguments_);
 }
 
 async function releaseTreeDigest(root, immutable = false) {
@@ -386,6 +483,14 @@ async function main() {
     try { await assertPrivateFile(value); return 0; }
     catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
   }
+  if (mode === "assert-control-target-paths" && secondValue && process.argv[5] && process.argv[6]) {
+    try { await assertControlTargetPaths(value, secondValue, process.argv[5], process.argv[6]); return 0; }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
+  }
+  if (mode === "launchctl-once" && secondValue && process.argv[5] && process.argv[6]) {
+    try { await launchctlOnce(value, secondValue, process.argv[5], Number(process.argv[6])); return 0; }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
+  }
   if (mode === "validate-staged-release" && secondValue) {
     try { console.log(await validateStagedRelease(value, secondValue)); return 0; }
     catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
@@ -444,6 +549,10 @@ async function main() {
       console.error(error instanceof Error ? error.message : String(error));
       return 1;
     }
+  }
+  if (mode === "wait-updater-identity" && secondValue && process.argv[5] && process.argv[6]) {
+    try { await waitForUpdaterIdentity(value, secondValue, process.argv[5], Number(process.argv[6])); return 0; }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
   }
   if(mode==="wait-dispatcher-sha"&&secondValue&&process.argv[5]) {
     try { await waitForDispatcherSha(value,secondValue,Number(process.argv[5])); return 0; }

@@ -786,10 +786,29 @@ export class RealRuntime implements RuntimePort {
       }
       const attemptBytes = await fs.readFile(attemptPath);
       const attempt = JSON.parse(attemptBytes.toString("utf8")) as Record<string, unknown>;
+      const rehearsalPath = path.join(attemptDirectory, "restore-rehearsal.json");
+      const rehearsalStats = await fs.lstat(rehearsalPath);
+      if (!rehearsalStats.isFile() || rehearsalStats.isSymbolicLink() || rehearsalStats.uid !== uid ||
+          rehearsalStats.nlink !== 1 || (rehearsalStats.mode & 0o077) !== 0) {
+        return { ready: false, build_sha: buildSha };
+      }
+      const rehearsalBytes = await fs.readFile(rehearsalPath);
+      const rehearsal = JSON.parse(rehearsalBytes.toString("utf8")) as Record<string, unknown>;
       const matchingAttempt = createHash("sha256").update(attemptBytes).digest("hex") === receipt.attempt_sha256 &&
         attempt.schema_version === 1 && attempt.phase === "verified" && attempt.new_build_sha === buildSha &&
         attempt.old_build_sha === receipt.old_build_sha && attempt.new_policy_sha256 === receipt.policy_sha256 &&
-        attempt.new_plist_sha256 === receipt.plist_sha256 && attempt.db_backup_sha256 === receipt.db_backup_sha256;
+        attempt.new_plist_sha256 === receipt.plist_sha256 && attempt.db_backup_sha256 === receipt.db_backup_sha256 &&
+        attempt.release_tree_sha256 === receipt.release_tree_sha256 &&
+        typeof attempt.release_tree_sha256 === "string" && /^[0-9a-f]{64}$/.test(attempt.release_tree_sha256) &&
+        attempt.restore_rehearsal_sha256 === receipt.restore_rehearsal_sha256 &&
+        typeof attempt.restore_rehearsal_sha256 === "string" && /^[0-9a-f]{64}$/.test(attempt.restore_rehearsal_sha256) &&
+        createHash("sha256").update(rehearsalBytes).digest("hex") === attempt.restore_rehearsal_sha256 &&
+        rehearsal.schema_version === 1 && rehearsal.backup_sha256 === attempt.db_backup_sha256 &&
+        rehearsal.old_binary_restored_backup_readable === true &&
+        typeof rehearsal.old_schema === "number" && Number.isSafeInteger(rehearsal.old_schema) && rehearsal.old_schema >= 0 &&
+        typeof rehearsal.new_schema === "number" && Number.isSafeInteger(rehearsal.new_schema) &&
+        rehearsal.new_schema >= rehearsal.old_schema &&
+        rehearsal.rollback === (rehearsal.new_schema > rehearsal.old_schema ? "restore_backup_required" : "same_schema");
       return {
         ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
           receipt.schema_migration_capability === capability && matchingAttempt,

@@ -36,15 +36,21 @@ test("control capability requires a verified attempt ledger bound to the exact r
     await fs.mkdir(attemptDir, { recursive: true, mode: 0o700 });
     await fs.chmod(attemptDir, 0o700);
     const digest = "a".repeat(64);
+    const rehearsal = { schema_version: 1, backup_sha256: digest, old_schema: 7, new_schema: 8,
+      rollback: "restore_backup_required", old_binary_restored_backup_readable: true };
+    const rehearsalBytes = Buffer.from(`${JSON.stringify(rehearsal)}\n`);
+    await fs.writeFile(path.join(attemptDir, "restore-rehearsal.json"), rehearsalBytes, { mode: 0o600 });
+    const rehearsalDigest = createHash("sha256").update(rehearsalBytes).digest("hex");
     const attempt = { schema_version: 1, phase: "verified", old_build_sha: "b".repeat(40),
       new_build_sha: targetSha, new_policy_sha256: digest, new_plist_sha256: digest,
-      db_backup_sha256: digest };
+      db_backup_sha256: digest, release_tree_sha256: digest, restore_rehearsal_sha256: rehearsalDigest };
     const attemptBytes = Buffer.from(`${JSON.stringify(attempt)}\n`);
     await fs.writeFile(path.join(attemptDir, "attempt.json"), attemptBytes, { mode: 0o600 });
     const receipt = { schema_version: 1, build_sha: targetSha,
       schema_migration_capability: "dispatcher_v2_to_v3_online_backup_v1", attempt_id: attemptId,
       attempt_sha256: createHash("sha256").update(attemptBytes).digest("hex"),
-      old_build_sha: attempt.old_build_sha, policy_sha256: digest, plist_sha256: digest, db_backup_sha256: digest };
+      old_build_sha: attempt.old_build_sha, policy_sha256: digest, plist_sha256: digest,
+      db_backup_sha256: digest, release_tree_sha256: digest, restore_rehearsal_sha256: rehearsalDigest };
     const receiptPath = path.join(policy.control_root, "control-plane-receipt.json");
     await fs.writeFile(receiptPath, JSON.stringify(receipt), { mode: 0o600 });
     const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);

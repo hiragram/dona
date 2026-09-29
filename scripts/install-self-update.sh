@@ -40,12 +40,21 @@ record_control_phase() {
   $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" advance "$CONTROL_LEDGER_DIR" "$@"
 }
 
+launchctl_once() {
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" launchctl-once "$@"
+}
+
+assert_control_targets() {
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-control-target-paths \
+    "$CONTROL_ROOT" "$RELEASE_ROOT" "$LAUNCH_AGENTS_DIR" "$CONTROL_BACKUP_ROOT"
+}
+
 bootstrap_updater_reconciled() {
   local context=$1
   local expected_sha=$2
   local output=""
   local exit_code=0
-  if output=$(/bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 2>&1); then
+  if output=$(launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 30000 2>&1); then
     return 0
   else
     exit_code=$?
@@ -70,7 +79,7 @@ bootstrap_dispatcher_reconciled() {
   local expected_sha=$2
   local output=""
   local exit_code=0
-  if output=$(/bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" 2>&1); then
+  if output=$(launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" 30000 2>&1); then
     return 0
   else
     exit_code=$?
@@ -95,7 +104,7 @@ restore_control_plane() {
       print -u2 "control-plane復旧前にUpdaterの登録identityを確認できません。"
       return 1
     fi
-    /bin/launchctl bootout "$DOMAIN/dev.dona.updater" >/dev/null 2>&1 || true
+    launchctl_once bootout "$DOMAIN" dev.dona.updater 30000 >/dev/null 2>&1 || true
   fi
   if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
     print -u2 "control-plane復旧前に新しいupdaterの停止を確認できません。backup: $CONTROL_BACKUP_ROOT"
@@ -149,7 +158,7 @@ restore_control_plane() {
       DISPATCHER_RESTORE_REQUIRED=0
       return 0
     fi
-    /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher" || dispatcher_bootout_exit=$?
+    launchctl_once bootout "$DOMAIN" dev.dona.dispatcher 30000 || dispatcher_bootout_exit=$?
     if ! wait_dispatcher_unregistered; then
       print -u2 "旧Dispatcher復旧前の登録解除を確認できません（bootout exit ${dispatcher_bootout_exit}）。backup: $CONTROL_BACKUP_ROOT"
       return 1
@@ -235,16 +244,16 @@ if [[ "$MODE" == "--bootstrap" ]]; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
   fi
   if ! /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
-    /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
+    launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 30000
   fi
   if /bin/launchctl print "$DOMAIN/dev.dona.slack-adapter" >/dev/null 2>&1; then
-    /bin/launchctl bootout "$DOMAIN/dev.dona.slack-adapter"
+    launchctl_once bootout "$DOMAIN" dev.dona.slack-adapter 30000
   fi
   if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
-    /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"
+    launchctl_once bootout "$DOMAIN" dev.dona.dispatcher 30000
   fi
-  /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
-  /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist"
+  launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" 30000
+  launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist" 30000
   print "stable updater、Dispatcher、Slack Adapterを順序付きでbootstrapしました。"
   exit 0
 fi
@@ -394,20 +403,23 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     chmod 600 "$BACKUP_ROOT/control-plane-receipt.was-absent"
   fi
 
+  assert_control_targets
+
   $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" create "$BACKUP_ROOT" \
     "$OLD_UPDATER_SHA" "$INSTALL_SHA" "$CONTROL_ROOT/policy.json" "$BACKUP_ROOT/policy.next.json" \
-    "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.next.plist"
+    "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.next.plist" "$STAGED_DIGEST"
   CONTROL_LEDGER_DIR="$BACKUP_ROOT"
 
   CONTROL_UPGRADE_ACTIVE=1
   record_control_phase updater_stop_intent bootout_updater
-  if ! /bin/launchctl bootout "$DOMAIN/dev.dona.updater"; then
-    if /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
-      print -u2 "stable updaterの停止受理を確認できません。fileは切り替えていません。"
-      CONTROL_UPGRADE_ACTIVE=0
-      record_control_phase needs_review
-      exit 1
-    fi
+  UPDATER_BOOTOUT_EXIT=0
+  launchctl_once bootout "$DOMAIN" dev.dona.updater 30000 || UPDATER_BOOTOUT_EXIT=$?
+  if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-launchd-unregistered \
+      "$DOMAIN" dev.dona.updater 30000; then
+    print -u2 "stable updaterの登録解除を確定できません（bootout exit ${UPDATER_BOOTOUT_EXIT}）。fileは切り替えていません。"
+    CONTROL_UPGRADE_ACTIVE=0
+    record_control_phase needs_review
+    exit 1
   fi
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$UPDATER_SOCKET"
   record_control_phase updater_stopped
@@ -426,9 +438,13 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/cp "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.previous.plist"
   /bin/cp "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" "$BACKUP_ROOT/dev.dona.dispatcher.previous.plist"
   if [[ -f "$CONTROL_ROOT/updater.sqlite3" ]]; then
+    assert_control_targets
     /usr/bin/python3 "$SCRIPT_DIR/backup-control-db.py" \
       "$CONTROL_ROOT/updater.sqlite3" "$BACKUP_ROOT/updater.previous.sqlite3"
-    record_control_phase backup_verified none "$BACKUP_ROOT/updater.previous.sqlite3"
+    $NODE_PATH "$SCRIPT_DIR/rehearse-control-restore.mjs" \
+      "$CONTROL_ROOT/updater/dist/database.js" "$FINAL_RELEASE/updater/dist/database.js" \
+      "$BACKUP_ROOT/updater.previous.sqlite3" "$BACKUP_ROOT/restore-rehearsal.json"
+    record_control_phase backup_verified none "$BACKUP_ROOT/updater.previous.sqlite3" "$BACKUP_ROOT/restore-rehearsal.json"
   else
     /usr/bin/touch "$BACKUP_ROOT/updater.database-was-absent"
     chmod 600 "$BACKUP_ROOT/updater.database-was-absent"
@@ -442,7 +458,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   DISPATCHER_RESTORE_REQUIRED=1
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$DISPATCHER_SOCKET" "$INSTALL_SHA"
   record_control_phase dispatcher_stop_intent bootout_dispatcher
-  if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
+  if ! launchctl_once bootout "$DOMAIN" dev.dona.dispatcher 30000; then
     if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
       print -u2 "Dispatcherの停止受理を確認できないため、plistを更新しません。"
       exit 1
@@ -462,19 +478,25 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   fi
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" 30000
   record_control_phase dispatcher_started
+  assert_control_targets
   /bin/mv "$CONTROL_ROOT/updater" "$BACKUP_ROOT/updater.previous"
   /bin/mv "$BACKUP_ROOT/updater.next" "$CONTROL_ROOT/updater"
   /bin/mv "$BACKUP_ROOT/policy.next.json" "$CONTROL_ROOT/policy.json"
   /bin/mv "$BACKUP_ROOT/dev.dona.updater.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
   record_control_phase control_swapped
 
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-published-release \
+    "$FINAL_RELEASE" "$INSTALL_SHA" "$STAGED_DIGEST"
   record_control_phase updater_start_intent bootstrap_updater
   if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" 30000 && \
     bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
-    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
+    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3 && \
+    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-identity "$UPDATER_SOCKET" "$INSTALL_SHA" "$DOMAIN" 30000; then
     record_control_phase updater_started
     $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" verify "$BACKUP_ROOT" \
-      "$CONTROL_ROOT/policy.json" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/updater.previous.sqlite3"
+      "$CONTROL_ROOT/policy.json" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" \
+      "$BACKUP_ROOT/updater.previous.sqlite3" "$BACKUP_ROOT/restore-rehearsal.json"
+    assert_control_targets
     record_control_phase verified
     CONTROL_RECEIPT_TMP="$CONTROL_ROOT/.control-plane-receipt.json.$$.$RANDOM.tmp"
     $NODE_PATH "$SCRIPT_DIR/write-control-receipt.mjs" "$BACKUP_ROOT" "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA"

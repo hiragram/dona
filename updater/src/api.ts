@@ -317,6 +317,8 @@ export class UpdaterApi {
           status: ready ? "ready" : "not_ready",
           service: "updater",
           build_sha: this.buildSha,
+          pid: process.pid,
+          process_start: this.activeReservation?.startupLock.processStart ?? null,
           protocol: 1,
           update_schema: 3,
         });

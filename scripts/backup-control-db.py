@@ -5,6 +5,7 @@ import os
 import sqlite3
 import stat
 import sys
+from pathlib import Path
 
 
 def verify(db):
@@ -29,7 +30,7 @@ def backup(source, target):
         or os.path.lexists(target)
     ):
         raise RuntimeError("control backup source or destination is invalid")
-    original = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    original = sqlite3.connect(Path(source).as_uri() + "?mode=ro", uri=True)
     try:
         before = verify(original)
         copied = sqlite3.connect(target)
@@ -39,7 +40,7 @@ def backup(source, target):
         finally:
             copied.close()
         os.chmod(target, 0o600)
-        with sqlite3.connect(f"file:{target}?mode=ro", uri=True) as restored:
+        with sqlite3.connect(Path(target).as_uri() + "?mode=ro", uri=True) as restored:
             after = verify(restored)
         if before != after:
             raise RuntimeError("control backup inventory differs from source")
