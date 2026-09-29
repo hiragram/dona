@@ -200,7 +200,7 @@ export class ReleaseStore {
       }
     }
     candidates.sort((left, right) => right.mtime - left.mtime || left.sha.localeCompare(right.sha));
-    const eligible = candidates.slice(this.policy.retain_successful);
+    const eligible = candidates;
     const cursor = await this.readCleanupCursor();
     const start = cursor ? eligible.findIndex((candidate) => candidate.mtime < cursor.mtime ||
       (candidate.mtime === cursor.mtime && candidate.sha > cursor.sha)) : 0;

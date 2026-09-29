@@ -35,7 +35,7 @@ describe("ReleaseStore", () => {
     await fs.symlink("/tmp", path.join(invalid, "outside"));
     const candidates = Array.from({ length: 11 }, (_, index) => (index + 3).toString(16).repeat(40));
     for (const sha of candidates) await installRelease(policy, sha);
-    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    const protectedShas = new Set([currentSha, "0".repeat(40), ...candidates.slice(-2)]);
     const plan = await store.cleanupPlan(protectedShas);
     assert.equal(plan.length, 8);
     assert.equal(plan.includes(invalidSha), false);
@@ -59,7 +59,7 @@ describe("ReleaseStore", () => {
     await fs.symlink("binary", path.join(release, "binary-link"));
     await fs.utimes(release, new Date("2020-01-01"), new Date("2020-01-01"));
     for (const sha of ["4".repeat(40), "5".repeat(40), "6".repeat(40)]) await installRelease(policy, sha);
-    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    const protectedShas = new Set([currentSha, "0".repeat(40), "5".repeat(40), "6".repeat(40)]);
     assert.ok((await store.cleanupPlan(protectedShas)).includes(candidateSha));
     assert.ok((await store.cleanup(protectedShas)).includes(candidateSha));
     await assert.rejects(fs.lstat(release), { code: "ENOENT" });
@@ -80,7 +80,7 @@ describe("ReleaseStore", () => {
     const safeSha = "d".repeat(40);
     const safe = await installRelease(policy, safeSha);
     await fs.utimes(safe, new Date("2019-01-01"), new Date("2019-01-01"));
-    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    const protectedShas = new Set([currentSha, "0".repeat(40), "e".repeat(40), "f".repeat(40)]);
     assert.deepEqual(await new ReleaseStore(policy).cleanup(protectedShas), []);
     assert.ok((await new ReleaseStore(policy).cleanup(protectedShas)).includes(safeSha));
     await assert.rejects(fs.lstat(safe), { code: "ENOENT" });

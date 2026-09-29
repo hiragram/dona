@@ -948,6 +948,12 @@ export class UpdateDatabase {
     return new Set(rows.flatMap((row) => [row.current_sha,row.target_sha,...(row.previous_sha?[row.previous_sha]:[])]));
   }
 
+  recentSuccessfulReleaseShas(limit = 2): Set<string> {
+    const rows = this.db.prepare(`SELECT target_sha FROM update_requests WHERE state='succeeded'
+      ORDER BY completed_at DESC,request_id DESC LIMIT ?`).all(limit) as Array<{target_sha:string}>;
+    return new Set(rows.map((row) => row.target_sha));
+  }
+
   nonTerminalCount(): number {
     const row = this.db.prepare(`SELECT COUNT(*) AS count FROM update_requests WHERE state NOT IN (${terminalStateSql})`)
       .get() as { count: number };

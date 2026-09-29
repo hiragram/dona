@@ -56,6 +56,7 @@ export class UpdateService {
     while (this.running) {
       try {
         this.controller.maintainDiagnostics();
+        await this.controller.maintainReleaseRetention();
         await this.controller.processNext();
         await this.controller.deliverOutbox();
       } catch (error) {
