@@ -273,6 +273,30 @@ if [[ "$MODE" == "--bootstrap" ]]; then
     print -u2 "install済みreleaseのbootstrap script identityを確認できません。"
     exit 1
   fi
+  /usr/bin/python3 - "$CONTROL_ROOT" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA" <<'PY'
+import hashlib, json, os, stat, sys
+control, releases, sha = sys.argv[1:]
+def private_bytes(file, mode):
+    fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or stat.S_IMODE(st.st_mode) != mode:
+            raise RuntimeError('bootstrap trust file identity is invalid')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            return stream.read()
+    finally:
+        os.close(fd)
+contract = json.loads(private_bytes(os.path.join(control, 'bootstrap-install-contract.json'), 0o600))
+if contract.get('schema_version') != 1 or contract.get('sha') != sha or not isinstance(contract.get('digests'), dict):
+    raise RuntimeError('bootstrap trust contract is invalid')
+for name in ('bootstrap-install-contract.mjs', 'control-updater-tree.mjs', 'self-update-install-preflight.mjs'):
+    source = os.path.join(releases, sha, 'scripts', name)
+    actual = hashlib.sha256(private_bytes(source, 0o400)).hexdigest()
+    if actual != contract['digests'].get('verifier:' + name):
+        raise RuntimeError('bootstrap verifier differs from the install contract')
+PY
+  $NODE_PATH "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/scripts/bootstrap-install-contract.mjs" \
+    bootstrap-verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA"
   if [[ "${0:A}" != "${BOOTSTRAP_SCRIPT:A}" ]]; then
     exec /bin/zsh "$BOOTSTRAP_SCRIPT" --bootstrap
   fi

@@ -40,6 +40,11 @@ test("bootstrap resume checks the install-time files independently of the curren
     await fs.mkdir(releases, { mode: 0o700 });
     await fs.mkdir(path.join(releases, sha), { mode: 0o700 });
     await fs.writeFile(path.join(releases, sha, "cli.js"), "release", { mode: 0o400 });
+    await fs.mkdir(path.join(releases, sha, "scripts"), { mode: 0o700 });
+    for (const name of ["bootstrap-install-contract.mjs", "control-updater-tree.mjs", "self-update-install-preflight.mjs"]) {
+      await fs.writeFile(path.join(releases, sha, "scripts", name), name, { mode: 0o400 });
+    }
+    await fs.chmod(path.join(releases, sha, "scripts"), 0o500);
     await fs.chmod(path.join(releases, sha), 0o500);
     for (const name of ["policy.json", "dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"]) {
       await fs.writeFile(path.join(name === "policy.json" ? control : agents, name), name, { mode: 0o600 });
@@ -71,6 +76,7 @@ test("bootstrap resume checks the install-time files independently of the curren
     assert.doesNotMatch(source, /cmp -s "\$INSTALL_TMP\/rendered\/dev\.dona\.(?:dispatcher|slack-adapter)\.plist"/);
   } finally {
     await fs.chmod(path.join(releases, sha), 0o700).catch(() => undefined);
+    await fs.chmod(path.join(releases, sha, "scripts"), 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -86,7 +92,8 @@ test("an interrupted install contract is recovered only from the same verified b
   const installedRelease = path.join(releases, sha);
   try {
     for (const directory of [control, agents, releases, rendered, staged, installedRelease,
-      path.join(control, "updater"), path.join(staged, "updater"), path.join(installedRelease, "updater")]) {
+      path.join(control, "updater"), path.join(staged, "updater"), path.join(installedRelease, "updater"),
+      path.join(staged, "scripts"), path.join(installedRelease, "scripts")]) {
       await fs.mkdir(directory, { mode: 0o700 });
     }
     for (const name of ["policy.json", "dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"]) {
@@ -98,6 +105,12 @@ test("an interrupted install contract is recovered only from the same verified b
       path.join(installedRelease, "updater")]) {
       await fs.writeFile(path.join(directory, "cli.js"), "same build", { mode: 0o400 });
     }
+    for (const name of ["bootstrap-install-contract.mjs", "control-updater-tree.mjs", "self-update-install-preflight.mjs"]) {
+      for (const directory of [path.join(staged, "scripts"), path.join(installedRelease, "scripts")]) {
+        await fs.writeFile(path.join(directory, name), name, { mode: 0o400 });
+      }
+    }
+    await fs.chmod(path.join(installedRelease, "scripts"), 0o500);
     await fs.chmod(path.join(installedRelease, "updater"), 0o500);
     await fs.chmod(installedRelease, 0o500);
     const temp = path.join(control, ".bootstrap-install-contract.json.tmp");
@@ -115,6 +128,7 @@ test("an interrupted install contract is recovered only from the same verified b
   } finally {
     await fs.chmod(installedRelease, 0o700).catch(() => undefined);
     await fs.chmod(path.join(installedRelease, "updater"), 0o700).catch(() => undefined);
+    await fs.chmod(path.join(installedRelease, "scripts"), 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -128,7 +142,8 @@ test("bootstrap binds current pointer and installed Node to the verified release
   const sha = "a".repeat(40);
   const release = path.join(releases, sha);
   try {
-    for (const directory of [control, agents, runtime, releases, release, path.join(control, "updater")]) {
+    for (const directory of [control, agents, runtime, releases, release, path.join(control, "updater"),
+      path.join(release, "scripts")]) {
       await fs.mkdir(directory, { mode: 0o700 });
     }
     await fs.writeFile(path.join(control, "updater", "cli.js"), "updater", { mode: 0o400 });
@@ -139,11 +154,35 @@ test("bootstrap binds current pointer and installed Node to the verified release
     }
     const manifest = path.join(release, "release-manifest.json");
     await fs.writeFile(manifest, JSON.stringify({ sha, node_version: process.versions.node, built_at: "2026-09-29T00:00:00Z" }), { mode: 0o400 });
+    for (const name of ["bootstrap-install-contract.mjs", "control-updater-tree.mjs", "self-update-install-preflight.mjs"]) {
+      await fs.writeFile(path.join(release, "scripts", name), name, { mode: 0o400 });
+    }
+    await fs.chmod(path.join(release, "scripts"), 0o500);
     await fs.symlink(`releases/${sha}`, path.join(runtime, "current"));
     await fs.chmod(release, 0o500);
     const record = () => execute(process.execPath, [installContract, "record", control, agents, releases, sha]);
     const verify = () => execute(process.execPath, [installContract, "bootstrap-verify", control, agents, releases, sha]);
     await record();
+    const installerSource = await fs.readFile(installer, "utf8");
+    const trustLauncher = installerSource.match(/<<'PY'\n([\s\S]*?)\nPY/)?.[1];
+    assert.ok(trustLauncher);
+    await execute("/usr/bin/python3", ["-c", trustLauncher, control, releases, sha]);
+    const verifier = path.join(release, "scripts", "bootstrap-install-contract.mjs");
+    await fs.chmod(release, 0o700);
+    await fs.chmod(path.join(release, "scripts"), 0o700);
+    await fs.chmod(verifier, 0o600);
+    await fs.writeFile(verifier, "tampered");
+    await fs.chmod(verifier, 0o400);
+    await fs.chmod(path.join(release, "scripts"), 0o500);
+    await fs.chmod(release, 0o500);
+    await assert.rejects(execute("/usr/bin/python3", ["-c", trustLauncher, control, releases, sha]));
+    await fs.chmod(release, 0o700);
+    await fs.chmod(path.join(release, "scripts"), 0o700);
+    await fs.chmod(verifier, 0o600);
+    await fs.writeFile(verifier, "bootstrap-install-contract.mjs");
+    await fs.chmod(verifier, 0o400);
+    await fs.chmod(path.join(release, "scripts"), 0o500);
+    await fs.chmod(release, 0o500);
     await verify();
     await fs.unlink(path.join(runtime, "current"));
     await fs.symlink(`elsewhere/${sha}`, path.join(runtime, "current"));
@@ -160,6 +199,7 @@ test("bootstrap binds current pointer and installed Node to the verified release
     await assert.rejects(verify(), /Node differs/);
   } finally {
     await fs.chmod(release, 0o700).catch(() => undefined);
+    await fs.chmod(path.join(release, "scripts"), 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });

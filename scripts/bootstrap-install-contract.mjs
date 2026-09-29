@@ -9,6 +9,7 @@ import { controlUpdaterTreeDigest } from "./control-updater-tree.mjs";
 import { releaseTreeDigest } from "./self-update-install-preflight.mjs";
 
 const names = ["dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"];
+const verifierNames = ["bootstrap-install-contract.mjs", "control-updater-tree.mjs", "self-update-install-preflight.mjs"];
 const contractName = "bootstrap-install-contract.json";
 
 async function privateDirectory(directory) {
@@ -36,6 +37,10 @@ async function installedDigests(controlRoot, agentsRoot, releaseRoot, sha) {
   }
   digests.control_updater_tree = controlUpdaterTreeDigest(path.join(controlRoot, "updater"));
   digests.release_tree = await releaseTreeDigest(path.join(releaseRoot, sha), true);
+  for (const name of verifierNames) {
+    digests[`verifier:${name}`] = createHash("sha256").update(
+      await privateFile(path.join(releaseRoot, sha, "scripts", name))).digest("hex");
+  }
   return digests;
 }
 
