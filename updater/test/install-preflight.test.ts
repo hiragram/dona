@@ -23,6 +23,7 @@ const controlLedger = fileURLToPath(new URL("../../scripts/control-attempt-ledge
 const controlBackup = fileURLToPath(new URL("../../scripts/backup-control-db.py", import.meta.url));
 const controlReceipt = fileURLToPath(new URL("../../scripts/write-control-receipt.mjs", import.meta.url));
 const controlRehearsal = fileURLToPath(new URL("../../scripts/rehearse-control-restore.mjs", import.meta.url));
+const installCi = fileURLToPath(new URL("../../scripts/verify-install-ci.mjs", import.meta.url));
 type WaitForLaunchdServiceAbsent = (
   domain: string,
   label: string,
@@ -47,13 +48,17 @@ type WaitForUpdaterIdentity = (
 ) => Promise<void>;
 type LaunchctlOnce = (operation: string, domain: string, target: string, timeoutMs: number,
   options?: { run?: (args: string[]) => Promise<unknown> }) => Promise<void>;
+type WaitForSlackSha = (socketPath: string, sha: string, domain: string, timeoutMs: number,
+  options?: { observe?: (target: string, timeoutMs: number) => Promise<boolean>;
+    healthRead?: () => Promise<unknown>; sleep?: (milliseconds: number) => Promise<void>; now?: () => number }) => Promise<void>;
 const preflightModule = await import(pathToFileURL(preflight).href) as {
   waitForLaunchdServiceAbsent: WaitForLaunchdServiceAbsent;
   waitForLaunchdUpdaterSha: WaitForLaunchdUpdaterSha;
   waitForUpdaterIdentity: WaitForUpdaterIdentity;
   launchctlOnce: LaunchctlOnce;
+  waitForSlackSha: WaitForSlackSha;
 };
-const { waitForLaunchdServiceAbsent, waitForLaunchdUpdaterSha, waitForUpdaterIdentity, launchctlOnce } = preflightModule;
+const { waitForLaunchdServiceAbsent, waitForLaunchdUpdaterSha, waitForUpdaterIdentity, launchctlOnce, waitForSlackSha } = preflightModule;
 
 test("developer installer atomically creates and shares the access receipt key",async()=>{
   const source=await fs.readFile(developerInstaller,"utf8");
@@ -65,6 +70,31 @@ test("developer installer atomically creates and shares the access receipt key",
 async function run(mode: string, ...values: string[]): Promise<void> {
   await execute(process.execPath, [preflight, mode, ...values]);
 }
+
+test("installer trust binds every required check to one exact main push workflow", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-install-ci-"));
+  const checksPath = path.join(root, "checks.json");
+  const workflowPath = path.join(root, "workflow.json");
+  const sha = "a".repeat(40);
+  const names = ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"];
+  const check_runs = names.map((name, index) => ({ name, head_sha: sha, status: "completed", conclusion: "success",
+    app: { slug: "github-actions" }, details_url: `https://github.com/hiragram/dona/actions/runs/42/job/${index + 1}` }));
+  try {
+    await fs.writeFile(checksPath, JSON.stringify({ total_count: 4, check_runs }));
+    assert.equal((await execute(process.execPath, [installCi, "checks", checksPath, sha])).stdout.trim(), "42");
+    const workflow = { id: 42, event: "push", head_branch: "main", head_sha: sha,
+      status: "completed", conclusion: "success", name: "CI" };
+    await fs.writeFile(workflowPath, JSON.stringify(workflow));
+    await execute(process.execPath, [installCi, "workflow", workflowPath, sha, "42"]);
+    await fs.writeFile(workflowPath, JSON.stringify({ ...workflow, event: "pull_request" }));
+    await assert.rejects(execute(process.execPath, [installCi, "workflow", workflowPath, sha, "42"]));
+    await fs.writeFile(checksPath, JSON.stringify({ total_count: 5, check_runs }));
+    await assert.rejects(execute(process.execPath, [installCi, "checks", checksPath, sha]));
+    await fs.writeFile(checksPath, JSON.stringify({ total_count: 4, check_runs: check_runs.map((run, index) =>
+      index === 3 ? { ...run, details_url: "https://github.com/hiragram/dona/actions/runs/43/job/4" } : run) }));
+    await assert.rejects(execute(process.execPath, [installCi, "checks", checksPath, sha]));
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
 
 test("installer accepts only canonical HTTPS and SSH forms for hiragram/dona", async () => {
   for (const remote of [
@@ -181,6 +211,23 @@ test("launchdの登録解除はstale registrationが消えてから安定観測�
     settledObservations: 3,
   });
   assert.deepEqual(targets, Array(6).fill("gui/501/dev.dona.dispatcher"));
+});
+
+test("Slack Adapterの登録解除と起動healthを固定labelとSHAで照合する", async () => {
+  let elapsed = 0;
+  const targets: string[] = [];
+  await waitForLaunchdServiceAbsent("gui/501", "dev.dona.slack-adapter", 1_000, {
+    observe: async (target: string) => { targets.push(target); return false; },
+    sleep: async (milliseconds: number) => { elapsed += milliseconds; }, now: () => elapsed,
+  });
+  assert.deepEqual(targets, Array(3).fill("gui/501/dev.dona.slack-adapter"));
+  const sha = "a".repeat(40);
+  const socket = path.join(os.tmpdir(), "dona-slack-health.sock");
+  const options = { observe: async (target: string) => target === "gui/501/dev.dona.slack-adapter",
+    healthRead: async () => ({ schema_version: 1, status: "ready", service: "slack_adapter", build_sha: sha }),
+    sleep: async (milliseconds: number) => { elapsed += milliseconds; }, now: () => elapsed };
+  await waitForSlackSha(socket, sha, "gui/501", 1_000, options);
+  await assert.rejects(waitForSlackSha(socket, "b".repeat(40), "gui/501", 250, options), /not observed/);
 });
 
 test("launchdの登録解除timeoutは対象labelを保持し、plist切替前に失敗する", async () => {

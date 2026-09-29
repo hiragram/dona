@@ -3,7 +3,7 @@
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import http from "node:http";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -242,6 +242,33 @@ export async function waitForDispatcherSha(socketPath,expectedSha,timeoutMs) {
   throw new Error(`dispatcher ${expectedSha} was not observed ready`);
 }
 
+export async function waitForSlackSha(socketPath, expectedSha, domain, timeoutMs, options = {}) {
+  if (!path.isAbsolute(socketPath) || !/^[0-9a-f]{40}$/.test(expectedSha) ||
+      !/^gui\/[1-9][0-9]*$/.test(domain) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("wait-slack-sha arguments are invalid");
+  }
+  const observe = options.observe ?? observeLaunchdRegistration;
+  const healthRead = options.healthRead ?? (() => udsJson(socketPath, "/health/version", 2_000));
+  const sleep = options.sleep ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)));
+  const now = options.now ?? Date.now;
+  const deadline = now() + timeoutMs;
+  let matches = 0;
+  do {
+    const remaining = Math.max(1, deadline - now());
+    const registered = await observeBeforeDeadline(observe, `${domain}/dev.dona.slack-adapter`, remaining);
+    let ready = false;
+    try {
+      const health = await healthRead();
+      ready = health?.schema_version === 1 && health.status === "ready" &&
+        health.service === "slack_adapter" && health.build_sha === expectedSha;
+    } catch { /* Socket publication may follow launchd registration. */ }
+    matches = registered && ready ? matches + 1 : 0;
+    if (matches >= 3) return;
+    await sleep(100);
+  } while (now() < deadline);
+  throw new Error("Slack Adapter registration and exact SHA health were not observed");
+}
+
 async function observeLaunchdRegistration(serviceTarget, timeoutMs) {
   try {
     await execute("/bin/launchctl", ["print", serviceTarget], { timeout: timeoutMs, killSignal: "SIGKILL" });
@@ -271,7 +298,7 @@ async function observeBeforeDeadline(observe, serviceTarget, timeoutMs) {
 }
 
 export async function waitForLaunchdServiceAbsent(domain,label,timeoutMs,options={}) {
-  if(!/^gui\/[1-9][0-9]*$/.test(domain)||!/^dev\.dona\.(?:dispatcher|updater)$/.test(label)||
+  if(!/^gui\/[1-9][0-9]*$/.test(domain)||!/^dev\.dona\.(?:dispatcher|updater|slack-adapter)$/.test(label)||
     !Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("wait-launchd-unregistered arguments are invalid");
   const observe=options.observe??observeLaunchdRegistration;
   const sleep=options.sleep??((milliseconds)=>new Promise(resolve=>setTimeout(resolve,milliseconds)));
@@ -562,6 +589,10 @@ async function main() {
     try { await waitForDispatcherSha(value,secondValue,Number(process.argv[5])); return 0; }
     catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
+  if (mode === "wait-slack-sha" && secondValue && process.argv[5] && process.argv[6]) {
+    try { await waitForSlackSha(value, secondValue, process.argv[5], Number(process.argv[6])); return 0; }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
+  }
   if (mode === "validate-existing-release" && secondValue && process.argv[5]) {
     try {
       await validateExistingRelease(value, secondValue, process.argv[5]);
@@ -576,4 +607,4 @@ async function main() {
 }
 
 const invokedPath = process.argv[1];
-if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) process.exitCode = await main();
+if (invokedPath && await fs.realpath(invokedPath) === await fs.realpath(fileURLToPath(import.meta.url))) process.exitCode = await main();

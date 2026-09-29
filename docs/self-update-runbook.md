@@ -13,7 +13,7 @@
 
 ## 初回installとlegacy移行
 
-cleanなcanonical main checkoutで明示的に実行します。installerはfetch後の`origin/main`とのSHA一致と、GitHub Actions由来の固定3 check成功を再検証します。
+cleanなcanonical main checkoutで明示的に実行します。installerはfetch後の`origin/main`とのSHA一致と、同じexact SHAの単一main push CI runに属する固定4 checkの成功を再検証します。
 
 ```sh
 ./scripts/install-self-update.sh --install
@@ -27,7 +27,7 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 ./scripts/install-self-update.sh --bootstrap
 ```
 
-`--bootstrap`は登録済みDispatcher/Slack Adapterがあれば停止前に拒否し、stable updater→Dispatcher→Slack Adapterの順にbootstrapします。Updater/Dispatcherのbootstrap応答が曖昧な場合は再送せず、exact SHAの登録、socket health、起動identityを照合します。実行中stable updaterをbootoutしません。
+`--bootstrap`は登録済みDispatcher/Slack Adapterがあれば停止前に拒否し、stable updater→Dispatcher→Slack Adapterの順にbootstrapします。bootstrap応答が曖昧な場合は再送せず、Updater/Dispatcherのexact SHA起動identityと、Slack Adapterの固定label登録・exact SHA socket healthを照合します。実行中stable updaterをbootoutしません。
 
 ## 通常update
 

@@ -19,8 +19,10 @@ else
 fi
 if [[ -n "$TARGET_ROOT" ]]; then
   DISPATCHER_SOCKET="$BASE_DIR/run/d.sock"
+  SLACK_SOCKET="$BASE_DIR/run/s.sock"
 else
   DISPATCHER_SOCKET="$BASE_DIR/run/dispatcher.sock"
+  SLACK_SOCKET="$BASE_DIR/run/slack-adapter.sock"
 fi
 RUNTIME_ROOT="$BASE_DIR/runtime"
 RELEASE_ROOT="$RUNTIME_ROOT/releases"
@@ -105,6 +107,26 @@ bootstrap_dispatcher_reconciled() {
     return 0
   fi
   print -u2 -- "${context}のlaunchctl bootstrapはexit ${exit_code}で失敗し、exact SHAの起動済み状態も確認できませんでした。"
+  if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
+  return 1
+}
+
+bootstrap_slack_reconciled() {
+  local output=""
+  local exit_code=0
+  if output=$(launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist" 30000 2>&1); then
+    :
+  else
+    exit_code=$?
+  fi
+  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-slack-sha \
+      "$SLACK_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000; then
+    if [[ "$exit_code" != "0" ]]; then
+      print -u2 -- "Slack Adapterのbootstrap応答はexit ${exit_code}でしたが、固定labelとexact SHA healthを確認しました。"
+    fi
+    return 0
+  fi
+  print -u2 -- "Slack Adapterの起動状態を確定できません。bootstrapを再送せず登録とhealthを照合してください。"
   if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
   return 1
 }
@@ -281,7 +303,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
     print -u2 "Dispatcher登録状態が不明のためSlack Adapterの起動を保留しました。再送せず登録とhealthを照合してください。"
     exit 1
   fi
-  launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist" 30000
+  if ! bootstrap_slack_reconciled; then exit 1; fi
   print "stable updater、Dispatcher、Slack Adapterを順序付きでbootstrapしました。"
   exit 0
 fi
@@ -309,15 +331,9 @@ if [[ "$INSTALL_SHA" != "$($GIT_PATH -C "$REPOSITORY_DIR" rev-parse refs/remotes
   exit 1
 fi
 $GH_PATH api --method GET "repos/hiragram/dona/commits/$INSTALL_SHA/check-runs" -f per_page=100 > "$INSTALL_TMP/check-runs.json"
-$NODE_PATH -e '
-const runs = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).check_runs ?? [];
-for (const name of ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"]) {
-  const candidates = runs.filter((run) => run.name === name && run.head_sha === process.argv[2] && run.app?.slug === "github-actions");
-  const latest = candidates.sort((a, b) => b.id - a.id)[0];
-  if (!latest || latest.status !== "completed" || latest.conclusion !== "success") {
-    throw new Error(`Required trusted check is not successful: ${name}`);
-  }
-}' "$INSTALL_TMP/check-runs.json" "$INSTALL_SHA"
+TRUSTED_RUN_ID=$($NODE_PATH "$SCRIPT_DIR/verify-install-ci.mjs" checks "$INSTALL_TMP/check-runs.json" "$INSTALL_SHA")
+$GH_PATH api --method GET "repos/hiragram/dona/actions/runs/$TRUSTED_RUN_ID" > "$INSTALL_TMP/workflow-run.json"
+$NODE_PATH "$SCRIPT_DIR/verify-install-ci.mjs" workflow "$INSTALL_TMP/workflow-run.json" "$INSTALL_SHA" "$TRUSTED_RUN_ID"
 if [[ "$MODE" == "--install" && -e "$CONTROL_ROOT/updater" ]]; then
   print -u2 "stable updaterは既にinstall済みです。updater自身の上書き更新は実施しません。"
   exit 1
