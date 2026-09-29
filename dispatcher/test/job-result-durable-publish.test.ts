@@ -159,4 +159,15 @@ describe("永続Job Result公開", () => {
       assert.deepEqual(await publisher.reconcile(candidate("別の結果")),{ outcome: "conflict" });
     } finally { lock?.close(); database.close(); }
   });
+
+  test("予約後にjobがterminal fenceを失えば未確定をpendingと表示しない", async () => {
+    const { database, job, candidate } = await fixture();
+    try {
+      const publication = candidate();
+      assert.equal(database.reservePublishedJobResult(publication).outcome,"reserved");
+      database.markJobNeedsReview(job.job_id,"worker_observation_unknown","Worker observation is unknown");
+      assert.equal(database.inspectPublishedJobResult(job.job_id,publication.canonicalDigest),"needs_review");
+      assert.equal(database.commitPublishedJobResult(publication),"conflict");
+    } finally { database.close(); }
+  });
 });

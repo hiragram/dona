@@ -2286,7 +2286,7 @@ export class DispatcherDatabase {
     if (receipt.state === "committed")
       return job.result_json === receipt.envelope_json && (job.status === "completed" || job.status === "failed") &&
         this.publishedResultFileMatches(job.result_path,jobId,receipt.envelope_json) ? "reused" : "needs_review";
-    return "pending";
+    return job.result_json === null && ["dispatching","running"].includes(job.status) ? "pending" : "needs_review";
   }
 
   private publishedResultFileMatches(resultPath: string, jobId: string, envelopeJson: string): boolean {
