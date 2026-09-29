@@ -131,6 +131,25 @@ describe("ReleaseStore", () => {
     }
   });
 
+  test("checks the scan deadline while revalidating contained hardlinks", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const tree = path.join(root, "hardlink-tree");
+    await fs.mkdir(tree);
+    await fs.writeFile(path.join(tree, "one"), "data", { mode: 0o600 });
+    await fs.link(path.join(tree, "one"), path.join(tree, "two"));
+    let calls = 0;
+    mock.method(performance, "now", () => ++calls <= 5 ? 0 : 4_000);
+    try {
+      const store = new ReleaseStore(policy) as unknown as {
+        scanTree(root: string, current: string, budget: { deadline:number; entries:number }): Promise<void>;
+      };
+      await assert.rejects(store.scanTree(tree, tree, { deadline: 3_000, entries: 0 }), /cleanup_tree_scan_budget_exceeded/);
+    } finally {
+      mock.restoreAll();
+    }
+  });
+
   test("rejects an oversized manifest before parsing cleanup candidates", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

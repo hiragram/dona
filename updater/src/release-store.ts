@@ -393,10 +393,12 @@ export class ReleaseStore {
     const hardlinks = new Map<string, { expectedLinks: number; paths: string[] }>();
     await this.scanTreeEntry(root, current, hardlinks, budget);
     for (const [inode, observation] of hardlinks) {
+      if (budget && performance.now() > budget.deadline) throw new Error("cleanup_tree_scan_budget_exceeded");
       if (observation.paths.length !== observation.expectedLinks) {
         throw new Error("staging_owner_permissions_or_hardlink_invalid");
       }
       for (const candidate of observation.paths) {
+        if (budget && performance.now() > budget.deadline) throw new Error("cleanup_tree_scan_budget_exceeded");
         const stats = await fs.lstat(candidate);
         if (!stats.isFile() || `${stats.dev}:${stats.ino}` !== inode || stats.nlink !== observation.paths.length ||
           stats.uid !== process.getuid?.() || (stats.mode & 0o022) !== 0) {
