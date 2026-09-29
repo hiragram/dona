@@ -59,6 +59,26 @@ describe("UpdateDatabase", () => {
     db.close();
   });
 
+  test("selects distinct successful releases by insertion order across clock reversal", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const databasePath = path.join(policy.control_root, "updater.sqlite3");
+    const db = new UpdateDatabase(databasePath);
+    const raw = new Database(databasePath);
+    const insert = raw.prepare(`INSERT INTO update_requests(request_id,source_event_id,reply_target_json,state,
+      current_sha,target_sha,plan_id,plan_hash,policy_version,compatibility_json,rollback_compatible,
+      created_at,updated_at,completed_at) VALUES(?,?, '{}','succeeded',?,?,?,'hash','policy','{}',1,?,?,?)`);
+    const older = "1".repeat(40);
+    const newer = "2".repeat(40);
+    insert.run("request-1","event-1",currentSha,older,"plan-1","2026-09-03","2026-09-03","2026-09-03");
+    insert.run("request-2","event-2",currentSha,newer,"plan-2","2026-09-02","2026-09-02","2026-09-02");
+    insert.run("request-3","event-3",currentSha,newer,"plan-3","2026-09-01","2026-09-01","2026-09-01");
+    assert.deepEqual(db.recentSuccessfulReleaseShas(1), new Set([newer]));
+    assert.deepEqual(db.recentSuccessfulReleaseShas(1,new Set([newer])), new Set([older]));
+    raw.close();
+    db.close();
+  });
+
   test("persists the exact inventory and rejects expired approval while retaining terminal evidence", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

@@ -952,7 +952,7 @@ export class UpdateDatabase {
     const excluded = [...excludedShas];
     const exclusion = excluded.length ? `AND target_sha NOT IN (${excluded.map(() => "?").join(",")})` : "";
     const rows = this.db.prepare(`SELECT target_sha FROM update_requests WHERE state='succeeded' ${exclusion}
-      GROUP BY target_sha ORDER BY MAX(completed_at) DESC,target_sha DESC LIMIT ?`)
+      GROUP BY target_sha ORDER BY MAX(rowid) DESC LIMIT ?`)
       .all(...excluded,limit) as Array<{target_sha:string}>;
     return new Set(rows.map((row) => row.target_sha));
   }
