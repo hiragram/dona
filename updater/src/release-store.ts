@@ -382,9 +382,13 @@ export class ReleaseStore {
       throw new Error("staging_owner_permissions_or_hardlink_invalid");
     }
     if (stats.isDirectory()) {
-      const children = await fs.readdir(current);
-      if (stats.nlink > 2 + children.length) throw new Error("staging_owner_permissions_or_hardlink_invalid");
-      for (const child of children) await this.scanTreeEntry(root, path.join(current, child), hardlinks, budget);
+      let childCount = 0;
+      for await (const child of await fs.opendir(current)) {
+        if (budget && Date.now() > budget.deadline) throw new Error("cleanup_tree_scan_budget_exceeded");
+        childCount++;
+        await this.scanTreeEntry(root, path.join(current, child.name), hardlinks, budget);
+      }
+      if (stats.nlink > 2 + childCount) throw new Error("staging_owner_permissions_or_hardlink_invalid");
       return;
     }
     if (!stats.isFile() || stats.nlink < 1) throw new Error("staging_owner_permissions_or_hardlink_invalid");
@@ -444,7 +448,7 @@ export class ReleaseStore {
     if (stats.isSymbolicLink()) return;
     if (stats.isDirectory()) {
       await fs.chmod(current, 0o700);
-      for (const child of await fs.readdir(current)) await this.makeMutableForRemoval(path.join(current, child));
+      for await (const child of await fs.opendir(current)) await this.makeMutableForRemoval(path.join(current, child.name));
     } else {
       await fs.chmod(current, 0o600);
     }
