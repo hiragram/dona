@@ -165,6 +165,41 @@ describe("ReleaseStore", () => {
     assert.equal((await fs.lstat(path.join(policy.release_root, currentSha))).isDirectory(), true);
   });
 
+  test("serializes activation with a cleanup already removing its target release", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const target = await installRelease(policy, targetSha);
+    const store = new ReleaseStore(policy);
+    let entered!: () => void;
+    const removalEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let resume!: () => void;
+    const resumeRemoval = new Promise<void>((resolve) => { resume = resolve; });
+    const originalRm = fs.rm.bind(fs);
+    mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+      if (args[0] === target) { entered(); await resumeRemoval; }
+      return originalRm(...args);
+    });
+    try {
+      const cleanup = store.cleanup(new Set([currentSha, "0".repeat(40)]));
+      await removalEntered;
+      let activationSettled = false;
+      const activation = store.activate(row(), target).then(
+        () => { activationSettled = true; return "activated"; },
+        () => { activationSettled = true; return "rejected"; },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(activationSettled, false);
+      resume();
+      assert.deepEqual(await cleanup, [targetSha]);
+      assert.equal(await activation, "rejected");
+      assert.equal((await store.observe()).current_sha, currentSha);
+    } finally {
+      resume();
+      mock.restoreAll();
+    }
+  });
+
   test("rejects a staging tree that exceeds the cleanup scan deadline before publish", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

@@ -39,7 +39,17 @@ async function writeAtomic(filePath: string, body: string, mode = 0o600): Promis
 }
 
 export class ReleaseStore {
+  private mutationTail: Promise<void> = Promise.resolve();
   constructor(private readonly policy: UpdatePolicy) {}
+
+  private async serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const prior = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => { release = resolve; });
+    await prior;
+    try { return await operation(); }
+    finally { release(); }
+  }
 
   async preflight(): Promise<{ free_bytes: number; disk_floor_bytes: number; same_filesystem: true }> {
     const [releaseStats, pointerParentStats, filesystem] = await Promise.all([
@@ -92,6 +102,10 @@ export class ReleaseStore {
   }
 
   async publish(stagingPath: string, manifest: ReleaseManifest): Promise<string> {
+    return this.serializeMutation(() => this.publishLocked(stagingPath, manifest));
+  }
+
+  private async publishLocked(stagingPath: string, manifest: ReleaseManifest): Promise<string> {
     fullSha(manifest.sha, "manifest.sha");
     const stagingRoot = path.join(this.policy.release_root, ".staging");
     await this.assertGeneratedPath(stagingRoot, stagingPath);
@@ -119,6 +133,10 @@ export class ReleaseStore {
   }
 
   async activate(request: UpdateRow, releasePath: string): Promise<ActivationReceipt> {
+    return this.serializeMutation(() => this.activateLocked(request, releasePath));
+  }
+
+  private async activateLocked(request: UpdateRow, releasePath: string): Promise<ActivationReceipt> {
     const target = await this.validateReleasePath(releasePath, request.target_sha);
     const current = await this.resolvePointer(this.policy.current_pointer, true);
     if (!current || path.basename(current) !== request.current_sha) throw new Error("current_pointer_cas_mismatch");
@@ -138,6 +156,10 @@ export class ReleaseStore {
   }
 
   async rollback(request: UpdateRow): Promise<ActivationReceipt> {
+    return this.serializeMutation(() => this.rollbackLocked(request));
+  }
+
+  private async rollbackLocked(request: UpdateRow): Promise<ActivationReceipt> {
     const current = await this.resolvePointer(this.policy.current_pointer, true);
     const previous = await this.resolvePointer(this.policy.previous_pointer, true);
     const activationReceipt = await this.readReceipt();
@@ -246,6 +268,10 @@ export class ReleaseStore {
   }
 
   async cleanup(protectedShas: ReadonlySet<string>): Promise<string[]> {
+    return this.serializeMutation(() => this.cleanupLocked(protectedShas));
+  }
+
+  private async cleanupLocked(protectedShas: ReadonlySet<string>): Promise<string[]> {
     const { planned, lastScanned } = await this.planCleanup(protectedShas);
     const removed: string[] = [];
     const errors: string[] = [];
