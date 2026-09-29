@@ -277,7 +277,8 @@ class FakeRuntime implements RuntimePort {
   inventoryLaunchdDigest = "a".repeat(64);
   inventoryChangesOnCall: number | undefined;
   inventoryCalls = 0;
-  runtimeInventory() {
+  controlEvents: Record<string, "waiting_agent" | "completed"> = {};
+  runtimeInventory(excludedControlEventIds: readonly string[] = []) {
     this.inventoryCalls += 1;
     if (this.inventoryChangesOnCall === this.inventoryCalls) this.inventoryRevision += 1;
     if (this.inventoryUnavailable) return Promise.reject(new Error("inventory_unavailable"));
@@ -287,7 +288,9 @@ class FakeRuntime implements RuntimePort {
       policy_version: this.policyVersion,
       launchd: { dispatcher_registered: this.inventoryDispatcherRegistered, slack_registered: true, identity_digest: this.inventoryLaunchdDigest },
       workers: { classes: this.inventoryWorkerCount ? { "running:legacy/unknown/unknown": this.inventoryWorkerCount } : {}, exception_digest: "b".repeat(64) },
-      pending: { updates: 0, update_notifications: 0, events: 0, jobs: this.inventoryWorkerCount,
+      pending: { updates: 0, update_notifications: 0,
+        events: Object.entries(this.controlEvents).filter(([id, status]) => status !== "completed" && !excludedControlEventIds.includes(id)).length,
+        jobs: this.inventoryWorkerCount,
         schedules: 0, notifications: this.inventoryRevision, digest: "c".repeat(64) },
     });
   }
@@ -636,6 +639,36 @@ async function fixture(policyVersion = "2026-09-03.2") {
 }
 
 describe("UpdateController isolated end-to-end", () => {
+  test("plan and approval control events may settle without changing the workload snapshot", async () => {
+    const f = await fixture();
+    f.runtime.controlEvents[sourceEventId] = "waiting_agent";
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    assert.equal((planned.plan as { inventory: { pending: { events: number } } }).inventory.pending.events, 0);
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.runtime.controlEvents[sourceEventId] = "completed";
+    f.runtime.controlEvents[approvalEventId] = "waiting_agent";
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "approval-own-events" });
+    f.dispatcher.terminal = true;
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.state, "succeeded");
+    f.database.close();
+
+    const unrelated = await fixture();
+    unrelated.runtime.controlEvents[sourceEventId] = "waiting_agent";
+    const separatePlan = await unrelated.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const separate = separatePlan.plan as { plan_id: string; plan_hash: string };
+    unrelated.runtime.controlEvents[sourceEventId] = "completed";
+    unrelated.runtime.controlEvents[approvalEventId] = "waiting_agent";
+    unrelated.runtime.controlEvents.evt_01M1ES03XY5CF8D9PM5CWX4SRY = "waiting_agent";
+    unrelated.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: separate.plan_id, plan_hash: separate.plan_hash, approval_id: "approval-other-event" });
+    unrelated.dispatcher.terminal = true;
+    await unrelated.controller.processNext();
+    assert.equal(unrelated.database.get(separatePlan.request_id as string)?.last_error_code, "inventory_replan_required");
+    unrelated.database.close();
+  });
+
   test("concurrent inventory changes fail planning and approval preflight closed", async () => {
     const planning = await fixture();
     planning.runtime.inventoryChangesOnCall = 2;

@@ -67,7 +67,8 @@ test("runtime inventory hashes live classes without exposing identifiers or payl
       CREATE TABLE jobs(job_id TEXT,status TEXT,source TEXT,steer_state TEXT,attempt_count INTEGER,
         herdr_workspace_id TEXT,completion_event_id TEXT,last_error_code TEXT,updated_at TEXT);
       PRAGMA user_version = 2;`);
-    db.prepare("INSERT INTO events VALUES ('evt_secret','waiting_agent',1,'slack','2026-09-29T00:00:00Z')").run();
+    const controlEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRV";
+    db.prepare("INSERT INTO events VALUES (?,'waiting_agent',1,'slack','2026-09-29T00:00:00Z')").run(controlEventId);
     db.prepare("INSERT INTO jobs VALUES ('job_secret','running','dona_job',NULL,1,'private_worker',NULL,NULL,'2026-09-29T00:00:00Z')").run();
     db.close();
     await fs.chmod(dbPath, 0o600);
@@ -79,6 +80,7 @@ test("runtime inventory hashes live classes without exposing identifiers or payl
     const runtime = new RealRuntime(policy, runner as unknown as ProcessRunner, agents);
     const inventory = await runtime.runtimeInventory();
     assert.equal(inventory.pending.events, 1);
+    assert.equal((await runtime.runtimeInventory([controlEventId])).pending.events, 0);
     assert.equal(inventory.pending.jobs, 1);
     assert.equal(inventory.workers.classes["running:worker:protocol_unknown:epoch_unknown:result_capability_unknown"], 1);
     assert.equal(JSON.stringify(inventory).includes("secret"), false);

@@ -556,12 +556,16 @@ export class RealRuntime implements RuntimePort {
   constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner(),
     private readonly launchAgentsRoot = path.join(os.homedir(), "Library", "LaunchAgents")) {}
 
-  async runtimeInventory(): Promise<RuntimeInventory> {
-    try { return await this.readRuntimeInventory(); }
+  async runtimeInventory(excludedControlEventIds: readonly string[] = []): Promise<RuntimeInventory> {
+    try { return await this.readRuntimeInventory(excludedControlEventIds); }
     catch { throw new Error("runtime_inventory_unavailable"); }
   }
 
-  private async readRuntimeInventory(): Promise<RuntimeInventory> {
+  private async readRuntimeInventory(excludedControlEventIds: readonly string[]): Promise<RuntimeInventory> {
+    if (excludedControlEventIds.length > 2 || new Set(excludedControlEventIds).size !== excludedControlEventIds.length ||
+      excludedControlEventIds.some((id) => !/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(id))) {
+      throw new Error("inventory_control_event_identity_invalid");
+    }
     // Read every Dispatcher-owned class in one SQLite snapshot. Never return
     // identifiers or payloads: they are used only as inputs to the digest.
     const database = new Database(this.dispatcherDatabasePath(), { readonly: true, fileMustExist: true });
@@ -579,15 +583,20 @@ export class RealRuntime implements RuntimePort {
         const exceptions = createHash("sha256");
         const classes: Record<string, number> = {};
         const counts = { events: 0, jobs: 0, schedules: 0, notifications: 0 };
-        const scan = (query: string, kind: keyof typeof counts, classify?: (row: Record<string, unknown>) => void) => {
-          for (const row of database.prepare(query).iterate() as Iterable<Record<string, unknown>>) {
+        const scan = (query: string, kind: keyof typeof counts, classify?: (row: Record<string, unknown>) => void,
+          params: readonly string[] = []) => {
+          for (const row of database.prepare(query).iterate(...params) as Iterable<Record<string, unknown>>) {
             counts[kind] += 1;
             const encoded = JSON.stringify(row);
             hash.update(`${encoded.length}:`).update(encoded);
             classify?.(row);
           }
         };
-        scan("SELECT event_id,status,schema_version,source,updated_at FROM events WHERE status NOT IN ('completed','failed','cancelled') ORDER BY event_id", "events");
+        const excluded = excludedControlEventIds.length ?
+          ` AND event_id NOT IN (${excludedControlEventIds.map(() => "?").join(",")})` : "";
+        scan(`SELECT event_id,status,schema_version,source,updated_at FROM events
+          WHERE status NOT IN ('completed','failed','cancelled')${excluded} ORDER BY event_id`,
+        "events", undefined, excludedControlEventIds);
         scan("SELECT job_id,status,source,steer_state,attempt_count,herdr_workspace_id,completion_event_id,last_error_code,updated_at FROM jobs WHERE status NOT IN ('completed','failed','cancelled') OR (completion_event_id IS NULL AND herdr_workspace_id IS NOT NULL) ORDER BY job_id", "jobs", (row) => {
           // The released DB has no owner epoch, protocol or Result publication
           // capability columns. Label those facts unknown rather than inferring

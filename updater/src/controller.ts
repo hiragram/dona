@@ -168,8 +168,8 @@ export class UpdateController {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");
       }
     }
-    const inventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory());
-    const confirmedInventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory());
+    const inventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory([request.source_event_id]));
+    const confirmedInventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory([request.source_event_id]));
     if (canonicalJson(confirmedInventory) !== canonicalJson(inventory)) throw new Error("runtime_inventory_unstable");
     if (inventory.policy_version !== this.policy.policy_version || inventory.app_schema !== inventory.dispatcher_schema ||
       inventory.dispatcher_protocol !== current.compatibility.protocol) throw new Error("runtime_inventory_identity_unverified");
@@ -912,8 +912,10 @@ export class UpdateController {
     catch { throw new InventoryPreflightError("inventory_snapshot_unverified"); }
     let current: RuntimeInventory;
     try {
-      current = this.completeRuntimeInventory(await this.runtime.runtimeInventory(), row.request_id);
-      const confirmed = this.completeRuntimeInventory(await this.runtime.runtimeInventory(), row.request_id);
+      if (!row.approval_event_id) throw new InventoryPreflightError("inventory_snapshot_unverified");
+      const excluded = [row.source_event_id, row.approval_event_id];
+      current = this.completeRuntimeInventory(await this.runtime.runtimeInventory(excluded), row.request_id);
+      const confirmed = this.completeRuntimeInventory(await this.runtime.runtimeInventory(excluded), row.request_id);
       if (canonicalJson(confirmed) !== canonicalJson(current)) throw new InventoryPreflightError("inventory_replan_required");
     }
     catch (error) {
