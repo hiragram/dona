@@ -1883,6 +1883,35 @@ test("needs_reviewのrevision本文/objectiveも7日で消去しfenceを保持",
   assert.equal(count(raw, "schedule_runs"), 2);
 });
 
+test("公開予約の隔離をschedule runへ同期しadminが失敗確定できる",()=>{
+  const {repo,dispatcher,raw}=setup();
+  repo.create("publish_review",{...input,action:"work.read_only"},due,actor,now);
+  const run=repo.materialize("publish_review",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective:input.content!,workspace:{kind:"scratch"}},
+    "/tmp/jobs","/tmp/results",new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));
+  dispatcher.beginJobDispatch(job.job_id,new Date(due));
+  dispatcher.markJobRunning(job.job_id,new Date(due));
+  const digest="a".repeat(64);
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+    VALUES(?,?,?,?,?,?,?,'reserved',?)`)
+    .run(job.job_id,digest,"{}",dispatcher.getJob(job.job_id)!.attempt_count,null,"b".repeat(64),1,due);
+  dispatcher.quarantinePublishedJobResult(job.job_id,digest);
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"needs_review");
+  assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+  dispatcher.reconcileScheduledRun(run.run_id,"failed",new Date(due));
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"failed");
+  assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at,committed_at)
+    VALUES(?,?,?,?,?,?,?,'committed',?,?)`)
+    .run(job.job_id,digest,"{}",dispatcher.getJob(job.job_id)!.attempt_count,null,"b".repeat(64),1,due,due);
+  assert.equal(dispatcher.quarantineIncompletePublishedResults(),1);
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"needs_review");
+  assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+});
+
 test("dona_scheduleは#11 routingへ流しlegacy scheduler eventだけを除外する", () => {
   const { repo, dispatcher, raw } = setup(); repo.create("work", { ...input, action: "work.read_only" }, due, actor, now);
   const run = repo.materialize("work", 1, due, later, due, actor).run;

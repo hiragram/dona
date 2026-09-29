@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, test } from "node:test";
+import { afterEach, describe, mock, test } from "node:test";
 import Database from "better-sqlite3";
 
 import { DispatcherDatabase } from "../src/database.js";
@@ -66,11 +67,11 @@ describe("永続Job Result公開", () => {
     try {
       await assert.rejects(publisher.commit(publication),/injected_commit_failure/);
       assert.deepEqual(await readJobResultEnvelope(job.result_path,job.job_id),publication.envelope);
-      assert.deepEqual(await publisher.reconcile(candidate()),{ outcome: "pending" });
+      assert.deepEqual(await publisher.reconcile(candidate()),{ outcome: "needs_review" });
       database.close();
       const reopened = new DispatcherDatabase(config.databasePath);
       try {
-        assert.equal(reopened.quarantineIncompletePublishedResults(),1);
+        assert.equal(reopened.quarantineIncompletePublishedResults(),0);
         assert.equal(reopened.getJob(job.job_id)?.status,"needs_review");
         assert.equal(reopened.inspectPublishedJobResult(job.job_id,publication.canonicalDigest),"needs_review");
         assert.equal(reopened.quarantineIncompletePublishedResults(),0);
@@ -85,9 +86,9 @@ describe("永続Job Result公開", () => {
       const temporary = `${job.result_path}.publish-${publication.canonicalDigest}.tmp`;
       await fs.writeFile(temporary,"stale",{ mode: 0o600 });
       await assert.rejects(publisher.commit(publication),/EEXIST/);
-      assert.equal(database.inspectPublishedJobResult(job.job_id,publication.canonicalDigest),"pending");
+      assert.equal(database.inspectPublishedJobResult(job.job_id,publication.canonicalDigest),"needs_review");
       assert.throws(() => database.saveJobResult(job.job_id,publication.envelope,job.result_path),/job_result_publish_reserved/);
-      assert.equal(database.quarantineIncompletePublishedResults(),1);
+      assert.equal(database.quarantineIncompletePublishedResults(),0);
       assert.equal(database.getJob(job.job_id)?.status,"needs_review");
     } finally { database.close(); }
   });
@@ -120,6 +121,22 @@ describe("永続Job Result公開", () => {
     } finally { database.close(); }
   });
 
+  test("一時的なfile読取障害で確定receiptを隔離しない",async()=>{
+    const {database,job,candidate,publisher}=await fixture();
+    try {
+      await publisher.commit(candidate());
+      const original=syncFs.openSync;
+      const patched=mock.method(syncFs,"openSync",((name:syncFs.PathLike,flags:number,mode?:number)=>{
+        if(name===job.result_path) throw Object.assign(new Error("too many open files"),{code:"EMFILE"});
+        return original(name,flags,mode);
+      }) as typeof syncFs.openSync);
+      try {assert.throws(()=>database.quarantineIncompletePublishedResults(),/too many open files/);}
+      finally {patched.mock.restore();}
+      assert.equal(database.getJob(job.job_id)?.status,"completed");
+      assert.equal(database.inspectPublishedJobResult(job.job_id,candidate().canonicalDigest),"reused");
+    } finally {database.close();}
+  });
+
   for (const point of ["after_reserve","before_rename","after_rename","before_db_commit","after_db_commit"] as const) {
     test(`${point}の応答喪失をreceiptで照合する`, async () => {
       const { database, job, candidate } = await fixture();
@@ -130,13 +147,13 @@ describe("永続Job Result公開", () => {
         });
         await assert.rejects(publisher.commit(publication),/injected_response_loss/);
         const state = database.inspectPublishedJobResult(job.job_id,publication.canonicalDigest);
-        assert.equal(state,point === "after_db_commit" ? "reused" : "pending");
+        assert.equal(state,point === "after_db_commit" ? "reused" : "needs_review");
         if (point === "after_db_commit") {
           assert.equal(database.getJob(job.job_id)?.status,"completed");
           assert.equal(database.quarantineIncompletePublishedResults(),0);
         } else {
           assert.equal(database.getJob(job.job_id)?.result_json,null);
-          assert.equal(database.quarantineIncompletePublishedResults(),1);
+          assert.equal(database.quarantineIncompletePublishedResults(),0);
           assert.equal(database.inspectPublishedJobResult(job.job_id,publication.canonicalDigest),"needs_review");
         }
       } finally { database.close(); }

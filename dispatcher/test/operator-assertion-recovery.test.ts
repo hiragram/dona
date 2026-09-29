@@ -106,6 +106,32 @@ test("公開receiptと異なるResultは申告しても受理しない",async()=
   } finally {raw.close();}
 });
 
+test("DB確定後のResult file喪失も隔離して申告で棄却できる",async()=>{
+  const state=await setup("published_result_reconciliation_required");
+  const result={schema_version:1,job_id:state.job.job_id,status:"completed" as const,summary:"保存済み",completed_at:new Date().toISOString()};
+  const raw=new Database(state.config.databasePath);
+  try {
+    raw.prepare("UPDATE jobs SET status='completed',result_json=?,last_error_code=NULL WHERE job_id=?")
+      .run(stableStringify(result),state.job.job_id);
+    raw.prepare(`INSERT INTO job_result_publish_receipts
+      (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at,committed_at)
+      VALUES(?,?,?,?,?,?,?,'committed',?,?)`)
+      .run(state.job.job_id,digest("winner"),stableStringify(result),state.job.attempt_count,null,digest("session"),1,new Date().toISOString(),new Date().toISOString());
+    assert.equal(state.database.quarantineIncompletePublishedResults(),1);
+    assert.equal(state.database.getJob(state.job.job_id)?.status,"needs_review");
+    const assertion=state.database.enqueue({...eventEnvelope("terminal-file-loss"),
+      occurred_at:new Date(Date.now()+1000).toISOString(),payload:{text:"Result file喪失を確認"}}).row;
+    state.database.manualComplete(assertion.event_id);
+    const preview=state.database.inspectOperatorAssertionRecovery(state.job.job_id);
+    const input={...state.input(),assertionEventId:assertion.event_id,expectedUpdatedAt:preview.updated_at,
+      expectedCause:preview.cause!,expectedResultClass:preview.result_class,expectedResultSha256:preview.result_sha256,
+      notificationEvidenceSha256:preview.notification_evidence_sha256};
+    assert.equal(state.database.recoverWithOperatorAssertion(input,new Date(Date.now()+2000)).status,"failed");
+    assert.equal(state.database.getJob(state.job.job_id)?.result_json,null);
+    assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(state.job.job_id),undefined);
+  } finally {raw.close();}
+});
+
 test("別の旧needs_review原因でも妥当Resultを受理する",async()=>{
   const state=await setup("stale_preparing_agent_unverified");
   await fs.mkdir(path.dirname(state.job.result_path),{recursive:true});

@@ -44,15 +44,26 @@ export class JobResultDurablePublisher implements JobResultPublishSink {
     const reserved = this.database.reservePublishedJobResult(candidate);
     if (reserved.outcome !== "reserved") return { outcome: reserved.outcome,
       ...(reserved.outcome === "reused" ? { receipt_id: candidate.canonicalDigest } : {}) };
+    try { return this.commitReserved(candidate,reserved); }
+    catch (error) {
+      const code=(error as NodeJS.ErrnoException).code;
+      if (!["SQLITE_BUSY","SQLITE_LOCKED"].includes(code??""))
+        this.database.quarantinePublishedJobResult(candidate.fence.jobId,candidate.canonicalDigest);
+      throw error;
+    }
+  }
+
+  private commitReserved(candidate: AuthorizedJobResultPublish,
+    reserved: { outcome: "reserved"; envelope: JobResultEnvelope; fresh: boolean }): { outcome: "created" | "reused" | "pending" | "conflict"; receipt_id?: string } {
     this.faultHook("after_reserve");
     const job = this.database.getJob(candidate.fence.jobId);
-    if (!job) return { outcome: "conflict" };
+    if (!job) { this.database.quarantinePublishedJobResult(candidate.fence.jobId,candidate.canonicalDigest); return { outcome: "conflict" }; }
     candidate.envelope = reserved.envelope;
     const encoded = stableStringify(reserved.envelope);
     if (Buffer.byteLength(encoded, "utf8") > jobResultEnvelopeMaxBytes) throw new Error("job_result_file_invalid");
     const existing = verifiedFile(job.result_path,job.job_id);
     if (existing) {
-      if (stableStringify(existing) !== encoded) return { outcome: "conflict" };
+      if (stableStringify(existing) !== encoded) { this.database.quarantinePublishedJobResult(job.job_id,candidate.canonicalDigest); return { outcome: "conflict" }; }
     } else {
       const temporary = `${job.result_path}.publish-${candidate.canonicalDigest}.tmp`;
       let handle: number | undefined;
@@ -64,7 +75,7 @@ export class JobResultDurablePublisher implements JobResultPublishSink {
         fs.closeSync(handle); handle = undefined;
         const checked = verifiedFile(temporary,job.job_id);
         if (!checked || stableStringify(checked) !== encoded) throw new Error("job_result_temp_invalid");
-        if (pathOccupied(job.result_path)) return { outcome: "conflict" };
+        if (pathOccupied(job.result_path)) { this.database.quarantinePublishedJobResult(job.job_id,candidate.canonicalDigest); return { outcome: "conflict" }; }
         this.faultHook("before_rename");
         fs.renameSync(temporary,job.result_path);
         this.faultHook("after_rename");
@@ -77,6 +88,7 @@ export class JobResultDurablePublisher implements JobResultPublishSink {
     this.faultHook("before_db_commit");
     const committed = this.database.commitPublishedJobResult(candidate,new Date(),this.notificationHook);
     this.faultHook("after_db_commit");
+    if(committed!=="reused") this.database.quarantinePublishedJobResult(job.job_id,candidate.canonicalDigest);
     return committed === "reused"
       ? { outcome: reserved.fresh ? "created" : "reused", receipt_id: candidate.canonicalDigest }
       : { outcome: "conflict" };

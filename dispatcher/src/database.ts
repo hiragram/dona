@@ -1672,9 +1672,13 @@ export class DispatcherDatabase {
       const job=this.getJobRequired(input.jobId);
       if(this.db.prepare("SELECT 1 FROM job_operator_assertion_recoveries WHERE job_id=?").get(job.job_id))
         throw new Error("operator_recovery_already_recorded");
+      const initialPublishReceipt=this.db.prepare("SELECT state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(job.job_id) as {state:string}|undefined;
       if(readEventJobBinding(this.db,job.source_event_id)?.owner.kind!=="slack_thread"||
         job.status!=="needs_review"||!job.last_error_code||job.last_error_code!==input.expectedCause||
-        job.updated_at!==input.expectedUpdatedAt||job.result_json!==null||job.steer_state!==null)
+        job.updated_at!==input.expectedUpdatedAt||
+        (job.result_json!==null&&!(job.last_error_code==="published_result_reconciliation_required"&&initialPublishReceipt?.state==="needs_review"))||
+        job.steer_state!==null)
         throw new Error("operator_recovery_job_changed");
       if(job.last_error_code==="result_path_exists"||
         (job.attempt_count===0&&job.dispatch_started_at===null&&job.prompt_accepted_at===null&&job.herdr_workspace_id===null))
@@ -1715,7 +1719,8 @@ export class DispatcherDatabase {
       if(publishReceipt && (publishReceipt.state!=="needs_review" || job.last_error_code!=="published_result_reconciliation_required"))
         throw new Error("operator_publish_receipt_changed");
       if(file.kind==="valid") {
-        if(publishReceipt && (!this.publishedResultFileMatches(job.result_path,job.job_id,publishReceipt.envelope_json) ||
+        if(publishReceipt && ((job.result_json!==null&&job.result_json!==publishReceipt.envelope_json) ||
+          !this.publishedResultFileMatches(job.result_path,job.job_id,publishReceipt.envelope_json) ||
           stableStringify(file.result)!==publishReceipt.envelope_json)) throw new Error("operator_publish_result_mismatch");
         this.saveJobResultInternal(job.job_id,file.result!,job.result_path,at,()=>{},true,publishReceipt?.canonical_digest);
         if(publishReceipt) this.db.prepare("UPDATE job_result_publish_receipts SET state='committed',committed_at=? WHERE job_id=? AND state='needs_review'")
@@ -1734,8 +1739,8 @@ export class DispatcherDatabase {
           }
         }
         const changed=this.db.prepare(`UPDATE jobs SET status='failed',completed_at=?,updated_at=?,completion_event_id=NULL,
-          last_error_code='operator_assertion_result_unaccepted',last_error_message=NULL
-          WHERE job_id=? AND status='needs_review' AND updated_at=? AND last_error_code=? AND result_json IS NULL`)
+          last_error_code='operator_assertion_result_unaccepted',last_error_message=NULL,result_json=NULL
+          WHERE job_id=? AND status='needs_review' AND updated_at=? AND last_error_code=?`)
           .run(at.toISOString(),at.toISOString(),job.job_id,input.expectedUpdatedAt,input.expectedCause).changes;
         if(changed!==1) throw new Error("operator_recovery_job_changed");
         if(publishReceipt) this.db.prepare("DELETE FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'")
@@ -2252,6 +2257,7 @@ export class DispatcherDatabase {
       }
       const result=this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
       if(row.job_id) {
+        this.db.prepare("DELETE FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").run(row.job_id);
         this.db.prepare(`UPDATE jobs SET status=?,completed_at=?,
           last_error_code=CASE WHEN (dispatch_started_at IS NOT NULL OR prompt_accepted_at IS NOT NULL OR herdr_workspace_id IS NOT NULL
               OR COALESCE(last_error_code,'') IN ('stale_preparing_agent_unverified','legacy_agent_sandbox_unknown'))
@@ -2318,14 +2324,47 @@ export class DispatcherDatabase {
   }
 
   private publishedResultFileMatches(resultPath: string, jobId: string, envelopeJson: string): boolean {
+    let handle: number;
     try {
-      const handle = fs.openSync(resultPath,fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-      try {
-        const stat = fs.fstatSync(handle);
-        return stat.isFile() && (stat.mode & 0o077) === 0 && stat.size <= jobResultEnvelopeMaxBytes &&
-          stableStringify(parseJobResultEnvelope(JSON.parse(fs.readFileSync(handle,"utf8")),jobId)) === envelopeJson;
-      } finally { fs.closeSync(handle); }
-    } catch { return false; }
+      handle = fs.openSync(resultPath,fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    } catch (error) {
+      if (["ENOENT","ELOOP"].includes((error as NodeJS.ErrnoException).code??"")) return false;
+      throw error;
+    }
+    try {
+      const stat = fs.fstatSync(handle);
+      if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size > jobResultEnvelopeMaxBytes) return false;
+      const bytes=fs.readFileSync(handle,"utf8");
+      try { return stableStringify(parseJobResultEnvelope(JSON.parse(bytes),jobId)) === envelopeJson; }
+      catch { return false; }
+    } finally { fs.closeSync(handle); }
+  }
+
+  /** Mark a known incomplete reservation without trusting a worker retry. */
+  quarantinePublishedJobResult(jobId:string,digest:string):void {
+    this.db.transaction(()=>{
+      const receipt=this.db.prepare("SELECT state,canonical_digest FROM job_result_publish_receipts WHERE job_id=?")
+        .get(jobId) as {state:string;canonical_digest:string}|undefined;
+      if(!receipt||receipt.canonical_digest!==digest||receipt.state!=="reserved") return;
+      this.db.prepare("UPDATE job_result_publish_receipts SET state='needs_review' WHERE job_id=? AND state='reserved'").run(jobId);
+      this.markPublishedJobNeedsReview(jobId);
+    }).immediate();
+  }
+
+  private markPublishedJobNeedsReview(jobId:string):void {
+    const job=this.getJobRequired(jobId),binding=readEventJobBinding(this.db,job.source_event_id);
+    if(["completed","failed"].includes(job.status)) {
+      this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='published_result_reconciliation_required',
+        last_error_message='Published Result requires file and database reconciliation',updated_at=? WHERE job_id=?`)
+        .run(nowUtc(),jobId);
+    } else this.markJobNeedsReview(jobId,"published_result_reconciliation_required",
+      "Published Result requires file and database reconciliation");
+    if(binding?.owner.kind==="schedule") {
+      const run=this.scheduler.getRun(binding.owner.run_id);
+      if(run&&["started","completed","failed","needs_review"].includes(run.status))
+        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,jobId,
+          new Date(Math.floor(Date.now()/1000)*1000).toISOString().replace(".000Z","Z"),job.source_event_id);
+    }
   }
 
   /** Called once on supervisor startup, before a new worker can ingest a stranded file. */
@@ -2341,8 +2380,7 @@ export class DispatcherDatabase {
         const current = this.db.prepare("SELECT state FROM job_result_publish_receipts WHERE job_id=?").get(row.job_id) as { state: string } | undefined;
         if (current?.state !== row.state) return;
         this.db.prepare("UPDATE job_result_publish_receipts SET state='needs_review' WHERE job_id=?").run(row.job_id);
-        this.markJobNeedsReview(row.job_id,"published_result_reconciliation_required",
-          "Published Result requires file and database reconciliation");
+        this.markPublishedJobNeedsReview(row.job_id);
         quarantined++;
       }).immediate();
     }
