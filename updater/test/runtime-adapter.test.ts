@@ -140,6 +140,7 @@ async function listen(
   service: "dispatcher" | "slack_adapter",
   requests: unknown[],
   pendingDrainResponses = 0,
+  healthStatus: "ready" | "not_ready" = "ready",
 ): Promise<http.Server> {
   await fs.mkdir(path.dirname(socketPath), { recursive: true });
   let remainingPending = pendingDrainResponses;
@@ -147,7 +148,7 @@ async function listen(
     if (request.url === "/health/version") {
       const body = JSON.stringify({
         schema_version: 1,
-        status: "ready",
+        status: healthStatus,
         service,
         build_sha: targetSha,
         protocol: 1,
@@ -158,7 +159,8 @@ async function listen(
         config: 1,
         ...(service === "slack_adapter" ? { workspaces_ready: true } : {}),
       });
-      response.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+      response.writeHead(healthStatus === "ready" ? 200 : 503,
+        { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
       response.end(body);
       return;
     }
@@ -187,6 +189,23 @@ async function listen(
   });
   return server;
 }
+
+test("RealRuntime observes a versioned 503 not_ready service as live during quiesce", async () => {
+  const { root, policy } = await tempPolicy();
+  const requests: unknown[] = [];
+  const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests, 0, "not_ready");
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    const health = await runtime.dispatcherHealth();
+    assert.equal(health.observed, true);
+    assert.equal(health.live, true);
+    assert.equal(health.ready, false);
+    assert.equal(health.build_sha, targetSha);
+  } finally {
+    await new Promise<void>((resolve) => dispatcher.close(() => resolve()));
+    await removeTree(root);
+  }
+});
 
 test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without live process access", async () => {
   const { root, policy } = await tempPolicy();
