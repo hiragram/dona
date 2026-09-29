@@ -56,9 +56,9 @@ export class UpdateService {
     while (this.running) {
       try {
         this.controller.maintainDiagnostics();
-        await this.controller.maintainReleaseRetention();
         await this.controller.processNext();
         await this.controller.deliverOutbox();
+        await this.controller.maintainReleaseRetention();
       } catch (error) {
         this.logger.error("Updater service iteration failed", {
           error_code: "service_iteration_failed",

@@ -44,6 +44,13 @@ describe("UpdateDatabase", () => {
     assert.deepEqual(db.recentSuccessfulReleaseShas(), new Set([targetSha]));
     raw.prepare("UPDATE update_outbox SET status='needs_review' WHERE outbox_id='outbox_test'").run();
     raw.prepare(`INSERT INTO update_outbox(outbox_id,request_id,external_event_id,payload_json,status,
+      created_at,updated_at) VALUES(?,?,?,?,?,?,?)`).run(
+        "outbox_clock_reversed",created.row.request_id,"update:test:clock-reversed","{}","pending",
+        "2026-09-01T23:00:00.000Z","2026-09-01T23:00:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set([currentSha, targetSha]));
+    raw.prepare("UPDATE update_outbox SET status='delivered',slack_reported_at=? WHERE outbox_id='outbox_clock_reversed'")
+      .run("2026-09-03T00:01:00.000Z");
+    raw.prepare(`INSERT INTO update_outbox(outbox_id,request_id,external_event_id,payload_json,status,
       created_at,updated_at,slack_reported_at) VALUES(?,?,?,?,?,?,?,?)`).run(
         "outbox_corrected",created.row.request_id,"update:test:corrected","{}","delivered",
         "2026-09-03T00:00:00.000Z","2026-09-03T00:00:00.000Z","2026-09-03T00:01:00.000Z");

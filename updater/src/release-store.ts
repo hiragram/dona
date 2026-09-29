@@ -1,6 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import type { UpdatePolicy } from "./policy.js";
 import type { ActivationReceipt, ReleaseManifest, UpdateRow } from "./types.js";
@@ -21,16 +22,19 @@ function inside(root: string, candidate: string): boolean {
 }
 
 async function writeAtomic(filePath: string, body: string, mode = 0o600): Promise<void> {
-  const temporary = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.tmp`);
+  const temporary = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
   const handle = await fs.open(temporary, "wx", mode);
   try {
     await handle.writeFile(body, "utf8");
     await handle.sync();
-  } finally {
     await handle.close();
+    await fs.rename(temporary, filePath);
+    await fsyncDirectory(path.dirname(filePath));
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await fs.unlink(temporary).catch(() => {});
+    throw error;
   }
-  await fs.rename(temporary, filePath);
-  await fsyncDirectory(path.dirname(filePath));
 }
 
 export class ReleaseStore {
