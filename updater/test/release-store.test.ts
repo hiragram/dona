@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, test } from "node:test";
+import { afterEach, describe, mock, test } from "node:test";
+import { performance } from "node:perf_hooks";
 
 import { ReleaseStore } from "../src/release-store.js";
 import type { UpdateRow } from "../src/types.js";
@@ -111,6 +112,23 @@ describe("ReleaseStore", () => {
     await assert.rejects(store.cleanupPlan(new Set([targetSha])), /retention_previous_pointer_missing/);
     await assert.rejects(store.cleanup(new Set([targetSha])), /retention_previous_pointer_missing/);
     assert.equal((await fs.lstat(path.join(policy.release_root, currentSha))).isDirectory(), true);
+  });
+
+  test("rejects a staging tree that exceeds the cleanup scan deadline before publish", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const store = new ReleaseStore(policy);
+    const staging = await store.prepareStaging(row().request_id, 1);
+    await fs.writeFile(path.join(staging, "app.js"), "export {};\n", { mode: 0o600 });
+    let calls = 0;
+    mock.method(performance, "now", () => ++calls === 1 ? 0 : 4_000);
+    try {
+      await assert.rejects(store.publish(staging, manifest(targetSha)), /cleanup_tree_scan_budget_exceeded/);
+      await assert.rejects(fs.lstat(path.join(policy.release_root, targetSha)), { code: "ENOENT" });
+    } finally {
+      mock.restoreAll();
+    }
   });
 
   test("rejects an oversized manifest before parsing cleanup candidates", async () => {

@@ -972,8 +972,11 @@ export class UpdateDatabase {
         let retain = row.completed_at === null || row.state === "needs_review" || row.notification_pending === 1;
         if (["failed", "cancelled", "rolled_back"].includes(row.state) && row.completed_at !== null) {
           const prior = readClock?.get(row.request_id) as {elapsed_ms:number;observed_uptime_ms:number}|undefined;
-          const elapsed = prior ? prior.elapsed_ms + Math.max(0, uptimeMs - prior.observed_uptime_ms) : 0;
-          writeClock?.run(row.request_id, elapsed, uptimeMs);
+          const elapsed = prior?.elapsed_ms !== undefined && prior.elapsed_ms >= 30 * 86_400_000
+            ? prior.elapsed_ms : prior ? prior.elapsed_ms + Math.max(0, uptimeMs - prior.observed_uptime_ms) : 0;
+          if (elapsed < 30 * 86_400_000 || (prior && prior.elapsed_ms < 30 * 86_400_000)) {
+            writeClock?.run(row.request_id, Math.min(elapsed, 30 * 86_400_000), uptimeMs);
+          }
           retain ||= elapsed < 30 * 86_400_000;
         }
         if (retain) for (const sha of [row.current_sha,row.target_sha,row.previous_sha]) if (sha) protectedShas.add(sha);

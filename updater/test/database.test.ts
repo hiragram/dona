@@ -70,6 +70,11 @@ describe("UpdateDatabase", () => {
       .run("2026-10-20T00:00:00.000Z");
     assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-10-20T00:01:00.000Z"), 1_001), new Set([currentSha, targetSha]));
     assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-11-20"), 30 * 86_400_000 + 1_001), new Set());
+    const expired = raw.prepare("SELECT elapsed_ms,observed_uptime_ms FROM update_retention_uptime WHERE request_id=?")
+      .get(created.row.request_id);
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-12-20"), 60 * 86_400_000 + 1_001), new Set());
+    assert.deepEqual(raw.prepare("SELECT elapsed_ms,observed_uptime_ms FROM update_retention_uptime WHERE request_id=?")
+      .get(created.row.request_id), expired);
     raw.prepare("UPDATE update_requests SET state='succeeded' WHERE request_id=?").run(created.row.request_id);
     assert.deepEqual(db.recentSuccessfulReleaseShas(), new Set([targetSha]));
     raw.prepare("UPDATE update_outbox SET status='needs_review' WHERE outbox_id='outbox_test'").run();

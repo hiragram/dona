@@ -95,14 +95,14 @@ export class ReleaseStore {
     fullSha(manifest.sha, "manifest.sha");
     const stagingRoot = path.join(this.policy.release_root, ".staging");
     await this.assertGeneratedPath(stagingRoot, stagingPath);
-    await this.scanTree(stagingPath, stagingPath);
+    await this.scanTree(stagingPath, stagingPath, { deadline: performance.now() + 3_000, entries: 0 });
     const releasePath = path.join(this.policy.release_root, manifest.sha);
     await this.assertGeneratedPath(this.policy.release_root, releasePath);
     const stageDevice = (await fs.stat(stagingPath)).dev;
     const releaseDevice = (await fs.stat(this.policy.release_root)).dev;
     if (stageDevice !== releaseDevice) throw new Error("cross_filesystem_release_publish");
     await writeAtomic(path.join(stagingPath, "release-manifest.json"), `${canonicalJson(manifest)}\n`);
-    await this.scanTree(stagingPath, stagingPath);
+    await this.scanTree(stagingPath, stagingPath, { deadline: performance.now() + 3_000, entries: 0 });
     try {
       await fs.rename(stagingPath, releasePath);
     } catch (error) {
