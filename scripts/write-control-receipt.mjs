@@ -2,9 +2,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { controlUpdaterTreeDigest } from "./control-updater-tree.mjs";
 
-const [attemptDirectory, output, expectedSha] = process.argv.slice(2);
+const [attemptDirectory, output, expectedSha, controlUpdaterRoot] = process.argv.slice(2);
 if (!path.isAbsolute(attemptDirectory ?? "") || !path.isAbsolute(output ?? "") ||
+    !path.isAbsolute(controlUpdaterRoot ?? "") ||
     !/^[0-9a-f]{40}$/.test(expectedSha ?? "") ||
     !/^[0-9a-f]{40}\.[A-Za-z0-9]+$/.test(path.basename(attemptDirectory))) {
   throw new Error("control receipt arguments are invalid");
@@ -36,6 +38,8 @@ const receipt = {
   plist_sha256: attempt.new_plist_sha256,
   db_backup_sha256: attempt.db_backup_sha256,
   release_tree_sha256: attempt.release_tree_sha256,
+  control_updater_tree_sha256: controlUpdaterTreeDigest(controlUpdaterRoot),
+  old_updater_tree_sha256: controlUpdaterTreeDigest(path.join(attemptDirectory, "updater.previous")),
   restore_rehearsal_sha256: attempt.restore_rehearsal_sha256,
   verified_at: new Date().toISOString(),
 };

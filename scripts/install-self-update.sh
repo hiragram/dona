@@ -282,6 +282,15 @@ if [[ "$MODE" == "--bootstrap" ]]; then
       exit 1
     fi
   done
+  BOOTSTRAP_UPDATER_SHA=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:DONA_UPDATER_BUILD_SHA" \
+    "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist")
+  if [[ ! "$BOOTSTRAP_UPDATER_SHA" =~ '^[0-9a-f]{40}$' || "$BOOTSTRAP_UPDATER_SHA" != "$ACTIVE_DISPATCHER_SHA" ]]; then
+    print -u2 "install済みUpdater plistとcurrent releaseのSHAが一致しません。"
+    exit 1
+  fi
+  $NODE_PATH -e 'const fs=require("node:fs");const manifest=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(manifest.sha!==process.argv[2])process.exit(1)' \
+    "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/release-manifest.json" "$BOOTSTRAP_UPDATER_SHA"
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$CONTROL_ROOT/updater/dist/cli.js"
   if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
   fi
@@ -291,11 +300,11 @@ if [[ "$MODE" == "--bootstrap" ]]; then
     exit 1
   fi
   if ! /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
-    if ! bootstrap_updater_reconciled "初回Updater登録" "$INSTALL_SHA"; then exit 1; fi
+    if ! bootstrap_updater_reconciled "初回Updater登録" "$BOOTSTRAP_UPDATER_SHA"; then exit 1; fi
   elif ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha \
-      "$CONTROL_ROOT/updater.sock" "$INSTALL_SHA" 30000 3 || \
+      "$CONTROL_ROOT/updater.sock" "$BOOTSTRAP_UPDATER_SHA" 30000 3 || \
       ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-identity \
-      "$CONTROL_ROOT/updater.sock" "$INSTALL_SHA" "$DOMAIN" 30000; then
+      "$CONTROL_ROOT/updater.sock" "$BOOTSTRAP_UPDATER_SHA" "$DOMAIN" 30000; then
     print -u2 "登録済みUpdaterのexact SHA起動identityを確認できません。"
     exit 1
   fi
@@ -543,7 +552,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     assert_control_targets
     record_control_phase verified
     CONTROL_RECEIPT_TMP="$CONTROL_ROOT/.control-plane-receipt.json.$$.$RANDOM.tmp"
-    $NODE_PATH "$SCRIPT_DIR/write-control-receipt.mjs" "$BACKUP_ROOT" "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA"
+    $NODE_PATH "$SCRIPT_DIR/write-control-receipt.mjs" "$BACKUP_ROOT" "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA" "$CONTROL_ROOT/updater"
     /bin/mv "$CONTROL_RECEIPT_TMP" "$CONTROL_ROOT/control-plane-receipt.json"
     $NODE_PATH -e 'const fs=require("node:fs");const fd=fs.openSync(process.argv[1],"r");try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}' "$CONTROL_ROOT"
     CONTROL_UPGRADE_ACTIVE=0

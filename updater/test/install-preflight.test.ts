@@ -329,6 +329,10 @@ test("macOS preserves hardened descendants when renaming a reopened staged updat
 
 test("installer exposes the guarded control-plane upgrade mode", async () => {
   const source = await fs.readFile(installer, "utf8");
+  const initialBootstrap = source.slice(source.indexOf('if [[ "$MODE" == "--bootstrap" ]]; then'), source.indexOf('if [[ "$(uname -s)"'));
+  assert.ok(initialBootstrap.startsWith('if [[ "$MODE" == "--bootstrap" ]]; then'));
+  assert.match(source, /BOOTSTRAP_UPDATER_SHA=\$\(\/usr\/libexec\/PlistBuddy/);
+  assert.doesNotMatch(initialBootstrap, /bootout "\$DOMAIN" dev\.dona\.(?:dispatcher|slack-adapter)/);
   assert.match(source, /--upgrade-control/);
   assert.match(source, /assert-control-upgrade-safe/);
   assert.match(source, /wait-updater-sha/);
@@ -505,8 +509,16 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
   const backup = path.join(root, "backup.sqlite3");
   const rehearsal = path.join(root, "restore-rehearsal.json");
   const attempt = path.join(root, `${"2".repeat(40)}.ABC123`);
+  const controlUpdater = path.join(root, "active-updater");
   try {
     await fs.mkdir(attempt, { mode: 0o700 });
+    await fs.mkdir(path.join(controlUpdater, "dist"), { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(controlUpdater, "dist", "database.js"), "verified", { mode: 0o400 });
+    await fs.chmod(path.join(controlUpdater, "dist"), 0o500);
+    await fs.chmod(controlUpdater, 0o700);
+    await fs.mkdir(path.join(attempt, "updater.previous", "dist"), { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(attempt, "updater.previous", "dist", "database.js"), "verified", { mode: 0o400 });
+    await fs.chmod(path.join(attempt, "updater.previous", "dist"), 0o500);
     await Promise.all([fs.writeFile(oldPolicy, "old"), fs.writeFile(newPolicy, "new"),
       fs.writeFile(oldPlist, "old plist"), fs.writeFile(newPlist, "new plist"), fs.writeFile(backup, "backup")]);
     await fs.writeFile(rehearsal, "rehearsal");
@@ -547,18 +559,22 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await fs.writeFile(newPolicy, "new");
     await advance("verified");
     const receiptPath = path.join(root, "control-receipt.tmp");
-    await execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40)]);
+    await execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40), controlUpdater]);
     const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8"));
     assert.equal(receipt.attempt_id, path.basename(attempt));
     assert.match(receipt.attempt_sha256, /^[0-9a-f]{64}$/);
     assert.match(receipt.restore_rehearsal_sha256, /^[0-9a-f]{64}$/);
-    await assert.rejects(execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40)]));
+    assert.match(receipt.control_updater_tree_sha256, /^[0-9a-f]{64}$/);
+    assert.match(receipt.old_updater_tree_sha256, /^[0-9a-f]{64}$/);
+    await assert.rejects(execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40), controlUpdater]));
     await advance("restore_required");
     await advance("restored");
     await assert.rejects(advance("verified"), /terminal/);
     await fs.writeFile(path.join(attempt, "attempt.json.tmp"), "partial");
     await assert.rejects(advance("needs_review"), /ambiguous/);
   } finally {
+    await fs.chmod(path.join(controlUpdater, "dist"), 0o700).catch(() => undefined);
+    await fs.chmod(path.join(attempt, "updater.previous", "dist"), 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });

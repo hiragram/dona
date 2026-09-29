@@ -822,7 +822,51 @@ export class RealRuntime implements RuntimePort {
       const currentArtifactsMatch =
         await artifactDigest(path.join(this.policy.control_root, "policy.json")) === attempt.new_policy_sha256 &&
         await artifactDigest(path.join(os.homedir(), "Library/LaunchAgents/dev.dona.updater.plist")) === attempt.new_plist_sha256 &&
-        await artifactDigest(path.join(attemptDirectory, "updater.previous.sqlite3")) === attempt.db_backup_sha256;
+        await artifactDigest(path.join(attemptDirectory, "updater.previous.sqlite3")) === attempt.db_backup_sha256 &&
+        await artifactDigest(path.join(attemptDirectory, "updater.previous/dist/database.js")) === rehearsal.old_database_module_sha256 &&
+        await artifactDigest(path.join(this.policy.control_root, "updater/dist/database.js")) === rehearsal.new_database_module_sha256;
+      const controlTreeDigest = async (root: string): Promise<string> => {
+        const hash = createHash("sha256");
+        const visit = async (directory: string, relativeDirectory = ""): Promise<void> => {
+          const directoryStats = await fs.lstat(directory);
+          if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || directoryStats.uid !== uid ||
+              (directoryStats.mode & 0o777) !== (relativeDirectory ? 0o500 : 0o700)) {
+            throw new Error("control_updater_directory_identity_unverified");
+          }
+          const entries = await fs.readdir(directory);
+          entries.sort((left, right) => left.localeCompare(right));
+          for (const name of entries) {
+            const relative = path.join(relativeDirectory, name);
+            const full = path.join(directory, name);
+            const stat = await fs.lstat(full);
+            if (stat.uid !== uid) throw new Error("control_updater_owner_unverified");
+            if (stat.isDirectory() && !stat.isSymbolicLink()) {
+              hash.update(`d\0${relative}\0`);
+              await visit(full, relative);
+            } else if (stat.isFile() && !stat.isSymbolicLink()) {
+              if (stat.nlink !== 1 || (stat.mode & 0o777) !== 0o400) throw new Error("control_updater_file_identity_unverified");
+              hash.update(`f\0${relative}\0`);
+              hash.update(await fs.readFile(full));
+              hash.update("\0");
+            } else if (stat.isSymbolicLink()) {
+              const resolved = await fs.realpath(full);
+              const inside = path.relative(root, resolved);
+              if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+                throw new Error("control_updater_link_escaped");
+              }
+              hash.update(`l\0${relative}\0${await fs.readlink(full)}\0`);
+            } else throw new Error("control_updater_entry_unverified");
+          }
+        };
+        await visit(root);
+        return hash.digest("hex");
+      };
+      const controlTreeMatches = typeof receipt.control_updater_tree_sha256 === "string" &&
+        /^[0-9a-f]{64}$/.test(receipt.control_updater_tree_sha256) &&
+        await controlTreeDigest(path.join(this.policy.control_root, "updater")) === receipt.control_updater_tree_sha256 &&
+        typeof receipt.old_updater_tree_sha256 === "string" &&
+        /^[0-9a-f]{64}$/.test(receipt.old_updater_tree_sha256) &&
+        await controlTreeDigest(path.join(attemptDirectory, "updater.previous")) === receipt.old_updater_tree_sha256;
       const releaseRoot = path.join(this.policy.release_root, buildSha);
       const releaseHash = createHash("sha256");
       const visitRelease = async (directory: string, relativeDirectory = ""): Promise<void> => {
@@ -863,7 +907,8 @@ export class RealRuntime implements RuntimePort {
       const releaseMatches = releaseHash.digest("hex") === receipt.release_tree_sha256;
       return {
         ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
-          receipt.schema_migration_capability === capability && matchingAttempt && currentArtifactsMatch && releaseMatches,
+          receipt.schema_migration_capability === capability && matchingAttempt && currentArtifactsMatch &&
+          releaseMatches && controlTreeMatches,
         build_sha: buildSha,
       };
     } catch {

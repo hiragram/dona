@@ -27,7 +27,7 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 ./scripts/install-self-update.sh --bootstrap
 ```
 
-`--bootstrap`は登録済みDispatcher/Slack Adapterがあれば停止前に拒否し、stable updater→Dispatcher→Slack Adapterの順にbootstrapします。bootstrap応答が曖昧な場合は再送せず、Updater/Dispatcherのexact SHA起動identityと、Slack Adapterの固定label登録・exact SHA socket healthを照合します。実行中stable updaterをbootoutしません。
+`--bootstrap`は登録済みDispatcher/Slack Adapterがあれば停止前に拒否し、install済みUpdater plistのSHAをcurrent releaseと照合してからstable updater→Dispatcher→Slack Adapterの順にbootstrapします。checkoutがinstall後に進んでも、そのHEADを起動対象とみなしません。bootstrap応答が曖昧な場合は再送せず、Updater/Dispatcherのexact SHA起動identityと、Slack Adapterの固定label登録・exact SHA socket healthを照合します。実行中stable updaterをbootoutしません。
 
 ## 通常update
 
