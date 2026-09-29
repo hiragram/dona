@@ -47,7 +47,8 @@ type WaitForUpdaterIdentity = (
     processStartRead?: (pid: number) => Promise<string>; lockRead?: () => Promise<unknown> },
 ) => Promise<void>;
 type WaitForDispatcherSha = (socketPath: string, sha: string, domain: string, timeoutMs: number,
-  options?: { healthRead?: () => Promise<unknown>; registrationRead?: () => Promise<string> }) => Promise<void>;
+  options?: { allowLegacyHealth?: boolean; healthRead?: () => Promise<unknown>;
+    registrationRead?: () => Promise<string>; processStartRead?: (pid: number) => Promise<string> }) => Promise<void>;
 type LaunchctlOnce = (operation: string, domain: string, target: string, timeoutMs: number,
   options?: { run?: (args: string[]) => Promise<unknown> }) => Promise<void>;
 type WaitForSlackSha = (socketPath: string, sha: string, domain: string, timeoutMs: number,
@@ -317,11 +318,23 @@ test("旧Updater復旧では旧health形式をstartup lockとlaunchdのPIDへ束
 
 test("Dispatcherの同一SHA healthは固定launchd labelの登録PIDも必要とする", async () => {
   const sha = "a".repeat(40);
-  const healthRead = async () => ({ status: "ready", service: "dispatcher", build_sha: sha });
-  await waitForDispatcherSha("/tmp/dispatcher.sock", sha, "gui/501", 500,
-    { healthRead, registrationRead: async () => "pid = 123" });
+  const processStart = "Tue Sep 29 03:00:00 2026";
+  const health = { status: "ready", service: "dispatcher", build_sha: sha, pid: 123,
+    process_start: processStart };
+  const options = { healthRead: async () => health,
+    registrationRead: async () => "pid = 123", processStartRead: async () => processStart };
+  await waitForDispatcherSha("/tmp/dispatcher.sock", sha, "gui/501", 500, options);
   await assert.rejects(waitForDispatcherSha("/tmp/dispatcher.sock", sha, "gui/501", 10,
-    { healthRead, registrationRead: async () => "" }), /not observed under its fixed launchd label/);
+    { ...options, registrationRead: async () => "" }), /not observed under its fixed launchd label/);
+  await assert.rejects(waitForDispatcherSha("/tmp/dispatcher.sock", sha, "gui/501", 10,
+    { ...options, registrationRead: async () => "pid = 124" }), /not observed under its fixed launchd label/);
+  await assert.rejects(waitForDispatcherSha("/tmp/dispatcher.sock", sha, "gui/501", 10,
+    { ...options, processStartRead: async () => "older process" }), /not observed under its fixed launchd label/);
+  const oldHealth = { status: "ready", service: "dispatcher", build_sha: sha };
+  await assert.rejects(waitForDispatcherSha("/tmp/dispatcher.sock", sha, "gui/501", 10,
+    { ...options, healthRead: async () => oldHealth }), /not observed under its fixed launchd label/);
+  await waitForDispatcherSha("/tmp/dispatcher.sock", sha, "gui/501", 500,
+    { ...options, allowLegacyHealth: true, healthRead: async () => oldHealth });
 });
 
 test("launchctl timeoutを単一writeで止め、targetを固定する", async () => {
@@ -487,6 +500,10 @@ test("control DB backup opens and checks an independent SQLite copy", async () =
     assert.equal((await fs.stat(target)).mode & 0o777, 0o600);
     const { stdout } = await execute("python3", ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT COUNT(*) FROM update_requests').fetchone()[0])", target]);
     assert.equal(stdout.trim(), "1");
+    await execute("python3", ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('VACUUM'); c.close()", source]);
+    await execute("python3", [controlBackup, "--verify-pair", source, target]);
+    await execute("python3", ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"INSERT INTO update_requests VALUES ('two')\"); c.commit(); c.close()", source]);
+    await assert.rejects(execute("python3", [controlBackup, "--verify-pair", source, target]));
     await assert.rejects(execute("python3", [controlBackup, source, target]));
   } finally {
     await fs.rm(root, { recursive: true, force: true });
@@ -626,7 +643,7 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
       path.join(attempt, "restore-rehearsal.json"), path.join(attempt, "control-plane-receipt.previous.json")]
       .map(file => fs.chmod(file, 0o600)));
     const verifyRestore = () => execute(process.execPath, [controlLedger, "verify-restore-control", attempt,
-      oldPolicy, oldPlist, controlUpdater, restoredDb, oldReceipt]);
+      oldPolicy, oldPlist, controlUpdater, restoredDb, oldReceipt, "copied"]);
     await verifyRestore();
     await execute(process.execPath, [controlLedger, "verify-restore-dispatcher", attempt, oldDispatcherPlist]);
     await fs.writeFile(restoredDb, "damaged");

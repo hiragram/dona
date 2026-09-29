@@ -243,13 +243,31 @@ export async function waitForDispatcherSha(socketPath, expectedSha, domain, time
   const registrationRead = options.registrationRead ?? (async () =>
     (await execute("/bin/launchctl", ["print", `${domain}/dev.dona.dispatcher`],
       { timeout: 2_000, killSignal: "SIGKILL" })).stdout);
+  const processStartRead = options.processStartRead ?? (async (pid) =>
+    (await execute("/bin/ps", ["-p", String(pid), "-o", "lstart="],
+      { timeout: 2_000, killSignal: "SIGKILL" })).stdout.trim());
   const deadline = Date.now() + timeoutMs;
   do {
     try {
       const [health, registration] = await Promise.all([healthRead(), registrationRead()]);
       const registeredPid = Number(registration.match(/\bpid = ([0-9]+)/)?.[1]);
-      if (health?.status === "ready" && health.service === "dispatcher" &&
-          health.build_sha === expectedSha && Number.isSafeInteger(registeredPid) && registeredPid > 0) return;
+      if (health?.status !== "ready" || health.service !== "dispatcher" ||
+          health.build_sha !== expectedSha || !Number.isSafeInteger(registeredPid) || registeredPid <= 0) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+      const legacyHealth = options.allowLegacyHealth === true &&
+        health.pid === undefined && health.process_start === undefined;
+      if (!legacyHealth && (!Number.isSafeInteger(health.pid) || health.pid <= 0 ||
+          typeof health.process_start !== "string" || !health.process_start)) {
+        throw new Error("Dispatcher health process identity is invalid");
+      }
+      const observedStart = await processStartRead(registeredPid);
+      if (!observedStart || (!legacyHealth && (health.pid !== registeredPid ||
+          health.process_start !== observedStart))) {
+        throw new Error("Dispatcher socket and launchd process identity disagree");
+      }
+      return;
     } catch { /* launchd activation and UDS publication are observed until the bounded deadline. */ }
     await new Promise(resolve => setTimeout(resolve, 100));
   } while (Date.now() < deadline);
@@ -605,7 +623,12 @@ async function main() {
     catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
   }
   if(mode==="wait-dispatcher-sha"&&secondValue&&process.argv[5]&&process.argv[6]) {
-    try { await waitForDispatcherSha(value,secondValue,process.argv[5],Number(process.argv[6])); return 0; }
+    try {
+      if (process.argv[7] !== undefined && process.argv[7] !== "legacy-health") throw new Error("wait-dispatcher-sha mode is invalid");
+      await waitForDispatcherSha(value,secondValue,process.argv[5],Number(process.argv[6]),
+        { allowLegacyHealth: process.argv[7] === "legacy-health" });
+      return 0;
+    }
     catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
   if (mode === "wait-slack-sha" && secondValue && process.argv[5] && process.argv[6]) {

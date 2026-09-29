@@ -59,7 +59,26 @@ def backup(source, target):
         original.close()
 
 
+def verify_pair(live, backup_file):
+    inventories = []
+    for file in (live, backup_file):
+        identity = os.lstat(file)
+        if (not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.getuid()
+                or identity.st_nlink != 1 or identity.st_mode & 0o077):
+            raise RuntimeError("control database identity is invalid")
+        database = sqlite3.connect(Path(file).as_uri() + "?mode=ro", uri=True)
+        try:
+            inventories.append(verify(database))
+        finally:
+            database.close()
+    if inventories[0] != inventories[1]:
+        raise RuntimeError("live control database inventory differs from backup")
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        raise SystemExit("Usage: backup-control-db.py <source> <target>")
-    backup(sys.argv[1], sys.argv[2])
+    if len(sys.argv) == 4 and sys.argv[1] == "--verify-pair":
+        verify_pair(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 3:
+        backup(sys.argv[1], sys.argv[2])
+    else:
+        raise SystemExit("Usage: backup-control-db.py <source> <target> | --verify-pair <live> <backup>")

@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { controlUpdaterTreeDigest } from "./control-updater-tree.mjs";
+import { execFileSync } from "node:child_process";
 
 const phases = ["prepared", "updater_stop_intent", "updater_stopped", "backup_verified", "dispatcher_stop_intent", "dispatcher_stopped", "dispatcher_start_intent", "dispatcher_started", "control_swapped", "updater_start_intent", "updater_started", "verified", "restore_required", "restored", "needs_review"];
 const nextPhase = new Map([
@@ -77,7 +78,8 @@ export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, o
   });
 }
 
-export function verifyRestoredControl(directory, policy, plist, updaterTree, database, receipt) {
+export function verifyRestoredControl(directory, policy, plist, updaterTree, database, receipt, databaseMode) {
+  if (!["copied", "live"].includes(databaseMode)) throw new Error("control restore database mode is invalid");
   assertPrivateDirectory(directory);
   assertPrivateFile(path.join(directory, "attempt.json"));
   const attempt = JSON.parse(fs.readFileSync(path.join(directory, "attempt.json"), "utf8"));
@@ -95,13 +97,18 @@ export function verifyRestoredControl(directory, policy, plist, updaterTree, dat
     const backup = path.join(directory, "updater.previous.sqlite3");
     assertPrivateFile(backup);
     assertPrivateFile(database);
-    if (digest(backup) !== attempt.db_backup_sha256 || digest(database) !== attempt.db_backup_sha256) {
+    if (digest(backup) !== attempt.db_backup_sha256 ||
+        (databaseMode === "copied" && digest(database) !== attempt.db_backup_sha256)) {
       throw new Error("restored control database differs from the verified backup");
     }
     const rehearsal = path.join(directory, "restore-rehearsal.json");
     assertPrivateFile(rehearsal);
     if (digest(rehearsal) !== attempt.restore_rehearsal_sha256) {
       throw new Error("control restore rehearsal differs from the saved attempt");
+    }
+    if (databaseMode === "live") {
+      execFileSync("/usr/bin/python3", [fileURLToPath(new URL("./backup-control-db.py", import.meta.url)),
+        "--verify-pair", database, backup], { timeout: 30_000, stdio: ["ignore", "ignore", "pipe"] });
     }
   }
   if (attempt.old_receipt_sha256 === null) {
@@ -183,7 +190,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
     if (command === "create" && args.length === 11) createAttempt(...args);
     else if (command === "advance" && args.length >= 2 && args.length <= 5) advanceAttempt(...args);
     else if (command === "verify" && args.length === 5) verifyAttemptArtifacts(...args);
-    else if (command === "verify-restore-control" && args.length === 6) verifyRestoredControl(...args);
+    else if (command === "verify-restore-control" && args.length === 7) verifyRestoredControl(...args);
     else if (command === "verify-restore-dispatcher" && args.length === 2) verifyRestoredDispatcher(...args);
     else throw new Error("invalid control attempt command");
   } catch (error) {
