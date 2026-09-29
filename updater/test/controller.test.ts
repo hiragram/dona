@@ -639,6 +639,37 @@ async function fixture(policyVersion = "2026-09-03.2") {
 }
 
 describe("UpdateController isolated end-to-end", () => {
+  test("同じsource eventのplan再実行では自身のpending requestをinventoryから除外する", async () => {
+    const f = await fixture();
+    const request = { source_event_id: sourceEventId, reply_target: replyTarget };
+    const first = await f.controller.plan(request);
+    const repeated = await f.controller.plan(request);
+    assert.equal(repeated.duplicate, true);
+    assert.equal(repeated.request_id, first.request_id);
+    assert.equal((repeated.plan as { plan_hash: string }).plan_hash, (first.plan as { plan_hash: string }).plan_hash);
+    assert.equal((repeated.plan as { inventory: { pending: { updates: number } } }).inventory.pending.updates, 0);
+    f.database.close();
+  });
+
+  test("期限切れplanはterminal化され、通知の解決後に別eventで再計画できる", async () => {
+    const f = await fixture();
+    const first = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    f.advance(15 * 60_000);
+    const secondEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRY";
+    await assert.rejects(f.controller.plan({ source_event_id: secondEventId, reply_target: replyTarget }),
+      /terminal notification is not settled/);
+    assert.equal(f.database.get(first.request_id as string)?.state, "failed");
+    assert.equal(f.database.get(first.request_id as string)?.last_error_code, "exact_plan_expired");
+    assert.deepEqual(f.runtime.calls, []);
+    const outbox = f.database.markOutboxDelivering(f.database.outboxFor(first.request_id as string)!.outbox_id);
+    f.database.markOutboxDelivered(outbox.outbox_id, "evt_expired_terminal");
+    f.database.markOutboxReported(outbox.outbox_id);
+    const second = await f.controller.plan({ source_event_id: secondEventId, reply_target: replyTarget });
+    assert.equal(second.duplicate, false);
+    assert.equal((second.plan as { inventory: { pending: { updates: number } } }).inventory.pending.updates, 0);
+    f.database.close();
+  });
+
   test("plan and approval control events may settle without changing the workload snapshot", async () => {
     const f = await fixture();
     f.runtime.controlEvents[sourceEventId] = "waiting_agent";

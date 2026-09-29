@@ -18,7 +18,7 @@ const inventory = { schema_version: 1 as const, control_plane_build_sha: targetS
 const compatibility = { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true };
 
 describe("UpdateDatabase", () => {
-  test("persists the exact inventory and rejects expired or cancelled approvals without losing accepted replay", async () => {
+  test("persists the exact inventory and rejects expired approval while retaining terminal evidence", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
@@ -35,8 +35,34 @@ describe("UpdateDatabase", () => {
     const approval = { source_event_id: approvalEventId, reply_target: replyTarget,
       plan_id: created.plan.plan_id, plan_hash: originalHash, approval_id: "explicit-intent" };
     assert.throws(() => db.approve(approval, new Date("2026-09-02T00:15:00.000Z")), /exact_plan_expired/);
-    db.approve(approval, new Date("2026-09-02T00:14:59.000Z"));
-    assert.equal(db.approve(approval, new Date("2026-09-02T00:16:00.000Z")).duplicate, true);
+    assert.equal(db.get(created.row.request_id)?.state, "failed");
+    assert.equal(db.get(created.row.request_id)?.last_error_code, "exact_plan_expired");
+    assert.equal(db.outboxFor(created.row.request_id)?.status, "pending");
+    assert.throws(() => db.approve(approval, new Date("2026-09-02T00:14:59.000Z")), /exact_plan_expired/);
+    db.close();
+  });
+
+  test("expires an unapproved plan once and permits a new plan after terminal notification settles", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const db = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
+    const material = { current_sha: currentSha, target_sha: targetSha, previous_sha: null,
+      policy_version: policy.policy_version, compatibility, rollback_compatible: true, inventory };
+    const first = db.createPlan({ source_event_id: sourceEventId, reply_target: replyTarget }, material,
+      new Date("2026-09-02T00:00:00.000Z"));
+    assert.equal(db.expireAwaitingApproval(new Date("2026-09-02T00:15:00.000Z")), 1);
+    assert.equal(db.expireAwaitingApproval(new Date("2026-09-02T00:15:01.000Z")), 0);
+    assert.equal(db.nonTerminalCount(), 0);
+    assert.equal(db.get(first.row.request_id)?.fence, 0);
+    const secondEventId = "evt_01M1ES03XY5CF8D9PM5CWX4SRY";
+    assert.throws(() => db.createPlan({ source_event_id: secondEventId, reply_target: replyTarget }, material,
+      new Date("2026-09-02T00:15:02.000Z")), /terminal notification is not settled/);
+    const outbox = db.markOutboxDelivering(db.outboxFor(first.row.request_id)!.outbox_id);
+    db.markOutboxDelivered(outbox.outbox_id, "evt_expired_terminal");
+    db.markOutboxReported(outbox.outbox_id);
+    const second = db.createPlan({ source_event_id: secondEventId, reply_target: replyTarget }, material,
+      new Date("2026-09-02T00:15:03.000Z"));
+    assert.equal(second.duplicate, false);
     db.close();
   });
 
@@ -161,7 +187,7 @@ describe("UpdateDatabase", () => {
     }));
     assert.throws(() => db.approve({
       source_event_id: sourceEventId, reply_target: replyTarget, plan_id: created.plan.plan_id, plan_hash: "f".repeat(64), approval_id: "approval-1",
-    }));
+    }, new Date("2026-09-02T00:00:01.000Z")));
     const approved = db.approve({
       source_event_id: approvalEventId, reply_target: replyTarget, plan_id: created.plan.plan_id, plan_hash: created.plan.plan_hash, approval_id: "approval-1",
     }, new Date("2026-09-02T00:00:02.000Z"));

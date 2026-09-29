@@ -168,8 +168,12 @@ export class UpdateController {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");
       }
     }
-    const inventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory([request.source_event_id]));
-    const confirmedInventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory([request.source_event_id]));
+    this.database.expireAwaitingApproval(this.clock.now());
+    const existing = this.database.getBySourceEventId(request.source_event_id);
+    const ownRequestId = existing && !["succeeded", "failed", "rolled_back", "needs_review", "cancelled"].includes(existing.state)
+      ? existing.request_id : undefined;
+    const inventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory([request.source_event_id]), ownRequestId);
+    const confirmedInventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory([request.source_event_id]), ownRequestId);
     if (canonicalJson(confirmedInventory) !== canonicalJson(inventory)) throw new Error("runtime_inventory_unstable");
     if (inventory.policy_version !== this.policy.policy_version || inventory.app_schema !== inventory.dispatcher_schema ||
       inventory.dispatcher_protocol !== current.compatibility.protocol) throw new Error("runtime_inventory_identity_unverified");
@@ -211,6 +215,7 @@ export class UpdateController {
   }
 
   async applyVerified(request: ApplyRequest): Promise<Record<string, unknown>> {
+    this.database.expireAwaitingApproval(this.clock.now());
     const row = this.database.getByPlanId(request.plan_id);
     if (!row || row.plan_hash !== request.plan_hash || !row.inventory_revision || !row.approval_expires_at) {
       throw new Error("exact_plan_approval_mismatch");

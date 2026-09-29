@@ -571,6 +571,7 @@ export class UpdateDatabase {
   }
 
   approve(input: ApplyRequest, at = new Date()): { row: UpdateRow; duplicate: boolean } {
+    this.expireAwaitingApproval(at);
     return this.db.transaction(() => {
       const row = this.db.prepare("SELECT * FROM update_requests WHERE plan_id = ?").get(input.plan_id) as UpdateRow | undefined;
       if (!row) throw new Error(`Plan ${input.plan_id} was not found`);
@@ -588,6 +589,9 @@ export class UpdateDatabase {
         return { row, duplicate: true };
       }
       if (row.state === "cancelled") throw new Error("cancelled_plan_cannot_be_approved");
+      if (row.state === "failed" && row.last_error_code === "exact_plan_expired") {
+        throw new Error("exact_plan_expired_or_inventory_unverified");
+      }
       if (at.toISOString() >= row.approval_expires_at) throw new Error("exact_plan_expired_or_inventory_unverified");
       this.transitionInternal(row, "approved", at, {
         approval_id: input.approval_id,
@@ -887,6 +891,24 @@ export class UpdateDatabase {
 
   get(requestId: string): UpdateRow | undefined {
     return this.db.prepare("SELECT * FROM update_requests WHERE request_id = ?").get(requestId) as UpdateRow | undefined;
+  }
+
+  getBySourceEventId(sourceEventId: string): UpdateRow | undefined {
+    return this.db.prepare("SELECT * FROM update_requests WHERE source_event_id = ?").get(sourceEventId) as UpdateRow | undefined;
+  }
+
+  expireAwaitingApproval(at = new Date()): number {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT * FROM update_requests
+        WHERE state = 'awaiting_approval' AND approval_expires_at <= ?`).all(at.toISOString()) as UpdateRow[];
+      for (const row of rows) {
+        this.completeInternal(row, "failed", "exact_plan_expired", {
+          last_error_code: "exact_plan_expired",
+          last_error_message: "Approval window expired before an update was started",
+        }, at);
+      }
+      return rows.length;
+    })();
   }
 
   getByPlanId(planId: string): UpdateRow | undefined {
