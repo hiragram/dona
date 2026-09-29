@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import os from "node:os";
+import { performance } from "node:perf_hooks";
 
 import { loadConfig } from "./config.js";
 import { DispatcherDatabase } from "./database.js";
@@ -11,6 +12,7 @@ import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { liveSessionReceiptRetentionSeconds } from "./live-session.js";
+import { inventoryJobArtifacts, inventorySizeIsComplete, readJobArtifactInventoryPage } from "./job-artifact-inventory.js";
 
 function projectLiveJob(row: Record<string, unknown>): Record<string, unknown> {
   const safeKeys = [
@@ -32,6 +34,7 @@ function usage(): never {
   dona-dispatcher event reconcile-notification <event_id> not_sent [--resume]
   dona-dispatcher event dead-letter <event_id>
   dona-dispatcher job list [--status STATUS]
+  dona-dispatcher job artifact-inventory [--cursor ROW_CURSOR] [--limit 1-20]
   dona-dispatcher job show <job_id> [--live-session | --live-session-receipt <receipt_id>]
   dona-dispatcher job live-session-retention [--apply --force]
   dona-dispatcher job reconcile-run <run_id> <failed|cancelled>
@@ -72,6 +75,23 @@ async function main(): Promise<void> {
   }
   if (!["event", "job", "scheduler"].includes(args[0]!)) usage();
   const command = args[1];
+  if (args[0] === "job" && command === "artifact-inventory") {
+    const cursorAt = args.indexOf("--cursor"), limitAt = args.indexOf("--limit");
+    if (args.length !== 2 + (cursorAt < 0 ? 0 : 2) + (limitAt < 0 ? 0 : 2)) usage();
+    const cursor = cursorAt < 0 ? "" : eventIdAt(args, cursorAt + 1);
+    const limit = limitAt < 0 ? 10 : Number(eventIdAt(args, limitAt + 1));
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) usage();
+    const rows = readJobArtifactInventoryPage(config.databasePath, cursor, limit + 1);
+    const selected = rows.slice(0, limit);
+    const artifacts = [];
+    const budget = { entries: 0, deadline: performance.now() + 3_000 };
+    for (const row of selected) artifacts.push(await inventoryJobArtifacts(row, config, budget));
+    console.log(JSON.stringify({ schema_version: 1, dry_run: true, artifacts,
+      next_cursor: rows.length > limit ? String(selected.at(-1)?.artifact_cursor) : null,
+      size_is_complete: inventorySizeIsComplete(artifacts),
+    }, null, 2));
+    return;
+  }
   const database = new DispatcherDatabase(config.databasePath, {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
