@@ -206,24 +206,27 @@ export async function waitForUpdaterIdentity(socketPath, expectedSha, domain, ti
       await new Promise(resolve => setTimeout(resolve, 100));
       continue;
     }
-    const pid = health.pid;
-    const processStart = health.process_start;
-    if (!Number.isSafeInteger(pid) || pid <= 0 || typeof processStart !== "string" || !processStart) {
+    const legacyHealth = options.allowLegacyHealth === true &&
+      health.pid === undefined && health.process_start === undefined;
+    if (!legacyHealth && (!Number.isSafeInteger(health.pid) || health.pid <= 0 ||
+        typeof health.process_start !== "string" || !health.process_start)) {
       throw new Error("updater health process identity is invalid");
     }
     let lock, registration, observedStart;
     try {
-      [lock, registration, observedStart] = await Promise.all([
-        lockRead(), registrationRead(), processStartRead(pid),
-      ]);
+      [lock, registration] = await Promise.all([lockRead(), registrationRead()]);
+      observedStart = await processStartRead(legacyHealth ? lock.pid : health.pid);
     } catch {
       await new Promise(resolve => setTimeout(resolve, 100));
       continue;
     }
     const registrationSha = registration.match(/DONA_UPDATER_BUILD_SHA => ([0-9a-f]{40})/)?.[1];
     const registrationPid = Number(registration.match(/\bpid = ([0-9]+)/)?.[1]);
-    if (lock.pid !== pid || lock.process_start !== processStart || observedStart !== processStart ||
-        registrationSha !== expectedSha || registrationPid !== pid) {
+    if (!Number.isSafeInteger(lock.pid) || lock.pid <= 0 ||
+        typeof lock.process_start !== "string" || !lock.process_start ||
+        (!legacyHealth && (lock.pid !== health.pid || lock.process_start !== health.process_start)) ||
+        observedStart !== lock.process_start || registrationSha !== expectedSha ||
+        registrationPid !== lock.pid) {
       throw new Error("updater socket, PID, start identity, and launchd registration disagree");
     }
     return;
@@ -582,7 +585,12 @@ async function main() {
     }
   }
   if (mode === "wait-updater-identity" && secondValue && process.argv[5] && process.argv[6]) {
-    try { await waitForUpdaterIdentity(value, secondValue, process.argv[5], Number(process.argv[6])); return 0; }
+    try {
+      if (process.argv[7] !== undefined && process.argv[7] !== "legacy-health") throw new Error("wait-updater-identity mode is invalid");
+      await waitForUpdaterIdentity(value, secondValue, process.argv[5], Number(process.argv[6]),
+        { allowLegacyHealth: process.argv[7] === "legacy-health" });
+      return 0;
+    }
     catch (error) { console.error(error instanceof Error ? error.message : String(error)); return 1; }
   }
   if(mode==="wait-dispatcher-sha"&&secondValue&&process.argv[5]) {

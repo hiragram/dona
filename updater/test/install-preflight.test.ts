@@ -43,7 +43,7 @@ type WaitForLaunchdUpdaterSha = (
 ) => Promise<void>;
 type WaitForUpdaterIdentity = (
   socketPath: string, sha: string, domain: string, timeoutMs: number,
-  options?: { healthRead?: () => Promise<unknown>; registrationRead?: () => Promise<string>;
+  options?: { allowLegacyHealth?: boolean; healthRead?: () => Promise<unknown>; registrationRead?: () => Promise<string>;
     processStartRead?: (pid: number) => Promise<string>; lockRead?: () => Promise<unknown> },
 ) => Promise<void>;
 type LaunchctlOnce = (operation: string, domain: string, target: string, timeoutMs: number,
@@ -289,6 +289,28 @@ test("Updater healthのPIDとstart identityをsocket lock・launchd・process観
     { ...options, healthRead: async () => ({ ...health, pid: null }) }), /invalid/);
 });
 
+test("旧Updater復旧では旧health形式をstartup lockとlaunchdのPIDへ束縛する", async () => {
+  const sha = "a".repeat(40);
+  const processStart = "Tue Sep 29 03:00:00 2026";
+  const health = { status: "ready", service: "updater", build_sha: sha };
+  const options = {
+    allowLegacyHealth: true,
+    healthRead: async () => health,
+    registrationRead: async () => `DONA_UPDATER_BUILD_SHA => ${sha}\npid = 123\n`,
+    processStartRead: async () => processStart,
+    lockRead: async () => ({ pid: 123, process_start: processStart }),
+  };
+  await waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500, options);
+  await assert.rejects(waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500,
+    { ...options, allowLegacyHealth: false }), /invalid/);
+  await assert.rejects(waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500,
+    { ...options, registrationRead: async () => `DONA_UPDATER_BUILD_SHA => ${sha}\npid = 124\n` }), /disagree/);
+  await assert.rejects(waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500,
+    { ...options, processStartRead: async () => "older process" }), /disagree/);
+  await assert.rejects(waitForUpdaterIdentity("/tmp/updater.sock", sha, "gui/501", 500,
+    { ...options, healthRead: async () => ({ ...health, pid: 123 }) }), /invalid/);
+});
+
 test("launchctl timeoutを単一writeで止め、targetを固定する", async () => {
   const calls: string[][] = [];
   await assert.rejects(launchctlOnce("bootout", "gui/501", "dev.dona.updater", 100,
@@ -365,6 +387,9 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /旧stable updaterをlaunchdへ再登録できません/);
   assert.match(source, /旧stable updaterの復旧healthを確認できません/);
   assert.match(source, /bootstrap_updater_reconciled/);
+  assert.match(source, /bootstrap_updater_reconciled "旧stable updaterの復旧" "\$OLD_UPDATER_SHA" legacy-health/);
+  const slackBootstrap = source.slice(source.indexOf("bootstrap_slack_reconciled()"), source.indexOf("restore_control_plane()"));
+  assert.match(slackBootstrap, /assert-socket-unused "\$SLACK_SOCKET"[\s\S]*launchctl_once bootstrap/);
   assert.match(source, /wait-launchd-updater-sha/);
   assert.match(source, /exact SHAの起動identityを確認しました/);
   assert.match(source, /再送せず照合が必要です/);

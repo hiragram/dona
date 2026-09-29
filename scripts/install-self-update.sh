@@ -54,13 +54,16 @@ assert_control_targets() {
 bootstrap_updater_reconciled() {
   local context=$1
   local expected_sha=$2
+  local identity_mode=${3:-}
+  local -a identity_args=()
+  if [[ -n "$identity_mode" ]]; then identity_args=("$identity_mode"); fi
   local output=""
   local exit_code=0
   if output=$(launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 30000 2>&1); then
     if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha \
       "$CONTROL_ROOT/updater.sock" "$expected_sha" 30000 3 && \
       $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-identity \
-      "$CONTROL_ROOT/updater.sock" "$expected_sha" "$DOMAIN" 30000; then
+      "$CONTROL_ROOT/updater.sock" "$expected_sha" "$DOMAIN" 30000 "${identity_args[@]}"; then
       return 0
     fi
     print -u2 -- "${context}の起動identityを確定できません。"
@@ -73,7 +76,7 @@ bootstrap_updater_reconciled() {
     if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha \
         "$CONTROL_ROOT/updater.sock" "$expected_sha" 30000 3 && \
         $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-identity \
-        "$CONTROL_ROOT/updater.sock" "$expected_sha" "$DOMAIN" 30000; then
+        "$CONTROL_ROOT/updater.sock" "$expected_sha" "$DOMAIN" 30000 "${identity_args[@]}"; then
       print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの起動identityを確認しました。"
       return 0
     fi
@@ -114,6 +117,10 @@ bootstrap_dispatcher_reconciled() {
 bootstrap_slack_reconciled() {
   local output=""
   local exit_code=0
+  if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$SLACK_SOCKET"; then
+    print -u2 -- "Slack Adapterのsocketを別processが使用中のためbootstrapしません。"
+    return 1
+  fi
   if output=$(launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist" 30000 2>&1); then
     :
   else
@@ -177,7 +184,7 @@ restore_control_plane() {
       return 1
     fi
   fi
-  if ! bootstrap_updater_reconciled "旧stable updaterの復旧" "$OLD_UPDATER_SHA"; then
+  if ! bootstrap_updater_reconciled "旧stable updaterの復旧" "$OLD_UPDATER_SHA" legacy-health; then
     print -u2 "旧stable updaterをlaunchdへ再登録できません。backup: $CONTROL_BACKUP_ROOT"
     return 1
   fi
