@@ -227,6 +227,7 @@ export class ReleaseStore {
     if (pointers.receipt && !pointers.previous_sha) throw new Error("retention_previous_pointer_missing");
     if (pointers.receipt && (pointers.receipt.to_sha !== pointers.current_sha ||
       pointers.receipt.from_sha !== pointers.previous_sha)) throw new Error("retention_pointer_receipt_mismatch");
+    await this.assertCleanupPointerManifests(pointers);
     const candidates: Array<{ sha: string; mtime: number }> = [];
     const rootScanDeadline = performance.now() + 3_000;
     let rootEntries = 0;
@@ -296,13 +297,14 @@ export class ReleaseStore {
         if (pointers.receipt && !pointers.previous_sha) throw new Error("retention_previous_pointer_missing");
         if (pointers.receipt && (pointers.receipt.to_sha !== pointers.current_sha ||
           pointers.receipt.from_sha !== pointers.previous_sha)) throw new Error("retention_pointer_receipt_mismatch");
+        await this.assertCleanupPointerManifests(pointers);
         if (protectedForSweep.has(sha) || pointers.current_sha === sha || pointers.previous_sha === sha) continue;
         await this.removeReleaseWithTombstone(releasePath, sha);
         removed.push(sha);
       } catch (error) {
         if (error instanceof CleanupTombstonePendingError) throw error;
         if (error instanceof Error && ["retention_current_pointer_missing", "retention_previous_pointer_missing",
-          "retention_pointer_receipt_mismatch"].includes(error.message)) throw error;
+          "retention_pointer_receipt_mismatch", "retention_pointer_manifest_invalid"].includes(error.message)) throw error;
         // A single corrupt or replaced candidate cannot block other releases.
         errors.push(`${sha}:${error instanceof Error ? error.message : "cleanup_failed"}`);
       }
@@ -373,8 +375,8 @@ export class ReleaseStore {
       (pointers.receipt.to_sha !== pointers.current_sha || pointers.receipt.from_sha !== pointers.previous_sha))) {
       throw new Error("release_cleanup_tombstone_pointer_unsafe");
     }
-    await this.makeMutableForRemoval(tombstone);
-    await this.removeGeneratedTree(this.policy.release_root, tombstone);
+    await this.assertCleanupPointerManifests(pointers);
+    if (!await this.removeTombstoneChunk(tombstone)) throw new CleanupTombstonePendingError();
     await this.clearCleanupTombstone();
     return receipt.sha;
   }
@@ -396,8 +398,7 @@ export class ReleaseStore {
         throw new Error("release_cleanup_tombstone_identity_mismatch");
       }
       await fsyncDirectory(this.policy.release_root);
-      await this.makeMutableForRemoval(tombstone);
-      await this.removeGeneratedTree(this.policy.release_root, tombstone);
+      if (!await this.removeTombstoneChunk(tombstone)) throw new CleanupTombstonePendingError();
       await this.clearCleanupTombstone();
     } catch { throw new CleanupTombstonePendingError(); }
   }
@@ -421,13 +422,36 @@ export class ReleaseStore {
   }
 
   private async readReceipt(): Promise<ActivationReceipt | null> {
+    let handle: fs.FileHandle;
     try {
-      const body = await fs.readFile(path.join(this.policy.control_root, "activation-receipt.json"), "utf8");
-      return parseActivationReceipt(JSON.parse(body));
+      handle = await fs.open(path.join(this.policy.control_root, "activation-receipt.json"),
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o077) !== 0 || stats.size > 4_096) throw new Error("activation_receipt_type_or_size_invalid");
+      const buffer = Buffer.alloc(4_097);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      if (bytesRead > 4_096) throw new Error("activation_receipt_type_or_size_invalid");
+      return parseActivationReceipt(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
+    } finally { await handle.close(); }
+  }
+
+  private async assertCleanupPointerManifests(pointers: {
+    current_sha: string | null; previous_sha: string | null;
+  }): Promise<void> {
+    try {
+      const current = await this.readCurrentManifest();
+      if (current.sha !== pointers.current_sha) throw new Error("pointer_changed");
+      if (pointers.previous_sha) {
+        const previous = await this.readPreviousManifest();
+        if (previous?.sha !== pointers.previous_sha) throw new Error("pointer_changed");
+      }
+    } catch { throw new Error("retention_pointer_manifest_invalid"); }
   }
 
   private async resolvePointer(pointer: string, required: boolean): Promise<string | null> {
@@ -625,15 +649,27 @@ export class ReleaseStore {
   }
 
 
-  private async makeMutableForRemoval(current: string): Promise<void> {
-    const stats = await fs.lstat(current);
-    if (stats.isSymbolicLink()) return;
-    if (stats.isDirectory()) {
-      await fs.chmod(current, 0o700);
-      for await (const child of await fs.opendir(current)) await this.makeMutableForRemoval(path.join(current, child.name));
-    } else {
-      await fs.chmod(current, 0o600);
-    }
+  private async removeTombstoneChunk(tombstone: string): Promise<boolean> {
+    await this.assertGeneratedPath(this.policy.release_root, tombstone);
+    const budget = { remaining: 4_096, deadline: performance.now() + 250 };
+    const remove = async (current: string): Promise<boolean> => {
+      if (--budget.remaining < 0 || performance.now() > budget.deadline) return false;
+      const stats = await fs.lstat(current);
+      if (stats.isDirectory() && !stats.isSymbolicLink()) {
+        await fs.chmod(current, 0o700);
+        for await (const child of await fs.opendir(current)) {
+          if (!await remove(path.join(current, child.name))) return false;
+        }
+        await fs.rmdir(current);
+      } else {
+        if (!stats.isFile() && !stats.isSymbolicLink()) throw new Error("cleanup_target_invalid");
+        await fs.unlink(current);
+      }
+      return true;
+    };
+    const complete = await remove(tombstone);
+    await fsyncDirectory(this.policy.release_root);
+    return complete;
   }
 
 }

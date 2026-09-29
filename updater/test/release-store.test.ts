@@ -165,6 +165,34 @@ describe("ReleaseStore", () => {
     assert.equal((await fs.lstat(path.join(policy.release_root, currentSha))).isDirectory(), true);
   });
 
+  test("rejects oversized and linked activation receipts before cleanup", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidate = await installRelease(policy, "b".repeat(40));
+    const store = new ReleaseStore(policy);
+    await fs.mkdir(policy.control_root, { recursive: true });
+    const receipt = path.join(policy.control_root, "activation-receipt.json");
+    await fs.writeFile(receipt, "x".repeat(4_097), { mode: 0o600 });
+    await assert.rejects(store.cleanup(new Set()), /activation_receipt_type_or_size_invalid/);
+    await fs.unlink(receipt);
+    await fs.symlink(candidate, receipt);
+    await assert.rejects(store.cleanup(new Set()), /ELOOP|activation_receipt_type_or_size_invalid/);
+    assert.equal((await fs.lstat(candidate)).isDirectory(), true);
+  });
+
+  test("keeps repair candidates when a protected pointer manifest is invalid", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidate = await installRelease(policy, "b".repeat(40));
+    const store = new ReleaseStore(policy);
+    await fs.writeFile(path.join(policy.release_root, currentSha, "release-manifest.json"), "{broken");
+    await assert.rejects(store.cleanupPlan(new Set()), /retention_pointer_manifest_invalid/);
+    await assert.rejects(store.cleanup(new Set()), /retention_pointer_manifest_invalid/);
+    assert.equal((await fs.lstat(candidate)).isDirectory(), true);
+  });
+
   test("serializes activation with a cleanup already removing its target release", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
@@ -175,10 +203,12 @@ describe("ReleaseStore", () => {
     const removalEntered = new Promise<void>((resolve) => { entered = resolve; });
     let resume!: () => void;
     const resumeRemoval = new Promise<void>((resolve) => { resume = resolve; });
-    const originalRm = fs.rm.bind(fs);
-    mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
-      if (args[0] === path.join(policy.release_root, `.cleanup-${targetSha}`)) { entered(); await resumeRemoval; }
-      return originalRm(...args);
+    const originalUnlink = fs.unlink.bind(fs);
+    mock.method(fs, "unlink", async (...args: Parameters<typeof fs.unlink>) => {
+      if (args[0] === path.join(policy.release_root, `.cleanup-${targetSha}`, "release-manifest.json")) {
+        entered(); await resumeRemoval;
+      }
+      return originalUnlink(...args);
     });
     try {
       const cleanup = store.cleanup(new Set([currentSha, "0".repeat(40)]));
@@ -208,12 +238,12 @@ describe("ReleaseStore", () => {
     const original = await installRelease(policy, candidateSha);
     const store = new ReleaseStore(policy);
     const protectedShas = new Set([currentSha, "0".repeat(40)]);
-    const remove = fs.rm.bind(fs);
+    const remove = fs.unlink.bind(fs);
     let interrupted = false;
-    mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
-      if (!interrupted && args[0] === path.join(policy.release_root, `.cleanup-${candidateSha}`)) {
+    mock.method(fs, "unlink", async (...args: Parameters<typeof fs.unlink>) => {
+      if (!interrupted && args[0] === path.join(policy.release_root, `.cleanup-${candidateSha}`, "release-manifest.json")) {
         interrupted = true;
-        await fs.unlink(path.join(String(args[0]), "release-manifest.json"));
+        await remove(args[0]);
         throw new Error("injected_io_error");
       }
       return remove(...args);
@@ -229,6 +259,30 @@ describe("ReleaseStore", () => {
     await assert.rejects(fs.lstat(path.join(policy.control_root, "release-cleanup-tombstone.json")), { code: "ENOENT" });
   });
 
+  test("bounds each tombstone deletion pass and resumes on the next sweep", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidateSha = "c".repeat(40);
+    const candidate = await installRelease(policy, candidateSha);
+    await fs.writeFile(path.join(candidate, "extra"), "release");
+    const store = new ReleaseStore(policy);
+    const unlink = fs.unlink.bind(fs);
+    let delayed = false;
+    mock.method(fs, "unlink", async (...args: Parameters<typeof fs.unlink>) => {
+      if (!delayed && String(args[0]).startsWith(path.join(policy.release_root, `.cleanup-${candidateSha}`))) {
+        delayed = true;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return unlink(...args);
+    });
+    try {
+      await assert.rejects(store.cleanup(new Set([currentSha, "0".repeat(40)])), /release_cleanup_tombstone_pending/);
+    } finally { mock.restoreAll(); }
+    assert.equal((await fs.lstat(path.join(policy.release_root, `.cleanup-${candidateSha}`))).isDirectory(), true);
+    assert.deepEqual(await new ReleaseStore(policy).cleanup(new Set([currentSha, "0".repeat(40)])), [candidateSha]);
+  });
+
   test("preserves a replacement tombstone whose inode does not match the saved deletion", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
@@ -238,9 +292,9 @@ describe("ReleaseStore", () => {
     const store = new ReleaseStore(policy);
     const protectedShas = new Set([currentSha, "0".repeat(40)]);
     const tombstone = path.join(policy.release_root, `.cleanup-${candidateSha}`);
-    const remove = fs.rm.bind(fs);
-    mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
-      if (args[0] === tombstone) throw new Error("injected_io_error");
+    const remove = fs.unlink.bind(fs);
+    mock.method(fs, "unlink", async (...args: Parameters<typeof fs.unlink>) => {
+      if (args[0] === path.join(tombstone, "release-manifest.json")) throw new Error("injected_io_error");
       return remove(...args);
     });
     try { await assert.rejects(store.cleanup(protectedShas), /release_cleanup_tombstone_pending/); }
@@ -380,7 +434,7 @@ describe("ReleaseStore", () => {
       to_sha: targetSha,
       pointer_switched_at: "2026-09-03T00:00:00.000Z",
       untrusted_extension: true,
-    }));
+    }), { mode: 0o600 });
     await assert.rejects(store.observe(), /unsupported fields/);
   });
 
