@@ -44,6 +44,77 @@ test("Dispatcher registration read distinguishes bootout from an ambiguous launc
   } finally { await removeTree(root); }
 });
 
+test("runtime inventory hashes live classes without exposing identifiers or payloads", async () => {
+  const { root, policy } = await tempPolicy();
+  const previousBuild = process.env.DONA_UPDATER_BUILD_SHA;
+  process.env.DONA_UPDATER_BUILD_SHA = targetSha;
+  try {
+    await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+    await fs.mkdir(policy.control_root, { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(policy.control_root, "control-plane-receipt.json"), JSON.stringify({
+      schema_version: 1, build_sha: targetSha,
+      schema_migration_capability: "dispatcher_v2_to_v3_online_backup_v1",
+    }), { mode: 0o600 });
+    const agents = path.join(root, "LaunchAgents");
+    await fs.mkdir(agents);
+    for (const label of [policy.launchd.dispatcher_label, policy.launchd.slack_label]) {
+      await fs.writeFile(path.join(agents, `${label}.plist`), `<plist><string>${label}</string></plist>`, { mode: 0o600 });
+    }
+    const dbPath = path.join(root, "Dona", "dona.sqlite3");
+    const db = new Database(dbPath);
+    db.exec(`CREATE TABLE events(event_id TEXT,status TEXT,schema_version INTEGER,source TEXT,updated_at TEXT);
+      CREATE TABLE jobs(job_id TEXT,status TEXT,source TEXT,steer_state TEXT,attempt_count INTEGER,
+        herdr_workspace_id TEXT,completion_event_id TEXT,last_error_code TEXT,updated_at TEXT);
+      PRAGMA user_version = 2;`);
+    db.prepare("INSERT INTO events VALUES ('evt_secret','waiting_agent',1,'slack','2026-09-29T00:00:00Z')").run();
+    db.prepare("INSERT INTO jobs VALUES ('job_secret','running','dona_job',NULL,1,'private_worker',NULL,NULL,'2026-09-29T00:00:00Z')").run();
+    db.close();
+    await fs.chmod(dbPath, 0o600);
+    const runner = new RecordingRunner();
+    let schemaVersion = 2;
+    runner.run = async (_executable, args, _options) => args[0]?.endsWith("app-schema-inspect-cli.js")
+      ? { ...ok, stdout: JSON.stringify({ schema_version: 1, user_version: schemaVersion, integrity_ok: true, foreign_key_violations: 0 }) }
+      : ok;
+    const runtime = new RealRuntime(policy, runner as unknown as ProcessRunner, agents);
+    const inventory = await runtime.runtimeInventory();
+    assert.equal(inventory.pending.events, 1);
+    assert.equal(inventory.pending.jobs, 1);
+    assert.equal(inventory.workers.classes["running:worker:protocol_unknown:epoch_unknown:result_capability_unknown"], 1);
+    assert.equal(JSON.stringify(inventory).includes("secret"), false);
+    const changed = new Database(dbPath);
+    changed.prepare("UPDATE jobs SET status='completed' WHERE job_id='job_secret'").run();
+    changed.close();
+    assert.notEqual((await runtime.runtimeInventory()).pending.digest, inventory.pending.digest);
+    await fs.writeFile(path.join(agents, `${policy.launchd.dispatcher_label}.plist`),
+      "<plist><string>changed registration</string></plist>", { mode: 0o600 });
+    assert.notEqual((await runtime.runtimeInventory()).launchd.identity_digest, inventory.launchd.identity_digest);
+    const v3 = new Database(dbPath);
+    v3.exec(`CREATE TABLE schedules(schedule_id TEXT,state TEXT,revision INTEGER,next_due TEXT,updated_at TEXT);
+      CREATE TABLE schedule_revisions(schedule_id TEXT,revision INTEGER,recurrence_hash TEXT,policy_json TEXT,
+        policy_version INTEGER,timezone TEXT,tzdb_version TEXT,authorization_revision INTEGER,expires_at TEXT,
+        action TEXT,content_scope TEXT,content_hash TEXT,target_json TEXT);
+      CREATE TABLE schedule_runs(run_id TEXT,status TEXT,revision INTEGER,event_id TEXT,job_id TEXT,reason TEXT);
+      CREATE TABLE connector_outbox(outbox_id TEXT,status TEXT,kind TEXT,run_id TEXT,content_hash TEXT,receipt_id TEXT,updated_at TEXT);
+      CREATE TABLE job_groups(source_event_id TEXT,notification_mode TEXT,attention_event_id TEXT,all_terminal_event_id TEXT,updated_at TEXT);
+      PRAGMA user_version = 3;`);
+    v3.prepare("INSERT INTO schedules VALUES ('sched_secret','active',1,NULL,'2026-09-29T00:00:00Z')").run();
+    v3.prepare("INSERT INTO schedule_revisions VALUES ('sched_secret',1,'hash','{}',1,'Asia/Tokyo','v1',1,'2099-01-01T00:00:00Z','work.read_only','fixed_objective_redacted_result','hash','{}')").run();
+    v3.prepare("INSERT INTO connector_outbox VALUES ('out_secret','pending','slack.work_result.post','run_secret','hash',NULL,'2026-09-29T00:00:00Z')").run();
+    v3.prepare("INSERT INTO job_groups VALUES ('evt_secret','grouped',NULL,NULL,'2026-09-29T00:00:00Z')").run();
+    v3.close();
+    schemaVersion = 3;
+    const expanded = await runtime.runtimeInventory();
+    assert.equal(expanded.pending.schedules, 1);
+    assert.equal(expanded.pending.notifications, 2);
+    assert.equal(JSON.stringify(expanded).includes("secret"), false);
+  } finally {
+    if (previousBuild === undefined) delete process.env.DONA_UPDATER_BUILD_SHA;
+    else process.env.DONA_UPDATER_BUILD_SHA = previousBuild;
+    await removeTree(root);
+  }
+});
+
 function agentResponse(cwd: string, sessionId: string | null, interactiveReady = true): string {
   return JSON.stringify({
     result: {

@@ -106,6 +106,24 @@ export interface UpdatePlan {
   rollback_compatible: boolean;
   compatibility_transition: CompatibilityTransition | null;
   created_at: string;
+  expires_at?: string;
+  inventory_revision?: string;
+  inventory?: RuntimeInventory;
+}
+
+// This projection contains only bounded counts, protocol classes and digests.
+// Raw job identifiers, objectives, paths and Result bodies stay in the source DB.
+export interface RuntimeInventory {
+  schema_version: 1;
+  control_plane_build_sha: string;
+  dispatcher_schema: number;
+  app_schema: number;
+  dispatcher_protocol: number;
+  policy_version: string;
+  launchd: { dispatcher_registered: boolean; slack_registered: boolean; identity_digest: string };
+  workers: { classes: Record<string, number>; exception_digest: string };
+  pending: { updates: number; update_notifications: number; events: number; jobs: number;
+    schedules: number; notifications: number; digest: string };
 }
 
 export interface CompatibilityTransition {
@@ -126,6 +144,10 @@ export interface UpdateRow {
   previous_sha: string | null;
   plan_id: string;
   plan_hash: string;
+  inventory_json?: string | null;
+  inventory_revision?: string | null;
+  approval_expires_at?: string | null;
+  preflight_inventory_revision?: string | null;
   policy_version: string;
   compatibility_json: string;
   transition_json?: string | null;

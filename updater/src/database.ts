@@ -13,6 +13,7 @@ import type {
   OutboxRow,
   PlanRequest,
   UpdatePlan,
+  RuntimeInventory,
   UpdateRow,
   UpdateState,
   RuntimeOperationKind,
@@ -77,6 +78,7 @@ export interface PlanMaterial {
   compatibility: Compatibility;
   rollback_compatible: boolean;
   compatibility_transition?: CompatibilityTransition;
+  inventory: RuntimeInventory;
 }
 
 export interface MutationFields {
@@ -114,9 +116,9 @@ export class UpdateDatabase {
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 7) {
+    if (version > 8) {
       this.db.close();
-      throw new Error(`Updater database schema ${version} is newer than supported schema 7`);
+      throw new Error(`Updater database schema ${version} is newer than supported schema 8`);
     }
     if (options.readonly) this.db.pragma("query_only = ON");
     else this.migrate();
@@ -130,7 +132,7 @@ export class UpdateDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 7) throw new Error(`Updater database schema ${version} is newer than supported schema 7`);
+    if (version > 8) throw new Error(`Updater database schema ${version} is newer than supported schema 8`);
     const migrate = (sql: string): void => {
       this.db.transaction(() => { this.db.exec(sql); })();
     };
@@ -318,6 +320,13 @@ export class UpdateDatabase {
       ALTER TABLE update_diagnostic_logs ADD COLUMN content_sha256 TEXT;
       PRAGMA user_version = 7;
     `);
+    if (version <= 7) migrate(`
+      ALTER TABLE update_requests ADD COLUMN inventory_json TEXT;
+      ALTER TABLE update_requests ADD COLUMN inventory_revision TEXT;
+      ALTER TABLE update_requests ADD COLUMN approval_expires_at TEXT;
+      ALTER TABLE update_requests ADD COLUMN preflight_inventory_revision TEXT;
+      PRAGMA user_version = 8;
+    `);
   }
 
   close(): void {
@@ -498,6 +507,8 @@ export class UpdateDatabase {
     const compatibilityJson = canonicalJson(material.compatibility);
     const transitionJson = material.compatibility_transition ? canonicalJson(material.compatibility_transition) : null;
     const createdAt = at.toISOString();
+    const inventoryJson = canonicalJson(material.inventory);
+    const inventoryRevision = sha256(inventoryJson);
     return this.db.transaction(() => {
       const existing = this.db.prepare("SELECT * FROM update_requests WHERE source_event_id = ?")
         .get(request.source_event_id) as UpdateRow | undefined;
@@ -505,7 +516,7 @@ export class UpdateDatabase {
         const mismatch = existing.reply_target_json !== replyTargetJson ||
           existing.current_sha !== material.current_sha || existing.target_sha !== material.target_sha ||
           existing.policy_version !== material.policy_version || existing.compatibility_json !== compatibilityJson ||
-          existing.transition_json !== transitionJson;
+          existing.transition_json !== transitionJson || existing.inventory_revision !== inventoryRevision;
         if (mismatch) throw new Error("A plan for this source event already exists with different material");
         return { row: existing, plan: this.planFromRow(existing), duplicate: true };
       }
@@ -531,18 +542,23 @@ export class UpdateDatabase {
         compatibility: material.compatibility,
         rollback_compatible: material.rollback_compatible,
         compatibility_transition: material.compatibility_transition ?? null,
+        inventory_revision: inventoryRevision,
+        inventory: material.inventory,
         created_at: createdAt,
+        expires_at: new Date(at.getTime() + 15 * 60_000).toISOString(),
       };
       const planHash = sha256(canonicalJson(canonicalPlan));
       this.db.prepare(`
         INSERT INTO update_requests (
           request_id, source_event_id, reply_target_json, state, current_sha, target_sha, previous_sha,
-          plan_id, plan_hash, policy_version, compatibility_json, transition_json, rollback_compatible, created_at, updated_at
-        ) VALUES (?, ?, ?, 'awaiting_approval', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          plan_id, plan_hash, policy_version, compatibility_json, transition_json, rollback_compatible,
+          inventory_json, inventory_revision, approval_expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'awaiting_approval', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         requestId, request.source_event_id, replyTargetJson, material.current_sha, material.target_sha,
         material.previous_sha, planId, planHash, material.policy_version, compatibilityJson, transitionJson,
-        material.rollback_compatible ? 1 : 0, createdAt, createdAt,
+        material.rollback_compatible ? 1 : 0, inventoryJson, inventoryRevision,
+        canonicalPlan.expires_at, createdAt, createdAt,
       );
       const row = this.getRequired(requestId);
       this.audit(row, null, "awaiting_approval", "plan_created", {
@@ -561,12 +577,18 @@ export class UpdateDatabase {
       if (row.reply_target_json !== canonicalJson(input.reply_target) || row.plan_hash !== input.plan_hash) {
         throw new Error("Apply request does not match the persisted exact plan");
       }
+      if (!row.inventory_json || !row.inventory_revision || !row.approval_expires_at ||
+        sha256(row.inventory_json) !== row.inventory_revision) {
+        throw new Error("exact_plan_expired_or_inventory_unverified");
+      }
       if (row.approval_id !== null) {
         if (row.approval_id !== input.approval_id || row.approval_event_id !== input.source_event_id) {
           throw new Error("Plan was already approved with a different approval receipt or event");
         }
         return { row, duplicate: true };
       }
+      if (row.state === "cancelled") throw new Error("cancelled_plan_cannot_be_approved");
+      if (at.toISOString() >= row.approval_expires_at) throw new Error("exact_plan_expired_or_inventory_unverified");
       this.transitionInternal(row, "approved", at, {
         approval_id: input.approval_id,
         approval_event_id: input.source_event_id,
@@ -867,6 +889,14 @@ export class UpdateDatabase {
     return this.db.prepare("SELECT * FROM update_requests WHERE request_id = ?").get(requestId) as UpdateRow | undefined;
   }
 
+  getByPlanId(planId: string): UpdateRow | undefined {
+    return this.db.prepare("SELECT * FROM update_requests WHERE plan_id = ?").get(planId) as UpdateRow | undefined;
+  }
+
+  readPlan(row: UpdateRow): UpdatePlan {
+    return this.planFromRow(row);
+  }
+
   getByPlan(planId: string): UpdateRow | undefined {
     return this.db.prepare("SELECT * FROM update_requests WHERE plan_id = ?").get(planId) as UpdateRow | undefined;
   }
@@ -976,6 +1006,7 @@ export class UpdateDatabase {
       "approval_id", "cancellation_requested", "last_error_code", "last_error_message", "completed_at",
       "approval_event_id", "cancellation_event_id", "lease_owner", "lease_expires_at", "activation_generation", "restart_attempts",
       "reconcile_after", "reconcile_deadline", "last_reconciled_at", "observed_active_sha",
+      "preflight_inventory_revision",
     ]);
     for (const key of Object.keys(fields)) if (!allowed.has(key)) throw new Error(`Unsupported update mutation field ${key}`);
     const assignments = ["state = ?", "updated_at = ?", ...Object.keys(fields).map((key) => `${key} = ?`)];
@@ -1075,6 +1106,11 @@ export class UpdateDatabase {
       compatibility_transition: row.transition_json
         ? JSON.parse(row.transition_json) as CompatibilityTransition
         : null,
+      ...(row.inventory_json && row.inventory_revision && row.approval_expires_at ? {
+        inventory: JSON.parse(row.inventory_json) as RuntimeInventory,
+        inventory_revision: row.inventory_revision,
+        expires_at: row.approval_expires_at,
+      } : {}),
       created_at: row.created_at,
     };
   }

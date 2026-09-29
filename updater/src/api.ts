@@ -10,7 +10,7 @@ import type { UpdateDatabase } from "./database.js";
 import type { Logger } from "./ports.js";
 import { redactText } from "./redaction.js";
 import type { UpdateService } from "./service.js";
-import { parseApplyRequest, parseCancelRequest, parsePlanRequest, parseRequestId, ValidationError } from "./validation.js";
+import { parseApplyRequest, parseCancelRequest, parsePlanId, parsePlanRequest, parseRequestId, ValidationError } from "./validation.js";
 
 function send(response: ServerResponse, status: number, body: unknown, contentType = "application/json; charset=utf-8"): void {
   const encoded = Buffer.from(typeof body === "string" ? body : JSON.stringify(body));
@@ -337,8 +337,12 @@ export class UpdaterApi {
         send(response, result.duplicate ? 200 : 201, result);
         return;
       }
+      if (request.method === "GET" && url.pathname === "/v1/plan") {
+        send(response, 200, this.controller.planStatus(parsePlanId(url.searchParams.get("plan_id"))));
+        return;
+      }
       if (request.method === "POST" && url.pathname === "/v1/apply") {
-        const result = this.controller.apply(parseApplyRequest(await readJson(request)));
+        const result = await this.controller.applyVerified(parseApplyRequest(await readJson(request)));
         this.service.wake();
         send(response, result.duplicate ? 200 : 202, result);
         return;

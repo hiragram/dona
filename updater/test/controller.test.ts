@@ -20,7 +20,7 @@ import type {
   SchemaRollout,
   UpdateRow,
 } from "../src/types.js";
-import { currentSha, installPointers, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
+import { currentSha, fixtureInventory, installPointers, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
@@ -213,7 +213,7 @@ class FakeGit implements GitPort {
     multi_job_enabled: false,
     capabilities: ["safe_read_max_widening_planner"],
   };
-  constructor(readonly target = targetSha, readonly reachable = true) {}
+  constructor(public target = targetSha, readonly reachable = true) {}
   async refresh(current: string) {
     return {
       current_sha: current,
@@ -257,6 +257,7 @@ class FakeDispatcher implements DispatcherPort {
   completionStatus = "queued";
   lastTerminalEventId: string | undefined;
   async eventTerminal(eventId: string) { this.lastTerminalEventId = eventId; return this.terminal; }
+  async verifyApproval() { return "a".repeat(64); }
   async safetyStatus() { return { safe: this.safe, unsafe_states: this.safe ? [] : ["jobs.cancelling:1"] }; }
   async deliverCompletion(_outbox: OutboxRow) { return this.delivery; }
   async completionLookup(): Promise<CompletionLookupResult> {
@@ -267,6 +268,29 @@ class FakeDispatcher implements DispatcherPort {
 }
 
 class FakeRuntime implements RuntimePort {
+  inventoryRevision = 0;
+  inventoryUnavailable = false;
+  inventoryControlPlaneSha = targetSha;
+  inventorySchema = 2;
+  inventoryWorkerCount = 0;
+  inventoryDispatcherRegistered = true;
+  inventoryLaunchdDigest = "a".repeat(64);
+  inventoryChangesOnCall: number | undefined;
+  inventoryCalls = 0;
+  runtimeInventory() {
+    this.inventoryCalls += 1;
+    if (this.inventoryChangesOnCall === this.inventoryCalls) this.inventoryRevision += 1;
+    if (this.inventoryUnavailable) return Promise.reject(new Error("inventory_unavailable"));
+    return Promise.resolve({
+      schema_version: 1 as const, control_plane_build_sha: this.inventoryControlPlaneSha,
+      dispatcher_schema: this.inventorySchema, app_schema: this.inventorySchema, dispatcher_protocol: 1,
+      policy_version: this.policyVersion,
+      launchd: { dispatcher_registered: this.inventoryDispatcherRegistered, slack_registered: true, identity_digest: this.inventoryLaunchdDigest },
+      workers: { classes: this.inventoryWorkerCount ? { "running:legacy/unknown/unknown": this.inventoryWorkerCount } : {}, exception_digest: "b".repeat(64) },
+      pending: { updates: 0, update_notifications: 0, events: 0, jobs: this.inventoryWorkerCount,
+        schedules: 0, notifications: this.inventoryRevision, digest: "c".repeat(64) },
+    });
+  }
   dispatcherRegistrationOverride: boolean | undefined;
   dispatcherRegistrationAppearsOnCall: number | undefined;
   dispatcherRegistrationThrowsOnCall: number | undefined;
@@ -352,6 +376,7 @@ class FakeRuntime implements RuntimePort {
     private readonly store: ReleaseStore,
     private readonly policySha: () => string,
     private readonly releaseRoot: string,
+    private readonly policyVersion = "2026-09-03.2",
   ) {}
   simulateStoppedRuntime(): void {
     this.mainAgentExists = false;
@@ -599,7 +624,7 @@ async function fixture(policyVersion = "2026-09-03.2") {
   const dispatcher = new FakeDispatcher();
   const git = new FakeGit();
   const build = new FakeBuild();
-  const runtime = new FakeRuntime(store, () => currentSha, policy.release_root);
+  const runtime = new FakeRuntime(store, () => currentSha, policy.release_root, policyVersion);
   let now = new Date("2026-09-02T00:00:00.000Z");
   const controller = new UpdateController(database, policy, git, build, store, runtime, dispatcher, logger, {
     now: () => new Date(now),
@@ -611,6 +636,85 @@ async function fixture(policyVersion = "2026-09-03.2") {
 }
 
 describe("UpdateController isolated end-to-end", () => {
+  test("concurrent inventory changes fail planning and approval preflight closed", async () => {
+    const planning = await fixture();
+    planning.runtime.inventoryChangesOnCall = 2;
+    await assert.rejects(planning.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget }),
+      /runtime_inventory_unstable/);
+    assert.equal(planning.database.nonTerminalCount(), 0);
+    planning.database.close();
+
+    const applying = await fixture();
+    const planned = await applying.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    applying.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "approval-concurrent" });
+    applying.dispatcher.terminal = true;
+    applying.runtime.inventoryChangesOnCall = applying.runtime.inventoryCalls + 2;
+    await applying.controller.processNext();
+    assert.equal(applying.database.get(planned.request_id as string)?.last_error_code, "inventory_replan_required");
+    assert.deepEqual(applying.runtime.calls, []);
+    applying.database.close();
+  });
+
+  test("apply requires Dispatcher proof for the persisted approval event", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    await assert.rejects(f.controller.applyVerified({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "unverified" }), /approval_receipt_mismatch/);
+    assert.equal(f.database.get(planned.request_id as string)?.state, "awaiting_approval");
+    const accepted = await f.controller.applyVerified({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "a".repeat(64) });
+    assert.equal(accepted.accepted, true);
+    assert.equal(f.database.get(planned.request_id as string)?.approval_event_id, approvalEventId);
+    f.database.close();
+  });
+
+  test("approved snapshot rejects worker, backlog, schema, build and registration drift before runtime writes", async () => {
+    for (const drift of ["worker", "worker_decrease", "backlog", "schema", "control", "launchd", "launchd_identity", "unavailable"] as const) {
+      const f = await fixture();
+      if (drift === "worker_decrease") f.runtime.inventoryWorkerCount = 1;
+      const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+      const plan = planned.plan as { plan_id: string; plan_hash: string };
+      f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+        plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: `approval-${drift}` });
+      f.dispatcher.terminal = true;
+      if (drift === "worker") f.runtime.inventoryWorkerCount = 1;
+      if (drift === "worker_decrease") f.runtime.inventoryWorkerCount = 0;
+      if (drift === "backlog") f.runtime.inventoryRevision = 1;
+      if (drift === "schema") f.runtime.inventorySchema = 3;
+      if (drift === "control") f.runtime.inventoryControlPlaneSha = "f".repeat(40);
+      if (drift === "launchd") f.runtime.inventoryDispatcherRegistered = false;
+      if (drift === "launchd_identity") f.runtime.inventoryLaunchdDigest = "d".repeat(64);
+      if (drift === "unavailable") f.runtime.inventoryUnavailable = true;
+      await f.controller.processNext();
+      const row = f.database.get(planned.request_id as string)!;
+      assert.equal(row.state, "failed", drift);
+      assert.equal(row.last_error_code, drift === "unavailable" ? "inventory_read_unavailable" : "inventory_replan_required", drift);
+      assert.equal(row.activation_generation, 0);
+      assert.equal(row.preflight_inventory_revision, null);
+      assert.deepEqual(f.runtime.calls, []);
+      assert.equal((await f.store.observe()).current_sha, currentSha);
+      f.database.close();
+    }
+  });
+
+  test("a new target tip requires a fresh plan before staging", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "approval-target-drift" });
+    f.dispatcher.terminal = true;
+    f.git.target = "f".repeat(40);
+    await f.controller.processNext();
+    assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "target_changed_replan_required");
+    assert.deepEqual(f.runtime.calls, []);
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    f.database.close();
+  });
+
   test("rejects active worker handoff before quiesce, stop, migration, or activation", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -1002,6 +1106,8 @@ describe("UpdateController isolated end-to-end", () => {
     f.dispatcher.terminal = true;
     assert.equal(await f.controller.processNext(), true);
     assert.equal(f.database.get(requestId)?.state, "succeeded");
+    assert.equal(f.database.get(requestId)?.preflight_inventory_revision,
+      (planned.plan as { inventory_revision: string }).inventory_revision);
     assert.equal((await f.store.observe()).current_sha, targetSha);
     assert.deepEqual(f.runtime.calls, [
       "quiesceSlack", "quiesceDispatcher", "waitForMainAgentIdle", "stopMainAgent", "stopSlack", "stopDispatcher",
@@ -1015,6 +1121,7 @@ describe("UpdateController isolated end-to-end", () => {
       previous_sha: currentSha,
       policy_version: f.policy.policy_version,
       compatibility: f.policy.compatibility,
+      inventory: fixtureInventory,
       rollback_compatible: true,
     }), /terminal notification is not settled/);
     f.dispatcher.delivery = { outcome: "acceptance_unknown", error_code: "completion_post_timeout" };
@@ -1927,7 +2034,7 @@ describe("UpdateController isolated end-to-end", () => {
 
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "complete");
-    f.advance(40 * 86_400_000);
+    f.advance(60 * 86_400_000);
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "purged");
     f.database.close();

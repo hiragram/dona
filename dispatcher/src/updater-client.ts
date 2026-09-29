@@ -32,6 +32,10 @@ export class UpdaterClient {
     return this.request("POST", "/v1/plan", input);
   }
 
+  planStatus(planId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/v1/plan?plan_id=${encodeURIComponent(planId)}`);
+  }
+
   apply(input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", "/v1/apply", input);
   }
