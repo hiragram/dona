@@ -19,13 +19,15 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 ./scripts/install-self-update.sh --install
 ```
 
-この段階ではimmutable initial release、stable updater copy、0600 policy/token/config/plistだけを配置し、processやlaunchctlは変更しません。既存`install-launchd.sh`はdeveloper checkoutを直接起動するlegacy方式です。新構成へ切り替えるmaintenance windowで、内容を確認してから次を別途実行します。
+この段階ではimmutable initial release、stable updater copy、0600 policy/token/config/plistだけを配置し、processやlaunchctlは変更しません。既存`install-launchd.sh`はdeveloper checkoutを直接起動するlegacy方式です。新構成へ切り替えるmaintenance windowでは、既存workerと通知をdrainし、稼働中のDispatcher/Slack Adapterのlaunchd label、PID、起動元を確認します。開発用processがあれば所有者が停止し、子processの終了も確認します。未知のprocessを停止しません。
+
+登録済みlegacy serviceは、運用者が確認済みのlabelに対してSlack Adapter、Dispatcherの順で`launchctl bootout gui/$UID/dev.dona.slack-adapter`と`launchctl bootout gui/$UID/dev.dona.dispatcher`を各1回だけ実行します。各操作の後、`node ./scripts/self-update-install-preflight.mjs wait-launchd-unregistered gui/$UID dev.dona.slack-adapter 30000`または同じcommandのlabelを`dev.dona.dispatcher`とした読み取りで登録解除を安定観測します。応答喪失やtimeout時はbootoutを再送せず、同じ読み取りで状態を照合します。登録解除が確定しない場合はここで停止し、現行serviceとsocket healthを調べます。両labelの登録解除とDispatcher socketの非使用を確認した後だけ、次を別途実行します。
 
 ```sh
 ./scripts/install-self-update.sh --bootstrap
 ```
 
-`--bootstrap`だけが、既存Slack Adapter→Dispatcherの順にbootoutし、stable updater→Dispatcher→Slack Adapterの順にbootstrapします。commandの結果が曖昧なら反復せず、`launchctl print gui/$UID/<label>`とhealthを確認します。実行中stable updaterはinstallerもbootoutしません。
+`--bootstrap`は登録済みDispatcher/Slack Adapterがあれば停止前に拒否し、stable updater→Dispatcher→Slack Adapterの順にbootstrapします。Updater/Dispatcherのbootstrap応答が曖昧な場合は再送せず、exact SHAの登録、socket health、起動identityを照合します。実行中stable updaterをbootoutしません。
 
 ## 通常update
 
