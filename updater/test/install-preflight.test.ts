@@ -40,15 +40,26 @@ test("bootstrap resume checks the install-time files independently of the curren
     await fs.mkdir(releases, { mode: 0o700 });
     await fs.mkdir(path.join(releases, sha), { mode: 0o700 });
     await fs.writeFile(path.join(releases, sha, "cli.js"), "release", { mode: 0o400 });
+    await fs.mkdir(path.join(releases, sha, "updater"), { mode: 0o700 });
+    await fs.writeFile(path.join(releases, sha, "updater", "cli.js"), "updater", { mode: 0o400 });
+    await fs.chmod(path.join(releases, sha, "updater"), 0o500);
     await fs.mkdir(path.join(releases, sha, "scripts"), { mode: 0o700 });
     for (const name of ["bootstrap-install-contract.mjs", "control-updater-tree.mjs", "self-update-install-preflight.mjs"]) {
       await fs.writeFile(path.join(releases, sha, "scripts", name), name, { mode: 0o400 });
     }
     await fs.chmod(path.join(releases, sha, "scripts"), 0o500);
     await fs.chmod(path.join(releases, sha), 0o500);
+    const plist = `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>ProgramArguments</key><array><string>${process.execPath}</string></array></dict></plist>`;
     for (const name of ["policy.json", "dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"]) {
-      await fs.writeFile(path.join(name === "policy.json" ? control : agents, name), name, { mode: 0o600 });
+      await fs.writeFile(path.join(name === "policy.json" ? control : agents, name), name === "policy.json" ? name : plist, { mode: 0o600 });
     }
+    await fs.chmod(path.join(control, "updater", "cli.js"), 0o600);
+    await fs.writeFile(path.join(control, "updater", "cli.js"), "different");
+    await fs.chmod(path.join(control, "updater", "cli.js"), 0o400);
+    await assert.rejects(execute(process.execPath, [installContract, "record", control, agents, releases, sha]), /immutable release/);
+    await fs.chmod(path.join(control, "updater", "cli.js"), 0o600);
+    await fs.writeFile(path.join(control, "updater", "cli.js"), "updater");
+    await fs.chmod(path.join(control, "updater", "cli.js"), 0o400);
     await execute(process.execPath, [installContract, "record", control, agents, releases, sha]);
     await execute(process.execPath, [installContract, "verify", control, agents, releases, sha]);
     await assert.rejects(execute(process.execPath, [installContract, "verify", control, agents, releases, "b".repeat(40)]));
@@ -76,6 +87,7 @@ test("bootstrap resume checks the install-time files independently of the curren
     assert.doesNotMatch(source, /cmp -s "\$INSTALL_TMP\/rendered\/dev\.dona\.(?:dispatcher|slack-adapter)\.plist"/);
   } finally {
     await fs.chmod(path.join(releases, sha), 0o700).catch(() => undefined);
+    await fs.chmod(path.join(releases, sha, "updater"), 0o700).catch(() => undefined);
     await fs.chmod(path.join(releases, sha, "scripts"), 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -98,8 +110,9 @@ test("an interrupted install contract is recovered only from the same verified b
     }
     for (const name of ["policy.json", "dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"]) {
       const destination = name === "policy.json" ? control : agents;
-      await fs.writeFile(path.join(rendered, name), name, { mode: 0o600 });
-      await fs.writeFile(path.join(destination, name), name, { mode: 0o600 });
+      const content = name === "policy.json" ? name : `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>ProgramArguments</key><array><string>${process.execPath}</string></array></dict></plist>`;
+      await fs.writeFile(path.join(rendered, name), content, { mode: 0o600 });
+      await fs.writeFile(path.join(destination, name), content, { mode: 0o600 });
     }
     for (const directory of [path.join(control, "updater"), path.join(staged, "updater"),
       path.join(installedRelease, "updater")]) {
@@ -117,10 +130,10 @@ test("an interrupted install contract is recovered only from the same verified b
     await fs.writeFile(temp, "partial", { mode: 0o600 });
     const recover = () => execute(process.execPath,
       [installContract, "recover", control, agents, releases, sha, rendered, staged]);
-    await fs.writeFile(path.join(agents, "dev.dona.dispatcher.plist"), "tampered");
+    await fs.writeFile(path.join(control, "policy.json"), "tampered");
     await assert.rejects(recover(), /trusted render/);
     assert.equal(await fs.readFile(temp, "utf8"), "partial");
-    await fs.writeFile(path.join(agents, "dev.dona.dispatcher.plist"), "dev.dona.dispatcher.plist");
+    await fs.writeFile(path.join(control, "policy.json"), "policy.json");
     await recover();
     await execute(process.execPath, [installContract, "verify", control, agents, releases, sha]);
     await assert.rejects(recover(), /already exists/);
@@ -147,6 +160,9 @@ test("bootstrap binds current pointer and installed Node to the verified release
       await fs.mkdir(directory, { mode: 0o700 });
     }
     await fs.writeFile(path.join(control, "updater", "cli.js"), "updater", { mode: 0o400 });
+    await fs.mkdir(path.join(release, "updater"), { mode: 0o700 });
+    await fs.writeFile(path.join(release, "updater", "cli.js"), "updater", { mode: 0o400 });
+    await fs.chmod(path.join(release, "updater"), 0o500);
     await fs.writeFile(path.join(control, "policy.json"), "policy", { mode: 0o600 });
     const plist = `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>ProgramArguments</key><array><string>${process.execPath}</string></array></dict></plist>`;
     for (const name of ["dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"]) {
@@ -166,7 +182,10 @@ test("bootstrap binds current pointer and installed Node to the verified release
     const installerSource = await fs.readFile(installer, "utf8");
     const trustLauncher = installerSource.match(/<<'PY'\n([\s\S]*?)\nPY/)?.[1];
     assert.ok(trustLauncher);
-    await execute("/usr/bin/python3", ["-c", trustLauncher, control, releases, sha]);
+    await execute("/usr/bin/python3", ["-c", trustLauncher, control, agents, releases, sha]);
+    await fs.writeFile(path.join(agents, "dev.dona.updater.plist"), plist.replace(process.execPath, "/usr/bin/true"));
+    await assert.rejects(execute("/usr/bin/python3", ["-c", trustLauncher, control, agents, releases, sha]), /bootstrap Node differs/);
+    await fs.writeFile(path.join(agents, "dev.dona.updater.plist"), plist);
     const verifier = path.join(release, "scripts", "bootstrap-install-contract.mjs");
     await fs.chmod(release, 0o700);
     await fs.chmod(path.join(release, "scripts"), 0o700);
@@ -175,7 +194,7 @@ test("bootstrap binds current pointer and installed Node to the verified release
     await fs.chmod(verifier, 0o400);
     await fs.chmod(path.join(release, "scripts"), 0o500);
     await fs.chmod(release, 0o500);
-    await assert.rejects(execute("/usr/bin/python3", ["-c", trustLauncher, control, releases, sha]));
+    await assert.rejects(execute("/usr/bin/python3", ["-c", trustLauncher, control, agents, releases, sha]));
     await fs.chmod(release, 0o700);
     await fs.chmod(path.join(release, "scripts"), 0o700);
     await fs.chmod(verifier, 0o600);
@@ -200,8 +219,22 @@ test("bootstrap binds current pointer and installed Node to the verified release
   } finally {
     await fs.chmod(release, 0o700).catch(() => undefined);
     await fs.chmod(path.join(release, "scripts"), 0o700).catch(() => undefined);
+    await fs.chmod(path.join(release, "updater"), 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test("initial bootstrap registration lookup has a deadline and rejects unknown results", async () => {
+  const { readLaunchdRegistration } = await import(pathToFileURL(preflight).href);
+  const target = "gui/501/dev.dona.dispatcher";
+  assert.equal(await readLaunchdRegistration("gui/501", "dev.dona.dispatcher", 50,
+    { observe: async (value: string) => { assert.equal(value, target); return true; } }), true);
+  assert.equal(await readLaunchdRegistration("gui/501", "dev.dona.dispatcher", 50,
+    { observe: async () => false }), false);
+  await assert.rejects(readLaunchdRegistration("gui/501", "dev.dona.dispatcher", 50,
+    { observe: async () => { throw new Error("permission denied"); } }), /permission denied/);
+  await assert.rejects(readLaunchdRegistration("gui/501", "dev.dona.dispatcher", 10,
+    { observe: async () => await new Promise<boolean>(() => undefined) }), /timed out/);
 });
 type WaitForLaunchdServiceAbsent = (
   domain: string,
@@ -588,8 +621,8 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /if \[\[ "\$MODE" != "--bootstrap" \]\]; then[\s\S]*render-self-update-templates\.mjs/);
   assert.match(source, /BOOTSTRAP_UPDATER_SHA=\$\(\/usr\/libexec\/PlistBuddy/);
   assert.doesNotMatch(initialBootstrap, /bootout "\$DOMAIN" dev\.dona\.(?:dispatcher|slack-adapter)/);
-  assert.match(initialBootstrap, /dispatcher_registered=0[\s\S]*wait-dispatcher-sha[\s\S]*if \[\[ "\$dispatcher_registered" == "0" \]\] &&[\s\S]*bootstrap_dispatcher_reconciled/);
-  assert.match(initialBootstrap, /slack_registered=0[\s\S]*wait-slack-sha[\s\S]*if \[\[ "\$slack_registered" == "0" \]\] && ! bootstrap_slack_reconciled/);
+  assert.match(initialBootstrap, /dispatcher_registered=\$\([\s\S]*read-launchd-registration[\s\S]*wait-dispatcher-sha[\s\S]*if \[\[ "\$dispatcher_registered" == "0" \]\] &&[\s\S]*bootstrap_dispatcher_reconciled/);
+  assert.match(initialBootstrap, /slack_registered=\$\([\s\S]*read-launchd-registration[\s\S]*wait-slack-sha[\s\S]*if \[\[ "\$slack_registered" == "0" \]\] && ! bootstrap_slack_reconciled/);
   assert.match(source, /--upgrade-control/);
   assert.match(source, /assert-control-upgrade-safe/);
   assert.match(source, /wait-updater-sha/);

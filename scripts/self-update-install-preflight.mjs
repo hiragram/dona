@@ -354,6 +354,15 @@ async function observeBeforeDeadline(observe, serviceTarget, timeoutMs) {
   }
 }
 
+export async function readLaunchdRegistration(domain, label, timeoutMs, options = {}) {
+  if (!/^gui\/[1-9][0-9]*$/.test(domain) || !/^dev\.dona\.(?:dispatcher|updater|slack-adapter)$/.test(label) ||
+      !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("launchd registration arguments are invalid");
+  }
+  const observe = options.observe ?? observeLaunchdRegistration;
+  return await observeBeforeDeadline(observe, `${domain}/${label}`, timeoutMs);
+}
+
 export async function waitForLaunchdServiceAbsent(domain,label,timeoutMs,options={}) {
   if(!/^gui\/[1-9][0-9]*$/.test(domain)||!/^dev\.dona\.(?:dispatcher|updater|slack-adapter)$/.test(label)||
     !Number.isSafeInteger(timeoutMs)||timeoutMs<=0)throw new Error("wait-launchd-unregistered arguments are invalid");
@@ -618,6 +627,10 @@ async function main() {
   }
   if(mode==="wait-launchd-unregistered"&&secondValue&&process.argv[5]) {
     try { await waitForLaunchdServiceAbsent(value,secondValue,Number(process.argv[5])); return 0; }
+    catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
+  }
+  if(mode==="read-launchd-registration"&&secondValue&&process.argv[5]) {
+    try { console.log((await readLaunchdRegistration(value,secondValue,Number(process.argv[5]))) ? "1" : "0"); return 0; }
     catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
   if(mode==="read-updater-registration-sha"&&secondValue) {

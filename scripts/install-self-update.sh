@@ -273,9 +273,9 @@ if [[ "$MODE" == "--bootstrap" ]]; then
     print -u2 "install済みreleaseのbootstrap script identityを確認できません。"
     exit 1
   fi
-  /usr/bin/python3 - "$CONTROL_ROOT" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA" <<'PY'
-import hashlib, json, os, stat, sys
-control, releases, sha = sys.argv[1:]
+  /usr/bin/python3 - "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA" <<'PY'
+import hashlib, json, os, plistlib, stat, sys
+control, agents, releases, sha = sys.argv[1:]
 def private_bytes(file, mode):
     fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW)
     try:
@@ -294,8 +294,22 @@ for name in ('bootstrap-install-contract.mjs', 'control-updater-tree.mjs', 'self
     actual = hashlib.sha256(private_bytes(source, 0o400)).hexdigest()
     if actual != contract['digests'].get('verifier:' + name):
         raise RuntimeError('bootstrap verifier differs from the install contract')
+for name in ('dev.dona.updater.plist', 'dev.dona.dispatcher.plist', 'dev.dona.slack-adapter.plist'):
+    plist = plistlib.loads(private_bytes(os.path.join(agents, name), 0o600))
+    node = plist['ProgramArguments'][0]
+    if not os.path.isabs(node):
+        raise RuntimeError('bootstrap Node path is invalid')
+    digest = hashlib.sha256()
+    with open(node, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != contract['digests'].get('node:' + name):
+        raise RuntimeError('bootstrap Node differs from the install contract')
 PY
-  $NODE_PATH "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/scripts/bootstrap-install-contract.mjs" \
+  NODE_PATH=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" \
+    "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist")
+  "$NODE_PATH" "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/scripts/bootstrap-install-contract.mjs" \
     bootstrap-verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA"
   if [[ "${0:A}" != "${BOOTSTRAP_SCRIPT:A}" ]]; then
     exec /bin/zsh "$BOOTSTRAP_SCRIPT" --bootstrap
@@ -364,13 +378,15 @@ if [[ "$MODE" == "--bootstrap" ]]; then
     "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/release-manifest.json" "$BOOTSTRAP_UPDATER_SHA"
   $NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" bootstrap-verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA"
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$CONTROL_ROOT/updater/dist/cli.js"
-  if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
-    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
+  dispatcher_registered=$("$NODE_PATH" "$SCRIPT_DIR/self-update-install-preflight.mjs" \
+    read-launchd-registration "$DOMAIN" dev.dona.dispatcher 5000)
+  slack_registered=$("$NODE_PATH" "$SCRIPT_DIR/self-update-install-preflight.mjs" \
+    read-launchd-registration "$DOMAIN" dev.dona.slack-adapter 5000)
+  updater_registered=$("$NODE_PATH" "$SCRIPT_DIR/self-update-install-preflight.mjs" \
+    read-launchd-registration "$DOMAIN" dev.dona.updater 5000)
+  if [[ "$dispatcher_registered" == "0" ]]; then
+    "$NODE_PATH" "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
   fi
-  dispatcher_registered=0
-  slack_registered=0
-  if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then dispatcher_registered=1; fi
-  if /bin/launchctl print "$DOMAIN/dev.dona.slack-adapter" >/dev/null 2>&1; then slack_registered=1; fi
   if [[ "$slack_registered" == "1" && "$dispatcher_registered" == "0" ]]; then
     print -u2 "Slack Adapterのみ登録済みのため初回bootstrapを再開できません。"
     exit 1
@@ -391,7 +407,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
       exit 1
     fi
   fi
-  if ! /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
+  if [[ "$updater_registered" == "0" ]]; then
     if ! bootstrap_updater_reconciled "初回Updater登録" "$BOOTSTRAP_UPDATER_SHA"; then exit 1; fi
   elif ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha \
       "$CONTROL_ROOT/updater.sock" "$BOOTSTRAP_UPDATER_SHA" 30000 3 || \

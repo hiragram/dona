@@ -36,6 +36,16 @@ async function installedDigests(controlRoot, agentsRoot, releaseRoot, sha) {
     digests[name] = createHash("sha256").update(await privateFile(file)).digest("hex");
   }
   digests.control_updater_tree = controlUpdaterTreeDigest(path.join(controlRoot, "updater"));
+  const expectedUpdater = controlUpdaterTreeDigest(path.join(releaseRoot, sha, "updater"), 0o500);
+  if (digests.control_updater_tree !== expectedUpdater) {
+    throw new Error("installed Updater differs from the immutable release");
+  }
+  for (const name of names) {
+    const nodePath = execFileSync("/usr/libexec/PlistBuddy", ["-c", "Print :ProgramArguments:0", path.join(agentsRoot, name)],
+      { encoding: "utf8", timeout: 5000 }).trim();
+    if (!path.isAbsolute(nodePath)) throw new Error("installed Node path is invalid");
+    digests[`node:${name}`] = createHash("sha256").update(await fs.readFile(nodePath)).digest("hex");
+  }
   digests.release_tree = await releaseTreeDigest(path.join(releaseRoot, sha), true);
   for (const name of verifierNames) {
     digests[`verifier:${name}`] = createHash("sha256").update(
