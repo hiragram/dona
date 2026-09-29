@@ -54,7 +54,7 @@ function publish(file, value, writeFile = fs.writeFileSync) {
 }
 
 export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, oldPlist, newPlist,
-  releaseDigest, oldUpdaterTree, oldDispatcherPlist, newDispatcherPlist, oldReceipt) {
+  releaseDigest, oldUpdaterTree, newUpdaterTree, oldDispatcherPlist, newDispatcherPlist, oldReceipt) {
   assertPrivateDirectory(directory);
   if (!sha(oldSha) || !sha(newSha) || !/^[0-9a-f]{64}$/.test(releaseDigest ?? "")) {
     throw new Error("control attempt SHA or release digest is invalid");
@@ -72,6 +72,7 @@ export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, o
     old_policy_sha256: digest(oldPolicy), new_policy_sha256: digest(newPolicy),
     old_plist_sha256: digest(oldPlist), new_plist_sha256: digest(newPlist),
     old_updater_tree_sha256: controlUpdaterTreeDigest(oldUpdaterTree),
+    new_updater_tree_sha256: controlUpdaterTreeDigest(newUpdaterTree, 0o500),
     old_dispatcher_plist_sha256: digest(oldDispatcherPlist),
     new_dispatcher_plist_sha256: digest(newDispatcherPlist),
     old_receipt_sha256: oldReceipt === "-" ? null : digest(oldReceipt),
@@ -191,7 +192,7 @@ export function verifyAttemptArtifacts(directory, policy, plist, dispatcherPlist
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   const [command, ...args] = process.argv.slice(2);
   try {
-    if (command === "create" && args.length === 12) createAttempt(...args);
+    if (command === "create" && args.length === 13) createAttempt(...args);
     else if (command === "advance" && args.length >= 2 && args.length <= 5) advanceAttempt(...args);
     else if (command === "verify" && args.length === 6) verifyAttemptArtifacts(...args);
     else if (command === "verify-restore-control" && args.length === 7) verifyRestoredControl(...args);

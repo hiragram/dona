@@ -801,6 +801,7 @@ export class RealRuntime implements RuntimePort {
         typeof attempt.new_dispatcher_plist_sha256 === "string" &&
         /^[0-9a-f]{64}$/.test(attempt.new_dispatcher_plist_sha256) &&
         attempt.new_dispatcher_plist_sha256 === receipt.dispatcher_plist_sha256 &&
+        attempt.new_updater_tree_sha256 === receipt.control_updater_tree_sha256 &&
         attempt.release_tree_sha256 === receipt.release_tree_sha256 &&
         typeof attempt.release_tree_sha256 === "string" && /^[0-9a-f]{64}$/.test(attempt.release_tree_sha256) &&
         attempt.restore_rehearsal_sha256 === receipt.restore_rehearsal_sha256 &&

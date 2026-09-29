@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
@@ -16,6 +17,11 @@ import {
 import type { SlackReminderConnector } from "./reminder-connector.js";
 import { parseJobProgressRequest, type SlackJobProgressReporter } from "./job-progress.js";
 import { SlackApiError } from "./slack-api.js";
+
+const slackProcessStart = execFileSync("/bin/ps", ["-p", String(process.pid), "-o", "lstart="], {
+  encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+}).trim();
+if (!slackProcessStart) throw new Error("Slack Adapter process start identity unavailable");
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
   const encoded = Buffer.from(JSON.stringify(body));
@@ -271,6 +277,8 @@ export class SlackHealthServer {
         status: ready ? "ready" : "not_ready",
         service: "slack_adapter",
         build_sha: this.buildSha,
+        pid: process.pid,
+        process_start: slackProcessStart,
         protocol: 1,
         app_schema: this.appSchemaWrite,
         app_schema_read_min: 2,

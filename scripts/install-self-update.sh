@@ -149,10 +149,11 @@ restore_control_plane() {
   if [[ "$CONTROL_UPGRADE_ACTIVE" != "1" || -z "$CONTROL_BACKUP_ROOT" ]]; then return 0; fi
   local updater_registration=""
   local restored_database_mode="live"
-  updater_registration=$(/bin/launchctl print "$DOMAIN/dev.dona.updater" 2>/dev/null) || updater_registration=""
-  if [[ -n "$updater_registration" ]]; then
-    if [[ "$updater_registration" != *"DONA_UPDATER_BUILD_SHA => ${INSTALL_SHA}"* &&
-          "$updater_registration" != *"DONA_UPDATER_BUILD_SHA => ${OLD_UPDATER_SHA}"* ]]; then
+  updater_registration=$($NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" \
+    read-updater-registration-sha "$DOMAIN" 30000) || return 1
+  if [[ "$updater_registration" != "absent" ]]; then
+    if [[ "$updater_registration" != "$INSTALL_SHA" &&
+          "$updater_registration" != "$OLD_UPDATER_SHA" ]]; then
       print -u2 "control-plane復旧前にUpdaterの登録identityを確認できません。"
       return 1
     fi
@@ -259,7 +260,27 @@ NPM_PATH=$(command -v npm)
 GIT_PATH=$(command -v git)
 GH_PATH=$(command -v gh)
 HERDR_PATH=$(command -v herdr)
-INSTALL_SHA=$($GIT_PATH -C "$REPOSITORY_DIR" rev-parse HEAD^{commit})
+if [[ "$MODE" == "--bootstrap" ]]; then
+  BOOTSTRAP_UPDATER_SHA=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:DONA_UPDATER_BUILD_SHA" \
+    "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist")
+  if [[ ! "$BOOTSTRAP_UPDATER_SHA" =~ '^[0-9a-f]{40}$' ]]; then
+    print -u2 "install済みUpdaterのSHAを確定できません。"
+    exit 1
+  fi
+  BOOTSTRAP_SCRIPT="$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/scripts/install-self-update.sh"
+  if [[ ! -f "$BOOTSTRAP_SCRIPT" || -L "$BOOTSTRAP_SCRIPT" ||
+        "$(/usr/bin/stat -f '%u:%Lp' "$BOOTSTRAP_SCRIPT")" != "$UID:400" ]]; then
+    print -u2 "install済みreleaseのbootstrap script identityを確認できません。"
+    exit 1
+  fi
+  if [[ "${0:A}" != "${BOOTSTRAP_SCRIPT:A}" ]]; then
+    exec /bin/zsh "$BOOTSTRAP_SCRIPT" --bootstrap
+  fi
+  NODE_PATH=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" \
+    "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist")
+else
+  INSTALL_SHA=$($GIT_PATH -C "$REPOSITORY_DIR" rev-parse HEAD^{commit})
+fi
 INSTALL_TMP=$(mktemp -d "${TMPDIR:-/tmp}/dona-self-update-install.XXXXXX")
 
 cleanup_temp() {
@@ -281,14 +302,16 @@ cleanup_temp() {
 }
 trap cleanup_temp EXIT
 
-$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}"
-if [[ -n "$TARGET_ROOT" ]]; then
-  EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR" "$MODE")
+if [[ "$MODE" != "--bootstrap" ]]; then
+  $NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}"
+  if [[ -n "$TARGET_ROOT" ]]; then
+    EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR" "$MODE")
+  fi
+  /usr/bin/plutil -lint "$INSTALL_TMP/rendered/dev.dona.updater.plist" \
+    "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" \
+    "$INSTALL_TMP/rendered/dev.dona.slack-adapter.plist"
+  $NODE_PATH -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$INSTALL_TMP/rendered/policy.json"
 fi
-/usr/bin/plutil -lint "$INSTALL_TMP/rendered/dev.dona.updater.plist" \
-  "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" \
-  "$INSTALL_TMP/rendered/dev.dona.slack-adapter.plist"
-$NODE_PATH -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$INSTALL_TMP/rendered/policy.json"
 
 if [[ "$MODE" == "--check" ]]; then
   print "self-update policyと3つのLaunchAgent templateは有効です。実環境は変更していません。"
@@ -519,7 +542,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" create "$BACKUP_ROOT" \
     "$OLD_UPDATER_SHA" "$INSTALL_SHA" "$CONTROL_ROOT/policy.json" "$BACKUP_ROOT/policy.next.json" \
     "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.next.plist" "$STAGED_DIGEST" \
-    "$CONTROL_ROOT/updater" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" \
+    "$CONTROL_ROOT/updater" "$FINAL_RELEASE/updater" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" \
     "$BACKUP_ROOT/dev.dona.dispatcher.next.plist" "$OLD_RECEIPT_PATH"
   CONTROL_LEDGER_DIR="$BACKUP_ROOT"
 

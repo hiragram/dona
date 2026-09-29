@@ -279,22 +279,30 @@ export async function waitForSlackSha(socketPath, expectedSha, domain, timeoutMs
       !/^gui\/[1-9][0-9]*$/.test(domain) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
     throw new Error("wait-slack-sha arguments are invalid");
   }
-  const observe = options.observe ?? observeLaunchdRegistration;
   const healthRead = options.healthRead ?? (() => udsJson(socketPath, "/health/version", 2_000));
+  const registrationRead = options.registrationRead ?? (async () =>
+    (await execute("/bin/launchctl", ["print", `${domain}/dev.dona.slack-adapter`],
+      { timeout: 2_000, killSignal: "SIGKILL" })).stdout);
+  const processStartRead = options.processStartRead ?? (async (pid) =>
+    (await execute("/bin/ps", ["-p", String(pid), "-o", "lstart="],
+      { timeout: 2_000, killSignal: "SIGKILL" })).stdout.trim());
   const sleep = options.sleep ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)));
   const now = options.now ?? Date.now;
   const deadline = now() + timeoutMs;
   let matches = 0;
   do {
-    const remaining = Math.max(1, deadline - now());
-    const registered = await observeBeforeDeadline(observe, `${domain}/dev.dona.slack-adapter`, remaining);
     let ready = false;
     try {
+      const registration = await registrationRead();
+      const registeredPid = Number(registration.match(/\bpid = ([0-9]+)/)?.[1]);
       const health = await healthRead();
       ready = health?.schema_version === 1 && health.status === "ready" &&
-        health.service === "slack_adapter" && health.build_sha === expectedSha;
+        health.service === "slack_adapter" && health.build_sha === expectedSha &&
+        Number.isSafeInteger(registeredPid) && registeredPid > 0 && health.pid === registeredPid &&
+        typeof health.process_start === "string" && health.process_start !== "" &&
+        health.process_start === await processStartRead(registeredPid);
     } catch { /* Socket publication may follow launchd registration. */ }
-    matches = registered && ready ? matches + 1 : 0;
+    matches = ready ? matches + 1 : 0;
     if (matches >= 3) return;
     await sleep(100);
   } while (now() < deadline);
@@ -313,6 +321,23 @@ async function observeLaunchdRegistration(serviceTarget, timeoutMs) {
     const exitCode = error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
     throw new Error(`launchd registration observation failed with exit ${exitCode}`);
   }
+}
+
+export async function readUpdaterRegistrationSha(domain, timeoutMs, options = {}) {
+  if (!/^gui\/[1-9][0-9]*$/.test(domain) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Updater registration lookup arguments are invalid");
+  }
+  const run = options.run ?? ((target, deadline) => execute("/bin/launchctl", ["print", target],
+    { timeout: deadline, killSignal: "SIGKILL" }));
+  let result;
+  try { result = await run(`${domain}/dev.dona.updater`, timeoutMs); }
+  catch (error) {
+    if (error && typeof error === "object" && error.code === 113) return null;
+    throw new Error("Updater registration lookup failed or timed out");
+  }
+  const matches = [...result.stdout.matchAll(/DONA_UPDATER_BUILD_SHA => ([0-9a-f]{40})/g)];
+  if (matches.length !== 1) throw new Error("Updater registration SHA is unavailable or ambiguous");
+  return matches[0][1];
 }
 
 async function observeBeforeDeadline(observe, serviceTarget, timeoutMs) {
@@ -593,6 +618,10 @@ async function main() {
   }
   if(mode==="wait-launchd-unregistered"&&secondValue&&process.argv[5]) {
     try { await waitForLaunchdServiceAbsent(value,secondValue,Number(process.argv[5])); return 0; }
+    catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
+  }
+  if(mode==="read-updater-registration-sha"&&secondValue) {
+    try { console.log(await readUpdaterRegistrationSha(value, Number(secondValue)) ?? "absent"); return 0; }
     catch(error) { console.error(error instanceof Error?error.message:String(error)); return 1; }
   }
   if (mode === "wait-launchd-updater-sha" && secondValue && process.argv[5]) {

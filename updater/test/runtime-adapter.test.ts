@@ -77,6 +77,7 @@ test("control capability requires a verified attempt ledger bound to the exact r
     const attempt = { schema_version: 1, phase: "verified", old_build_sha: "b".repeat(40),
       new_build_sha: targetSha, new_policy_sha256: digest, new_plist_sha256: digest,
       new_dispatcher_plist_sha256: digest,
+      new_updater_tree_sha256: controlTreeDigest,
       db_backup_sha256: digest, release_tree_sha256: releaseDigest, restore_rehearsal_sha256: rehearsalDigest };
     const attemptBytes = Buffer.from(`${JSON.stringify(attempt)}\n`);
     await fs.writeFile(path.join(attemptDir, "attempt.json"), attemptBytes, { mode: 0o600 });

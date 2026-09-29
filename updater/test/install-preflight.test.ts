@@ -191,8 +191,10 @@ type WaitForDispatcherSha = (socketPath: string, sha: string, domain: string, ti
 type LaunchctlOnce = (operation: string, domain: string, target: string, timeoutMs: number,
   options?: { run?: (args: string[]) => Promise<unknown> }) => Promise<void>;
 type WaitForSlackSha = (socketPath: string, sha: string, domain: string, timeoutMs: number,
-  options?: { observe?: (target: string, timeoutMs: number) => Promise<boolean>;
+  options?: { registrationRead?: () => Promise<string>; processStartRead?: (pid: number) => Promise<string>;
     healthRead?: () => Promise<unknown>; sleep?: (milliseconds: number) => Promise<void>; now?: () => number }) => Promise<void>;
+type ReadUpdaterRegistrationSha = (domain: string, timeoutMs: number,
+  options?: { run?: (target: string, timeoutMs: number) => Promise<{ stdout: string }> }) => Promise<string | null>;
 const preflightModule = await import(pathToFileURL(preflight).href) as {
   waitForLaunchdServiceAbsent: WaitForLaunchdServiceAbsent;
   waitForLaunchdUpdaterSha: WaitForLaunchdUpdaterSha;
@@ -200,9 +202,10 @@ const preflightModule = await import(pathToFileURL(preflight).href) as {
   waitForDispatcherSha: WaitForDispatcherSha;
   launchctlOnce: LaunchctlOnce;
   waitForSlackSha: WaitForSlackSha;
+  readUpdaterRegistrationSha: ReadUpdaterRegistrationSha;
 };
 const { waitForLaunchdServiceAbsent, waitForLaunchdUpdaterSha, waitForUpdaterIdentity,
-  waitForDispatcherSha, launchctlOnce, waitForSlackSha } = preflightModule;
+  waitForDispatcherSha, launchctlOnce, waitForSlackSha, readUpdaterRegistrationSha } = preflightModule;
 
 test("developer installer atomically creates and shares the access receipt key",async()=>{
   const source=await fs.readFile(developerInstaller,"utf8");
@@ -367,11 +370,33 @@ test("Slack Adapterの登録解除と起動healthを固定labelとSHAで照合�
   assert.deepEqual(targets, Array(3).fill("gui/501/dev.dona.slack-adapter"));
   const sha = "a".repeat(40);
   const socket = path.join(os.tmpdir(), "dona-slack-health.sock");
-  const options = { observe: async (target: string) => target === "gui/501/dev.dona.slack-adapter",
-    healthRead: async () => ({ schema_version: 1, status: "ready", service: "slack_adapter", build_sha: sha }),
+  const options = { registrationRead: async () => "pid = 123",
+    processStartRead: async () => "Tue Sep 29 13:00:00 2026",
+    healthRead: async () => ({ schema_version: 1, status: "ready", service: "slack_adapter", build_sha: sha,
+      pid: 123, process_start: "Tue Sep 29 13:00:00 2026" }),
     sleep: async (milliseconds: number) => { elapsed += milliseconds; }, now: () => elapsed };
   await waitForSlackSha(socket, sha, "gui/501", 1_000, options);
   await assert.rejects(waitForSlackSha(socket, "b".repeat(40), "gui/501", 250, options), /not observed/);
+  await assert.rejects(waitForSlackSha(socket, sha, "gui/501", 250,
+    { ...options, healthRead: async () => ({ ...(await options.healthRead()), pid: 124 }) }), /not observed/);
+});
+
+test("復旧前のUpdater登録照会は期限付きでSHAだけを返す", async () => {
+  const sha = "a".repeat(40);
+  const targets: string[] = [];
+  assert.equal(await readUpdaterRegistrationSha("gui/501", 30000, {
+    run: async (target, timeout) => {
+      targets.push(`${target}:${timeout}`);
+      return { stdout: `environment = { DONA_UPDATER_BUILD_SHA => ${sha} }` };
+    },
+  }), sha);
+  assert.deepEqual(targets, ["gui/501/dev.dona.updater:30000"]);
+  await assert.rejects(readUpdaterRegistrationSha("gui/501", 30000, {
+    run: async () => { throw Object.assign(new Error("timeout"), { killed: true }); },
+  }), /failed or timed out/);
+  await assert.rejects(readUpdaterRegistrationSha("gui/501", 30000, {
+    run: async () => ({ stdout: "unverified" }),
+  }), /unavailable or ambiguous/);
 });
 
 test("launchdの登録解除timeoutは対象labelを保持し、plist切替前に失敗する", async () => {
@@ -516,8 +541,11 @@ test("macOS preserves hardened descendants when renaming a reopened staged updat
 
 test("installer exposes the guarded control-plane upgrade mode", async () => {
   const source = await fs.readFile(installer, "utf8");
-  const initialBootstrap = source.slice(source.indexOf('if [[ "$MODE" == "--bootstrap" ]]; then'), source.indexOf('if [[ "$(uname -s)"'));
+  const initialBootstrap = source.slice(source.indexOf('if [[ "$MODE" == "--bootstrap" ]]; then', source.indexOf('trap cleanup_temp EXIT')), source.indexOf('if [[ "$(uname -s)"'));
   assert.ok(initialBootstrap.startsWith('if [[ "$MODE" == "--bootstrap" ]]; then'));
+  assert.ok(source.indexOf('exec /bin/zsh "$BOOTSTRAP_SCRIPT" --bootstrap') <
+    source.indexOf('render-self-update-templates.mjs'));
+  assert.match(source, /if \[\[ "\$MODE" != "--bootstrap" \]\]; then[\s\S]*render-self-update-templates\.mjs/);
   assert.match(source, /BOOTSTRAP_UPDATER_SHA=\$\(\/usr\/libexec\/PlistBuddy/);
   assert.doesNotMatch(initialBootstrap, /bootout "\$DOMAIN" dev\.dona\.(?:dispatcher|slack-adapter)/);
   assert.match(initialBootstrap, /dispatcher_registered=0[\s\S]*wait-dispatcher-sha[\s\S]*if \[\[ "\$dispatcher_registered" == "0" \]\] &&[\s\S]*bootstrap_dispatcher_reconciled/);
@@ -722,12 +750,17 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
   const rehearsal = path.join(root, "restore-rehearsal.json");
   const attempt = path.join(root, `${"2".repeat(40)}.ABC123`);
   const controlUpdater = path.join(root, "active-updater");
+  const newUpdater = path.join(root, "release-updater");
   try {
     await fs.mkdir(attempt, { mode: 0o700 });
     await fs.mkdir(path.join(controlUpdater, "dist"), { recursive: true, mode: 0o700 });
     await fs.writeFile(path.join(controlUpdater, "dist", "database.js"), "verified", { mode: 0o400 });
     await fs.chmod(path.join(controlUpdater, "dist"), 0o500);
     await fs.chmod(controlUpdater, 0o700);
+    await fs.mkdir(path.join(newUpdater, "dist"), { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(newUpdater, "dist", "database.js"), "verified", { mode: 0o400 });
+    await fs.chmod(path.join(newUpdater, "dist"), 0o500);
+    await fs.chmod(newUpdater, 0o500);
     await fs.mkdir(path.join(attempt, "updater.previous", "dist"), { recursive: true, mode: 0o700 });
     await fs.writeFile(path.join(attempt, "updater.previous", "dist", "database.js"), "verified", { mode: 0o400 });
     await fs.chmod(path.join(attempt, "updater.previous", "dist"), 0o500);
@@ -740,7 +773,7 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await fs.writeFile(rehearsal, "rehearsal");
     const create = () => execute(process.execPath, [controlLedger, "create", attempt,
       "1".repeat(40), "2".repeat(40), oldPolicy, newPolicy, oldPlist, newPlist, "f".repeat(64),
-      controlUpdater, oldDispatcherPlist, newDispatcherPlist, oldReceipt]);
+      controlUpdater, newUpdater, oldDispatcherPlist, newDispatcherPlist, oldReceipt]);
     const spacedCheckout = path.join(root, "checkout with spaces");
     await fs.mkdir(spacedCheckout);
     const spacedLedger = path.join(spacedCheckout, "control-attempt-ledger.mjs");
@@ -751,7 +784,7 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await fs.mkdir(spacedAttempt, { mode: 0o700 });
     await execute(process.execPath, [spacedLedger, "create", spacedAttempt,
       "1".repeat(40), "2".repeat(40), oldPolicy, newPolicy, oldPlist, newPlist, "f".repeat(64),
-      controlUpdater, oldDispatcherPlist, newDispatcherPlist, oldReceipt]);
+      controlUpdater, newUpdater, oldDispatcherPlist, newDispatcherPlist, oldReceipt]);
     assert.equal(JSON.parse(await fs.readFile(path.join(spacedAttempt, "attempt.json"), "utf8")).phase, "prepared");
     const advance = (phase: string, operation = "none", database?: string) =>
       execute(process.execPath, [controlLedger, "advance", attempt, phase, operation, ...(database ? [database] : [])]);
@@ -782,12 +815,25 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await fs.writeFile(newDispatcherPlist, "new dispatcher");
     await advance("verified");
     const receiptPath = path.join(root, "control-receipt.tmp");
+    const currentModule = path.join(controlUpdater, "dist", "database.js");
+    await fs.chmod(path.join(controlUpdater, "dist"), 0o700);
+    await fs.chmod(currentModule, 0o600);
+    await fs.writeFile(currentModule, "tampered");
+    await fs.chmod(currentModule, 0o400);
+    await fs.chmod(path.join(controlUpdater, "dist"), 0o500);
+    await assert.rejects(execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40), controlUpdater]), /verified release/);
+    await fs.chmod(path.join(controlUpdater, "dist"), 0o700);
+    await fs.chmod(currentModule, 0o600);
+    await fs.writeFile(currentModule, "verified");
+    await fs.chmod(currentModule, 0o400);
+    await fs.chmod(path.join(controlUpdater, "dist"), 0o500);
     await execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40), controlUpdater]);
     const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8"));
     assert.equal(receipt.attempt_id, path.basename(attempt));
     assert.match(receipt.attempt_sha256, /^[0-9a-f]{64}$/);
     assert.match(receipt.restore_rehearsal_sha256, /^[0-9a-f]{64}$/);
     assert.match(receipt.control_updater_tree_sha256, /^[0-9a-f]{64}$/);
+    assert.equal(receipt.control_updater_tree_sha256, snapshot.new_updater_tree_sha256);
     assert.match(receipt.old_updater_tree_sha256, /^[0-9a-f]{64}$/);
     assert.match(receipt.dispatcher_plist_sha256, /^[0-9a-f]{64}$/);
     await assert.rejects(execute(process.execPath, [controlReceipt, attempt, receiptPath, "2".repeat(40), controlUpdater]));
@@ -820,6 +866,8 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await fs.writeFile(path.join(attempt, "attempt.json.tmp"), "partial");
     await assert.rejects(advance("needs_review"), /ambiguous/);
   } finally {
+    await fs.chmod(newUpdater, 0o700).catch(() => undefined);
+    await fs.chmod(path.join(newUpdater, "dist"), 0o700).catch(() => undefined);
     await fs.chmod(path.join(controlUpdater, "dist"), 0o700).catch(() => undefined);
     await fs.chmod(path.join(attempt, "updater.previous", "dist"), 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
@@ -831,22 +879,25 @@ test("control attempt disk-full write keeps the prior state and blocks a blind r
   const attempt = path.join(root, "attempt");
   const file = path.join(root, "identity");
   const tree = path.join(root, "updater");
+  const releaseTree = path.join(root, "release-updater");
   try {
     await fs.mkdir(attempt, { mode: 0o700 });
     await fs.mkdir(tree, { mode: 0o700 });
+    await fs.mkdir(releaseTree, { mode: 0o500 });
     await fs.writeFile(file, "identity", { mode: 0o600 });
     const ledger = await import(pathToFileURL(controlLedger).href) as {
       createAttempt: (...args: string[]) => void;
       advanceAttempt: (...args: unknown[]) => void;
     };
     ledger.createAttempt(attempt, "1".repeat(40), "2".repeat(40), file, file, file, file,
-      "f".repeat(64), tree, file, file, "-");
+      "f".repeat(64), tree, releaseTree, file, file, "-");
     assert.throws(() => ledger.advanceAttempt(attempt, "updater_stop_intent", "none", undefined, undefined,
       { writeFileSync: () => { throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); } }), /disk full/);
     assert.equal(JSON.parse(await fs.readFile(path.join(attempt, "attempt.json"), "utf8")).phase, "prepared");
     await assert.rejects(execute(process.execPath,
       [controlLedger, "advance", attempt, "updater_stop_intent"]), /ambiguous/);
   } finally {
+    await fs.chmod(releaseTree, 0o700).catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });

@@ -29,6 +29,11 @@ if (attempt.schema_version !== 1 || attempt.phase !== "verified" || attempt.new_
     !/^[0-9a-f]{64}$/.test(attempt.old_updater_tree_sha256 ?? "")) {
   throw new Error("control attempt is not verified");
 }
+const newUpdaterTreeSha256 = controlUpdaterTreeDigest(controlUpdaterRoot);
+if (!/^[0-9a-f]{64}$/.test(attempt.new_updater_tree_sha256 ?? "") ||
+    newUpdaterTreeSha256 !== attempt.new_updater_tree_sha256) {
+  throw new Error("installed updater differs from the verified release");
+}
 const oldUpdaterTreeSha256 = controlUpdaterTreeDigest(path.join(attemptDirectory, "updater.previous"));
 if (oldUpdaterTreeSha256 !== attempt.old_updater_tree_sha256) {
   throw new Error("restore updater differs from the saved control attempt");
@@ -45,7 +50,7 @@ const receipt = {
   dispatcher_plist_sha256: attempt.new_dispatcher_plist_sha256,
   db_backup_sha256: attempt.db_backup_sha256,
   release_tree_sha256: attempt.release_tree_sha256,
-  control_updater_tree_sha256: controlUpdaterTreeDigest(controlUpdaterRoot),
+  control_updater_tree_sha256: newUpdaterTreeSha256,
   old_updater_tree_sha256: oldUpdaterTreeSha256,
   restore_rehearsal_sha256: attempt.restore_rehearsal_sha256,
   verified_at: new Date().toISOString(),

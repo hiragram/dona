@@ -78,6 +78,8 @@ describe("SlackHealthServer", () => {
     const version = await request(socketPath, "/health/version");
     assert.equal(version.status, 200);
     assert.equal(version.body.build_sha, "development");
+    assert.equal(version.body.pid, process.pid);
+    assert.match(String(version.body.process_start), /\S/);
     assert.equal(version.body.app_schema, 3);
     assert.equal(version.body.app_schema_read_min, 2);
     assert.equal(version.body.app_schema_read_max, 3);
