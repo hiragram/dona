@@ -914,7 +914,7 @@ export function validateJobResultPublish(input: unknown, job: Pick<JobRow, "job_
   // completed_at is Dispatcher-owned and deliberately excluded from request identity.
   const canonicalDigest = createHash("sha256").update(`job-result-publish:v1\n${job.job_id}\n${canonicalJson(parsed.data)}`).digest("hex");
   return { request: parsed.data, envelope, canonicalDigest, encodedBytes,
-    reconcileOnly: job.status === "completed" || job.status === "failed" };
+    reconcileOnly: job.status === "completed" || job.status === "failed" || job.status === "needs_review" };
 }
 
 interface Grant {
@@ -1051,7 +1051,8 @@ export class JobResultPublishCapabilities {
     }
     const job = getJob(grant.jobId);
     if (!job || job.job_id !== grant.jobId) throw new JobResultPublishError("capability_invalid");
-    const terminalReconcile = (job.status === "completed" || job.status === "failed") && typeof job.result_json === "string";
+    const terminalReconcile = ((job.status === "completed" || job.status === "failed") && typeof job.result_json === "string") ||
+      job.status === "needs_review";
     if (grant.session !== session) throw new JobResultPublishError("worker_session_stale");
     if (terminalReconcile) return job;
     if (this.currentSession(job.job_id) !== session ||
@@ -1088,7 +1089,8 @@ export class JobResultPublishCapabilities {
       .filter((value): value is string => typeof value === "string" && value.length > 0);
     // Terminal reconciliation is read-only. Excluding live private values here
     // prevents a conflict/redaction response from becoming a membership oracle.
-    const terminalReconcile = (job.status === "completed" || job.status === "failed") && typeof job.result_json === "string";
+    const terminalReconcile = ((job.status === "completed" || job.status === "failed") && typeof job.result_json === "string") ||
+      job.status === "needs_review";
     return { ...validateJobResultPublish(input, job, new Date(this.now()).toISOString(),
       terminalReconcile ? undefined : forbiddenDigests,
       terminalReconcile ? undefined : forbiddenValues,
