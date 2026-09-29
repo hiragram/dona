@@ -314,6 +314,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   fi
   $NODE_PATH -e 'const fs=require("node:fs");const manifest=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(manifest.sha!==process.argv[2])process.exit(1)' \
     "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/release-manifest.json" "$BOOTSTRAP_UPDATER_SHA"
+  $NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$BOOTSTRAP_UPDATER_SHA"
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$CONTROL_ROOT/updater/dist/cli.js"
   if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
@@ -328,8 +329,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   fi
   if [[ "$dispatcher_registered" == "1" ]]; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist"
-    if ! /usr/bin/cmp -s "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" ||
-       ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
+    if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
          "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000; then
       print -u2 "登録済みDispatcherのplistと起動状態を今回のinstallに照合できません。"
       exit 1
@@ -337,8 +337,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   fi
   if [[ "$slack_registered" == "1" ]]; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist"
-    if ! /usr/bin/cmp -s "$INSTALL_TMP/rendered/dev.dona.slack-adapter.plist" "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist" ||
-       ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-slack-sha \
+    if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-slack-sha \
          "$SLACK_SOCKET" "$ACTIVE_DISPATCHER_SHA" "$DOMAIN" 30000; then
       print -u2 "登録済みSlack Adapterのplistと起動状態を今回のinstallに照合できません。"
       exit 1
@@ -656,6 +655,7 @@ for plist in dev.dona.updater dev.dona.dispatcher dev.dona.slack-adapter; do
   chmod 600 "$LAUNCH_AGENTS_DIR/.$plist.plist.tmp"
   /bin/mv "$LAUNCH_AGENTS_DIR/.$plist.plist.tmp" "$LAUNCH_AGENTS_DIR/$plist.plist"
 done
+$NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" record "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$INSTALL_SHA"
 
 print "immutable release、stable updater、policy、plistを配置しました。processは開始していません。"
 print "設定を確認後、明示的に '$0 --bootstrap' を実行してください。"

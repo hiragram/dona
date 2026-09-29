@@ -24,6 +24,33 @@ const controlBackup = fileURLToPath(new URL("../../scripts/backup-control-db.py"
 const controlReceipt = fileURLToPath(new URL("../../scripts/write-control-receipt.mjs", import.meta.url));
 const controlRehearsal = fileURLToPath(new URL("../../scripts/rehearse-control-restore.mjs", import.meta.url));
 const installCi = fileURLToPath(new URL("../../scripts/verify-install-ci.mjs", import.meta.url));
+const installContract = fileURLToPath(new URL("../../scripts/bootstrap-install-contract.mjs", import.meta.url));
+
+test("bootstrap resume checks the install-time files independently of the current checkout", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-install-contract-"));
+  const control = path.join(root, "control");
+  const agents = path.join(root, "agents");
+  const sha = "a".repeat(40);
+  try {
+    await fs.mkdir(control, { mode: 0o700 });
+    await fs.mkdir(agents, { mode: 0o700 });
+    for (const name of ["policy.json", "dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"]) {
+      await fs.writeFile(path.join(name === "policy.json" ? control : agents, name), name, { mode: 0o600 });
+    }
+    await execute(process.execPath, [installContract, "record", control, agents, sha]);
+    await execute(process.execPath, [installContract, "verify", control, agents, sha]);
+    await assert.rejects(execute(process.execPath, [installContract, "verify", control, agents, "b".repeat(40)]));
+    await fs.writeFile(path.join(agents, "dev.dona.slack-adapter.plist"), "changed");
+    await assert.rejects(execute(process.execPath, [installContract, "verify", control, agents, sha]));
+    await assert.rejects(execute(process.execPath, [installContract, "record", control, agents, sha]));
+    const source = await fs.readFile(installer, "utf8");
+    assert.match(source, /bootstrap-install-contract\.mjs" verify/);
+    assert.match(source, /bootstrap-install-contract\.mjs" record/);
+    assert.doesNotMatch(source, /cmp -s "\$INSTALL_TMP\/rendered\/dev\.dona\.(?:dispatcher|slack-adapter)\.plist"/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 type WaitForLaunchdServiceAbsent = (
   domain: string,
   label: string,
