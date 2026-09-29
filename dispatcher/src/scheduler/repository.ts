@@ -1204,6 +1204,12 @@ export class SchedulerRepository {
         WHERE job_id IN (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?
           AND json_extract(owner_json,'$.kind')='schedule')
           AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=jobs.job_id AND newer.content_delete_at>?)`).run(now,now);
+      if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_result_publish_receipts'").get())
+        this.db.prepare(`DELETE FROM job_result_publish_receipts WHERE job_id IN
+          (SELECT job_id FROM job_completion_results WHERE content_delete_at<=?
+            AND json_extract(owner_json,'$.kind')='schedule')
+          AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
+            WHERE newer.job_id=job_result_publish_receipts.job_id AND newer.content_delete_at>?)`).run(now,now);
       this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]'),last_error_message=NULL
         WHERE event_id IN (SELECT source_event_id FROM job_completion_results WHERE content_delete_at<=?
           AND json_extract(owner_json,'$.kind')='schedule') AND source='dona_schedule'

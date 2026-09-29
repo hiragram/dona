@@ -1710,8 +1710,16 @@ export class DispatcherDatabase {
       const file=this.operatorResultFile(job);
       if(file.kind!==input.expectedResultClass||file.sha256!==input.expectedResultSha256)
         throw new Error("operator_result_drift");
+      const publishReceipt=this.db.prepare("SELECT canonical_digest,envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(job.job_id) as {canonical_digest:string;envelope_json:string;state:string}|undefined;
+      if(publishReceipt && (publishReceipt.state!=="needs_review" || job.last_error_code!=="published_result_reconciliation_required"))
+        throw new Error("operator_publish_receipt_changed");
       if(file.kind==="valid") {
-        this.saveJobResultInternal(job.job_id,file.result!,job.result_path,at,()=>{},true);
+        if(publishReceipt && (!this.publishedResultFileMatches(job.result_path,job.job_id,publishReceipt.envelope_json) ||
+          stableStringify(file.result)!==publishReceipt.envelope_json)) throw new Error("operator_publish_result_mismatch");
+        this.saveJobResultInternal(job.job_id,file.result!,job.result_path,at,()=>{},true,publishReceipt?.canonical_digest);
+        if(publishReceipt) this.db.prepare("UPDATE job_result_publish_receipts SET state='committed',committed_at=? WHERE job_id=? AND state='needs_review'")
+          .run(at.toISOString(),job.job_id);
       } else {
         for(const id of new Set([job.completion_event_id,group.attention_event_id])) {
           if(!id) continue;
@@ -1730,6 +1738,8 @@ export class DispatcherDatabase {
           WHERE job_id=? AND status='needs_review' AND updated_at=? AND last_error_code=? AND result_json IS NULL`)
           .run(at.toISOString(),at.toISOString(),job.job_id,input.expectedUpdatedAt,input.expectedCause).changes;
         if(changed!==1) throw new Error("operator_recovery_job_changed");
+        if(publishReceipt) this.db.prepare("DELETE FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'")
+          .run(job.job_id);
         if(group.attention_event_id) {
           const event=this.getRequired(group.attention_event_id);
           if((JSON.parse(event.payload_json) as {job_id?:string}).job_id===job.job_id)
@@ -1786,7 +1796,7 @@ export class DispatcherDatabase {
         return job;
       }
       if(readEventJobBinding(this.db,job.source_event_id)?.owner.kind!=="slack_thread" ||
-        job.status!=="needs_review"||!["result_missing","invalid_result","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
+        job.status!=="needs_review"||!["result_missing","invalid_result","invalid_result_agent_stopped","published_result_reconciliation_required"].includes(job.last_error_code??"")||
         job.updated_at!==expectedUpdatedAt||job.last_error_code!==expectedCause||job.result_json!==null)
         throw new Error("late_result_job_changed");
       const receipt=this.getLiveSessionReceipt(jobId,stopReceiptId);
@@ -1811,8 +1821,16 @@ export class DispatcherDatabase {
       }
       const file=this.lateResultFile(job);
       if(file.sha256!==expectedDigest) throw new Error("late_result_digest_drift");
+      const publishReceipt=this.db.prepare("SELECT canonical_digest,envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(jobId) as {canonical_digest:string;envelope_json:string;state:string}|undefined;
+      if(publishReceipt && (publishReceipt.state!=="needs_review" ||
+        job.last_error_code!=="published_result_reconciliation_required" ||
+        !this.publishedResultFileMatches(job.result_path,jobId,publishReceipt.envelope_json) ||
+        stableStringify(file.result)!==publishReceipt.envelope_json)) throw new Error("late_publish_result_mismatch");
       this.assertMaintenanceFenceReceipt();
-      this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
+      this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true,publishReceipt?.canonical_digest);
+      if(publishReceipt) this.db.prepare("UPDATE job_result_publish_receipts SET state='committed',committed_at=? WHERE job_id=? AND state='needs_review'")
+        .run(at.toISOString(),jobId);
       if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.markTerminalWorkerStopProof(jobId);
       this.enqueueJobNotification(jobId,at);

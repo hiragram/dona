@@ -528,11 +528,16 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
   ],completed_at:due},notificationPath,new Date(due),deliveryEvidence(completionEventId,bodySha,"2.000009","1.000001",due,"suspended"));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at,committed_at)
+    VALUES(?,?,?,?,?,?,?,'committed',?,?)`)
+    .run(job.job_id,"a".repeat(64),'{"summary":"sensitive result"}',job.attempt_count,null,"b".repeat(64),1,due,due);
   fs.mkdirSync(path.dirname(job.result_path),{recursive:true}); fs.writeFileSync(job.result_path,"sensitive result");
   const temporaryResult=`${job.result_path}.tmp`; fs.writeFileSync(temporaryResult,"partial sensitive result"); repo.purge("2026-09-12T00:01:01Z");
   assert.equal(fs.existsSync(job.result_path),false);
   assert.equal(fs.existsSync(temporaryResult),false);
   assert.equal((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(job.job_id) as {result_json:string|null}).result_json,null);
+  assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
   assert.equal((raw.prepare("SELECT result_file_deleted_at FROM job_completion_results WHERE job_id=?").get(job.job_id) as {result_file_deleted_at:string|null}).result_file_deleted_at,"2026-09-12T00:01:01Z");
   assert.equal((raw.prepare("SELECT objective FROM jobs WHERE job_id=?").get(job.job_id) as {objective:string}).objective,"[deleted]");
   assert.equal(JSON.parse((raw.prepare("SELECT payload_json FROM events WHERE event_id=?").get(run.event_id) as {payload_json:string}).payload_json).work.objective,"[deleted]");
