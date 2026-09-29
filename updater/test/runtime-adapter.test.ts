@@ -42,8 +42,12 @@ test("control capability requires a verified attempt ledger bound to the exact r
     const releaseDir = path.join(policy.release_root, targetSha);
     await fs.mkdir(releaseDir, { recursive: true, mode: 0o700 });
     await fs.writeFile(path.join(releaseDir, "control.txt"), artifact, { mode: 0o400 });
+    const manifest = { schema_version: 1, sha: targetSha, built_at: "2026-09-29T00:00:00Z" };
+    const manifestPath = path.join(releaseDir, "release-manifest.json");
+    await fs.writeFile(manifestPath, JSON.stringify(manifest), { mode: 0o400 });
     await fs.chmod(releaseDir, 0o500);
-    const releaseDigest = createHash("sha256").update("f\0control.txt\0").update(artifact).update("\0").digest("hex");
+    const releaseDigest = createHash("sha256").update("f\0control.txt\0").update(artifact).update("\0")
+      .update("f\0release-manifest.json\0").update(JSON.stringify({ ...manifest, built_at: null })).update("\0").digest("hex");
     await fs.writeFile(path.join(policy.control_root, "policy.json"), artifact, { mode: 0o600 });
     const agents = path.join(root, "Library/LaunchAgents");
     await fs.mkdir(agents, { recursive: true });
@@ -82,6 +86,17 @@ test("control capability requires a verified attempt ledger bound to the exact r
     await fs.chmod(path.join(releaseDir, "control.txt"), 0o600);
     await fs.writeFile(path.join(releaseDir, "control.txt"), artifact);
     await fs.chmod(path.join(releaseDir, "control.txt"), 0o400);
+    await fs.chmod(releaseDir, 0o500);
+    await fs.chmod(releaseDir, 0o700);
+    await fs.chmod(manifestPath, 0o600);
+    await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, sha: "c".repeat(40) }));
+    await fs.chmod(manifestPath, 0o400);
+    await fs.chmod(releaseDir, 0o500);
+    assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });
+    await fs.chmod(releaseDir, 0o700);
+    await fs.chmod(manifestPath, 0o600);
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await fs.chmod(manifestPath, 0o400);
     await fs.chmod(releaseDir, 0o500);
     await fs.writeFile(path.join(policy.control_root, "policy.json"), "changed", { mode: 0o600 });
     assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });

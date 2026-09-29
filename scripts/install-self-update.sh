@@ -68,8 +68,13 @@ bootstrap_updater_reconciled() {
   fi
   if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-launchd-updater-sha \
     "$DOMAIN" "$expected_sha" 30000; then
-    print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの登録済み状態を確認しました。"
-    return 0
+    if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha \
+        "$CONTROL_ROOT/updater.sock" "$expected_sha" 30000 3 && \
+        $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-identity \
+        "$CONTROL_ROOT/updater.sock" "$expected_sha" "$DOMAIN" 30000; then
+      print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの起動identityを確認しました。"
+      return 0
+    fi
   fi
   print -u2 -- "${context}のlaunchctl bootstrapはexit ${exit_code}で、登録状態を確定できません。再送せず照合が必要です。"
   if [[ -n "$output" ]]; then print -u2 -- "$output"; fi
@@ -258,14 +263,19 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
   fi
+  if /bin/launchctl print "$DOMAIN/dev.dona.slack-adapter" >/dev/null 2>&1 ||
+     /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
+    print -u2 "初回bootstrapでは登録済みDispatcher/Slack Adapterを停止しません。既存serviceの状態を確認してください。"
+    exit 1
+  fi
   if ! /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
     if ! bootstrap_updater_reconciled "初回Updater登録" "$INSTALL_SHA"; then exit 1; fi
-  fi
-  if /bin/launchctl print "$DOMAIN/dev.dona.slack-adapter" >/dev/null 2>&1; then
-    launchctl_once bootout "$DOMAIN" dev.dona.slack-adapter 30000
-  fi
-  if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
-    launchctl_once bootout "$DOMAIN" dev.dona.dispatcher 30000
+  elif ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha \
+      "$CONTROL_ROOT/updater.sock" "$INSTALL_SHA" 30000 3 || \
+      ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-identity \
+      "$CONTROL_ROOT/updater.sock" "$INSTALL_SHA" "$DOMAIN" 30000; then
+    print -u2 "登録済みUpdaterのexact SHA起動identityを確認できません。"
+    exit 1
   fi
   if ! bootstrap_dispatcher_reconciled "初回Dispatcher登録" "$ACTIVE_DISPATCHER_SHA"; then
     print -u2 "Dispatcher登録状態が不明のためSlack Adapterの起動を保留しました。再送せず登録とhealthを照合してください。"

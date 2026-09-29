@@ -315,7 +315,7 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /旧stable updaterの復旧healthを確認できません/);
   assert.match(source, /bootstrap_updater_reconciled/);
   assert.match(source, /wait-launchd-updater-sha/);
-  assert.match(source, /exact SHAの登録済み状態を確認しました/);
+  assert.match(source, /exact SHAの起動identityを確認しました/);
   assert.match(source, /再送せず照合が必要です/);
   assert.doesNotMatch(source, /for attempt in 1 2/);
   assert.match(source, /control-attempt-ledger\.mjs" create/);
@@ -549,6 +549,7 @@ test("an existing immutable release is reusable only with the exact control-plan
     sha,
     repository: "hiragram/dona",
     policy_version: "2026-09-03.2",
+    built_at: "2026-09-29T00:00:00Z",
     compatibility: {
       protocol: 1,
       config: 1,

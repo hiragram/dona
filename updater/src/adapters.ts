@@ -832,7 +832,7 @@ export class RealRuntime implements RuntimePort {
         const entries = await fs.readdir(directory, { withFileTypes: true });
         entries.sort((left, right) => left.name.localeCompare(right.name));
         for (const entry of entries) {
-          if (!relativeDirectory && (entry.name === ".git" || entry.name === "release-manifest.json")) continue;
+          if (!relativeDirectory && entry.name === ".git") continue;
           const relative = path.join(relativeDirectory, entry.name);
           const full = path.join(directory, entry.name);
           const stat = await fs.lstat(full);
@@ -843,7 +843,11 @@ export class RealRuntime implements RuntimePort {
           } else if (stat.isFile() && !stat.isSymbolicLink()) {
             if (stat.nlink !== 1 || (stat.mode & 0o777) !== 0o400) throw new Error("release_file_identity_unverified");
             releaseHash.update(`f\0${relative}\0`);
-            releaseHash.update(await fs.readFile(full));
+            if (relative === "release-manifest.json") {
+              const manifest = JSON.parse(await fs.readFile(full, "utf8")) as Record<string, unknown>;
+              if (typeof manifest.built_at !== "string") throw new Error("release_manifest_identity_unverified");
+              releaseHash.update(JSON.stringify({ ...manifest, built_at: null }));
+            } else releaseHash.update(await fs.readFile(full));
             releaseHash.update("\0");
           } else if (stat.isSymbolicLink()) {
             const resolved = await fs.realpath(full);

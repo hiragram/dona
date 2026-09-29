@@ -351,7 +351,7 @@ async function releaseTreeDigest(root, immutable = false) {
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
       const relative = path.join(relativeDirectory, entry.name);
-      if (relativeDirectory === "" && [".git", "release-manifest.json"].includes(entry.name)) continue;
+      if (relativeDirectory === "" && entry.name === ".git") continue;
       const fullPath = path.join(directory, entry.name);
       const stats = await fs.lstat(fullPath);
       if (stats.uid !== process.getuid() || (!stats.isSymbolicLink() && (stats.mode & 0o077) !== 0) ||
@@ -365,7 +365,11 @@ async function releaseTreeDigest(root, immutable = false) {
         await visit(fullPath, relative);
       } else if (stats.isFile() && !stats.isSymbolicLink()) {
         hash.update(`f\0${relative}\0`);
-        hash.update(await fs.readFile(fullPath));
+        if (relative === "release-manifest.json") {
+          const manifest = JSON.parse(await fs.readFile(fullPath, "utf8"));
+          if (typeof manifest.built_at !== "string") throw new Error("release manifest identity is invalid");
+          hash.update(JSON.stringify({ ...manifest, built_at: null }));
+        } else hash.update(await fs.readFile(fullPath));
         hash.update("\0");
       } else if (stats.isSymbolicLink()) {
         const resolved = await fs.realpath(fullPath);
