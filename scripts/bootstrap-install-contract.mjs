@@ -38,6 +38,36 @@ async function installedDigests(controlRoot, agentsRoot, releaseRoot, sha) {
   return digests;
 }
 
+async function expectedInstallDigests(controlRoot, agentsRoot, releaseRoot, sha, renderedRoot, stagedRoot) {
+  const installed = await installedDigests(controlRoot, agentsRoot, releaseRoot, sha);
+  const renderedFiles = { "policy.json": path.join(renderedRoot, "policy.json") };
+  for (const name of names) renderedFiles[name] = path.join(renderedRoot, name);
+  for (const [name, file] of Object.entries(renderedFiles)) {
+    const expected = createHash("sha256").update(await privateFile(file)).digest("hex");
+    if (installed[name] !== expected) throw new Error("installed file differs from the trusted render");
+  }
+  const expectedRelease = await releaseTreeDigest(stagedRoot);
+  if (installed.release_tree !== expectedRelease ||
+      installed.control_updater_tree !== controlUpdaterTreeDigest(path.join(releaseRoot, sha, "updater"), 0o500)) {
+    throw new Error("installed tree differs from the trusted build");
+  }
+  return installed;
+}
+
+export async function recoverInstallContract(controlRoot, agentsRoot, releaseRoot, sha, renderedRoot, stagedRoot) {
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("install SHA is invalid");
+  const target = path.join(controlRoot, contractName);
+  const temp = path.join(controlRoot, `.${contractName}.tmp`);
+  try { await fs.lstat(target); throw new Error("install contract already exists"); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  await expectedInstallDigests(controlRoot, agentsRoot, releaseRoot, sha, renderedRoot, stagedRoot);
+  try {
+    await privateFile(temp);
+    await fs.unlink(temp);
+  } catch (error) { if (error.code !== "ENOENT") throw error; }
+  await recordInstallContract(controlRoot, agentsRoot, releaseRoot, sha);
+}
+
 export async function recordInstallContract(controlRoot, agentsRoot, releaseRoot, sha) {
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("install SHA is invalid");
   const digests = await installedDigests(controlRoot, agentsRoot, releaseRoot, sha);
@@ -52,6 +82,8 @@ export async function recordInstallContract(controlRoot, agentsRoot, releaseRoot
     await handle.sync();
   } finally { await handle.close(); }
   await fs.rename(temp, target);
+  const directory = await fs.open(controlRoot, "r");
+  try { await directory.sync(); } finally { await directory.close(); }
   await verifyInstallContract(controlRoot, agentsRoot, releaseRoot, sha);
 }
 
@@ -67,10 +99,12 @@ export async function verifyInstallContract(controlRoot, agentsRoot, releaseRoot
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [, , mode, controlRoot, agentsRoot, releaseRoot, sha] = process.argv;
+  const [, , mode, controlRoot, agentsRoot, releaseRoot, sha, renderedRoot, stagedRoot] = process.argv;
   try {
-    if (process.argv.length !== 7) throw new Error("install contract arguments are invalid");
-    if (mode === "record") await recordInstallContract(controlRoot, agentsRoot, releaseRoot, sha);
+    if (mode === "recover" && process.argv.length === 9) {
+      await recoverInstallContract(controlRoot, agentsRoot, releaseRoot, sha, renderedRoot, stagedRoot);
+    } else if (process.argv.length !== 7) throw new Error("install contract arguments are invalid");
+    else if (mode === "record") await recordInstallContract(controlRoot, agentsRoot, releaseRoot, sha);
     else if (mode === "verify") await verifyInstallContract(controlRoot, agentsRoot, releaseRoot, sha);
     else throw new Error("install contract mode is invalid");
   } catch (error) {

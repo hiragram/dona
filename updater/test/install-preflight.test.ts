@@ -74,6 +74,50 @@ test("bootstrap resume checks the install-time files independently of the curren
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("an interrupted install contract is recovered only from the same verified build", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-install-contract-recovery-"));
+  const control = path.join(root, "control");
+  const agents = path.join(root, "agents");
+  const releases = path.join(root, "releases");
+  const rendered = path.join(root, "rendered");
+  const staged = path.join(root, "staged");
+  const sha = "a".repeat(40);
+  const installedRelease = path.join(releases, sha);
+  try {
+    for (const directory of [control, agents, releases, rendered, staged, installedRelease,
+      path.join(control, "updater"), path.join(staged, "updater"), path.join(installedRelease, "updater")]) {
+      await fs.mkdir(directory, { mode: 0o700 });
+    }
+    for (const name of ["policy.json", "dev.dona.updater.plist", "dev.dona.dispatcher.plist", "dev.dona.slack-adapter.plist"]) {
+      const destination = name === "policy.json" ? control : agents;
+      await fs.writeFile(path.join(rendered, name), name, { mode: 0o600 });
+      await fs.writeFile(path.join(destination, name), name, { mode: 0o600 });
+    }
+    for (const directory of [path.join(control, "updater"), path.join(staged, "updater"),
+      path.join(installedRelease, "updater")]) {
+      await fs.writeFile(path.join(directory, "cli.js"), "same build", { mode: 0o400 });
+    }
+    await fs.chmod(path.join(installedRelease, "updater"), 0o500);
+    await fs.chmod(installedRelease, 0o500);
+    const temp = path.join(control, ".bootstrap-install-contract.json.tmp");
+    await fs.writeFile(temp, "partial", { mode: 0o600 });
+    const recover = () => execute(process.execPath,
+      [installContract, "recover", control, agents, releases, sha, rendered, staged]);
+    await fs.writeFile(path.join(agents, "dev.dona.dispatcher.plist"), "tampered");
+    await assert.rejects(recover(), /trusted render/);
+    assert.equal(await fs.readFile(temp, "utf8"), "partial");
+    await fs.writeFile(path.join(agents, "dev.dona.dispatcher.plist"), "dev.dona.dispatcher.plist");
+    await recover();
+    await execute(process.execPath, [installContract, "verify", control, agents, releases, sha]);
+    await assert.rejects(recover(), /already exists/);
+    await assert.rejects(fs.stat(temp), { code: "ENOENT" });
+  } finally {
+    await fs.chmod(installedRelease, 0o700).catch(() => undefined);
+    await fs.chmod(path.join(installedRelease, "updater"), 0o700).catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 type WaitForLaunchdServiceAbsent = (
   domain: string,
   label: string,

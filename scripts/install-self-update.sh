@@ -388,10 +388,6 @@ $GH_PATH api --method GET "repos/hiragram/dona/commits/$INSTALL_SHA/check-runs" 
 TRUSTED_RUN_ID=$($NODE_PATH "$SCRIPT_DIR/verify-install-ci.mjs" checks "$INSTALL_TMP/check-runs.json" "$INSTALL_SHA")
 $GH_PATH api --method GET "repos/hiragram/dona/actions/runs/$TRUSTED_RUN_ID" > "$INSTALL_TMP/workflow-run.json"
 $NODE_PATH "$SCRIPT_DIR/verify-install-ci.mjs" workflow "$INSTALL_TMP/workflow-run.json" "$INSTALL_SHA" "$TRUSTED_RUN_ID"
-if [[ "$MODE" == "--install" && -e "$CONTROL_ROOT/updater" ]]; then
-  print -u2 "stable updaterは既にinstall済みです。updater自身の上書き更新は実施しません。"
-  exit 1
-fi
 if [[ "$MODE" == "--upgrade-control" && ! -d "$CONTROL_ROOT/updater" ]]; then
   print -u2 "stable updaterが未導入です。先に--installと--bootstrapを実行してください。"
   exit 1
@@ -434,6 +430,20 @@ done
 NPM_VERSION=$($NPM_PATH --version)
 $NODE_PATH "$SCRIPT_DIR/write-release-manifest.mjs" "$STAGING_DIR" "$INSTALL_SHA" "$NPM_VERSION" "2026-09-03.2"
 STAGED_DIGEST=$($NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-staged-release "$STAGING_DIR" "$INSTALL_SHA")
+if [[ "$MODE" == "--install" && ( -e "$CONTROL_ROOT/updater" || -L "$CONTROL_ROOT/updater" ) ]]; then
+  for label in dev.dona.updater dev.dona.dispatcher dev.dona.slack-adapter; do
+    if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-launchd-unregistered \
+      "$DOMAIN" "$label" 30000; then
+      print -u2 "install契約の再開前にserviceの登録解除を確定できません。配置物を変更しません。"
+      exit 1
+    fi
+  done
+  $NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" recover \
+    "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$INSTALL_SHA" \
+    "$INSTALL_TMP/rendered" "$STAGING_DIR"
+  print "配置済みartifactを今回のexact SHA buildへ照合し、install契約を復旧しました。"
+  exit 0
+fi
 FINAL_RELEASE="$RELEASE_ROOT/$INSTALL_SHA"
 if [[ -e "$FINAL_RELEASE" ]]; then
   if [[ "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]] || \

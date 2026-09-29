@@ -2,12 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
-export function controlUpdaterTreeDigest(root) {
+export function controlUpdaterTreeDigest(root, rootMode = 0o700) {
   if (!path.isAbsolute(root)) throw new Error("control updater root is invalid");
   const uid = process.getuid();
   const rootStats = fs.lstatSync(root);
   if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || rootStats.uid !== uid ||
-      (rootStats.mode & 0o777) !== 0o700) throw new Error("control updater root identity is invalid");
+      (rootStats.mode & 0o777) !== rootMode) throw new Error("control updater root identity is invalid");
   const hash = createHash("sha256");
   const visit = (directory, relativeDirectory = "") => {
     for (const name of fs.readdirSync(directory).sort((a, b) => a.localeCompare(b))) {
