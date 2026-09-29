@@ -1178,6 +1178,11 @@ export class SchedulerRepository {
     const resultFiles=this.db.prepare(`SELECT DISTINCT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
       WHERE c.content_delete_at<=? AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=j.job_id AND newer.content_delete_at>?)`).all(now,now) as Array<{job_id:string;result_path:string}>;
+    const orphanFiles=this.db.prepare(`SELECT j.job_id,j.result_path FROM jobs j JOIN job_owner_bindings b USING(job_id)
+      WHERE json_extract(b.owner_json,'$.kind')='schedule' AND j.status='needs_review'
+        AND j.last_error_code='published_result_reconciliation_required' AND j.updated_at<=?
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id)`)
+      .all(add(now,-604800)) as Array<{job_id:string;result_path:string}>;
     const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e
       LEFT JOIN schedule_runs r ON r.event_id=e.event_id
       LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id OR c.notification_event_id=e.event_id
@@ -1210,6 +1215,11 @@ export class SchedulerRepository {
             AND json_extract(owner_json,'$.kind')='schedule')
           AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
             WHERE newer.job_id=job_result_publish_receipts.job_id AND newer.content_delete_at>?)`).run(now,now);
+      for(const row of orphanFiles) {
+        this.db.prepare("DELETE FROM job_result_publish_receipts WHERE job_id=?").run(row.job_id);
+        this.db.prepare("UPDATE jobs SET result_json=NULL,objective='[deleted]',last_error_message=NULL WHERE job_id=?")
+          .run(row.job_id);
+      }
       this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]'),last_error_message=NULL
         WHERE event_id IN (SELECT source_event_id FROM job_completion_results WHERE content_delete_at<=?
           AND json_extract(owner_json,'$.kind')='schedule') AND source='dona_schedule'
@@ -1267,6 +1277,7 @@ export class SchedulerRepository {
     if(this.deleteJobResult) for(const row of resultFiles) if(this.deleteJobResult(row.job_id,row.result_path)) {
       this.db.prepare("UPDATE job_completion_results SET result_file_deleted_at=? WHERE job_id=? AND result_file_deleted_at IS NULL").run(now,row.job_id);
     }
+    if(this.deleteJobResult) for(const row of orphanFiles) this.deleteJobResult(row.job_id,row.result_path);
     if(this.deleteJobResult) for(const row of eventResults) if(this.deleteJobResult(row.event_id,row.result_path)) {
       this.db.prepare("UPDATE events SET result_path=NULL WHERE event_id=? AND result_path=?").run(row.event_id,row.result_path);
     }

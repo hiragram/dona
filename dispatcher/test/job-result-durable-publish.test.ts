@@ -93,6 +93,20 @@ describe("永続Job Result公開", () => {
     } finally { database.close(); }
   });
 
+  test("取消後に残った予約receiptも再起動照合で復旧可能にする",async()=>{
+    const {database,job,candidate,config}=await fixture();
+    try {
+      const publication=candidate();
+      assert.equal(database.reservePublishedJobResult(publication).outcome,"reserved");
+      const raw=new Database(config.databasePath);
+      try {raw.prepare("UPDATE jobs SET status='cancelled' WHERE job_id=?").run(job.job_id);}
+      finally {raw.close();}
+      assert.equal(database.quarantineIncompletePublishedResults(),1);
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+      assert.equal(database.inspectPublishedJobResult(job.job_id,publication.canonicalDigest),"needs_review");
+    } finally {database.close();}
+  });
+
   test("既存の旧方式Resultと異なるjobへの公開を拒否する", async () => {
     const { database, job, candidate, publisher } = await fixture();
     try {
@@ -114,7 +128,9 @@ describe("永続Job Result公開", () => {
       assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === job.job_id),true);
       await fs.unlink(job.result_path);
       assert.deepEqual(await publisher.reconcile(candidate()),{ outcome: "needs_review" });
-      assert.equal(database.quarantineIncompletePublishedResults(),1);
+      assert.throws(() => database.enqueueJobNotification(job.job_id),/published_result_reconciliation_required/);
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+      assert.equal(database.quarantineIncompletePublishedResults(),0);
       assert.equal(database.inspectPublishedJobResult(job.job_id,publication.canonicalDigest),"needs_review");
       assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === job.job_id),false);
       assert.throws(() => database.enqueueJobNotification(job.job_id),/published_result_reconciliation_required/);

@@ -2300,6 +2300,24 @@ export class DispatcherDatabase {
           job.attempt_count !== candidate.fence.attemptCount || job.herdr_pane_id !== candidate.fence.paneId ||
           expectedLiveSessionIdentity(job,this.getJobLiveSessionIdentity(job.job_id)) !== candidate.fence.session) return { outcome: "conflict" };
       candidate.assertCurrentGrant();
+      if(readEventJobBinding(this.db,job.source_event_id)?.owner.kind==="schedule") {
+        const serialized=stableStringify(candidate.envelope);
+        validateWorkResultEnvelope(serialized);
+        if(containsHostAbsolutePath(serialized)||serialized.includes(job.workspace_path)||
+          serialized.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
+        const rendered=renderJobResult(candidate.envelope as unknown as Record<string,unknown>);
+        validateWorkResultContent(rendered);
+        if(containsHostAbsolutePath(rendered)||rendered.includes(job.workspace_path)||
+          rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
+        if((candidate.envelope.actions??[]).length!==0) throw new Error("scheduled_work_external_write_reported");
+        const completedAt=Date.parse(candidate.envelope.completed_at),at=Date.now();
+        if(completedAt>at) throw new Error("completed_at_is_in_the_future");
+        const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
+        if(acceptedDeadline&&at>Date.parse(acceptedDeadline)+3_600_000)
+          throw new Error("scheduled_work_result_deadline_exceeded");
+        if(job.dispatch_started_at&&completedAt<Date.parse(job.dispatch_started_at))
+          throw new Error("completed_at_precedes_prompt_dispatch");
+      }
       this.db.prepare(`INSERT INTO job_result_publish_receipts
         (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
         VALUES(?,?,?,?,?,?,?,'reserved',?)`)
@@ -2353,9 +2371,9 @@ export class DispatcherDatabase {
 
   private markPublishedJobNeedsReview(jobId:string):void {
     const job=this.getJobRequired(jobId),binding=readEventJobBinding(this.db,job.source_event_id);
-    if(["completed","failed"].includes(job.status)) {
+    if(["completed","failed","cancelled"].includes(job.status)) {
       this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='published_result_reconciliation_required',
-        last_error_message='Published Result requires file and database reconciliation',updated_at=? WHERE job_id=?`)
+        last_error_message='Published Result requires file and database reconciliation',steer_state=NULL,updated_at=? WHERE job_id=?`)
         .run(nowUtc(),jobId);
     } else this.markJobNeedsReview(jobId,"published_result_reconciliation_required",
       "Published Result requires file and database reconciliation");
@@ -2385,6 +2403,22 @@ export class DispatcherDatabase {
       }).immediate();
     }
     return quarantined;
+  }
+
+  private quarantineChangedCommittedResult(jobId:string):void {
+    const receipt=this.db.prepare("SELECT envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+      .get(jobId) as {envelope_json:string;state:string}|undefined;
+    if(receipt?.state!=="committed") return;
+    const job=this.getJobRequired(jobId);
+    if(job.result_json===receipt.envelope_json&&
+      this.publishedResultFileMatches(job.result_path,jobId,receipt.envelope_json)) return;
+    this.db.transaction(()=>{
+      const current=this.db.prepare("SELECT envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(jobId) as {envelope_json:string;state:string}|undefined;
+      if(current?.state!=="committed"||current.envelope_json!==receipt.envelope_json) return;
+      this.db.prepare("UPDATE job_result_publish_receipts SET state='needs_review' WHERE job_id=? AND state='committed'").run(jobId);
+      this.markPublishedJobNeedsReview(jobId);
+    }).immediate();
   }
 
   commitPublishedJobResult(candidate: AuthorizedJobResultPublish, at = new Date(), notificationHook: JobNotificationHook = () => {}): "reused" | "conflict" {
@@ -2613,6 +2647,7 @@ export class DispatcherDatabase {
   }
 
   enqueueJobNotification(jobId: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): EnqueueResult {
+    this.quarantineChangedCommittedResult(jobId);
     return this.db.transaction(() => {
       const job = this.getJobRequired(jobId);
       if (this.db.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").get(jobId))
@@ -2754,7 +2789,10 @@ export class DispatcherDatabase {
 
   private materializeJobCompletion(jobId: string, at: Date, notificationHook: JobNotificationHook = () => {}): EnqueueResult {
     const job = this.getJobRequired(jobId);
-    if (this.db.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").get(jobId))
+    const receipt=this.db.prepare("SELECT state,envelope_json FROM job_result_publish_receipts WHERE job_id=?")
+      .get(jobId) as {state:string;envelope_json:string}|undefined;
+    if (receipt?.state==="needs_review" || (receipt?.state==="committed" &&
+      (job.result_json!==receipt.envelope_json || !this.publishedResultFileMatches(job.result_path,jobId,receipt.envelope_json))))
       throw new Error("published_result_reconciliation_required");
     this.assertJobCompletionBinding(job);
     if (!jobNotificationStatuses.has(job.status)) throw new Error("job_not_ready_for_completion");
