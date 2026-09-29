@@ -314,7 +314,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   fi
   $NODE_PATH -e 'const fs=require("node:fs");const manifest=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(manifest.sha!==process.argv[2])process.exit(1)' \
     "$RELEASE_ROOT/$BOOTSTRAP_UPDATER_SHA/release-manifest.json" "$BOOTSTRAP_UPDATER_SHA"
-  $NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$BOOTSTRAP_UPDATER_SHA"
+  $NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" verify "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$BOOTSTRAP_UPDATER_SHA"
   $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-private-file "$CONTROL_ROOT/updater/dist/cli.js"
   if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
@@ -508,7 +508,8 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" create "$BACKUP_ROOT" \
     "$OLD_UPDATER_SHA" "$INSTALL_SHA" "$CONTROL_ROOT/policy.json" "$BACKUP_ROOT/policy.next.json" \
     "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" "$BACKUP_ROOT/dev.dona.updater.next.plist" "$STAGED_DIGEST" \
-    "$CONTROL_ROOT/updater" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" "$OLD_RECEIPT_PATH"
+    "$CONTROL_ROOT/updater" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" \
+    "$BACKUP_ROOT/dev.dona.dispatcher.next.plist" "$OLD_RECEIPT_PATH"
   CONTROL_LEDGER_DIR="$BACKUP_ROOT"
 
   CONTROL_UPGRADE_ACTIVE=1
@@ -596,6 +597,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     record_control_phase updater_started
     $NODE_PATH "$SCRIPT_DIR/control-attempt-ledger.mjs" verify "$BACKUP_ROOT" \
       "$CONTROL_ROOT/policy.json" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" \
+      "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" \
       "$BACKUP_ROOT/updater.previous.sqlite3" "$BACKUP_ROOT/restore-rehearsal.json"
     assert_control_targets
     record_control_phase verified
@@ -655,7 +657,7 @@ for plist in dev.dona.updater dev.dona.dispatcher dev.dona.slack-adapter; do
   chmod 600 "$LAUNCH_AGENTS_DIR/.$plist.plist.tmp"
   /bin/mv "$LAUNCH_AGENTS_DIR/.$plist.plist.tmp" "$LAUNCH_AGENTS_DIR/$plist.plist"
 done
-$NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" record "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$INSTALL_SHA"
+$NODE_PATH "$SCRIPT_DIR/bootstrap-install-contract.mjs" record "$CONTROL_ROOT" "$LAUNCH_AGENTS_DIR" "$RELEASE_ROOT" "$INSTALL_SHA"
 
 print "immutable release、stable updater、policy、plistを配置しました。processは開始していません。"
 print "設定を確認後、明示的に '$0 --bootstrap' を実行してください。"

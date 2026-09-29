@@ -399,7 +399,7 @@ export async function launchctlOnce(operation, domain, target, timeoutMs, option
   await run(arguments_);
 }
 
-async function releaseTreeDigest(root, immutable = false) {
+export async function releaseTreeDigest(root, immutable = false) {
   const rootStats = await fs.lstat(root);
   if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) throw new Error("release comparison root is invalid");
   if (rootStats.uid !== process.getuid() || (rootStats.mode & 0o077) !== 0 ||

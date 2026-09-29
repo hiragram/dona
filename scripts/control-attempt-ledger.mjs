@@ -54,7 +54,7 @@ function publish(file, value, writeFile = fs.writeFileSync) {
 }
 
 export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, oldPlist, newPlist,
-  releaseDigest, oldUpdaterTree, oldDispatcherPlist, oldReceipt) {
+  releaseDigest, oldUpdaterTree, oldDispatcherPlist, newDispatcherPlist, oldReceipt) {
   assertPrivateDirectory(directory);
   if (!sha(oldSha) || !sha(newSha) || !/^[0-9a-f]{64}$/.test(releaseDigest ?? "")) {
     throw new Error("control attempt SHA or release digest is invalid");
@@ -64,6 +64,7 @@ export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, o
   assertPrivateFile(oldPolicy);
   assertPrivateFile(oldPlist);
   assertPrivateFile(oldDispatcherPlist);
+  assertPrivateFile(newDispatcherPlist);
   if (oldReceipt !== "-") assertPrivateFile(oldReceipt);
   publish(file, {
     schema_version: 1, old_build_sha: oldSha, new_build_sha: newSha,
@@ -72,6 +73,7 @@ export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, o
     old_plist_sha256: digest(oldPlist), new_plist_sha256: digest(newPlist),
     old_updater_tree_sha256: controlUpdaterTreeDigest(oldUpdaterTree),
     old_dispatcher_plist_sha256: digest(oldDispatcherPlist),
+    new_dispatcher_plist_sha256: digest(newDispatcherPlist),
     old_receipt_sha256: oldReceipt === "-" ? null : digest(oldReceipt),
     phase: "prepared", sequence: 1, db_backup_sha256: null, restore_rehearsal_sha256: null, launchd_operations: [],
     updated_at: new Date().toISOString(),
@@ -172,13 +174,15 @@ export function advanceAttempt(directory, phase, operation = "none", backup = un
   publish(file, next, options.writeFileSync);
 }
 
-export function verifyAttemptArtifacts(directory, policy, plist, backup, rehearsal) {
+export function verifyAttemptArtifacts(directory, policy, plist, dispatcherPlist, backup, rehearsal) {
   assertPrivateDirectory(directory);
   const file = path.join(directory, "attempt.json");
   assertPrivateFile(file);
   const attempt = JSON.parse(fs.readFileSync(file, "utf8"));
   if (attempt.phase !== "updater_started" || digest(policy) !== attempt.new_policy_sha256 ||
-      digest(plist) !== attempt.new_plist_sha256 || digest(backup) !== attempt.db_backup_sha256 ||
+      digest(plist) !== attempt.new_plist_sha256 ||
+      digest(dispatcherPlist) !== attempt.new_dispatcher_plist_sha256 ||
+      digest(backup) !== attempt.db_backup_sha256 ||
       digest(rehearsal) !== attempt.restore_rehearsal_sha256) {
     throw new Error("control attempt artifacts do not match the verified identities");
   }
@@ -187,9 +191,9 @@ export function verifyAttemptArtifacts(directory, policy, plist, backup, rehears
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   const [command, ...args] = process.argv.slice(2);
   try {
-    if (command === "create" && args.length === 11) createAttempt(...args);
+    if (command === "create" && args.length === 12) createAttempt(...args);
     else if (command === "advance" && args.length >= 2 && args.length <= 5) advanceAttempt(...args);
-    else if (command === "verify" && args.length === 5) verifyAttemptArtifacts(...args);
+    else if (command === "verify" && args.length === 6) verifyAttemptArtifacts(...args);
     else if (command === "verify-restore-control" && args.length === 7) verifyRestoredControl(...args);
     else if (command === "verify-restore-dispatcher" && args.length === 2) verifyRestoredDispatcher(...args);
     else throw new Error("invalid control attempt command");

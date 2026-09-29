@@ -64,6 +64,8 @@ test("control capability requires a verified attempt ledger bound to the exact r
     const agents = path.join(root, "Library/LaunchAgents");
     await fs.mkdir(agents, { recursive: true });
     await fs.writeFile(path.join(agents, "dev.dona.updater.plist"), artifact, { mode: 0o600 });
+    const dispatcherPlist = path.join(agents, "dev.dona.dispatcher.plist");
+    await fs.writeFile(dispatcherPlist, artifact, { mode: 0o600 });
     const controlBackup = path.join(attemptDir, "updater.previous.sqlite3");
     await fs.writeFile(controlBackup, artifact, { mode: 0o600 });
     const rehearsal = { schema_version: 1, backup_sha256: digest, old_schema: 7, new_schema: 8,
@@ -74,6 +76,7 @@ test("control capability requires a verified attempt ledger bound to the exact r
     const rehearsalDigest = createHash("sha256").update(rehearsalBytes).digest("hex");
     const attempt = { schema_version: 1, phase: "verified", old_build_sha: "b".repeat(40),
       new_build_sha: targetSha, new_policy_sha256: digest, new_plist_sha256: digest,
+      new_dispatcher_plist_sha256: digest,
       db_backup_sha256: digest, release_tree_sha256: releaseDigest, restore_rehearsal_sha256: rehearsalDigest };
     const attemptBytes = Buffer.from(`${JSON.stringify(attempt)}\n`);
     await fs.writeFile(path.join(attemptDir, "attempt.json"), attemptBytes, { mode: 0o600 });
@@ -81,12 +84,16 @@ test("control capability requires a verified attempt ledger bound to the exact r
       schema_migration_capability: "dispatcher_v2_to_v3_online_backup_v1", attempt_id: attemptId,
       attempt_sha256: createHash("sha256").update(attemptBytes).digest("hex"),
       old_build_sha: attempt.old_build_sha, policy_sha256: digest, plist_sha256: digest,
+      dispatcher_plist_sha256: digest,
       db_backup_sha256: digest, release_tree_sha256: releaseDigest, restore_rehearsal_sha256: rehearsalDigest,
       control_updater_tree_sha256: controlTreeDigest, old_updater_tree_sha256: controlTreeDigest };
     const receiptPath = path.join(policy.control_root, "control-plane-receipt.json");
     await fs.writeFile(receiptPath, JSON.stringify(receipt), { mode: 0o600 });
     const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
     assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: true, build_sha: targetSha });
+    await fs.writeFile(dispatcherPlist, "tampered", { mode: 0o600 });
+    assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });
+    await fs.writeFile(dispatcherPlist, artifact, { mode: 0o600 });
     await fs.writeFile(controlBackup, "tampered", { mode: 0o600 });
     assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });
     await fs.writeFile(controlBackup, artifact, { mode: 0o600 });

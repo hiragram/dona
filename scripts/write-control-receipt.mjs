@@ -25,6 +25,7 @@ if (attempt.schema_version !== 1 || attempt.phase !== "verified" || attempt.new_
     !/^[0-9a-f]{64}$/.test(attempt.release_tree_sha256 ?? "") ||
     !/^[0-9a-f]{64}$/.test(attempt.new_policy_sha256 ?? "") ||
     !/^[0-9a-f]{64}$/.test(attempt.new_plist_sha256 ?? "") ||
+    !/^[0-9a-f]{64}$/.test(attempt.new_dispatcher_plist_sha256 ?? "") ||
     !/^[0-9a-f]{64}$/.test(attempt.old_updater_tree_sha256 ?? "")) {
   throw new Error("control attempt is not verified");
 }
@@ -41,6 +42,7 @@ const receipt = {
   old_build_sha: attempt.old_build_sha,
   policy_sha256: attempt.new_policy_sha256,
   plist_sha256: attempt.new_plist_sha256,
+  dispatcher_plist_sha256: attempt.new_dispatcher_plist_sha256,
   db_backup_sha256: attempt.db_backup_sha256,
   release_tree_sha256: attempt.release_tree_sha256,
   control_updater_tree_sha256: controlUpdaterTreeDigest(controlUpdaterRoot),

@@ -798,6 +798,9 @@ export class RealRuntime implements RuntimePort {
         attempt.schema_version === 1 && attempt.phase === "verified" && attempt.new_build_sha === buildSha &&
         attempt.old_build_sha === receipt.old_build_sha && attempt.new_policy_sha256 === receipt.policy_sha256 &&
         attempt.new_plist_sha256 === receipt.plist_sha256 && attempt.db_backup_sha256 === receipt.db_backup_sha256 &&
+        typeof attempt.new_dispatcher_plist_sha256 === "string" &&
+        /^[0-9a-f]{64}$/.test(attempt.new_dispatcher_plist_sha256) &&
+        attempt.new_dispatcher_plist_sha256 === receipt.dispatcher_plist_sha256 &&
         attempt.release_tree_sha256 === receipt.release_tree_sha256 &&
         typeof attempt.release_tree_sha256 === "string" && /^[0-9a-f]{64}$/.test(attempt.release_tree_sha256) &&
         attempt.restore_rehearsal_sha256 === receipt.restore_rehearsal_sha256 &&
@@ -822,6 +825,7 @@ export class RealRuntime implements RuntimePort {
       const currentArtifactsMatch =
         await artifactDigest(path.join(this.policy.control_root, "policy.json")) === attempt.new_policy_sha256 &&
         await artifactDigest(path.join(os.homedir(), "Library/LaunchAgents/dev.dona.updater.plist")) === attempt.new_plist_sha256 &&
+        await artifactDigest(path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")) === attempt.new_dispatcher_plist_sha256 &&
         await artifactDigest(path.join(attemptDirectory, "updater.previous.sqlite3")) === attempt.db_backup_sha256 &&
         await artifactDigest(path.join(attemptDirectory, "updater.previous/dist/database.js")) === rehearsal.old_database_module_sha256 &&
         await artifactDigest(path.join(this.policy.control_root, "updater/dist/database.js")) === rehearsal.new_database_module_sha256;
