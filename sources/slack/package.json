@@ -28,7 +28,7 @@
     "@slack/socket-mode": "^3.0.1",
     "@slack/web-api": "^8.1.1",
     "dotenv": "^17.2.2",
-    "undici": "^7.29.0",
+    "undici": "^7.30.0",
     "zod": "^4.5.4"
   },
   "devDependencies": {
