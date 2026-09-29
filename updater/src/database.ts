@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 import Database from "better-sqlite3";
+import os from "node:os";
 import { ulid } from "ulid";
 
 import { assertTransition, isTerminal } from "./state-machine.js";
@@ -116,9 +117,9 @@ export class UpdateDatabase {
     this.db.pragma("busy_timeout = 2000");
     this.db.pragma("foreign_keys = ON");
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 8) {
+    if (version > 9) {
       this.db.close();
-      throw new Error(`Updater database schema ${version} is newer than supported schema 8`);
+      throw new Error(`Updater database schema ${version} is newer than supported schema 9`);
     }
     if (options.readonly) this.db.pragma("query_only = ON");
     else this.migrate();
@@ -132,7 +133,7 @@ export class UpdateDatabase {
 
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > 8) throw new Error(`Updater database schema ${version} is newer than supported schema 8`);
+    if (version > 9) throw new Error(`Updater database schema ${version} is newer than supported schema 9`);
     const migrate = (sql: string): void => {
       this.db.transaction(() => { this.db.exec(sql); })();
     };
@@ -326,6 +327,15 @@ export class UpdateDatabase {
       ALTER TABLE update_requests ADD COLUMN approval_expires_at TEXT;
       ALTER TABLE update_requests ADD COLUMN preflight_inventory_revision TEXT;
       PRAGMA user_version = 8;
+    `);
+    if (version <= 8) migrate(`
+      CREATE INDEX IF NOT EXISTS update_outbox_request_latest_idx ON update_outbox(request_id, outbox_id);
+      CREATE TABLE IF NOT EXISTS update_retention_uptime (
+        request_id TEXT PRIMARY KEY REFERENCES update_requests(request_id),
+        elapsed_ms INTEGER NOT NULL,
+        observed_uptime_ms INTEGER NOT NULL
+      );
+      PRAGMA user_version = 9;
     `);
   }
 
@@ -931,21 +941,43 @@ export class UpdateDatabase {
     return this.db.prepare("SELECT * FROM update_requests ORDER BY created_at DESC LIMIT ?").all(limit) as UpdateRow[];
   }
 
-  retentionProtectedReleaseShas(at = new Date()): Set<string> {
+  retentionProtectedReleaseShas(_at = new Date(), uptimeMs = Math.floor(os.uptime() * 1_000)): Set<string> {
     // Unresolved attempts and notifications can still require either side of
-    // the update for rollback, reconciliation, or a completion report. Keep
-    // terminal rollback evidence for a bounded 30-day review window.
-    const terminalEvidenceCutoff = new Date(at.getTime() - 30 * 86_400_000).toISOString();
-    const rows = this.db.prepare(`SELECT current_sha,target_sha,previous_sha FROM update_requests r
-      WHERE r.completed_at IS NULL OR r.state='needs_review' OR
-        (r.state IN ('failed','cancelled','rolled_back') AND r.completed_at>=?) OR EXISTS (
+    // the update for rollback, reconciliation, or a completion report. Wall
+    // clock timestamps cannot prove 30 days of age after an NTP correction.
+    // Count only observed system uptime; a reboot can delay expiry, never
+    // advance it. Legacy records start their clock at first observation.
+    if (!Number.isSafeInteger(uptimeMs) || uptimeMs < 0) throw new Error("retention_uptime_invalid");
+    const rows = this.db.prepare(`SELECT request_id,current_sha,target_sha,previous_sha,state,completed_at,
+      EXISTS (
         SELECT 1 FROM update_outbox o WHERE o.request_id=r.request_id
           AND o.outbox_id=(SELECT newest.outbox_id FROM update_outbox newest
             WHERE newest.request_id=r.request_id ORDER BY newest.rowid DESC LIMIT 1)
           AND o.superseded_by_outbox_id IS NULL
+          AND (o.status <> 'delivered' OR o.slack_reported_at IS NULL)) AS notification_pending
+      FROM update_requests r WHERE r.completed_at IS NULL OR r.state IN ('needs_review','failed','cancelled','rolled_back')
+        OR EXISTS (SELECT 1 FROM update_outbox o WHERE o.request_id=r.request_id AND o.superseded_by_outbox_id IS NULL
           AND (o.status <> 'delivered' OR o.slack_reported_at IS NULL))`)
-      .all(terminalEvidenceCutoff) as Array<{current_sha:string;target_sha:string;previous_sha:string|null}>;
-    return new Set(rows.flatMap((row) => [row.current_sha,row.target_sha,...(row.previous_sha?[row.previous_sha]:[])]));
+      .all() as Array<{request_id:string;current_sha:string;target_sha:string;previous_sha:string|null;
+        state:string;completed_at:string|null;notification_pending:number}>;
+    const readClock = this.db.prepare("SELECT elapsed_ms,observed_uptime_ms FROM update_retention_uptime WHERE request_id=?");
+    const writeClock = this.db.prepare(`INSERT INTO update_retention_uptime(request_id,elapsed_ms,observed_uptime_ms)
+      VALUES(?,?,?) ON CONFLICT(request_id) DO UPDATE SET elapsed_ms=excluded.elapsed_ms,
+      observed_uptime_ms=excluded.observed_uptime_ms`);
+    return this.db.transaction(() => {
+      const protectedShas = new Set<string>();
+      for (const row of rows) {
+        let retain = row.completed_at === null || row.state === "needs_review" || row.notification_pending === 1;
+        if (["failed", "cancelled", "rolled_back"].includes(row.state) && row.completed_at !== null) {
+          const prior = readClock.get(row.request_id) as {elapsed_ms:number;observed_uptime_ms:number}|undefined;
+          const elapsed = prior ? prior.elapsed_ms + Math.max(0, uptimeMs - prior.observed_uptime_ms) : 0;
+          writeClock.run(row.request_id, elapsed, uptimeMs);
+          retain ||= elapsed < 30 * 86_400_000;
+        }
+        if (retain) for (const sha of [row.current_sha,row.target_sha,row.previous_sha]) if (sha) protectedShas.add(sha);
+      }
+      return protectedShas;
+    })();
   }
 
   recentSuccessfulReleaseShas(limit = 2, excludedShas: ReadonlySet<string> = new Set()): Set<string> {

@@ -333,14 +333,35 @@ export class ReleaseStore {
     try { handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
     try {
-      if ((await handle.stat()).size > 256) throw new Error("release_cleanup_cursor_invalid");
-      const value: unknown = JSON.parse(await handle.readFile("utf8"));
-      if (!value || typeof value !== "object" || Array.isArray(value) ||
-        Object.keys(value).sort().join(",") !== "mtime,sha") throw new Error("release_cleanup_cursor_invalid");
-      const cursor = value as { sha: unknown; mtime: unknown };
-      if (typeof cursor.sha !== "string" || !/^[0-9a-f]{40}$/.test(cursor.sha) ||
-        typeof cursor.mtime !== "number" || !Number.isFinite(cursor.mtime)) throw new Error("release_cleanup_cursor_invalid");
-      return cursor as { sha: string; mtime: number };
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o022) !== 0) throw new Error("release_cleanup_cursor_type_invalid");
+      let value: unknown;
+      try {
+        if (stats.size > 256) throw new Error("release_cleanup_cursor_invalid");
+        value = JSON.parse(await handle.readFile("utf8"));
+        if (!value || typeof value !== "object" || Array.isArray(value) ||
+          Object.keys(value).sort().join(",") !== "mtime,sha") throw new Error("release_cleanup_cursor_invalid");
+        const cursor = value as { sha: unknown; mtime: unknown };
+        if (typeof cursor.sha !== "string" || !/^[0-9a-f]{40}$/.test(cursor.sha) ||
+          typeof cursor.mtime !== "number" || !Number.isFinite(cursor.mtime)) throw new Error("release_cleanup_cursor_invalid");
+        return cursor as { sha: string; mtime: number };
+      } catch (error) {
+        if (error instanceof Error && error.message !== "release_cleanup_cursor_invalid" &&
+          !(error instanceof SyntaxError)) throw error;
+        // The cursor is only a scan hint. Keep the damaged bytes for diagnosis
+        // and restart at the beginning, where every candidate is revalidated.
+        const current = await fs.lstat(file);
+        if (!current.isFile() || current.dev !== stats.dev || current.ino !== stats.ino) {
+          throw new Error("release_cleanup_cursor_changed");
+        }
+        const quarantined = `${file}.invalid.${randomUUID()}`;
+        await fs.rename(file, quarantined);
+        const moved = await fs.lstat(quarantined);
+        if (moved.dev !== stats.dev || moved.ino !== stats.ino) throw new Error("release_cleanup_cursor_changed");
+        await fsyncDirectory(this.policy.control_root);
+        return null;
+      }
     } finally { await handle.close(); }
   }
 

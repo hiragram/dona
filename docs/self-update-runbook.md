@@ -54,7 +54,7 @@ pre-activation中の`npm ci/test/typecheck/build`は、memory上の`output_limit
 - `get_self_update_status`の`diagnostics`は新しい順に最大32件だけを返し、`diagnostics_total_count`と`diagnostics_omitted_count`で全件数と省略数を示します。各項目は`log_id`、attempt、step、redaction後byte size、`complete` / `truncated` / `write_failed` / `purged` / `missing` / `size_mismatch` / `read_error`と、最大4 KiBのredacted tailだけを含み、private absolute pathは返しません。
 - token、URL、local pathはbounded carry bufferとUTF-8 decoderを通して永続化前にredactします。DB error summary、logger、terminal outboxには従来どおり短いsummaryとopaque IDだけが入り、raw stdout/stderrは入りません。
 - temp fileのまま停止したcaptureは、SQLiteの`updater_writer_lease`をtransactionで取得し、その後にUpdater API socketを取得した単一writerのservice起動時だけ安全性を再検証して回収し、`write_failed`へ落とします。別の生存PIDがleaseを保持している場合はsocketへ触れず起動を拒否し、停止時はservice loopを止めてからleaseを解放します。crash後のdead PIDだけをCASで引き継ぎ、PID再利用など生存判定が曖昧な場合はfail closedにします。read-only CLIによるDB openはactive captureを変更しません。final file不在やsize不一致も`complete`へ丸めません。診断保存の失敗はupdate failureを成功へ変えません。
-- control DBは診断logのcontent digest、writer lease、exact inventory/承認期限/preflight revisionを含む`user_version = 8`へforward-onlyで移行します。schema 8を読めない旧stable Updaterへのbinary差戻しは行わず、stable Updaterの配布・backup・rollback確認は通常のアプリself-updateやこのPRのmergeとは別の、明示承認付きcontrol-plane更新として扱います。
+- control DBは診断logのcontent digest、writer lease、exact inventory/承認期限/preflight revision、outbox検索indexを含む`user_version = 9`へforward-onlyで移行します。schema 9を読めない旧stable Updaterへのbinary差戻しは行わず、stable Updaterの配布・backup・rollback確認は通常のアプリself-updateやこのPRのmergeとは別の、明示承認付きcontrol-plane更新として扱います。
 - retentionは常駐serviceが60秒ごとに評価し、terminal requestだけを古い順に対象とします。active captureとnon-terminal requestを削除せず、purge後もDB recordと元byte sizeを保持します。
 
 この機能を含むアプリPRのmergeだけでは、稼働中のstable Updaterへ新しいcapture実装やDB migrationは配布されません。production control planeへの反映は、別のmaintenance window、exact SHA確認、明示承認を伴う`--upgrade-control`の責務です。
@@ -137,6 +137,6 @@ legacy compatibilityとして、`job_key`省略時の`legacy-default`、`duplica
 
 ## Retention
 
-current、previous、active attempt、needs_review、未報告の最新通知が参照するreleaseを保護し、failed/cancelled/rolled_backのrelease証拠はterminal後30日間保護します。さらにDBで確認した直近2 successful releaseを保護します。disk floor 2 GiB未満ではstageを開始しません。`doctor`は最大8件のcleanup候補をdry-run表示し、success後と常駐serviceの60秒ごとのmaintenanceで、SHA形式・realpath containment・owner/mode・内部linkを再検証したreleaseだけを対象にします。候補のdeep scanは1回あたり最大16件で、cleanup時のcursorを永続化し、無効候補が続いても次回は後続候補へ進みます。
+current、previous、active attempt、needs_review、未報告の最新通知が参照するreleaseを保護し、failed/cancelled/rolled_backのrelease証拠は最初のretention観測から累積30日以上のsystem uptimeが確認できるまで保護します。時計補正や再起動で保持期間を短縮せず、初回観測や再起動によって実際の保持期間は延び得ます。さらにDBで確認した直近2 successful releaseを保護します。disk floor 2 GiB未満ではstageを開始しません。`doctor`は最大8件のcleanup候補をdry-run表示し、success後と常駐serviceの60秒ごとのmaintenanceで、SHA形式・realpath containment・owner/mode・内部linkを再検証したreleaseだけを対象にします。候補のdeep scanは1回あたり最大16件で、cleanup時のcursorを永続化し、破損cursorは隔離して先頭から再検証します。
 
 診断logのretentionはrelease retentionとは別です。policyの`diagnostic_log_limit_bytes`、`diagnostic_aggregate_limit_bytes`、`diagnostic_retention_days`を使い、terminal requestのfinalized logだけをpurgeします。

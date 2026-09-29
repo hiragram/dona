@@ -86,6 +86,20 @@ describe("ReleaseStore", () => {
     await assert.rejects(fs.lstat(safe), { code: "ENOENT" });
   });
 
+  test("quarantines a damaged scan cursor and restarts candidate validation", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidateSha = "a".repeat(40);
+    await installRelease(policy, candidateSha);
+    const cursorPath = path.join(policy.control_root, "release-cleanup-cursor.json");
+    await fs.mkdir(policy.control_root, { recursive: true });
+    await fs.writeFile(cursorPath, "{broken");
+    const store = new ReleaseStore(policy);
+    assert.ok((await store.cleanupPlan(new Set([currentSha, "0".repeat(40)]))).includes(candidateSha));
+    assert.ok((await fs.readdir(policy.control_root)).some((entry) => entry.startsWith("release-cleanup-cursor.json.invalid.")));
+  });
+
   test("rejects an oversized manifest before parsing cleanup candidates", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

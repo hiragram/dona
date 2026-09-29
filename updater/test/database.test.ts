@@ -38,8 +38,12 @@ describe("UpdateDatabase", () => {
       .run("2026-09-02T00:02:00.000Z");
     assert.deepEqual(db.retentionProtectedReleaseShas(), new Set());
     raw.prepare("UPDATE update_requests SET state='rolled_back' WHERE request_id=?").run(created.row.request_id);
-    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-09-20")), new Set([currentSha, targetSha]));
-    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-10-20")), new Set());
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-09-20"), 1_000), new Set([currentSha, targetSha]));
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-10-20"), 1_000), new Set([currentSha, targetSha]));
+    raw.prepare("UPDATE update_outbox SET slack_reported_at=? WHERE outbox_id='outbox_test'")
+      .run("2026-10-20T00:00:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-10-20T00:01:00.000Z"), 1_001), new Set([currentSha, targetSha]));
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-11-20"), 30 * 86_400_000 + 1_001), new Set());
     raw.prepare("UPDATE update_requests SET state='succeeded' WHERE request_id=?").run(created.row.request_id);
     assert.deepEqual(db.recentSuccessfulReleaseShas(), new Set([targetSha]));
     raw.prepare("UPDATE update_outbox SET status='needs_review' WHERE outbox_id='outbox_test'").run();
@@ -176,7 +180,7 @@ describe("UpdateDatabase", () => {
     db.close();
   });
 
-  test("atomically migrates the released schema 1 database through schema 8", async () => {
+  test("atomically migrates the released schema 1 database through schema 9", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
@@ -188,7 +192,8 @@ describe("UpdateDatabase", () => {
         state TEXT NOT NULL
       );
       CREATE TABLE update_outbox (
-        outbox_id TEXT PRIMARY KEY
+        outbox_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL
       );
       PRAGMA user_version = 1;
     `);
@@ -208,7 +213,9 @@ describe("UpdateDatabase", () => {
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'updater_writer_lease'").get());
     const diagnosticColumns = migrated.pragma("table_info(update_diagnostic_logs)") as Array<{ name: string }>;
     assert.ok(diagnosticColumns.some((column) => column.name === "content_sha256"));
-    assert.equal(migrated.pragma("user_version", { simple: true }), 8);
+    assert.equal(migrated.pragma("user_version", { simple: true }), 9);
+    assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE name='update_outbox_request_latest_idx'").get());
+    assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE name='update_retention_uptime'").get());
     migrated.close();
   });
 
@@ -243,9 +250,9 @@ describe("UpdateDatabase", () => {
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
     await fs.mkdir(policy.control_root, { recursive: true });
     const raw = new Database(databasePath);
-    raw.pragma("user_version = 9");
+    raw.pragma("user_version = 10");
     raw.close();
-    assert.throws(() => new UpdateDatabase(databasePath, { readonly: true }), /newer than supported schema 8/);
+    assert.throws(() => new UpdateDatabase(databasePath, { readonly: true }), /newer than supported schema 9/);
   });
 
   test("binds idempotent approval to the exact plan and detects payload mismatch", async () => {
