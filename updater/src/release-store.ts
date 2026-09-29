@@ -22,6 +22,11 @@ function inside(root: string, candidate: string): boolean {
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
+interface CleanupTombstone { sha: string; dev: string; ino: string; birthtime_ns: string; }
+class CleanupTombstonePendingError extends Error {
+  constructor() { super("release_cleanup_tombstone_pending"); }
+}
+
 async function writeAtomic(filePath: string, body: string, mode = 0o600): Promise<void> {
   const temporary = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
   const handle = await fs.open(temporary, "wx", mode);
@@ -272,8 +277,12 @@ export class ReleaseStore {
   }
 
   private async cleanupLocked(protectedShas: ReadonlySet<string>): Promise<string[]> {
-    const { planned, lastScanned } = await this.planCleanup(protectedShas);
-    const removed: string[] = [];
+    await this.ensureRoots();
+    const recovered = await this.recoverCleanupTombstone();
+    const protectedForSweep = new Set(protectedShas);
+    if (recovered) protectedForSweep.add(recovered);
+    const { planned, lastScanned } = await this.planCleanup(protectedForSweep);
+    const removed: string[] = recovered ? [recovered] : [];
     const errors: string[] = [];
     for (const candidate of planned) {
       const { sha } = candidate;
@@ -287,11 +296,11 @@ export class ReleaseStore {
         if (pointers.receipt && !pointers.previous_sha) throw new Error("retention_previous_pointer_missing");
         if (pointers.receipt && (pointers.receipt.to_sha !== pointers.current_sha ||
           pointers.receipt.from_sha !== pointers.previous_sha)) throw new Error("retention_pointer_receipt_mismatch");
-        if (protectedShas.has(sha) || pointers.current_sha === sha || pointers.previous_sha === sha) continue;
-        await this.makeMutableForRemoval(releasePath);
-        await this.removeGeneratedTree(this.policy.release_root, releasePath);
+        if (protectedForSweep.has(sha) || pointers.current_sha === sha || pointers.previous_sha === sha) continue;
+        await this.removeReleaseWithTombstone(releasePath, sha);
         removed.push(sha);
       } catch (error) {
+        if (error instanceof CleanupTombstonePendingError) throw error;
         if (error instanceof Error && ["retention_current_pointer_missing", "retention_previous_pointer_missing",
           "retention_pointer_receipt_mismatch"].includes(error.message)) throw error;
         // A single corrupt or replaced candidate cannot block other releases.
@@ -306,6 +315,91 @@ export class ReleaseStore {
     }
     if (errors.length) throw new Error(`release_cleanup_candidates_failed: ${errors.join(",")}`);
     return removed;
+  }
+
+  private cleanupTombstonePath(sha: string): string {
+    fullSha(sha);
+    return path.join(this.policy.release_root, `.cleanup-${sha}`);
+  }
+
+  private cleanupTombstoneReceiptPath(): string {
+    return path.join(this.policy.control_root, "release-cleanup-tombstone.json");
+  }
+
+  private async readCleanupTombstone(): Promise<CleanupTombstone | null> {
+    let handle: fs.FileHandle;
+    try { handle = await fs.open(this.cleanupTombstoneReceiptPath(), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.nlink !== 1 || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o077) !== 0 || stats.size > 512) throw new Error("release_cleanup_tombstone_receipt_invalid");
+      const value: unknown = JSON.parse(await handle.readFile("utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value) ||
+        Object.keys(value).sort().join(",") !== "birthtime_ns,dev,ino,sha") throw new Error("release_cleanup_tombstone_receipt_invalid");
+      const record = value as Record<string, unknown>;
+      if (typeof record.sha !== "string" || !/^[0-9a-f]{40}$/.test(record.sha) ||
+        ![record.dev,record.ino,record.birthtime_ns].every((part) => typeof part === "string" && /^\d{1,30}$/.test(part)) ||
+        record.birthtime_ns === "0") throw new Error("release_cleanup_tombstone_receipt_invalid");
+      return record as unknown as CleanupTombstone;
+    } finally { await handle.close(); }
+  }
+
+  private async clearCleanupTombstone(): Promise<void> {
+    await fs.unlink(this.cleanupTombstoneReceiptPath());
+    await fsyncDirectory(this.policy.control_root);
+  }
+
+  private async recoverCleanupTombstone(): Promise<string | null> {
+    const receipt = await this.readCleanupTombstone();
+    if (!receipt) return null;
+    const tombstone = this.cleanupTombstonePath(receipt.sha);
+    let stats: Awaited<ReturnType<typeof fs.lstat>>;
+    try { stats = await fs.lstat(tombstone, { bigint: true }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // The crash preceded rename, or followed complete deletion. Replan any
+      // still-present original release under current protection rules.
+      await this.clearCleanupTombstone();
+      return null;
+    }
+    if (!stats.isDirectory() || stats.isSymbolicLink() || stats.dev.toString() !== receipt.dev ||
+      stats.ino.toString() !== receipt.ino || stats.birthtimeNs.toString() !== receipt.birthtime_ns ||
+      stats.uid !== BigInt(process.getuid?.() ?? -1) || (stats.mode & 0o022n) !== 0n) {
+      throw new Error("release_cleanup_tombstone_identity_mismatch");
+    }
+    const pointers = await this.observe();
+    if (!pointers.current_sha || (pointers.receipt &&
+      (pointers.receipt.to_sha !== pointers.current_sha || pointers.receipt.from_sha !== pointers.previous_sha))) {
+      throw new Error("release_cleanup_tombstone_pointer_unsafe");
+    }
+    await this.makeMutableForRemoval(tombstone);
+    await this.removeGeneratedTree(this.policy.release_root, tombstone);
+    await this.clearCleanupTombstone();
+    return receipt.sha;
+  }
+
+  private async removeReleaseWithTombstone(releasePath: string, sha: string): Promise<void> {
+    const stats = await fs.lstat(releasePath, { bigint: true });
+    if (stats.birthtimeNs <= 0n) throw new Error("release_cleanup_birthtime_unavailable");
+    const receipt: CleanupTombstone = { sha, dev: stats.dev.toString(), ino: stats.ino.toString(),
+      birthtime_ns: stats.birthtimeNs.toString() };
+    const tombstone = this.cleanupTombstonePath(sha);
+    try { await fs.lstat(tombstone); throw new Error("release_cleanup_tombstone_exists"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    await writeAtomic(this.cleanupTombstoneReceiptPath(), `${JSON.stringify(receipt)}\n`);
+    try {
+      await fs.rename(releasePath, tombstone);
+      const moved = await fs.lstat(tombstone, { bigint: true });
+      if (!moved.isDirectory() || moved.dev.toString() !== receipt.dev || moved.ino.toString() !== receipt.ino ||
+        moved.birthtimeNs.toString() !== receipt.birthtime_ns) {
+        throw new Error("release_cleanup_tombstone_identity_mismatch");
+      }
+      await fsyncDirectory(this.policy.release_root);
+      await this.makeMutableForRemoval(tombstone);
+      await this.removeGeneratedTree(this.policy.release_root, tombstone);
+      await this.clearCleanupTombstone();
+    } catch { throw new CleanupTombstonePendingError(); }
   }
 
   private async ensureRoots(): Promise<void> {

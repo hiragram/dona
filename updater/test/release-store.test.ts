@@ -177,7 +177,7 @@ describe("ReleaseStore", () => {
     const resumeRemoval = new Promise<void>((resolve) => { resume = resolve; });
     const originalRm = fs.rm.bind(fs);
     mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
-      if (args[0] === target) { entered(); await resumeRemoval; }
+      if (args[0] === path.join(policy.release_root, `.cleanup-${targetSha}`)) { entered(); await resumeRemoval; }
       return originalRm(...args);
     });
     try {
@@ -198,6 +198,59 @@ describe("ReleaseStore", () => {
       resume();
       mock.restoreAll();
     }
+  });
+
+  test("resumes an identity-bound tombstone after partial release removal", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidateSha = "b".repeat(40);
+    const original = await installRelease(policy, candidateSha);
+    const store = new ReleaseStore(policy);
+    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    const remove = fs.rm.bind(fs);
+    let interrupted = false;
+    mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+      if (!interrupted && args[0] === path.join(policy.release_root, `.cleanup-${candidateSha}`)) {
+        interrupted = true;
+        await fs.unlink(path.join(String(args[0]), "release-manifest.json"));
+        throw new Error("injected_io_error");
+      }
+      return remove(...args);
+    });
+    try {
+      await assert.rejects(store.cleanup(protectedShas), /release_cleanup_tombstone_pending/);
+    } finally { mock.restoreAll(); }
+    await assert.rejects(fs.lstat(original), { code: "ENOENT" });
+    const replacement = await installRelease(policy, candidateSha);
+    assert.ok((await new ReleaseStore(policy).cleanup(protectedShas)).includes(candidateSha));
+    assert.equal((await fs.lstat(replacement)).isDirectory(), true);
+    await assert.rejects(fs.lstat(path.join(policy.release_root, `.cleanup-${candidateSha}`)), { code: "ENOENT" });
+    await assert.rejects(fs.lstat(path.join(policy.control_root, "release-cleanup-tombstone.json")), { code: "ENOENT" });
+  });
+
+  test("preserves a replacement tombstone whose inode does not match the saved deletion", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const candidateSha = "b".repeat(40);
+    await installRelease(policy, candidateSha);
+    const store = new ReleaseStore(policy);
+    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    const tombstone = path.join(policy.release_root, `.cleanup-${candidateSha}`);
+    const remove = fs.rm.bind(fs);
+    mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+      if (args[0] === tombstone) throw new Error("injected_io_error");
+      return remove(...args);
+    });
+    try { await assert.rejects(store.cleanup(protectedShas), /release_cleanup_tombstone_pending/); }
+    finally { mock.restoreAll(); }
+    const originalTombstone = path.join(root, "saved-tombstone");
+    await fs.rename(tombstone, originalTombstone);
+    await fs.mkdir(tombstone, { mode: 0o700 });
+    await assert.rejects(new ReleaseStore(policy).cleanup(protectedShas), /release_cleanup_tombstone_identity_mismatch/);
+    assert.equal((await fs.lstat(tombstone)).isDirectory(), true);
+    assert.equal((await fs.lstat(originalTombstone)).isDirectory(), true);
   });
 
   test("rejects a staging tree that exceeds the cleanup scan deadline before publish", async () => {
