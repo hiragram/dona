@@ -403,7 +403,7 @@ function ensureLegacyNotificationMigration(db: Database.Database): void {
     reason TEXT NOT NULL,
     decision TEXT NOT NULL CHECK (decision IN ('held','auto_eligible')),
     detected_at TEXT NOT NULL,
-    UNIQUE(job_id,job_updated_at)
+    UNIQUE(job_id,job_updated_at,reason,group_transition)
   );
   CREATE INDEX IF NOT EXISTS job_notification_candidates_decision_idx
     ON job_notification_reconciliation_candidates(decision,detected_at,candidate_id);
@@ -413,10 +413,35 @@ function ensureLegacyNotificationMigration(db: Database.Database): void {
   CREATE TRIGGER IF NOT EXISTS job_notification_candidates_no_delete
     BEFORE DELETE ON job_notification_reconciliation_candidates
     BEGIN SELECT RAISE(ABORT,'job_notification_candidate_append_only'); END;`);
+  const candidateSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='job_notification_reconciliation_candidates'")
+    .get() as {sql:string};
+  if (candidateSchema.sql.includes('UNIQUE(job_id,job_updated_at)')) {
+    db.transaction(() => {
+      db.exec(`DROP TRIGGER job_notification_candidates_no_update;
+        DROP TRIGGER job_notification_candidates_no_delete;
+        DROP INDEX job_notification_candidates_decision_idx;
+        CREATE TABLE job_notification_reconciliation_candidates_next (
+          candidate_id INTEGER PRIMARY KEY, job_id TEXT NOT NULL, source_event_id TEXT NOT NULL,
+          job_status TEXT NOT NULL, job_updated_at TEXT NOT NULL, original_terminal_at TEXT,
+          destination_age_seconds INTEGER, prior_event_count INTEGER NOT NULL,
+          group_mode TEXT, group_transition TEXT, reason TEXT NOT NULL,
+          decision TEXT NOT NULL CHECK (decision IN ('held','auto_eligible')), detected_at TEXT NOT NULL,
+          UNIQUE(job_id,job_updated_at,reason,group_transition));
+        INSERT INTO job_notification_reconciliation_candidates_next SELECT * FROM job_notification_reconciliation_candidates;
+        DROP TABLE job_notification_reconciliation_candidates;
+        ALTER TABLE job_notification_reconciliation_candidates_next RENAME TO job_notification_reconciliation_candidates;
+        CREATE INDEX job_notification_candidates_decision_idx
+          ON job_notification_reconciliation_candidates(decision,detected_at,candidate_id);
+        CREATE TRIGGER job_notification_candidates_no_update BEFORE UPDATE ON job_notification_reconciliation_candidates
+          BEGIN SELECT RAISE(ABORT,'job_notification_candidate_append_only'); END;
+        CREATE TRIGGER job_notification_candidates_no_delete BEFORE DELETE ON job_notification_reconciliation_candidates
+          BEGIN SELECT RAISE(ABORT,'job_notification_candidate_append_only'); END;`);
+    }).immediate();
+  }
   db.prepare("INSERT OR IGNORE INTO job_notification_policy_epoch(singleton,started_at) VALUES(1,?)").run(nowUtc());
 }
 
-function snapshotNotificationCandidates(db: Database.Database): void {
+function snapshotNotificationCandidates(db: Database.Database, jobId?: string): void {
   const epoch = db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
     .get() as {started_at:string};
   const detectedAt = nowUtc();
@@ -446,9 +471,25 @@ function snapshotNotificationCandidates(db: Database.Database): void {
     WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
       AND json_extract(b.owner_json,'$.kind')='slack_thread'
       AND j.completion_event_id IS NULL
-      AND NOT EXISTS (SELECT 1 FROM job_notification_reconciliation_candidates c
-        WHERE c.job_id=j.job_id AND c.job_updated_at=j.updated_at)`)
-    .run(detectedAt,epoch.started_at,epoch.started_at,detectedAt);
+      AND (? IS NULL OR j.job_id=?)`)
+    .run(detectedAt,epoch.started_at,epoch.started_at,detectedAt,jobId??null,jobId??null);
+}
+
+function recordHeldGroupTransitionCandidate(db: Database.Database, jobId: string, transition: JobGroupTransition): void {
+  const detectedAt = nowUtc();
+  db.prepare(`INSERT OR IGNORE INTO job_notification_reconciliation_candidates (
+    job_id,source_event_id,job_status,job_updated_at,original_terminal_at,
+    destination_age_seconds,prior_event_count,group_mode,group_transition,reason,decision,detected_at)
+    SELECT j.job_id,j.source_event_id,j.status,j.updated_at,COALESCE(j.completed_at,j.updated_at),
+      CASE WHEN j.thread_ts IS NOT NULL AND CAST(j.thread_ts AS REAL)>0
+        THEN MAX(0,CAST((julianday(?) - julianday(CAST(j.thread_ts AS REAL)/86400.0 + 2440587.5))*86400 AS INTEGER))
+        ELSE NULL END,
+      (SELECT COUNT(*) FROM events e WHERE e.source='dona_job'
+        AND substr(e.external_event_id,1,length(j.job_id)+1)=j.job_id||':'),
+      g.notification_mode,?,'pre_policy_'||?||'_pending','held',?
+    FROM jobs j JOIN job_groups g ON g.source_event_id=j.source_event_id
+    WHERE j.job_id=? AND g.notification_mode='grouped' AND g.all_terminal_event_id IS NULL`)
+    .run(detectedAt,transition,transition,detectedAt,jobId);
 }
 
 function classifyMigratedLegacyNotifications(db: Database.Database): void {
@@ -852,7 +893,24 @@ export class DispatcherDatabase {
       }
       // Routing and legacy status recovery must finish before the durable
       // candidate snapshot; no notification worker is running yet.
-      this.db.transaction(() => snapshotNotificationCandidates(this.db)).immediate();
+      this.db.transaction(() => {
+        snapshotNotificationCandidates(this.db);
+        const epoch=this.db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
+          .get() as {started_at:string};
+        const groups=this.db.prepare(`SELECT g.source_event_id,g.attention_event_id FROM job_groups g
+          WHERE g.notification_mode='grouped' AND g.attention_event_id IS NOT NULL
+            AND g.all_terminal_event_id IS NULL`).all() as Array<{source_event_id:string;attention_event_id:string}>;
+        for(const row of groups) {
+          const group=this.getJobGroupRequired(row.source_event_id);
+          if(!this.groupCanClaimAllTerminal(row.source_event_id,group)) continue;
+          const payload=JSON.parse(this.getRequired(row.attention_event_id).payload_json) as {job_id?:string};
+          if(!payload.job_id) continue;
+          const job=this.getJob(payload.job_id);
+          if(job?.source_event_id===row.source_event_id && job.created_at<epoch.started_at &&
+            readEventJobBinding(this.db,row.source_event_id)?.owner.kind==="slack_thread")
+            recordHeldGroupTransitionCandidate(this.db,job.job_id,"all_terminal");
+        }
+      }).immediate();
     } catch (error) {
       this.db.close();
       throw error;
@@ -1534,6 +1592,7 @@ export class DispatcherDatabase {
         (job_id,source_event_id,job_status,last_error_code,evidence_sha256,decision,reconciled_at)
         VALUES (?,?,?,?,?,'not_sent',?)`)
         .run(jobId,job.source_event_id,job.status,job.last_error_code,evidenceSha256,reconciledAt);
+      snapshotNotificationCandidates(this.db,jobId);
       return {job_id:jobId,state:"not_sent" as const,reconciled_at:reconciledAt};
     }).immediate();
   }
@@ -2516,24 +2575,45 @@ export class DispatcherDatabase {
   }
 
   enqueueJobNotification(jobId: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): EnqueueResult {
-    return this.db.transaction(() => {
+    const outcome = this.db.transaction(() => {
       const job = this.getJobRequired(jobId);
       this.assertJobSourceMatchesThread(jobId, job.source_event_id);
       const binding = readEventJobBinding(this.db, job.source_event_id)!;
       const policy = this.db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
         .get() as {started_at:string};
       if (binding.owner.kind === "slack_thread" && job.created_at < policy.started_at) {
+        const group = this.getJobGroup(job.source_event_id);
+        if (group && this.groupCanClaimAllTerminal(job.source_event_id,group)) {
+          recordHeldGroupTransitionCandidate(this.db,jobId,"all_terminal");
+          return null;
+        }
+        if(group?.all_terminal_event_id) {
+          const existing=this.getRequired(group.all_terminal_event_id);
+          if(existing.source!=="dona_job") throw new Error("historical_notification_event_invalid");
+          return {row:existing,duplicate:true,payloadMismatch:false};
+        }
         if (job.completion_event_id) {
           const existing = this.get(job.completion_event_id);
           if (!existing || existing.source !== "dona_job") throw new Error("historical_notification_event_invalid");
+          if(group?.notification_mode==="grouped") {
+            const desired=this.buildJobGroupSnapshot(job.source_event_id,group,job).transition;
+            const oldPayload=JSON.parse(existing.payload_json) as {group?:{transition?:string}};
+            if(desired==="attention" && oldPayload.group?.transition!=="attention") {
+              recordHeldGroupTransitionCandidate(this.db,jobId,"attention");
+              return null;
+            }
+          }
           return {row:existing,duplicate:true,payloadMismatch:false};
         }
-        throw new Error("historical_notification_requires_reconciliation");
+        snapshotNotificationCandidates(this.db,jobId);
+        return null;
       }
       return binding.owner.kind === "schedule"
         ? this.materializeJobCompletion(jobId, at, notificationHook)
         : this.enqueueRegularJobNotification(jobId, at, notificationHook);
     }).immediate();
+    if (outcome === null) throw new Error("historical_notification_requires_reconciliation");
+    return outcome;
   }
 
   private enqueueJobNotificationAfterRecovery(jobId: string, at: Date): EnqueueResult | null {
@@ -2541,12 +2621,26 @@ export class DispatcherDatabase {
     const binding = readEventJobBinding(this.db, job.source_event_id);
     const policy = this.db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
       .get() as {started_at:string};
-    if (binding?.owner.kind === "slack_thread" && job.created_at < policy.started_at &&
-        job.completion_event_id === null) {
-      // This method is called inside the recovery transaction. Keep the job and
-      // its recovery audit, but atomically record that its old thread needs review.
-      snapshotNotificationCandidates(this.db);
-      return null;
+    if (binding?.owner.kind === "slack_thread" && job.created_at < policy.started_at) {
+      const group=this.getJobGroup(job.source_event_id);
+      if(group && this.groupCanClaimAllTerminal(job.source_event_id,group)) {
+        recordHeldGroupTransitionCandidate(this.db,jobId,"all_terminal");
+        return null;
+      }
+      if(group?.notification_mode==="grouped" && job.completion_event_id) {
+        const desired=this.buildJobGroupSnapshot(job.source_event_id,group,job).transition;
+        const existing=this.getRequired(job.completion_event_id);
+        const oldPayload=JSON.parse(existing.payload_json) as {group?:{transition?:string}};
+        if(desired==="attention" && oldPayload.group?.transition!=="attention") {
+          recordHeldGroupTransitionCandidate(this.db,jobId,"attention");
+          return null;
+        }
+      }
+      if(job.completion_event_id === null) {
+        // Keep recovery and its audit, while holding the old thread notification.
+        snapshotNotificationCandidates(this.db,jobId);
+        return null;
+      }
     }
     return this.enqueueJobNotification(jobId,at);
   }
@@ -3757,6 +3851,12 @@ export class DispatcherDatabase {
       VALUES(?,?,?,?,?,?,?)`)
       .run(jobId, job.source_event_id, attentionEventId, status, kind, resolutionEventId, at.toISOString());
     this.handoffResolvedAttention(attentionEventId,at);
+    const group=this.getJobGroup(job.source_event_id);
+    const policy=this.db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
+      .get() as {started_at:string};
+    if(job.created_at<policy.started_at && readEventJobBinding(this.db,job.source_event_id)?.owner.kind==="slack_thread" &&
+      group && this.groupCanClaimAllTerminal(job.source_event_id,group))
+      recordHeldGroupTransitionCandidate(this.db,jobId,"all_terminal");
   }
 
   private handoffResolvedAttention(attentionEventId: string, at: Date): void {
@@ -3797,17 +3897,29 @@ export class DispatcherDatabase {
     to: JobStatus,
     values: Record<string, string | null>,
   ): void {
-    const timestamp = nowUtc();
-    const binding=readEventJobBinding(this.db,this.getJobRequired(jobId).source_event_id),persisted={...values};
-    const job=this.getJobRequired(jobId);
-    if(binding?.owner.kind==="schedule"&&typeof persisted.last_error_message==="string") persisted.last_error_message=this.safeNotificationError(persisted.last_error_message,true,job);
-    const assignments = [...Object.keys(persisted).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
-    const params = [...Object.values(persisted), to, timestamp, jobId, ...from];
-    const placeholders = from.map(() => "?").join(", ");
-    const changed = this.db.prepare(
-      `UPDATE jobs SET ${assignments.join(", ")} WHERE job_id = ? AND status IN (${placeholders})`,
-    ).run(...params).changes;
-    if (changed !== 1) throw new Error(`Invalid status transition for job ${jobId} to ${to}`);
+    this.db.transaction(() => {
+      const timestamp = nowUtc();
+      const binding=readEventJobBinding(this.db,this.getJobRequired(jobId).source_event_id),persisted={...values};
+      const job=this.getJobRequired(jobId);
+      if(binding?.owner.kind==="schedule"&&typeof persisted.last_error_message==="string") persisted.last_error_message=this.safeNotificationError(persisted.last_error_message,true,job);
+      const assignments = [...Object.keys(persisted).map((key) => `${key} = ?`), "status = ?", "updated_at = ?"];
+      const params = [...Object.values(persisted), to, timestamp, jobId, ...from];
+      const placeholders = from.map(() => "?").join(", ");
+      const changed = this.db.prepare(
+        `UPDATE jobs SET ${assignments.join(", ")} WHERE job_id = ? AND status IN (${placeholders})`,
+      ).run(...params).changes;
+      if (changed !== 1) throw new Error(`Invalid status transition for job ${jobId} to ${to}`);
+      if (jobNotificationStatuses.has(to)) {
+        const policy = this.db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
+          .get() as {started_at:string};
+        if (binding?.owner.kind === "slack_thread" && job.created_at < policy.started_at) {
+          snapshotNotificationCandidates(this.db,jobId);
+          const group=this.getJobGroup(job.source_event_id);
+          if(group && this.groupCanClaimAllTerminal(job.source_event_id,group))
+            recordHeldGroupTransitionCandidate(this.db,jobId,"all_terminal");
+        }
+      }
+    }).immediate();
   }
 
   private transition(
