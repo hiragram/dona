@@ -100,6 +100,19 @@ describe("ReleaseStore", () => {
     assert.ok((await fs.readdir(policy.control_root)).some((entry) => entry.startsWith("release-cleanup-cursor.json.invalid.")));
   });
 
+  test("stops cleanup when an activation receipt expects a missing previous pointer", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const target = await installRelease(policy, targetSha);
+    const store = new ReleaseStore(policy);
+    await store.activate(row(), target);
+    await fs.unlink(policy.previous_pointer);
+    await assert.rejects(store.cleanupPlan(new Set([targetSha])), /retention_previous_pointer_missing/);
+    await assert.rejects(store.cleanup(new Set([targetSha])), /retention_previous_pointer_missing/);
+    assert.equal((await fs.lstat(path.join(policy.release_root, currentSha))).isDirectory(), true);
+  });
+
   test("rejects an oversized manifest before parsing cleanup candidates", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
