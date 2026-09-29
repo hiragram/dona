@@ -2274,15 +2274,17 @@ export class DispatcherDatabase {
       }
       const result=this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
       if(row.job_id) {
+        const discardedPublish=this.db.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'")
+          .get(row.job_id)!==undefined;
         this.db.prepare("DELETE FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").run(row.job_id);
-        this.db.prepare(`UPDATE jobs SET status=?,completed_at=?,
+        this.db.prepare(`UPDATE jobs SET status=?,completed_at=?,result_json=CASE WHEN ? THEN NULL ELSE result_json END,
           last_error_code=CASE WHEN (dispatch_started_at IS NOT NULL OR prompt_accepted_at IS NOT NULL OR herdr_workspace_id IS NOT NULL
               OR COALESCE(last_error_code,'') IN ('stale_preparing_agent_unverified','legacy_agent_sandbox_unknown'))
             AND COALESCE(last_error_code,'') NOT IN ('invalid_result_agent_stopped','agent_not_found','agent_not_running')
             AND NOT EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)
             THEN 'schedule_reconcile_worker_unverified' ELSE NULL END,
           last_error_message=NULL,updated_at=? WHERE job_id=? AND status IN ('needs_review','blocked')`)
-          .run(outcome,reconciledAt,reconciledAt,row.job_id);
+          .run(outcome,reconciledAt,discardedPublish?1:0,reconciledAt,row.job_id);
         this.db.prepare("UPDATE job_completion_results SET work_state=? WHERE job_id=? AND work_state='needs_review'").run(outcome,row.job_id);
       }
       return result;
@@ -2409,6 +2411,13 @@ export class DispatcherDatabase {
           .run(notice.event_id,notice.event_id,job.source_event_id);
         this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=? AND completion_event_id=?")
           .run(jobId,notice.event_id);
+      } else if(notice&&["dispatching","waiting_agent"].includes(notice.status)) {
+        const at=nowUtc();
+        this.db.prepare(`UPDATE events SET status='needs_review',updated_at=?,
+          last_error_code='published_result_notification_reconciliation_required',last_error_message=NULL
+          WHERE event_id=? AND status IN ('dispatching','waiting_agent')`).run(at,notice.event_id);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=?")
+          .run(notice.event_id);
       }
     }
     if(["completed","failed","cancelled"].includes(job.status)) {
@@ -2419,7 +2428,7 @@ export class DispatcherDatabase {
       "Published Result requires file and database reconciliation");
     if(binding?.owner.kind==="schedule") {
       const run=this.scheduler.getRun(binding.owner.run_id);
-      if(run&&["started","completed","failed","needs_review"].includes(run.status))
+      if(run&&["started","completed","failed","cancelled","needs_review"].includes(run.status))
         this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,jobId,
           new Date(Math.floor(Date.now()/1000)*1000).toISOString().replace(".000Z","Z"),job.source_event_id);
     }

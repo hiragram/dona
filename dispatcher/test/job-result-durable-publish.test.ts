@@ -167,6 +167,21 @@ describe("永続Job Result公開", () => {
     } finally {database.close();}
   });
 
+  test("処理中の完了通知は配送不明として停止する",async()=>{
+    const {database,job,candidate,publisher,config}=await fixture();
+    try {
+      await publisher.commit(candidate());
+      const notice=database.enqueueJobNotification(job.job_id).row;
+      database.beginDispatch(notice.event_id,`${config.resultsDir}/${notice.event_id}.json`);
+      database.markWaiting(notice.event_id);
+      await fs.unlink(job.result_path);
+      assert.equal(database.quarantineIncompletePublishedResults(),1);
+      assert.equal(database.get(notice.event_id)?.status,"needs_review");
+      assert.equal(database.get(notice.event_id)?.last_error_code,"published_result_notification_reconciliation_required");
+      assert.equal(database.getJob(job.job_id)?.status,"needs_review");
+    } finally {database.close();}
+  });
+
   for (const point of ["after_reserve","before_rename","after_rename","before_db_commit","after_db_commit"] as const) {
     test(`${point}の応答喪失をreceiptで照合する`, async () => {
       const { database, job, candidate } = await fixture();

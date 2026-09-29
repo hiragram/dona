@@ -1902,9 +1902,14 @@ test("公開予約の隔離をschedule runへ同期しadminが失敗確定でき
   dispatcher.quarantinePublishedJobResult(job.job_id,digest);
   assert.equal(dispatcher.getJob(job.job_id)?.status,"needs_review");
   assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+  raw.prepare("UPDATE jobs SET result_json=? WHERE job_id=?")
+    .run('{"status":"completed","summary":"unverified success"}',job.job_id);
   dispatcher.reconcileScheduledRun(run.run_id,"failed",new Date(due));
   assert.equal(dispatcher.getJob(job.job_id)?.status,"failed");
+  assert.equal(dispatcher.getJob(job.job_id)?.result_json,null);
   assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
+  raw.prepare("UPDATE jobs SET status='cancelled' WHERE job_id=?").run(job.job_id);
+  raw.prepare("UPDATE schedule_runs SET status='cancelled' WHERE run_id=?").run(run.run_id);
   raw.prepare(`INSERT INTO job_result_publish_receipts
     (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at,committed_at)
     VALUES(?,?,?,?,?,?,?,'committed',?,?)`)
@@ -1934,14 +1939,22 @@ test("completion rowのない隔離済みschedule receiptとfileを7日後に消
   fs.writeFileSync(`${job.result_path}.publish-${digest}.tmp`,"private temp");
   raw.prepare("UPDATE events SET result_json=? WHERE event_id=?").run('{"summary":"private event result"}',run.event_id);
   const cutoff=`${new Date(Date.parse(dispatcher.getJob(job.job_id)!.updated_at)+604801000).toISOString().slice(0,19)}Z`;
+  const before=repo.retentionPlan(cutoff);
+  assert.equal(before.job_contents,1);
+  assert.equal(before.event_contents,1);
+  assert.equal(before.result_files,1);
   repo.purge(cutoff);
-  assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
+  assert.equal((raw.prepare("SELECT envelope_json FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id) as {envelope_json:string}).envelope_json,"{}");
   assert.equal(fs.existsSync(job.result_path),false);
   assert.equal(fs.existsSync(`${job.result_path}.publish-${digest}.tmp`),false);
   assert.equal(dispatcher.getJob(job.job_id)?.objective,"[deleted]");
   const source=dispatcher.get(run.event_id!)!;
   assert.equal((JSON.parse(source.payload_json) as {work:{objective:string}}).work.objective,"[deleted]");
   assert.equal(source.result_json,null);
+  assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,"published_result_retention_purged");
+  assert.equal(repo.retentionPlan(cutoff).result_files,0);
+  repo.purge(cutoff);
+  assert.equal(repo.retentionPlan(cutoff).result_files,0);
 });
 
 test("schedule固有の不受理Resultは予約receiptを残さない",()=>{
