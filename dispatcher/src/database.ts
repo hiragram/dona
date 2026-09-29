@@ -392,7 +392,7 @@ function ensureLegacyNotificationMigration(db: Database.Database): void {
   CREATE TABLE IF NOT EXISTS job_notification_reconciliation_candidates (
     candidate_id INTEGER PRIMARY KEY,
     job_id TEXT NOT NULL,
-    source_event_id TEXT NOT NULL REFERENCES events(event_id),
+    source_event_id TEXT NOT NULL,
     job_status TEXT NOT NULL,
     job_updated_at TEXT NOT NULL,
     original_terminal_at TEXT,
@@ -426,7 +426,7 @@ function snapshotNotificationCandidates(db: Database.Database): void {
     job_id,source_event_id,job_status,job_updated_at,original_terminal_at,
     destination_age_seconds,prior_event_count,group_mode,group_transition,reason,decision,detected_at)
     SELECT j.job_id,j.source_event_id,j.status,j.updated_at,
-      CASE WHEN j.status IN ('blocked','needs_review') THEN j.updated_at ELSE j.completed_at END,
+      COALESCE(j.completed_at,j.updated_at),
       CASE WHEN j.thread_ts IS NOT NULL AND CAST(j.thread_ts AS REAL)>0
         THEN MAX(0,CAST((julianday(?) - julianday(CAST(j.thread_ts AS REAL)/86400.0 + 2440587.5))*86400 AS INTEGER))
         ELSE NULL END,
@@ -1804,7 +1804,7 @@ export class DispatcherDatabase {
       }
       if(this.operatorResultFile(job).sha256!==input.expectedResultSha256)
         throw new Error("operator_result_drift");
-      this.enqueueJobNotification(job.job_id,at);
+      this.enqueueJobNotificationAfterRecovery(job.job_id,at);
       const settled=this.getJobRequired(job.job_id);
       this.db.prepare(`INSERT INTO job_operator_assertion_recoveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(job.job_id,assertion.event_id,actor,tenant,workspace,channel,assertion.occurred_at,
@@ -1881,7 +1881,7 @@ export class DispatcherDatabase {
       this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
       if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.markTerminalWorkerStopProof(jobId);
-      this.enqueueJobNotification(jobId,at);
+      this.enqueueJobNotificationAfterRecovery(jobId,at);
       const accepted=this.getJobRequired(jobId);
       this.db.prepare(`INSERT INTO job_late_result_reconciliations VALUES(?,?,?,?,?,?,?,?,?,?)`)
         .run(jobId,expectedUpdatedAt,expectedCause,expectedDigest,stopReceiptId,sideEffectsEvidenceSha256,
@@ -1932,7 +1932,7 @@ export class DispatcherDatabase {
         const payload=JSON.parse(this.getRequired(group.attention_event_id).payload_json) as {job_id?:string};
         if(payload.job_id===jobId) this.recordAttentionResolution(jobId, group.attention_event_id, "failed", "operator_reconcile", null, at);
       }
-      this.enqueueJobNotification(jobId, at);
+      this.enqueueJobNotificationAfterRecovery(jobId, at);
       return this.getJobRequired(jobId);
     }).immediate();
   }
@@ -1958,7 +1958,7 @@ export class DispatcherDatabase {
       }
       if (!this.attentionNotificationSettled(event)) throw new Error("attention_notification_requires_reconciliation");
       this.recordAttentionResolution(jobId, attentionEventId, "failed", "operator_reconcile", null, at);
-      this.enqueueJobNotification(jobId, at);
+      this.enqueueJobNotificationAfterRecovery(jobId, at);
       return this.getJobRequired(jobId);
     }).immediate();
   }
@@ -2008,7 +2008,7 @@ export class DispatcherDatabase {
         .run(at.toISOString(),at.toISOString(),jobId,expectedUpdatedAt).changes;
       if (changed !== 1) throw new Error("job_changed_since_review");
       this.recordAttentionResolution(jobId,attentionEventId,"failed","operator_reconcile",null,at);
-      this.enqueueJobNotification(jobId,at);
+      this.enqueueJobNotificationAfterRecovery(jobId,at);
       return this.getJobRequired(jobId);
     }).immediate();
   }
@@ -2534,6 +2534,21 @@ export class DispatcherDatabase {
         ? this.materializeJobCompletion(jobId, at, notificationHook)
         : this.enqueueRegularJobNotification(jobId, at, notificationHook);
     }).immediate();
+  }
+
+  private enqueueJobNotificationAfterRecovery(jobId: string, at: Date): EnqueueResult | null {
+    const job = this.getJobRequired(jobId);
+    const binding = readEventJobBinding(this.db, job.source_event_id);
+    const policy = this.db.prepare("SELECT started_at FROM job_notification_policy_epoch WHERE singleton=1")
+      .get() as {started_at:string};
+    if (binding?.owner.kind === "slack_thread" && job.created_at < policy.started_at &&
+        job.completion_event_id === null) {
+      // This method is called inside the recovery transaction. Keep the job and
+      // its recovery audit, but atomically record that its old thread needs review.
+      snapshotNotificationCandidates(this.db);
+      return null;
+    }
+    return this.enqueueJobNotification(jobId,at);
   }
 
   private enqueueRegularJobNotification(
