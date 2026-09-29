@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import Database from "better-sqlite3";
 
 import type { DispatcherConfig } from "./config.js";
 import { jobProgressPath, workspaceFromJob } from "./job-prompt.js";
@@ -11,6 +12,17 @@ interface ArtifactObservation {
   kind: "worktree" | "progress" | "result";
   cleanup_state: ScanState;
   allocated_bytes: number | null;
+}
+
+export function readJobArtifactInventoryPage(databasePath: string, afterJobId: string, limit: number): JobRow[] {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 21 ||
+    (afterJobId !== "" && !/^job_[0-9a-hjkmnp-tv-z]{26}$/.test(afterJobId)))
+    throw new Error("artifact_inventory_cursor_or_limit_invalid");
+  const database = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    return database.prepare(`SELECT job_id,workspace_json,workspace_path,result_path,status,created_at,completed_at
+      FROM jobs WHERE job_id>? ORDER BY job_id LIMIT ?`).all(afterJobId, limit) as JobRow[];
+  } finally { database.close(); }
 }
 
 async function scanArtifact(root: string, trustedRoot: string,

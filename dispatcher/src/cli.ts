@@ -12,7 +12,7 @@ import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { liveSessionReceiptRetentionSeconds } from "./live-session.js";
-import { inventoryJobArtifacts } from "./job-artifact-inventory.js";
+import { inventoryJobArtifacts, readJobArtifactInventoryPage } from "./job-artifact-inventory.js";
 
 function projectLiveJob(row: Record<string, unknown>): Record<string, unknown> {
   const safeKeys = [
@@ -75,6 +75,23 @@ async function main(): Promise<void> {
   }
   if (!["event", "job", "scheduler"].includes(args[0]!)) usage();
   const command = args[1];
+  if (args[0] === "job" && command === "artifact-inventory") {
+    const cursorAt = args.indexOf("--cursor"), limitAt = args.indexOf("--limit");
+    if (args.length !== 2 + (cursorAt < 0 ? 0 : 2) + (limitAt < 0 ? 0 : 2)) usage();
+    const cursor = cursorAt < 0 ? "" : eventIdAt(args, cursorAt + 1);
+    const limit = limitAt < 0 ? 10 : Number(eventIdAt(args, limitAt + 1));
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) usage();
+    const rows = readJobArtifactInventoryPage(config.databasePath, cursor, limit + 1);
+    const selected = rows.slice(0, limit);
+    const artifacts = [];
+    const budget = { entries: 0, deadline: performance.now() + 3_000 };
+    for (const row of selected) artifacts.push(await inventoryJobArtifacts(row, config, budget));
+    console.log(JSON.stringify({ schema_version: 1, dry_run: true, artifacts,
+      next_cursor: rows.length > limit ? selected.at(-1)?.job_id : null,
+      size_is_complete: artifacts.every((job) => job.artifacts.every((item) => item.cleanup_state === "present" || item.cleanup_state === "missing")),
+    }, null, 2));
+    return;
+  }
   const database = new DispatcherDatabase(config.databasePath, {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
@@ -98,23 +115,6 @@ async function main(): Promise<void> {
       usage();
     }
     if (args[0] === "job") {
-      if (command === "artifact-inventory") {
-        const cursorAt = args.indexOf("--cursor"), limitAt = args.indexOf("--limit");
-        if (args.length !== 2 + (cursorAt < 0 ? 0 : 2) + (limitAt < 0 ? 0 : 2)) usage();
-        const cursor = cursorAt < 0 ? "" : eventIdAt(args, cursorAt + 1);
-        const limit = limitAt < 0 ? 10 : Number(eventIdAt(args, limitAt + 1));
-        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) usage();
-        const rows = database.listJobsForArtifactInventory(cursor, limit + 1);
-        const selected = rows.slice(0, limit);
-        const artifacts = [];
-        const budget = { entries: 0, deadline: performance.now() + 3_000 };
-        for (const row of selected) artifacts.push(await inventoryJobArtifacts(row, config, budget));
-        console.log(JSON.stringify({ schema_version: 1, dry_run: true, artifacts,
-          next_cursor: rows.length > limit ? selected.at(-1)?.job_id : null,
-          size_is_complete: artifacts.every((job) => job.artifacts.every((item) => item.cleanup_state === "present" || item.cleanup_state === "missing")),
-        }, null, 2));
-        return;
-      }
       if (command === "list") {
         const statusIndex = args.indexOf("--status");
         const status = statusIndex === -1 ? undefined : args[statusIndex + 1];

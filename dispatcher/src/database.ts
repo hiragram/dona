@@ -1248,13 +1248,6 @@ export class DispatcherDatabase {
     return this.db.prepare("SELECT * FROM jobs ORDER BY created_at LIMIT ?").all(limit) as JobRow[];
   }
 
-  listJobsForArtifactInventory(afterJobId: string, limit: number): JobRow[] {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 21 ||
-      (afterJobId !== "" && !/^job_[0-9a-z]{26}$/.test(afterJobId))) throw new Error("artifact_inventory_cursor_or_limit_invalid");
-    return this.db.prepare("SELECT * FROM jobs WHERE job_id>? ORDER BY job_id LIMIT ?")
-      .all(afterJobId, limit) as JobRow[];
-  }
-
   listLegacySharedGrantJobs():JobRow[] {
     return this.db.prepare(`SELECT j.* FROM jobs j JOIN legacy_job_agents_to_stop l USING(job_id) WHERE l.stopped_at IS NULL
       ORDER BY j.created_at,j.job_id`).all() as JobRow[];

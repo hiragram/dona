@@ -3,8 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import Database from "better-sqlite3";
 
-import { inventoryJobArtifacts } from "../src/job-artifact-inventory.js";
+import { inventoryJobArtifacts, readJobArtifactInventoryPage } from "../src/job-artifact-inventory.js";
 import type { DispatcherConfig } from "../src/config.js";
 import type { JobRow } from "../src/types.js";
 
@@ -40,5 +41,23 @@ test("job artifact inventory measures only contract paths and reports unsafe ent
     const redirected = await inventoryJobArtifacts(row, config);
     assert.equal(redirected.artifacts[0]?.cleanup_state, "unsafe");
     assert.equal(redirected.artifacts[1]?.cleanup_state, "unsafe");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("artifact inventory pages jobs through a read-only database handle", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-artifact-page-"));
+  try {
+    const databasePath = path.join(root, "jobs.sqlite3");
+    const db = new Database(databasePath);
+    db.exec("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, workspace_json TEXT, workspace_path TEXT, result_path TEXT, status TEXT, created_at TEXT, completed_at TEXT)");
+    const insert = db.prepare("INSERT INTO jobs VALUES(?,?,?,?,?,?,?)");
+    for (const jobId of ["job_01m3p6jrm2g3rsjbadbmpzmend", "job_01m3p6jrm2g3rsjbadbmpzmenf"])
+      insert.run(jobId, '{"kind":"scratch"}', "workspace", "result", "completed", "2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z");
+    db.close();
+    const first = readJobArtifactInventoryPage(databasePath, "", 1);
+    assert.equal(first.length, 1);
+    assert.equal(readJobArtifactInventoryPage(databasePath, first[0]!.job_id, 1)[0]?.job_id,
+      "job_01m3p6jrm2g3rsjbadbmpzmenf");
+    assert.throws(() => readJobArtifactInventoryPage(databasePath, "invalid", 1), /cursor_or_limit_invalid/);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
