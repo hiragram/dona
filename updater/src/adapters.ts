@@ -3,8 +3,8 @@ import fsSync from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { parse as parseDotenv } from "dotenv";
 import Database from "better-sqlite3";
 
@@ -764,14 +764,156 @@ export class RealRuntime implements RuntimePort {
       const receiptPath = path.join(this.policy.control_root, "control-plane-receipt.json");
       const stats = await fs.lstat(receiptPath);
       const uid = process.getuid?.();
-      if (!stats.isFile() || stats.isSymbolicLink() || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+      if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || uid === undefined || stats.uid !== uid || (stats.mode & 0o077) !== 0) {
         return { ready: false, build_sha: buildSha };
       }
       const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as Record<string, unknown>;
       this.dispatcherDatabasePath();
+      const attemptId = receipt.attempt_id;
+      if (typeof attemptId !== "string" || !/^[0-9a-f]{40}\.[A-Za-z0-9]+$/.test(attemptId) ||
+          typeof receipt.attempt_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(receipt.attempt_sha256)) {
+        return { ready: false, build_sha: buildSha };
+      }
+      const attemptDirectory = path.join(this.policy.control_root, "control-backups", attemptId);
+      const attemptDirectoryStats = await fs.lstat(attemptDirectory);
+      const attemptPath = path.join(attemptDirectory, "attempt.json");
+      const attemptStats = await fs.lstat(attemptPath);
+      if (!attemptDirectoryStats.isDirectory() || attemptDirectoryStats.isSymbolicLink() ||
+          attemptDirectoryStats.uid !== uid || (attemptDirectoryStats.mode & 0o077) !== 0 ||
+          !attemptStats.isFile() || attemptStats.isSymbolicLink() || attemptStats.uid !== uid ||
+          attemptStats.nlink !== 1 || (attemptStats.mode & 0o077) !== 0) {
+        return { ready: false, build_sha: buildSha };
+      }
+      const attemptBytes = await fs.readFile(attemptPath);
+      const attempt = JSON.parse(attemptBytes.toString("utf8")) as Record<string, unknown>;
+      const rehearsalPath = path.join(attemptDirectory, "restore-rehearsal.json");
+      const rehearsalStats = await fs.lstat(rehearsalPath);
+      if (!rehearsalStats.isFile() || rehearsalStats.isSymbolicLink() || rehearsalStats.uid !== uid ||
+          rehearsalStats.nlink !== 1 || (rehearsalStats.mode & 0o077) !== 0) {
+        return { ready: false, build_sha: buildSha };
+      }
+      const rehearsalBytes = await fs.readFile(rehearsalPath);
+      const rehearsal = JSON.parse(rehearsalBytes.toString("utf8")) as Record<string, unknown>;
+      const matchingAttempt = createHash("sha256").update(attemptBytes).digest("hex") === receipt.attempt_sha256 &&
+        attempt.schema_version === 1 && attempt.phase === "verified" && attempt.new_build_sha === buildSha &&
+        attempt.old_build_sha === receipt.old_build_sha && attempt.new_policy_sha256 === receipt.policy_sha256 &&
+        attempt.new_plist_sha256 === receipt.plist_sha256 && attempt.db_backup_sha256 === receipt.db_backup_sha256 &&
+        typeof attempt.new_dispatcher_plist_sha256 === "string" &&
+        /^[0-9a-f]{64}$/.test(attempt.new_dispatcher_plist_sha256) &&
+        attempt.new_dispatcher_plist_sha256 === receipt.dispatcher_plist_sha256 &&
+        attempt.new_updater_tree_sha256 === receipt.control_updater_tree_sha256 &&
+        attempt.release_tree_sha256 === receipt.release_tree_sha256 &&
+        typeof attempt.release_tree_sha256 === "string" && /^[0-9a-f]{64}$/.test(attempt.release_tree_sha256) &&
+        attempt.restore_rehearsal_sha256 === receipt.restore_rehearsal_sha256 &&
+        typeof attempt.restore_rehearsal_sha256 === "string" && /^[0-9a-f]{64}$/.test(attempt.restore_rehearsal_sha256) &&
+        createHash("sha256").update(rehearsalBytes).digest("hex") === attempt.restore_rehearsal_sha256 &&
+        rehearsal.schema_version === 1 && rehearsal.backup_sha256 === attempt.db_backup_sha256 &&
+        rehearsal.old_binary_restored_backup_readable === true &&
+        typeof rehearsal.old_schema === "number" && Number.isSafeInteger(rehearsal.old_schema) && rehearsal.old_schema >= 0 &&
+        typeof rehearsal.new_schema === "number" && Number.isSafeInteger(rehearsal.new_schema) &&
+        rehearsal.new_schema >= rehearsal.old_schema &&
+        rehearsal.rollback === (rehearsal.new_schema > rehearsal.old_schema ? "restore_backup_required" : "same_schema");
+      const artifactDigest = async (file: string): Promise<string> => {
+        const handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+        try {
+          const stat = await handle.stat();
+          if (!stat.isFile() || stat.uid !== uid || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) {
+            throw new Error("control_artifact_identity_unverified");
+          }
+          return createHash("sha256").update(await handle.readFile()).digest("hex");
+        } finally { await handle.close(); }
+      };
+      const currentArtifactsMatch =
+        await artifactDigest(path.join(this.policy.control_root, "policy.json")) === attempt.new_policy_sha256 &&
+        await artifactDigest(path.join(os.homedir(), "Library/LaunchAgents/dev.dona.updater.plist")) === attempt.new_plist_sha256 &&
+        await artifactDigest(path.join(os.homedir(), "Library/LaunchAgents/dev.dona.dispatcher.plist")) === attempt.new_dispatcher_plist_sha256 &&
+        await artifactDigest(path.join(attemptDirectory, "updater.previous.sqlite3")) === attempt.db_backup_sha256 &&
+        await artifactDigest(path.join(attemptDirectory, "updater.previous/dist/database.js")) === rehearsal.old_database_module_sha256 &&
+        await artifactDigest(path.join(this.policy.control_root, "updater/dist/database.js")) === rehearsal.new_database_module_sha256;
+      const controlTreeDigest = async (root: string): Promise<string> => {
+        const hash = createHash("sha256");
+        const visit = async (directory: string, relativeDirectory = ""): Promise<void> => {
+          const directoryStats = await fs.lstat(directory);
+          if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || directoryStats.uid !== uid ||
+              (directoryStats.mode & 0o777) !== (relativeDirectory ? 0o500 : 0o700)) {
+            throw new Error("control_updater_directory_identity_unverified");
+          }
+          const entries = await fs.readdir(directory);
+          entries.sort((left, right) => left.localeCompare(right));
+          for (const name of entries) {
+            const relative = path.join(relativeDirectory, name);
+            const full = path.join(directory, name);
+            const stat = await fs.lstat(full);
+            if (stat.uid !== uid) throw new Error("control_updater_owner_unverified");
+            if (stat.isDirectory() && !stat.isSymbolicLink()) {
+              hash.update(`d\0${relative}\0`);
+              await visit(full, relative);
+            } else if (stat.isFile() && !stat.isSymbolicLink()) {
+              if (stat.nlink !== 1 || (stat.mode & 0o777) !== 0o400) throw new Error("control_updater_file_identity_unverified");
+              hash.update(`f\0${relative}\0`);
+              hash.update(await fs.readFile(full));
+              hash.update("\0");
+            } else if (stat.isSymbolicLink()) {
+              const resolved = await fs.realpath(full);
+              const inside = path.relative(root, resolved);
+              if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+                throw new Error("control_updater_link_escaped");
+              }
+              hash.update(`l\0${relative}\0${await fs.readlink(full)}\0`);
+            } else throw new Error("control_updater_entry_unverified");
+          }
+        };
+        await visit(root);
+        return hash.digest("hex");
+      };
+      const controlTreeMatches = typeof receipt.control_updater_tree_sha256 === "string" &&
+        /^[0-9a-f]{64}$/.test(receipt.control_updater_tree_sha256) &&
+        await controlTreeDigest(path.join(this.policy.control_root, "updater")) === receipt.control_updater_tree_sha256 &&
+        typeof receipt.old_updater_tree_sha256 === "string" &&
+        /^[0-9a-f]{64}$/.test(receipt.old_updater_tree_sha256) &&
+        await controlTreeDigest(path.join(attemptDirectory, "updater.previous")) === receipt.old_updater_tree_sha256;
+      const releaseRoot = path.join(this.policy.release_root, buildSha);
+      const releaseHash = createHash("sha256");
+      const visitRelease = async (directory: string, relativeDirectory = ""): Promise<void> => {
+        const directoryStats = await fs.lstat(directory);
+        if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || directoryStats.uid !== uid ||
+            (directoryStats.mode & 0o777) !== 0o500) throw new Error("release_identity_unverified");
+        const entries = await fs.readdir(directory, { withFileTypes: true });
+        entries.sort((left, right) => left.name.localeCompare(right.name));
+        for (const entry of entries) {
+          if (!relativeDirectory && entry.name === ".git") continue;
+          const relative = path.join(relativeDirectory, entry.name);
+          const full = path.join(directory, entry.name);
+          const stat = await fs.lstat(full);
+          if (stat.uid !== uid) throw new Error("release_owner_unverified");
+          if (stat.isDirectory() && !stat.isSymbolicLink()) {
+            releaseHash.update(`d\0${relative}\0`);
+            await visitRelease(full, relative);
+          } else if (stat.isFile() && !stat.isSymbolicLink()) {
+            if (stat.nlink !== 1 || (stat.mode & 0o777) !== 0o400) throw new Error("release_file_identity_unverified");
+            releaseHash.update(`f\0${relative}\0`);
+            if (relative === "release-manifest.json") {
+              const manifest = JSON.parse(await fs.readFile(full, "utf8")) as Record<string, unknown>;
+              if (typeof manifest.built_at !== "string") throw new Error("release_manifest_identity_unverified");
+              releaseHash.update(JSON.stringify({ ...manifest, built_at: null }));
+            } else releaseHash.update(await fs.readFile(full));
+            releaseHash.update("\0");
+          } else if (stat.isSymbolicLink()) {
+            const resolved = await fs.realpath(full);
+            const inside = path.relative(releaseRoot, resolved);
+            if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+              throw new Error("release_link_escaped");
+            }
+            releaseHash.update(`l\0${relative}\0${await fs.readlink(full)}\0`);
+          } else throw new Error("release_entry_unverified");
+        }
+      };
+      await visitRelease(releaseRoot);
+      const releaseMatches = releaseHash.digest("hex") === receipt.release_tree_sha256;
       return {
         ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
-          receipt.schema_migration_capability === capability,
+          receipt.schema_migration_capability === capability && matchingAttempt && currentArtifactsMatch &&
+          releaseMatches && controlTreeMatches,
         build_sha: buildSha,
       };
     } catch {

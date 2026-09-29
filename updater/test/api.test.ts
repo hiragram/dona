@@ -45,6 +45,8 @@ test("Updater version health requires both the service loop and writable persist
     let response = await request(socketPath);
     assert.equal(response.status, 200);
     assert.equal(response.body.build_sha, "2".repeat(40));
+    assert.equal(response.body.pid, process.pid);
+    assert.equal(typeof response.body.process_start, "string");
     assert.equal(response.body.update_schema, 3);
     running = false;
     assert.equal((await request(socketPath)).status, 503);

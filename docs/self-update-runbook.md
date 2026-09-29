@@ -13,19 +13,21 @@
 
 ## 初回installとlegacy移行
 
-cleanなcanonical main checkoutで明示的に実行します。installerはfetch後の`origin/main`とのSHA一致と、GitHub Actions由来の固定3 check成功を再検証します。
+cleanなcanonical main checkoutで明示的に実行します。installerはfetch後の`origin/main`とのSHA一致と、同じexact SHAの単一main push CI runに属する固定4 checkの成功を再検証します。
 
 ```sh
 ./scripts/install-self-update.sh --install
 ```
 
-この段階ではimmutable initial release、stable updater copy、0600 policy/token/config/plistだけを配置し、processやlaunchctlは変更しません。既存`install-launchd.sh`はdeveloper checkoutを直接起動するlegacy方式です。新構成へ切り替えるmaintenance windowで、内容を確認してから次を別途実行します。
+この段階ではimmutable initial release、stable updater copy、0600 policy/token/config/plistだけを配置し、processやlaunchctlは変更しません。既存`install-launchd.sh`はdeveloper checkoutを直接起動するlegacy方式です。新構成へ切り替えるmaintenance windowでは、既存workerと通知をdrainし、稼働中のDispatcher/Slack Adapterのlaunchd label、PID、起動元を確認します。開発用processがあれば所有者が停止し、子processの終了も確認します。未知のprocessを停止しません。
+
+登録済みlegacy serviceは、運用者が確認済みのlabelに対してSlack Adapter、Dispatcherの順で`launchctl bootout gui/$UID/dev.dona.slack-adapter`と`launchctl bootout gui/$UID/dev.dona.dispatcher`を各1回だけ実行します。各操作の後、`node ./scripts/self-update-install-preflight.mjs wait-launchd-unregistered gui/$UID dev.dona.slack-adapter 30000`または同じcommandのlabelを`dev.dona.dispatcher`とした読み取りで登録解除を安定観測します。応答喪失やtimeout時はbootoutを再送せず、同じ読み取りで状態を照合します。登録解除が確定しない場合はここで停止し、現行serviceとsocket healthを調べます。両labelの登録解除とDispatcher socketの非使用を確認した後だけ、次を別途実行します。
 
 ```sh
 ./scripts/install-self-update.sh --bootstrap
 ```
 
-`--bootstrap`だけが、既存Slack Adapter→Dispatcherの順にbootoutし、stable updater→Dispatcher→Slack Adapterの順にbootstrapします。commandの結果が曖昧なら反復せず、`launchctl print gui/$UID/<label>`とhealthを確認します。実行中stable updaterはinstallerもbootoutしません。
+`--bootstrap`はinstall済みUpdater plistのSHAをcurrent releaseと照合してからstable updater→Dispatcher→Slack Adapterの順にbootstrapします。checkoutがinstall後に進んでも、そのHEADを起動対象とみなしません。Slack Adapter段階だけ失敗した後の再実行では、登録済みDispatcherのinstall済みplistと固定label・PID・exact SHA healthを確認し、再登録せずSlack段階へ進みます。登録済みSlack Adapterもplistとhealthが一致する場合だけ完了済みと認め、不一致なら停止します。bootstrap応答が曖昧な場合は同じwriteを再送せず、登録とsocket healthを照合します。実行中stable updaterをbootoutしません。
 
 ## 通常update
 
@@ -88,7 +90,11 @@ maintenance windowを確保し、cleanな最新main checkoutで次を実行し�
 ./scripts/install-self-update.sh --upgrade-control
 ```
 
-このmodeは、同じSHAのreleaseが既存でもfresh stagingと実行treeの内容hashが一致しない限り再利用しません。Updaterだけを停止し、socket停止後にSQLite全件でnonterminal countが0であることを再確認します。その後、旧updater/policy/plistとcheckpoint・integrity確認済みSQLiteを`update-control/control-backups/<new-sha>.<attempt>/`へ保存します。新SHA、`update_schema: 3`、DB読書きが揃うversion healthを確認できなければ旧一式とDBを戻し、旧SHA healthを確認します。成功後もDispatcher/Slack Adapterは旧releaseのままなので、表示された新SHAを対象に通常のplan/applyを続けます。
+このmodeはowner-privateな`.staging`でexact SHAのarchiveを展開し、隔離したnpm cache/configで各componentのinstall・test・typecheck・buildを行います。manifestのlockfile hash、toolchain、compatibility、実行entrypointとtree全体を検証してからSHA directoryへ配置し、read-only modeへ変更した後にも同じtree digestを照合します。同じSHAのreleaseが既存でもfresh stagingとのmanifest identity、内容hash、owner、mode、hardlinkを照合できない限り再利用しません。partial stagingや配置後のmode設定中に停止したreleaseは完了扱いにしません。
+
+停止前に`control-backups/<new-sha>.<attempt>/attempt.json`へ旧新build SHA、policy/plist digestを記録します。以後、UpdaterとDispatcherの停止・起動intent、観測結果、DB backup digest、control切替、version health、復旧結果を単調増加するsequenceとともにatomic renameで保存します。Updaterだけを停止し、launchd登録解除の安定観測とsocket停止後にSQLite全件でnonterminal countが0であることを再確認します。旧updater/policy/plistとSQLite Online Backupを同じattemptに保存し、backupを別connectionでopenしてintegrity、外部キー、schema version、table数、request件数を元DBと照合します。さらにbackupのコピーを旧UpdaterのDB readerでopenする復元rehearsalを行い、そのreceipt digestをattemptへ記録します。新SHA、`update_schema: 3`、DB読書きが揃うfresh process healthを確認し、socket healthのPID・start identityをstartup lock、OS process、launchd登録と照合してから、capability receiptをattempt ledgerと復元rehearsalのdigestへ束縛して公開します。`launchctl`は単一の期限付きcallと読み取り照合を使い、応答が不明な場合も同じbootstrapを再送しません。
+
+control DB schemaのforward/rollback境界は次のとおりです。rehearsalはbackupのコピーを新binaryでmigrationし、`old_schema`と`new_schema`を記録します。`new_schema > old_schema`なら`restore_backup_required`、同じなら`same_schema`とし、いずれもbackupの別コピーを旧binaryで開けることを確認します。新Updater起動前の失敗は保存済みOnline Backupを開けることを確認して旧binaryと旧DBへ戻し、旧SHA healthを再読します。新Updaterのmigration後でも、通常runtimeのwriterを解放していない間だけ同じbackupへ復元できます。旧binaryが新schemaを読めない場合、DBを戻さずbinaryだけを差し戻すことは禁じます。backupが欠落・不一致、停止identityや起動acceptanceが不明、または復元後の旧SHA healthが不明なら自動再送せず`needs_review`として隔離します。成功後もDispatcher/Slack Adapterは旧releaseのままなので、表示された新SHAを対象に別の通常plan/applyを続けます。このcontrol-plane receiptは通常runtime updateの承認やactivation receiptを兼ねません。
 
 policy `2026-09-03.1`で`main_agent_start_failed`になった既存requestは、旧runtime上でtarget pointer、activation receipt、両service、`dona-main`が一致した場合だけ証拠を保存します。この時点では訂正通知を送りません。通常updateでDispatcher/Slack Adapterの`update_notification_protocol: 1`を確認した後、新しいterminal fenceを発行し、元threadへ訂正を1回だけ投稿します。
 

@@ -579,6 +579,8 @@ describe("DispatcherApi", () => {
       reply_target: { kind: "slack_thread", workspace_id: "T_TEST", channel_id: "C_TEST", thread_ts: "1756722030.123456" },
     }]);
     const version = await request(config.socketPath, "GET", "/health/version");
+    assert.equal(version.body.pid, process.pid);
+    assert.match(version.body.process_start as string, /\S/);
     assert.deepEqual(
       {
         app_schema: version.body.app_schema,
