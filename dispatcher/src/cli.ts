@@ -12,7 +12,7 @@ import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { liveSessionReceiptRetentionSeconds } from "./live-session.js";
-import { inventoryJobArtifacts, readJobArtifactInventoryPage } from "./job-artifact-inventory.js";
+import { inventoryJobArtifacts, inventorySizeIsComplete, readJobArtifactInventoryPage } from "./job-artifact-inventory.js";
 
 function projectLiveJob(row: Record<string, unknown>): Record<string, unknown> {
   const safeKeys = [
@@ -88,7 +88,7 @@ async function main(): Promise<void> {
     for (const row of selected) artifacts.push(await inventoryJobArtifacts(row, config, budget));
     console.log(JSON.stringify({ schema_version: 1, dry_run: true, artifacts,
       next_cursor: rows.length > limit ? selected.at(-1)?.job_id : null,
-      size_is_complete: artifacts.every((job) => job.artifacts.every((item) => item.cleanup_state === "present" || item.cleanup_state === "missing")),
+      size_is_complete: inventorySizeIsComplete(artifacts),
     }, null, 2));
     return;
   }

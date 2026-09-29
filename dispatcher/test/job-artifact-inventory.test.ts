@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import Database from "better-sqlite3";
 
-import { inventoryJobArtifacts, readJobArtifactInventoryPage } from "../src/job-artifact-inventory.js";
+import { inventoryJobArtifacts, inventorySizeIsComplete, readJobArtifactInventoryPage } from "../src/job-artifact-inventory.js";
 import type { DispatcherConfig } from "../src/config.js";
 import type { JobRow } from "../src/types.js";
 
@@ -30,6 +30,11 @@ test("job artifact inventory measures only contract paths and reports unsafe ent
     assert.equal(first.artifacts[1]?.cleanup_state, "missing");
     assert.equal(first.artifacts[2]?.cleanup_state, "present");
     assert.equal(typeof first.artifacts[0]?.allocated_bytes, "number");
+    assert.equal(inventorySizeIsComplete([first]), false);
+    const legacyResult = path.join(config.jobResultsDir, `${job_id}.json`);
+    await fs.writeFile(legacyResult, "{}");
+    const legacy = await inventoryJobArtifacts({ ...row, result_path: legacyResult }, config);
+    assert.equal(legacy.artifacts[2]?.cleanup_state, "present");
     await fs.symlink(root, path.join(workspace_path, "escape"));
     const unsafe = await inventoryJobArtifacts(row, config);
     assert.equal(unsafe.artifacts[0]?.cleanup_state, "unsafe");
@@ -38,6 +43,27 @@ test("job artifact inventory measures only contract paths and reports unsafe ent
     assert.equal(mismatch.artifacts[2]?.cleanup_state, "contract_mismatch");
     const malformed = await inventoryJobArtifacts({ ...row, workspace_json: "{" }, config);
     assert.ok(malformed.artifacts.every((artifact) => artifact.cleanup_state === "contract_mismatch"));
+    const invalidId = await inventoryJobArtifacts({ ...row, job_id: "../outside" }, config);
+    assert.ok(invalidId.artifacts.every((artifact) => artifact.cleanup_state === "contract_mismatch"));
+    await fs.unlink(path.join(workspace_path, "escape"));
+    const outside = path.join(root, "outside-tree");
+    await fs.mkdir(outside);
+    await fs.writeFile(path.join(outside, "private"), "outside");
+    const opendir = fs.opendir.bind(fs);
+    let replaced = false;
+    mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
+      if (!replaced && args[0] === workspace_path) {
+        replaced = true;
+        await fs.rename(workspace_path, path.join(root, "moved-worktree"));
+        await fs.symlink(outside, workspace_path);
+      }
+      return opendir(...args);
+    });
+    try {
+      const raced = await inventoryJobArtifacts(row, config);
+      assert.equal(raced.artifacts[0]?.cleanup_state, "unsafe");
+      assert.equal(raced.artifacts[0]?.allocated_bytes, null);
+    } finally { mock.restoreAll(); }
     await fs.rename(config.jobsWorkspaceRoot, path.join(root, "moved-workspaces"));
     await fs.symlink(path.join(root, "moved-workspaces"), config.jobsWorkspaceRoot);
     const redirected = await inventoryJobArtifacts(row, config);
