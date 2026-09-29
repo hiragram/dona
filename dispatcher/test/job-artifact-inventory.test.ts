@@ -36,6 +36,8 @@ test("job artifact inventory measures only contract paths and reports unsafe ent
     assert.equal(unsafe.artifacts[0]?.allocated_bytes, null);
     const mismatch = await inventoryJobArtifacts({ ...row, result_path: path.join(root, "outside") }, config);
     assert.equal(mismatch.artifacts[2]?.cleanup_state, "contract_mismatch");
+    const malformed = await inventoryJobArtifacts({ ...row, workspace_json: "{" }, config);
+    assert.ok(malformed.artifacts.every((artifact) => artifact.cleanup_state === "contract_mismatch"));
     await fs.rename(config.jobsWorkspaceRoot, path.join(root, "moved-workspaces"));
     await fs.symlink(path.join(root, "moved-workspaces"), config.jobsWorkspaceRoot);
     const redirected = await inventoryJobArtifacts(row, config);

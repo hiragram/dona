@@ -75,7 +75,17 @@ export async function inventoryJobArtifacts(row: JobRow, config: DispatcherConfi
     job_id: string; status: JobRow["status"]; created_at: string; terminal_at: string | null;
     protection_reasons: string[]; artifacts: ArtifactObservation[];
   }> {
-  const workspace = workspaceFromJob(row);
+  const protection_reasons = row.status === "needs_review" ? ["needs_review"]
+    : ["completed", "failed", "cancelled"].includes(row.status)
+      ? ["notification_unverified", "retention_expiry_unverified"] : ["nonterminal"];
+  const base = { job_id: row.job_id, status: row.status, created_at: row.created_at,
+    terminal_at: row.completed_at, protection_reasons };
+  let workspace: ReturnType<typeof workspaceFromJob>;
+  try { workspace = workspaceFromJob(row); }
+  catch {
+    return { ...base, artifacts: (["worktree", "progress", "result"] as const).map((kind) =>
+      ({ kind, cleanup_state: "contract_mismatch" as const, allocated_bytes: null })) };
+  }
   const expectedWorkspace = workspace.kind === "scratch"
     ? path.join(config.jobsWorkspaceRoot, "scratch", row.job_id)
     : path.join(config.jobsWorkspaceRoot, "github", ...workspace.repository.split("/"), "worktrees", row.job_id);
@@ -96,9 +106,5 @@ export async function inventoryJobArtifacts(row: JobRow, config: DispatcherConfi
       : { cleanup_state: "contract_mismatch" as const, allocated_bytes: null };
     artifacts.push({ kind: candidate.kind, ...observation });
   }
-  const protection_reasons = row.status === "needs_review" ? ["needs_review"]
-    : ["completed", "failed", "cancelled"].includes(row.status)
-      ? ["notification_unverified", "retention_expiry_unverified"] : ["nonterminal"];
-  return { job_id: row.job_id, status: row.status, created_at: row.created_at,
-    terminal_at: row.completed_at, protection_reasons, artifacts };
+  return { ...base, artifacts };
 }
