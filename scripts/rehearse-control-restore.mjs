@@ -25,6 +25,16 @@ fs.chmodSync(temporaryDirectory, 0o700);
 const readVersion = (file) => Number(execFileSync("/usr/bin/python3", ["-c",
   "import sqlite3,sys,pathlib; c=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro',uri=True); print(c.execute('PRAGMA user_version').fetchone()[0]); c.close()", file],
   { encoding: "utf8", timeout: 30_000 }).trim());
+const inventory = (file) => JSON.parse(execFileSync("/usr/bin/python3", ["-c", `
+import json,sqlite3,sys,pathlib
+c=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro',uri=True)
+try:
+ if c.execute('PRAGMA integrity_check').fetchone()!=('ok',): raise RuntimeError('integrity check failed')
+ if c.execute('PRAGMA foreign_key_check').fetchone() is not None: raise RuntimeError('foreign key check failed')
+ tables=[row[0] for row in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+ print(json.dumps({'tables':tables,'rows':{name:c.execute('SELECT COUNT(*) FROM "'+name.replace('"','""')+'"').fetchone()[0] for name in tables}}))
+finally: c.close()
+`, file], { encoding: "utf8", timeout: 30_000 }));
 const openModule = (modulePath, file, readonly) => {
   const moduleUrl = pathToFileURL(modulePath).href;
   const code = `import { UpdateDatabase } from ${JSON.stringify(moduleUrl)}; const db = new UpdateDatabase(process.argv[1], ${readonly ? "{ readonly: true }" : "{}"}); db.close();`;
@@ -35,19 +45,29 @@ const openModule = (modulePath, file, readonly) => {
 };
 try {
   const oldSchema = readVersion(backup);
+  const originalInventory = inventory(backup);
   const forward = path.join(temporaryDirectory, "forward.sqlite3");
   fs.copyFileSync(backup, forward);
   fs.chmodSync(forward, 0o600);
   openModule(newDatabaseModule, forward, false);
   const newSchema = readVersion(forward);
+  const forwardInventory = inventory(forward);
   if (!Number.isSafeInteger(oldSchema) || !Number.isSafeInteger(newSchema) || newSchema < oldSchema) {
     throw new Error("control DB forward migration is invalid");
+  }
+  for (const name of originalInventory.tables) {
+    if (!(name in forwardInventory.rows) || forwardInventory.rows[name] < originalInventory.rows[name]) {
+      throw new Error("control DB forward inventory lost existing rows");
+    }
   }
   const restored = path.join(temporaryDirectory, "updater.sqlite3");
   fs.copyFileSync(backup, restored);
   fs.chmodSync(restored, 0o600);
   openModule(oldDatabaseModule, restored, true);
   if (readVersion(restored) !== oldSchema) throw new Error("restored control schema changed during rehearsal");
+  if (JSON.stringify(inventory(restored)) !== JSON.stringify(originalInventory)) {
+    throw new Error("restored control inventory differs from backup");
+  }
   if (createHash("sha256").update(fs.readFileSync(backup)).digest("hex") !== backupHash) {
     throw new Error("restore rehearsal changed the immutable backup");
   }

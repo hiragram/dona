@@ -55,7 +55,14 @@ bootstrap_updater_reconciled() {
   local output=""
   local exit_code=0
   if output=$(launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 30000 2>&1); then
-    return 0
+    if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha \
+      "$CONTROL_ROOT/updater.sock" "$expected_sha" 30000 3 && \
+      $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-identity \
+      "$CONTROL_ROOT/updater.sock" "$expected_sha" "$DOMAIN" 30000; then
+      return 0
+    fi
+    print -u2 -- "${context}の起動identityを確定できません。"
+    return 1
   else
     exit_code=$?
   fi
@@ -80,7 +87,10 @@ bootstrap_dispatcher_reconciled() {
   local output=""
   local exit_code=0
   if output=$(launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" 30000 2>&1); then
-    return 0
+    if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
+      "$DISPATCHER_SOCKET" "$expected_sha" 30000; then return 0; fi
+    print -u2 -- "${context}のDispatcher healthを確定できません。"
+    return 1
   else
     exit_code=$?
   fi
@@ -234,6 +244,11 @@ if [[ "$MODE" == "--check" ]]; then
 fi
 
 if [[ "$MODE" == "--bootstrap" ]]; then
+  ACTIVE_DISPATCHER_SHA=$(/usr/bin/basename "$(/usr/bin/readlink "$RUNTIME_ROOT/current")")
+  if [[ ! "$ACTIVE_DISPATCHER_SHA" =~ '^[0-9a-f]{40}$' ]]; then
+    print -u2 "起動対象のDispatcher SHAを確定できません。"
+    exit 1
+  fi
   for plist in dev.dona.updater dev.dona.dispatcher dev.dona.slack-adapter; do
     if [[ ! -f "$LAUNCH_AGENTS_DIR/$plist.plist" ]]; then
       print -u2 "Missing $LAUNCH_AGENTS_DIR/$plist.plist. Run --install first."
@@ -244,7 +259,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
   fi
   if ! /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
-    launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist" 30000
+    if ! bootstrap_updater_reconciled "初回Updater登録" "$INSTALL_SHA"; then exit 1; fi
   fi
   if /bin/launchctl print "$DOMAIN/dev.dona.slack-adapter" >/dev/null 2>&1; then
     launchctl_once bootout "$DOMAIN" dev.dona.slack-adapter 30000
@@ -252,7 +267,10 @@ if [[ "$MODE" == "--bootstrap" ]]; then
   if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
     launchctl_once bootout "$DOMAIN" dev.dona.dispatcher 30000
   fi
-  launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.dispatcher.plist" 30000
+  if ! bootstrap_dispatcher_reconciled "初回Dispatcher登録" "$ACTIVE_DISPATCHER_SHA"; then
+    print -u2 "Dispatcher登録状態が不明のためSlack Adapterの起動を保留しました。再送せず登録とhealthを照合してください。"
+    exit 1
+  fi
   launchctl_once bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.slack-adapter.plist" 30000
   print "stable updater、Dispatcher、Slack Adapterを順序付きでbootstrapしました。"
   exit 0

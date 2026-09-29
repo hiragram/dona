@@ -809,9 +809,56 @@ export class RealRuntime implements RuntimePort {
         typeof rehearsal.new_schema === "number" && Number.isSafeInteger(rehearsal.new_schema) &&
         rehearsal.new_schema >= rehearsal.old_schema &&
         rehearsal.rollback === (rehearsal.new_schema > rehearsal.old_schema ? "restore_backup_required" : "same_schema");
+      const artifactDigest = async (file: string): Promise<string> => {
+        const handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+        try {
+          const stat = await handle.stat();
+          if (!stat.isFile() || stat.uid !== uid || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) {
+            throw new Error("control_artifact_identity_unverified");
+          }
+          return createHash("sha256").update(await handle.readFile()).digest("hex");
+        } finally { await handle.close(); }
+      };
+      const currentArtifactsMatch =
+        await artifactDigest(path.join(this.policy.control_root, "policy.json")) === attempt.new_policy_sha256 &&
+        await artifactDigest(path.join(os.homedir(), "Library/LaunchAgents/dev.dona.updater.plist")) === attempt.new_plist_sha256;
+      const releaseRoot = path.join(this.policy.release_root, buildSha);
+      const releaseHash = createHash("sha256");
+      const visitRelease = async (directory: string, relativeDirectory = ""): Promise<void> => {
+        const directoryStats = await fs.lstat(directory);
+        if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || directoryStats.uid !== uid ||
+            (directoryStats.mode & 0o777) !== 0o500) throw new Error("release_identity_unverified");
+        const entries = await fs.readdir(directory, { withFileTypes: true });
+        entries.sort((left, right) => left.name.localeCompare(right.name));
+        for (const entry of entries) {
+          if (!relativeDirectory && (entry.name === ".git" || entry.name === "release-manifest.json")) continue;
+          const relative = path.join(relativeDirectory, entry.name);
+          const full = path.join(directory, entry.name);
+          const stat = await fs.lstat(full);
+          if (stat.uid !== uid) throw new Error("release_owner_unverified");
+          if (stat.isDirectory() && !stat.isSymbolicLink()) {
+            releaseHash.update(`d\0${relative}\0`);
+            await visitRelease(full, relative);
+          } else if (stat.isFile() && !stat.isSymbolicLink()) {
+            if (stat.nlink !== 1 || (stat.mode & 0o777) !== 0o400) throw new Error("release_file_identity_unverified");
+            releaseHash.update(`f\0${relative}\0`);
+            releaseHash.update(await fs.readFile(full));
+            releaseHash.update("\0");
+          } else if (stat.isSymbolicLink()) {
+            const resolved = await fs.realpath(full);
+            const inside = path.relative(releaseRoot, resolved);
+            if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+              throw new Error("release_link_escaped");
+            }
+            releaseHash.update(`l\0${relative}\0${await fs.readlink(full)}\0`);
+          } else throw new Error("release_entry_unverified");
+        }
+      };
+      await visitRelease(releaseRoot);
+      const releaseMatches = releaseHash.digest("hex") === receipt.release_tree_sha256;
       return {
         ready: receipt.schema_version === 1 && receipt.build_sha === buildSha &&
-          receipt.schema_migration_capability === capability && matchingAttempt,
+          receipt.schema_migration_capability === capability && matchingAttempt && currentArtifactsMatch && releaseMatches,
         build_sha: buildSha,
       };
     } catch {

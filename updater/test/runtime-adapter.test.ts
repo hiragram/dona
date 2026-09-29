@@ -26,16 +26,28 @@ class RecordingRunner {
 test("control capability requires a verified attempt ledger bound to the exact receipt", async () => {
   const { root, policy } = await tempPolicy();
   const previousSha = process.env.DONA_UPDATER_BUILD_SHA;
+  const previousHome = process.env.HOME;
   const attemptId = `${targetSha}.ABC123`;
   const attemptDir = path.join(policy.control_root, "control-backups", attemptId);
   try {
     process.env.DONA_UPDATER_BUILD_SHA = targetSha;
+    process.env.HOME = root;
     await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
     await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
     await fs.writeFile(path.join(path.dirname(policy.config_root), "dona.sqlite3"), "database", { mode: 0o600 });
     await fs.mkdir(attemptDir, { recursive: true, mode: 0o700 });
     await fs.chmod(attemptDir, 0o700);
-    const digest = "a".repeat(64);
+    const artifact = Buffer.from("verified control artifact");
+    const digest = createHash("sha256").update(artifact).digest("hex");
+    const releaseDir = path.join(policy.release_root, targetSha);
+    await fs.mkdir(releaseDir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(releaseDir, "control.txt"), artifact, { mode: 0o400 });
+    await fs.chmod(releaseDir, 0o500);
+    const releaseDigest = createHash("sha256").update("f\0control.txt\0").update(artifact).update("\0").digest("hex");
+    await fs.writeFile(path.join(policy.control_root, "policy.json"), artifact, { mode: 0o600 });
+    const agents = path.join(root, "Library/LaunchAgents");
+    await fs.mkdir(agents, { recursive: true });
+    await fs.writeFile(path.join(agents, "dev.dona.updater.plist"), artifact, { mode: 0o600 });
     const rehearsal = { schema_version: 1, backup_sha256: digest, old_schema: 7, new_schema: 8,
       rollback: "restore_backup_required", old_binary_restored_backup_readable: true };
     const rehearsalBytes = Buffer.from(`${JSON.stringify(rehearsal)}\n`);
@@ -43,23 +55,39 @@ test("control capability requires a verified attempt ledger bound to the exact r
     const rehearsalDigest = createHash("sha256").update(rehearsalBytes).digest("hex");
     const attempt = { schema_version: 1, phase: "verified", old_build_sha: "b".repeat(40),
       new_build_sha: targetSha, new_policy_sha256: digest, new_plist_sha256: digest,
-      db_backup_sha256: digest, release_tree_sha256: digest, restore_rehearsal_sha256: rehearsalDigest };
+      db_backup_sha256: digest, release_tree_sha256: releaseDigest, restore_rehearsal_sha256: rehearsalDigest };
     const attemptBytes = Buffer.from(`${JSON.stringify(attempt)}\n`);
     await fs.writeFile(path.join(attemptDir, "attempt.json"), attemptBytes, { mode: 0o600 });
     const receipt = { schema_version: 1, build_sha: targetSha,
       schema_migration_capability: "dispatcher_v2_to_v3_online_backup_v1", attempt_id: attemptId,
       attempt_sha256: createHash("sha256").update(attemptBytes).digest("hex"),
       old_build_sha: attempt.old_build_sha, policy_sha256: digest, plist_sha256: digest,
-      db_backup_sha256: digest, release_tree_sha256: digest, restore_rehearsal_sha256: rehearsalDigest };
+      db_backup_sha256: digest, release_tree_sha256: releaseDigest, restore_rehearsal_sha256: rehearsalDigest };
     const receiptPath = path.join(policy.control_root, "control-plane-receipt.json");
     await fs.writeFile(receiptPath, JSON.stringify(receipt), { mode: 0o600 });
     const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
     assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: true, build_sha: targetSha });
+    await fs.chmod(releaseDir, 0o700);
+    await fs.chmod(path.join(releaseDir, "control.txt"), 0o600);
+    await fs.writeFile(path.join(releaseDir, "control.txt"), "tampered");
+    await fs.chmod(path.join(releaseDir, "control.txt"), 0o400);
+    await fs.chmod(releaseDir, 0o500);
+    assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });
+    await fs.chmod(releaseDir, 0o700);
+    await fs.chmod(path.join(releaseDir, "control.txt"), 0o600);
+    await fs.writeFile(path.join(releaseDir, "control.txt"), artifact);
+    await fs.chmod(path.join(releaseDir, "control.txt"), 0o400);
+    await fs.chmod(releaseDir, 0o500);
+    await fs.writeFile(path.join(policy.control_root, "policy.json"), "changed", { mode: 0o600 });
+    assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });
     await fs.writeFile(path.join(attemptDir, "attempt.json"), `${JSON.stringify({ ...attempt, phase: "restore_required" })}\n`);
     assert.deepEqual(await runtime.schemaMigrationCapability(receipt.schema_migration_capability), { ready: false, build_sha: targetSha });
   } finally {
     if (previousSha === undefined) delete process.env.DONA_UPDATER_BUILD_SHA;
     else process.env.DONA_UPDATER_BUILD_SHA = previousSha;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await fs.chmod(path.join(policy.release_root, targetSha), 0o700).catch(() => undefined);
     await removeTree(root);
   }
 });
