@@ -5,7 +5,7 @@ import { afterEach, describe, test } from "node:test";
 
 import { ReleaseStore } from "../src/release-store.js";
 import type { UpdateRow } from "../src/types.js";
-import { currentSha, installPointers, manifest, removeTree, targetSha, tempPolicy } from "./helpers.js";
+import { currentSha, installPointers, installRelease, manifest, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
@@ -25,6 +25,27 @@ function row(): UpdateRow {
 }
 
 describe("ReleaseStore", () => {
+  test("isolates an invalid release while planning and cleaning a bounded batch", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const store = new ReleaseStore(policy);
+    const invalidSha = "1".repeat(40);
+    const invalid = await installRelease(policy, invalidSha);
+    await fs.symlink("/tmp", path.join(invalid, "outside"));
+    const candidates = Array.from({ length: 11 }, (_, index) => (index + 3).toString(16).repeat(40));
+    for (const sha of candidates) await installRelease(policy, sha);
+    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    const plan = await store.cleanupPlan(protectedShas);
+    assert.equal(plan.length, 9);
+    assert.equal(plan.includes(invalidSha), false);
+    const removed = await store.cleanup(protectedShas);
+    assert.equal(removed.length, 8);
+    assert.equal((await store.observe()).current_sha, currentSha);
+    assert.equal((await store.observe()).previous_sha, "0".repeat(40));
+    assert.equal((await fs.lstat(invalid)).isDirectory(), true);
+  });
+
   test("publishes an immutable release and atomically activates and rolls it back", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

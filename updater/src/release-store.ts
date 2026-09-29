@@ -182,12 +182,21 @@ export class ReleaseStore {
 
   async cleanupPlan(protectedShas: ReadonlySet<string>): Promise<string[]> {
     await this.ensureRoots();
+    const pointers = await this.observe();
     const candidates: Array<{ sha: string; mtime: number }> = [];
     for (const name of await fs.readdir(this.policy.release_root)) {
-      if (!/^[0-9a-f]{40}$/.test(name) || protectedShas.has(name)) continue;
+      if (!/^[0-9a-f]{40}$/.test(name) || protectedShas.has(name) ||
+        name === pointers.current_sha || name === pointers.previous_sha) continue;
       const releasePath = path.join(this.policy.release_root, name);
-      await this.validateReleasePath(releasePath, name);
-      candidates.push({ sha: name, mtime: (await fs.stat(releasePath)).mtimeMs });
+      try {
+        await this.validateReleasePath(releasePath, name);
+        await this.readManifest(releasePath);
+        await this.validateRemovalTree(releasePath);
+        candidates.push({ sha: name, mtime: (await fs.stat(releasePath)).mtimeMs });
+      } catch {
+        // An invalid release is quarantined by omission. It must not prevent
+        // safe candidates from being reported, or count toward retention.
+      }
     }
     candidates.sort((left, right) => right.mtime - left.mtime);
     return candidates.slice(this.policy.retain_successful).map(({ sha }) => sha);
@@ -195,20 +204,36 @@ export class ReleaseStore {
 
   async cleanup(protectedShas: ReadonlySet<string>): Promise<string[]> {
     const planned = await this.cleanupPlan(protectedShas);
-    for (const sha of planned) {
+    const removed: string[] = [];
+    const errors: string[] = [];
+    for (const sha of planned.slice(0, 8)) {
       const releasePath = path.join(this.policy.release_root, sha);
-      await this.validateReleasePath(releasePath, sha);
-      await this.makeMutableForRemoval(releasePath);
-      await this.removeGeneratedTree(this.policy.release_root, releasePath);
+      try {
+        await this.validateReleasePath(releasePath, sha);
+        await this.readManifest(releasePath);
+        await this.validateRemovalTree(releasePath);
+        const pointers = await this.observe();
+        if (protectedShas.has(sha) || pointers.current_sha === sha || pointers.previous_sha === sha) continue;
+        await this.makeMutableForRemoval(releasePath);
+        await this.removeGeneratedTree(this.policy.release_root, releasePath);
+        removed.push(sha);
+      } catch (error) {
+        // A single corrupt or replaced candidate cannot block other releases.
+        errors.push(`${sha}:${error instanceof Error ? error.message : "cleanup_failed"}`);
+      }
     }
-    return planned;
+    if (errors.length) throw new Error(`release_cleanup_candidates_failed: ${errors.join(",")}`);
+    return removed;
   }
 
   private async ensureRoots(): Promise<void> {
     await fs.mkdir(this.policy.control_root, { recursive: true, mode: 0o700 });
     await fs.mkdir(this.policy.release_root, { recursive: true, mode: 0o700 });
-    await fs.chmod(this.policy.control_root, 0o700);
-    await fs.chmod(this.policy.release_root, 0o700);
+    for (const root of [this.policy.control_root, this.policy.release_root]) {
+      const stats = await fs.lstat(root);
+      if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid?.() ||
+        (stats.mode & 0o022) !== 0) throw new Error("release_root_owner_or_permissions_invalid");
+    }
     if ((await fs.stat(this.policy.control_root)).dev === (await fs.stat(this.policy.release_root)).dev) {
       // Separate directories are intentional; sharing a filesystem is safe and simplifies durable rename.
     }
@@ -370,5 +395,18 @@ export class ReleaseStore {
     } else {
       await fs.chmod(current, 0o600);
     }
+  }
+
+  private async validateRemovalTree(current: string): Promise<void> {
+    const stats = await fs.lstat(current);
+    if (stats.isSymbolicLink() || stats.uid !== process.getuid?.() || (stats.mode & 0o022) !== 0) {
+      throw new Error("cleanup_tree_owner_or_permissions_invalid");
+    }
+    if (stats.isFile()) {
+      if (stats.nlink !== 1) throw new Error("cleanup_tree_hardlink_invalid");
+      return;
+    }
+    if (!stats.isDirectory()) throw new Error("cleanup_tree_type_invalid");
+    for (const child of await fs.readdir(current)) await this.validateRemovalTree(path.join(current, child));
   }
 }

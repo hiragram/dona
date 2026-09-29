@@ -309,7 +309,9 @@ export class UpdateController {
       this.git.refresh(current.sha),
       this.runtime.mainAgentStatus(path.join(this.policy.release_root, current.sha)),
     ]);
-    const protectedShas = new Set([current.sha, ...(previous ? [previous.sha] : [])]);
+    const protectedShas = this.database.retentionProtectedReleaseShas();
+    protectedShas.add(current.sha);
+    if (previous) protectedShas.add(previous.sha);
     return {
       schema_version: 1,
       policy_version: this.policy.policy_version,
@@ -906,7 +908,10 @@ export class UpdateController {
       }, this.clock.now());
       this.logger.info("Update succeeded", { request_id: row.request_id, target_sha: row.target_sha, fence: row.fence });
       try {
-        await this.releases.cleanup(new Set([row.target_sha, row.current_sha]));
+        const protectedShas = this.database.retentionProtectedReleaseShas();
+        protectedShas.add(row.target_sha);
+        protectedShas.add(row.current_sha);
+        await this.releases.cleanup(protectedShas);
       } catch (error) {
         this.logger.warn("Release retention cleanup failed after successful activation", {
           request_id: row.request_id,

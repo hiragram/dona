@@ -18,6 +18,29 @@ const inventory = { schema_version: 1 as const, control_plane_build_sha: targetS
 const compatibility = { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true };
 
 describe("UpdateDatabase", () => {
+  test("retains release evidence until a successful update notification is reported", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const db = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
+    const created = db.createPlan({ source_event_id: sourceEventId, reply_target: replyTarget }, {
+      current_sha: currentSha, target_sha: targetSha, previous_sha: null,
+      policy_version: policy.policy_version, compatibility, rollback_compatible: true, inventory,
+    }, new Date("2026-09-02T00:00:00.000Z"));
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set([currentSha, targetSha]));
+    const raw = new Database(path.join(policy.control_root, "updater.sqlite3"));
+    raw.prepare("UPDATE update_requests SET state='succeeded',completed_at=? WHERE request_id=?")
+      .run("2026-09-02T00:01:00.000Z", created.row.request_id);
+    raw.prepare(`INSERT INTO update_outbox(outbox_id,request_id,external_event_id,payload_json,status,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?)`).run("outbox_test",created.row.request_id,"update:test:terminal","{}","pending",
+        "2026-09-02T00:01:00.000Z","2026-09-02T00:01:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set([currentSha, targetSha]));
+    raw.prepare("UPDATE update_outbox SET status='delivered',slack_reported_at=? WHERE outbox_id='outbox_test'")
+      .run("2026-09-02T00:02:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set());
+    raw.close();
+    db.close();
+  });
+
   test("persists the exact inventory and rejects expired approval while retaining terminal evidence", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

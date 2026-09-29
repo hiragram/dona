@@ -931,6 +931,17 @@ export class UpdateDatabase {
     return this.db.prepare("SELECT * FROM update_requests ORDER BY created_at DESC LIMIT ?").all(limit) as UpdateRow[];
   }
 
+  retentionProtectedReleaseShas(): Set<string> {
+    // Unresolved attempts and notifications can still require either side of
+    // the update for rollback, reconciliation, or a completion report.
+    const rows = this.db.prepare(`SELECT current_sha,target_sha,previous_sha FROM update_requests r
+      WHERE r.state <> 'succeeded' OR EXISTS (
+        SELECT 1 FROM update_outbox o WHERE o.request_id=r.request_id
+          AND (o.status <> 'delivered' OR o.slack_reported_at IS NULL))`)
+      .all() as Array<{current_sha:string;target_sha:string;previous_sha:string|null}>;
+    return new Set(rows.flatMap((row) => [row.current_sha,row.target_sha,...(row.previous_sha?[row.previous_sha]:[])]));
+  }
+
   nonTerminalCount(): number {
     const row = this.db.prepare(`SELECT COUNT(*) AS count FROM update_requests WHERE state NOT IN (${terminalStateSql})`)
       .get() as { count: number };
