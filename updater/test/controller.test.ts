@@ -105,7 +105,7 @@ test("非互換transitionはrollback不可と提示しtarget異常時に旧runti
     app_schema_write: 2, rollback_safe: true,
   };
   const targetCompatibility: Compatibility = {
-    ...sourceCompatibility, app_schema_read_max: 3, app_schema_write: 3, rollback_safe: false,
+    ...sourceCompatibility, app_schema_read_max: 3, app_schema_write: 3,
   };
   f.policy.compatibility = sourceCompatibility;
   f.policy.compatibility_transitions = [{
@@ -2661,6 +2661,9 @@ describe("UpdateController isolated end-to-end", () => {
     git.refresh=async current=>({current_sha:current,target_sha:targetSha,target_reachable:true,ci_trusted:true,target_rollout:git.targetRollout,target_compatibility:{...policy.compatibility,rollback_safe:false}});
     const controller=new UpdateController(database,policy,git,new FakeBuild(),store,runtime,dispatcher,logger);
     await assert.rejects(controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/target_compatibility_does_not_match_the_approved_policy_version/);
+    policy.compatibility={...policy.compatibility,rollback_safe:false};
+    await assert.rejects(controller.plan({source_event_id:sourceEventId,reply_target:replyTarget}),/target_is_not_rollback_compatible_with_current_release/);
+    assert.equal(database.list().length,0);
     database.close();
   });
 
