@@ -33,6 +33,7 @@ import { insertEventJobBinding, legacySlackBinding, migrateJobRouting, readEvent
 import { migrateScheduler, type SchedulerMigrationStep } from "./scheduler/schema.js";
 import {
   insertLiveSessionReceipt,
+  expectedLiveSessionIdentity,
   liveSessionIdentityGenerationSha256,
   migrateLiveSession,
   projectLiveSessionReceipt,
@@ -42,12 +43,31 @@ import {
 } from "./live-session.js";
 import { projectWorkResultContent, SchedulerRepository, validateWorkResultContent, validateWorkResultEnvelope } from "./scheduler/repository.js";
 import { jobResultEnvelopeMaxBytes } from "./job-result-publish.js";
+import type { AuthorizedJobResultPublish } from "./job-result-publish.js";
 import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobCreationPayloadSha256FromWorkspace,
   jobObjectiveCharacterMax, legacyJobKey, parseCreateJobRequest, parseJobResultEnvelope, parseJobWorkspace, serializeJobWorkspace, stableStringify } from "./validation.js";
 
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
+const jobResultPublishReceiptSchemaSql = `CREATE TABLE IF NOT EXISTS job_result_publish_receipts(
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  canonical_digest TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL,
+  pane_id TEXT,
+  session_sha256 TEXT NOT NULL,
+  grant_generation INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('reserved','committed','needs_review')),
+  reserved_at TEXT NOT NULL,
+  committed_at TEXT)`;
+function pathOccupied(filePath: string): boolean {
+  try { fs.lstatSync(filePath); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
 function configuredSchemaWrite(): 2 | 3 {
   const manifestPath = process.env.DONA_RELEASE_MANIFEST_PATH;
   if (!manifestPath) return 3;
@@ -533,6 +553,10 @@ export function migrateDispatcherDatabase(
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
     const hasTerminalCleanups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_terminal_worker_cleanups'").get() !== undefined;
     if (hasTerminalCleanups) db.exec("CREATE TEMP TABLE preserved_terminal_cleanups_v3 AS SELECT * FROM job_terminal_worker_cleanups");
+    const hasPublishReceipts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_result_publish_receipts'").get() !== undefined;
+    if (hasPublishReceipts) db.exec(`CREATE TEMP TABLE preserved_job_result_publish_receipts_v3 AS
+      SELECT * FROM job_result_publish_receipts;
+      DROP TABLE job_result_publish_receipts;`);
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -616,6 +640,9 @@ export function migrateDispatcherDatabase(
     if (hasTerminalCleanups) db.exec(`INSERT INTO job_terminal_worker_cleanups(job_id,outcome,identity_json,updated_at)
       SELECT c.job_id,c.outcome,c.identity_json,c.updated_at FROM preserved_terminal_cleanups_v3 c JOIN jobs USING(job_id);
       DROP TABLE preserved_terminal_cleanups_v3;`);
+    if (hasPublishReceipts) db.exec(`${jobResultPublishReceiptSchemaSql};
+      INSERT INTO job_result_publish_receipts SELECT * FROM preserved_job_result_publish_receipts_v3;
+      DROP TABLE preserved_job_result_publish_receipts_v3;`);
     db.exec("DROP TABLE legacy_job_stop_markers_v3");
     migrationHook("indexes_recreated");
 
@@ -742,6 +769,7 @@ export class DispatcherDatabase {
         outcome TEXT NOT NULL CHECK(outcome IN ('pending','attempting','stopped','unknown','rejected')),
         identity_json TEXT,
         updated_at TEXT NOT NULL)`);
+      this.db.exec(jobResultPublishReceiptSchemaSql);
       // Job IDs are Herdr control names. Never move a saved name to another job.
       this.db.exec(`CREATE TRIGGER IF NOT EXISTS jobs_agent_identity_immutable
         BEFORE UPDATE OF job_id,agent_name ON jobs
@@ -1370,7 +1398,9 @@ export class DispatcherDatabase {
       SELECT j.* FROM jobs j
       JOIN job_owner_bindings b ON b.job_id=j.job_id
       LEFT JOIN job_groups g ON g.source_event_id=j.source_event_id
-      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review') AND (
+      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
+        AND NOT EXISTS (SELECT 1 FROM job_result_publish_receipts r WHERE r.job_id=j.job_id AND r.state='needs_review')
+        AND (
         (json_extract(b.owner_json,'$.kind')='schedule' AND j.completion_event_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
         OR (json_extract(b.owner_json,'$.kind')='slack_thread'
@@ -1642,9 +1672,13 @@ export class DispatcherDatabase {
       const job=this.getJobRequired(input.jobId);
       if(this.db.prepare("SELECT 1 FROM job_operator_assertion_recoveries WHERE job_id=?").get(job.job_id))
         throw new Error("operator_recovery_already_recorded");
+      const initialPublishReceipt=this.db.prepare("SELECT state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(job.job_id) as {state:string}|undefined;
       if(readEventJobBinding(this.db,job.source_event_id)?.owner.kind!=="slack_thread"||
         job.status!=="needs_review"||!job.last_error_code||job.last_error_code!==input.expectedCause||
-        job.updated_at!==input.expectedUpdatedAt||job.result_json!==null||job.steer_state!==null)
+        job.updated_at!==input.expectedUpdatedAt||
+        (job.result_json!==null&&!(job.last_error_code==="published_result_reconciliation_required"&&initialPublishReceipt?.state==="needs_review"))||
+        job.steer_state!==null)
         throw new Error("operator_recovery_job_changed");
       if(job.last_error_code==="result_path_exists"||
         (job.attempt_count===0&&job.dispatch_started_at===null&&job.prompt_accepted_at===null&&job.herdr_workspace_id===null))
@@ -1680,8 +1714,24 @@ export class DispatcherDatabase {
       const file=this.operatorResultFile(job);
       if(file.kind!==input.expectedResultClass||file.sha256!==input.expectedResultSha256)
         throw new Error("operator_result_drift");
+      const publishReceipt=this.db.prepare("SELECT canonical_digest,envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(job.job_id) as {canonical_digest:string;envelope_json:string;state:string}|undefined;
+      if(publishReceipt && (publishReceipt.state!=="needs_review" || job.last_error_code!=="published_result_reconciliation_required"))
+        throw new Error("operator_publish_receipt_changed");
       if(file.kind==="valid") {
-        this.saveJobResultInternal(job.job_id,file.result!,job.result_path,at,()=>{},true);
+        if(publishReceipt && ((job.result_json!==null&&job.result_json!==publishReceipt.envelope_json) ||
+          !this.publishedResultFileMatches(job.result_path,job.job_id,publishReceipt.envelope_json) ||
+          stableStringify(file.result)!==publishReceipt.envelope_json)) throw new Error("operator_publish_result_mismatch");
+        if(publishReceipt) {
+          this.fsyncPublishedResult(job.result_path);
+          if(!this.publishedResultFileMatches(job.result_path,job.job_id,publishReceipt.envelope_json))
+            throw new Error("operator_publish_result_mismatch");
+          if(/^[0-9a-f]{64}$/.test(publishReceipt.canonical_digest))
+            fs.rmSync(`${job.result_path}.publish-${publishReceipt.canonical_digest}.tmp`,{force:true});
+        }
+        this.saveJobResultInternal(job.job_id,file.result!,job.result_path,at,()=>{},true,publishReceipt?.canonical_digest);
+        if(publishReceipt) this.db.prepare("UPDATE job_result_publish_receipts SET state='committed',committed_at=? WHERE job_id=? AND state='needs_review'")
+          .run(at.toISOString(),job.job_id);
       } else {
         for(const id of new Set([job.completion_event_id,group.attention_event_id])) {
           if(!id) continue;
@@ -1696,10 +1746,15 @@ export class DispatcherDatabase {
           }
         }
         const changed=this.db.prepare(`UPDATE jobs SET status='failed',completed_at=?,updated_at=?,completion_event_id=NULL,
-          last_error_code='operator_assertion_result_unaccepted',last_error_message=NULL
-          WHERE job_id=? AND status='needs_review' AND updated_at=? AND last_error_code=? AND result_json IS NULL`)
+          last_error_code='operator_assertion_result_unaccepted',last_error_message=NULL,result_json=NULL
+          WHERE job_id=? AND status='needs_review' AND updated_at=? AND last_error_code=?`)
           .run(at.toISOString(),at.toISOString(),job.job_id,input.expectedUpdatedAt,input.expectedCause).changes;
         if(changed!==1) throw new Error("operator_recovery_job_changed");
+        if(publishReceipt) {
+          if(!/^[0-9a-f]{64}$/.test(publishReceipt.canonical_digest)) throw new Error("operator_publish_receipt_changed");
+          fs.rmSync(`${job.result_path}.publish-${publishReceipt.canonical_digest}.tmp`,{force:true});
+          this.db.prepare("DELETE FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").run(job.job_id);
+        }
         if(group.attention_event_id) {
           const event=this.getRequired(group.attention_event_id);
           if((JSON.parse(event.payload_json) as {job_id?:string}).job_id===job.job_id)
@@ -1756,7 +1811,7 @@ export class DispatcherDatabase {
         return job;
       }
       if(readEventJobBinding(this.db,job.source_event_id)?.owner.kind!=="slack_thread" ||
-        job.status!=="needs_review"||!["result_missing","invalid_result","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
+        job.status!=="needs_review"||!["result_missing","invalid_result","invalid_result_agent_stopped","published_result_reconciliation_required"].includes(job.last_error_code??"")||
         job.updated_at!==expectedUpdatedAt||job.last_error_code!==expectedCause||job.result_json!==null)
         throw new Error("late_result_job_changed");
       const receipt=this.getLiveSessionReceipt(jobId,stopReceiptId);
@@ -1781,8 +1836,23 @@ export class DispatcherDatabase {
       }
       const file=this.lateResultFile(job);
       if(file.sha256!==expectedDigest) throw new Error("late_result_digest_drift");
+      const publishReceipt=this.db.prepare("SELECT canonical_digest,envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(jobId) as {canonical_digest:string;envelope_json:string;state:string}|undefined;
+      if(publishReceipt && (publishReceipt.state!=="needs_review" ||
+        job.last_error_code!=="published_result_reconciliation_required" ||
+        !this.publishedResultFileMatches(job.result_path,jobId,publishReceipt.envelope_json) ||
+        stableStringify(file.result)!==publishReceipt.envelope_json)) throw new Error("late_publish_result_mismatch");
+      if(publishReceipt) {
+        this.fsyncPublishedResult(job.result_path);
+        if(!this.publishedResultFileMatches(job.result_path,jobId,publishReceipt.envelope_json))
+          throw new Error("late_publish_result_mismatch");
+        if(/^[0-9a-f]{64}$/.test(publishReceipt.canonical_digest))
+          fs.rmSync(`${job.result_path}.publish-${publishReceipt.canonical_digest}.tmp`,{force:true});
+      }
       this.assertMaintenanceFenceReceipt();
-      this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true);
+      this.saveJobResultInternal(jobId,file.result,job.result_path,at,()=>{},true,publishReceipt?.canonical_digest);
+      if(publishReceipt) this.db.prepare("UPDATE job_result_publish_receipts SET state='committed',committed_at=? WHERE job_id=? AND state='needs_review'")
+        .run(at.toISOString(),jobId);
       if(this.lateResultFile(job).sha256!==expectedDigest) throw new Error("late_result_digest_drift");
       this.markTerminalWorkerStopProof(jobId);
       this.enqueueJobNotification(jobId,at);
@@ -2204,14 +2274,17 @@ export class DispatcherDatabase {
       }
       const result=this.scheduler.reconcileWorkRun(runId,outcome,{tenant_id:row.tenant_id,actor_id:"dispatcher-admin",role:"admin",source_event_id:null},reconciledAt);
       if(row.job_id) {
-        this.db.prepare(`UPDATE jobs SET status=?,completed_at=?,
+        const discardedPublish=this.db.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'")
+          .get(row.job_id)!==undefined;
+        this.db.prepare("DELETE FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").run(row.job_id);
+        this.db.prepare(`UPDATE jobs SET status=?,completed_at=?,result_json=CASE WHEN ? THEN NULL ELSE result_json END,
           last_error_code=CASE WHEN (dispatch_started_at IS NOT NULL OR prompt_accepted_at IS NOT NULL OR herdr_workspace_id IS NOT NULL
               OR COALESCE(last_error_code,'') IN ('stale_preparing_agent_unverified','legacy_agent_sandbox_unknown'))
             AND COALESCE(last_error_code,'') NOT IN ('invalid_result_agent_stopped','agent_not_found','agent_not_running')
             AND NOT EXISTS (SELECT 1 FROM legacy_job_agents_to_stop l WHERE l.job_id=jobs.job_id AND l.stopped_at IS NOT NULL)
             THEN 'schedule_reconcile_worker_unverified' ELSE NULL END,
           last_error_message=NULL,updated_at=? WHERE job_id=? AND status IN ('needs_review','blocked')`)
-          .run(outcome,reconciledAt,reconciledAt,row.job_id);
+          .run(outcome,reconciledAt,discardedPublish?1:0,reconciledAt,row.job_id);
         this.db.prepare("UPDATE job_completion_results SET work_state=? WHERE job_id=? AND work_state='needs_review'").run(outcome,row.job_id);
       }
       return result;
@@ -2222,12 +2295,214 @@ export class DispatcherDatabase {
     this.saveJobResultInternal(jobId,result,resultPath,at,notificationHook,false);
   }
 
-  private saveJobResultInternal(jobId: string, result: JobResultEnvelope, resultPath: string, at: Date, notificationHook: JobNotificationHook, operatorLate: boolean): void {
+  /** A reservation is the single-winner fence shared with legacy file ingestion. */
+  reservePublishedJobResult(candidate: AuthorizedJobResultPublish):
+    { outcome: "reserved"; envelope: JobResultEnvelope; fresh: boolean } | { outcome: "reused" | "conflict" } {
+    return this.db.transaction((): { outcome: "reserved"; envelope: JobResultEnvelope; fresh: boolean } | { outcome: "reused" | "conflict" } => {
+      const job = this.getJob(candidate.fence.jobId);
+      if (!job || job.job_id !== candidate.envelope.job_id) return { outcome: "conflict" };
+      this.assertJobCompletionBinding(job);
+      const receipt = this.db.prepare("SELECT canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(job.job_id) as { canonical_digest: string; envelope_json: string; attempt_count: number; pane_id: string | null; session_sha256: string; grant_generation: number; state: string } | undefined;
+      if (receipt) {
+        if (receipt.canonical_digest !== candidate.canonicalDigest) return { outcome: "conflict" };
+        if (receipt.state === "committed" && job.result_json === receipt.envelope_json) return { outcome: "reused" };
+        if (receipt.state === "needs_review") return { outcome: "conflict" };
+        if (receipt.attempt_count !== candidate.fence.attemptCount || receipt.pane_id !== candidate.fence.paneId ||
+            receipt.session_sha256 !== createHash("sha256").update(candidate.fence.session).digest("hex") ||
+            receipt.grant_generation !== candidate.fence.grantGeneration) return { outcome: "conflict" };
+        return receipt.state === "committed" ? { outcome: "conflict" }
+          : { outcome: "reserved", envelope: parseJobResultEnvelope(JSON.parse(receipt.envelope_json),job.job_id), fresh: false };
+      }
+      if (job.result_json !== null || pathOccupied(job.result_path) ||
+          !candidate.fence.publishableStatuses.includes(job.status as "dispatching" | "running") ||
+          job.attempt_count !== candidate.fence.attemptCount || job.herdr_pane_id !== candidate.fence.paneId ||
+          expectedLiveSessionIdentity(job,this.getJobLiveSessionIdentity(job.job_id)) !== candidate.fence.session) return { outcome: "conflict" };
+      candidate.assertCurrentGrant();
+      if(readEventJobBinding(this.db,job.source_event_id)?.owner.kind==="schedule") {
+        const serialized=stableStringify(candidate.envelope);
+        validateWorkResultEnvelope(serialized);
+        if(containsHostAbsolutePath(serialized)||serialized.includes(job.workspace_path)||
+          serialized.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
+        const rendered=renderJobResult(candidate.envelope as unknown as Record<string,unknown>);
+        validateWorkResultContent(rendered);
+        if(containsHostAbsolutePath(rendered)||rendered.includes(job.workspace_path)||
+          rendered.includes(path.dirname(job.result_path))) throw new Error("scheduled_work_local_path_reported");
+        if((candidate.envelope.actions??[]).length!==0) throw new Error("scheduled_work_external_write_reported");
+        const completedAt=Date.parse(candidate.envelope.completed_at),at=Date.now();
+        if(completedAt>at) throw new Error("completed_at_is_in_the_future");
+        const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
+        if(acceptedDeadline&&at>Date.parse(acceptedDeadline)+3_600_000)
+          throw new Error("scheduled_work_result_deadline_exceeded");
+        if(job.dispatch_started_at&&completedAt<Date.parse(job.dispatch_started_at))
+          throw new Error("completed_at_precedes_prompt_dispatch");
+      }
+      this.db.prepare(`INSERT INTO job_result_publish_receipts
+        (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+        VALUES(?,?,?,?,?,?,?,'reserved',?)`)
+        .run(job.job_id,candidate.canonicalDigest,stableStringify(candidate.envelope),candidate.fence.attemptCount,
+          candidate.fence.paneId,createHash("sha256").update(candidate.fence.session).digest("hex"),
+          candidate.fence.grantGeneration,new Date().toISOString());
+      return { outcome: "reserved", envelope: candidate.envelope, fresh: true };
+    }).immediate();
+  }
+
+  /** This projection deliberately never returns worker text or private paths. */
+  inspectPublishedJobResult(jobId: string, digest: string): "pending" | "reused" | "needs_review" | "conflict" {
+    const job = this.getJob(jobId);
+    const receipt = this.db.prepare("SELECT canonical_digest,envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+      .get(jobId) as { canonical_digest: string; envelope_json: string; state: string } | undefined;
+    if (!job || !receipt || receipt.canonical_digest !== digest) return "conflict";
+    if (receipt.state === "needs_review") return "needs_review";
+    if (receipt.state === "committed")
+      return job.result_json === receipt.envelope_json && (job.status === "completed" || job.status === "failed") &&
+        this.publishedResultFileMatches(job.result_path,jobId,receipt.envelope_json) ? "reused" : "needs_review";
+    return job.result_json === null && ["dispatching","running"].includes(job.status) ? "pending" : "needs_review";
+  }
+
+  private publishedResultFileMatches(resultPath: string, jobId: string, envelopeJson: string): boolean {
+    let handle: number;
+    try {
+      handle = fs.openSync(resultPath,fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    } catch (error) {
+      if (["ENOENT","ELOOP"].includes((error as NodeJS.ErrnoException).code??"")) return false;
+      throw error;
+    }
+    try {
+      const stat = fs.fstatSync(handle);
+      if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size > jobResultEnvelopeMaxBytes) return false;
+      const bytes=fs.readFileSync(handle,"utf8");
+      try { return stableStringify(parseJobResultEnvelope(JSON.parse(bytes),jobId)) === envelopeJson; }
+      catch { return false; }
+    } finally { fs.closeSync(handle); }
+  }
+
+  private fsyncPublishedResult(resultPath:string):void {
+    const file=fs.openSync(resultPath,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW);
+    try {fs.fsyncSync(file);} finally {fs.closeSync(file);}
+    const directory=fs.openSync(path.dirname(resultPath),fsConstants.O_RDONLY);
+    try {fs.fsyncSync(directory);} finally {fs.closeSync(directory);}
+  }
+
+  /** Mark a known incomplete reservation without trusting a worker retry. */
+  quarantinePublishedJobResult(jobId:string,digest:string):void {
+    this.db.transaction(()=>{
+      const receipt=this.db.prepare("SELECT state,canonical_digest FROM job_result_publish_receipts WHERE job_id=?")
+        .get(jobId) as {state:string;canonical_digest:string}|undefined;
+      if(!receipt||receipt.canonical_digest!==digest||receipt.state!=="reserved") return;
+      this.db.prepare("UPDATE job_result_publish_receipts SET state='needs_review' WHERE job_id=? AND state='reserved'").run(jobId);
+      this.markPublishedJobNeedsReview(jobId);
+    }).immediate();
+  }
+
+  private markPublishedJobNeedsReview(jobId:string):void {
+    const job=this.getJobRequired(jobId),binding=readEventJobBinding(this.db,job.source_event_id);
+    if(job.completion_event_id) {
+      const notice=this.get(job.completion_event_id);
+      if(notice&&["queued","retryable_failed"].includes(notice.status)) {
+        const at=nowUtc();
+        this.db.prepare(`UPDATE events SET status='completed',completed_at=?,updated_at=?,
+          last_error_code='job_result_superseded',last_error_message=NULL WHERE event_id=? AND status IN ('queued','retryable_failed')`)
+          .run(at,at,notice.event_id);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='none' WHERE notification_event_id=? AND notification_state='pending'")
+          .run(notice.event_id);
+        this.db.prepare(`UPDATE job_groups SET attention_event_id=CASE WHEN attention_event_id=? THEN NULL ELSE attention_event_id END,
+          all_terminal_event_id=CASE WHEN all_terminal_event_id=? THEN NULL ELSE all_terminal_event_id END WHERE source_event_id=?`)
+          .run(notice.event_id,notice.event_id,job.source_event_id);
+        this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=? AND completion_event_id=?")
+          .run(jobId,notice.event_id);
+      } else if(notice&&["dispatching","waiting_agent"].includes(notice.status)) {
+        const at=nowUtc();
+        this.db.prepare(`UPDATE events SET status='needs_review',updated_at=?,
+          last_error_code='published_result_notification_reconciliation_required',last_error_message=NULL
+          WHERE event_id=? AND status IN ('dispatching','waiting_agent')`).run(at,notice.event_id);
+        this.db.prepare("UPDATE job_completion_results SET notification_state='needs_review' WHERE notification_event_id=?")
+          .run(notice.event_id);
+      }
+    }
+    if(["completed","failed","cancelled"].includes(job.status)) {
+      this.db.prepare(`UPDATE jobs SET status='needs_review',last_error_code='published_result_reconciliation_required',
+        last_error_message='Published Result requires file and database reconciliation',steer_state=NULL,updated_at=? WHERE job_id=?`)
+        .run(nowUtc(),jobId);
+    } else this.markJobNeedsReview(jobId,"published_result_reconciliation_required",
+      "Published Result requires file and database reconciliation");
+    if(binding?.owner.kind==="schedule") {
+      const run=this.scheduler.getRun(binding.owner.run_id);
+      if(run&&["started","completed","failed","cancelled","needs_review"].includes(run.status))
+        this.scheduler.markWorkRunNeedsReview(binding.owner.run_id,jobId,
+          new Date(Math.floor(Date.now()/1000)*1000).toISOString().replace(".000Z","Z"),job.source_event_id);
+    }
+  }
+
+  /** Called once on supervisor startup, before a new worker can ingest a stranded file. */
+  quarantineIncompletePublishedResults(): number {
+    let quarantined = 0;
+    const rows = this.db.prepare(`SELECT r.job_id,r.state,r.envelope_json,j.result_path,j.result_json
+      FROM job_result_publish_receipts r JOIN jobs j USING(job_id) WHERE r.state IN ('reserved','committed')`)
+      .all() as Array<{ job_id: string; state: string; envelope_json: string; result_path: string; result_json: string | null }>;
+    for (const row of rows) {
+      const validFile = this.publishedResultFileMatches(row.result_path,row.job_id,row.envelope_json);
+      if (row.state === "committed" && validFile && row.result_json === row.envelope_json) continue;
+      this.db.transaction(() => {
+        const current = this.db.prepare("SELECT state FROM job_result_publish_receipts WHERE job_id=?").get(row.job_id) as { state: string } | undefined;
+        if (current?.state !== row.state) return;
+        this.db.prepare("UPDATE job_result_publish_receipts SET state='needs_review' WHERE job_id=?").run(row.job_id);
+        this.markPublishedJobNeedsReview(row.job_id);
+        quarantined++;
+      }).immediate();
+    }
+    return quarantined;
+  }
+
+  private quarantineChangedCommittedResult(jobId:string):void {
+    const receipt=this.db.prepare("SELECT envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+      .get(jobId) as {envelope_json:string;state:string}|undefined;
+    if(receipt?.state!=="committed") return;
+    const job=this.getJobRequired(jobId);
+    if(job.result_json===receipt.envelope_json&&
+      this.publishedResultFileMatches(job.result_path,jobId,receipt.envelope_json)) return;
+    this.db.transaction(()=>{
+      const current=this.db.prepare("SELECT envelope_json,state FROM job_result_publish_receipts WHERE job_id=?")
+        .get(jobId) as {envelope_json:string;state:string}|undefined;
+      if(current?.state!=="committed"||current.envelope_json!==receipt.envelope_json) return;
+      this.db.prepare("UPDATE job_result_publish_receipts SET state='needs_review' WHERE job_id=? AND state='committed'").run(jobId);
+      this.markPublishedJobNeedsReview(jobId);
+    }).immediate();
+  }
+
+  commitPublishedJobResult(candidate: AuthorizedJobResultPublish, at = new Date(), notificationHook: JobNotificationHook = () => {}): "reused" | "conflict" {
+    return this.db.transaction(() => {
+      const job = this.getJob(candidate.fence.jobId);
+      const receipt = this.db.prepare("SELECT canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at FROM job_result_publish_receipts WHERE job_id=?")
+        .get(candidate.fence.jobId) as { canonical_digest: string; envelope_json: string; attempt_count: number; pane_id: string | null; session_sha256: string; grant_generation: number; state: string; reserved_at:string } | undefined;
+      if (!job || !receipt || receipt.canonical_digest !== candidate.canonicalDigest ||
+          receipt.envelope_json !== stableStringify(candidate.envelope) ||
+          receipt.attempt_count !== candidate.fence.attemptCount || receipt.pane_id !== candidate.fence.paneId ||
+          receipt.session_sha256 !== createHash("sha256").update(candidate.fence.session).digest("hex") ||
+          receipt.grant_generation !== candidate.fence.grantGeneration) return "conflict";
+      if (receipt.state === "committed") return job.result_json === receipt.envelope_json ? "reused" : "conflict";
+      if (receipt.state === "needs_review") return "conflict";
+      if (job.result_json !== null ||
+          !candidate.fence.publishableStatuses.includes(job.status as "dispatching" | "running") ||
+          job.attempt_count !== candidate.fence.attemptCount || job.herdr_pane_id !== candidate.fence.paneId ||
+          expectedLiveSessionIdentity(job,this.getJobLiveSessionIdentity(job.job_id)) !== candidate.fence.session) return "conflict";
+      candidate.assertCurrentGrant();
+      this.saveJobResultInternal(job.job_id,candidate.envelope,job.result_path,at,notificationHook,false,candidate.canonicalDigest,new Date(receipt.reserved_at));
+      this.db.prepare("UPDATE job_result_publish_receipts SET state='committed',committed_at=? WHERE job_id=? AND state='reserved'")
+        .run(at.toISOString(),job.job_id);
+      return "reused";
+    }).immediate();
+  }
+
+  private saveJobResultInternal(jobId: string, result: JobResultEnvelope, resultPath: string, at: Date, notificationHook: JobNotificationHook, operatorLate: boolean, publishedDigest?: string, scheduleValidationAt=at): void {
     this.db.transaction(() => {
       const job=this.getJobRequired(jobId);
       this.assertJobCompletionBinding(job);
       if (result.job_id !== jobId) throw new Error("job_result_identity_mismatch");
       if (job.result_json === stableStringify(result) && job.status === result.status) return;
+      const publishReceipt=this.db.prepare("SELECT canonical_digest FROM job_result_publish_receipts WHERE job_id=?")
+        .get(jobId) as { canonical_digest: string } | undefined;
+      if (publishReceipt && publishReceipt.canonical_digest !== publishedDigest) throw new Error("job_result_publish_reserved");
       const binding = readEventJobBinding(this.db,job.source_event_id);
       if (binding?.owner.kind === "schedule") {
         const serialized=stableStringify(result);
@@ -2240,9 +2515,9 @@ export class DispatcherDatabase {
       }
       const status: JobStatus = result.status === "completed" ? "completed" : "failed";
       const completedAt = new Date(result.completed_at);
-      if(binding?.owner.kind==="schedule"&&completedAt.getTime()>at.getTime()) throw new Error("completed_at_is_in_the_future");
+      if(binding?.owner.kind==="schedule"&&completedAt.getTime()>scheduleValidationAt.getTime()) throw new Error("completed_at_is_in_the_future");
       const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
-      if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
+      if(binding?.owner.kind==="schedule"&&acceptedDeadline&&scheduleValidationAt.getTime()>Date.parse(acceptedDeadline)+3_600_000)
         throw new Error("scheduled_work_result_deadline_exceeded");
       const recoverAmbiguous=job.status==="needs_review"&&(operatorLate||["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
         (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
@@ -2269,8 +2544,9 @@ export class DispatcherDatabase {
           this.db.prepare("UPDATE jobs SET completion_event_id=NULL WHERE job_id=?").run(jobId);
         }
         if(recoverAmbiguous&&binding?.owner.kind==="schedule") this.scheduler.recoverWorkRunForResult(binding.owner.run_id,jobId,job.source_event_id,new Date(Math.floor(at.getTime()/1000)*1000).toISOString().replace(".000Z","Z"));
-        this.updateJob(jobId, recoverAmbiguous?["needs_review"]:["running","cancelling"], status, {
-          result_json: stableStringify(result), result_path: resultPath, completed_at: completedAt.toISOString(),
+        this.updateJob(jobId, recoverAmbiguous?["needs_review"]:publishedDigest?["dispatching","running"]:["running","cancelling"], status, {
+          result_json: stableStringify(result), result_path: resultPath,
+          completed_at: publishedDigest ? result.completed_at : completedAt.toISOString(),
           last_error_code: job.status === "cancelling" && job.last_error_code !== "cancel_worker_stopped"
             ? "cancel_worker_unverified" : job.steer_state === "dispatching" || job.steer_state === "accepted"
               ? "terminal_steer_worker_unverified" : result.status === "failed" ? "agent_reported_failure" : null,
@@ -2420,8 +2696,11 @@ export class DispatcherDatabase {
   }
 
   enqueueJobNotification(jobId: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): EnqueueResult {
+    this.quarantineChangedCommittedResult(jobId);
     return this.db.transaction(() => {
       const job = this.getJobRequired(jobId);
+      if (this.db.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").get(jobId))
+        throw new Error("published_result_reconciliation_required");
       this.assertJobSourceMatchesThread(jobId, job.source_event_id);
       const binding = readEventJobBinding(this.db, job.source_event_id)!;
       return binding.owner.kind === "schedule"
@@ -2559,6 +2838,11 @@ export class DispatcherDatabase {
 
   private materializeJobCompletion(jobId: string, at: Date, notificationHook: JobNotificationHook = () => {}): EnqueueResult {
     const job = this.getJobRequired(jobId);
+    const receipt=this.db.prepare("SELECT state,envelope_json FROM job_result_publish_receipts WHERE job_id=?")
+      .get(jobId) as {state:string;envelope_json:string}|undefined;
+    if (receipt?.state==="needs_review" || (receipt?.state==="committed" &&
+      (job.result_json!==receipt.envelope_json || !this.publishedResultFileMatches(job.result_path,jobId,receipt.envelope_json))))
+      throw new Error("published_result_reconciliation_required");
     this.assertJobCompletionBinding(job);
     if (!jobNotificationStatuses.has(job.status)) throw new Error("job_not_ready_for_completion");
     if (job.completion_event_id) {

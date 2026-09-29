@@ -7,14 +7,15 @@ import { JobResultPublishCapabilities, JobResultPublishError, jobResultEnvelopeM
 
 export interface JobResultPublishSink {
   /** Compare candidate.fence and call candidate.assertCurrentGrant() inside the synchronous Result transaction. */
-  commit(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "created" | "reused" | "conflict" }>;
+  commit(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "created" | "reused" | "pending" | "conflict"; receipt_id?: string }>;
   /** Must compare the durable digest and may never mutate a terminal Result. */
-  reconcile(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "reused" | "conflict" }>;
+  reconcile(candidate: AuthorizedJobResultPublish): Promise<{ outcome: "reused" | "pending" | "needs_review" | "conflict"; receipt_id?: string }>;
 }
 const oversizedBodyDrainBytes = 65_536;
 
-function reply(response: ServerResponse, status: number, code: string): void {
-  const encoded = Buffer.from(JSON.stringify({ schema_version: 1, code }));
+function reply(response: ServerResponse, status: number, code: string, receiptId?: string): void {
+  const encoded = Buffer.from(JSON.stringify({ schema_version: 1, code,
+    ...(receiptId && /^[a-f0-9]{64}$/.test(receiptId) ? { receipt_id: receiptId } : {}) }));
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": encoded.length });
   response.end(encoded);
 }
@@ -247,7 +248,7 @@ export class JobResultPublishServer {
     const headerDeadline = this.headerDeadlines.get(request.socket);
     if (headerDeadline) clearTimeout(headerDeadline);
     this.headerDeadlines.delete(request.socket);
-    if (request.method !== "POST" || !["/v1/job-result-publish", "/v1/job-result-publish/renew"].includes(request.url ?? "")) {
+    if (request.method !== "POST" || !["/v1/job-result-publish", "/v1/job-result-publish/renew", "/v1/job-result-publish/reconcile"].includes(request.url ?? "")) {
       reject(request, response, 404, "not_found"); return;
     }
     const capability = request.headers["x-dona-job-result-capability"];
@@ -314,7 +315,7 @@ export class JobResultPublishServer {
       const candidate = this.grants.validate(capability, session, input, this.getJob);
       if (this.stopping) throw new JobResultPublishError("job_not_publishable");
       const publish = (async () => {
-        const result = candidate.reconcileOnly
+        const result = candidate.reconcileOnly || request.url === "/v1/job-result-publish/reconcile"
           ? await this.sink.reconcile(candidate)
           : await this.sink.commit(candidate);
         if (response.destroyed || response.writableFinished) return;
@@ -322,7 +323,9 @@ export class JobResultPublishServer {
           response.once("finish", () => resolve());
           response.once("close", () => resolve());
         });
-        reply(response, result.outcome === "conflict" ? 409 : result.outcome === "created" ? 202 : 200, result.outcome);
+        reply(response, result.outcome === "conflict" ? 409 : result.outcome === "needs_review" ? 423 : result.outcome === "pending" ? 425 : result.outcome === "created" ? 202 : 200,
+          result.outcome,
+          result.outcome === "created" || result.outcome === "reused" ? result.receipt_id : undefined);
         await finished;
       })();
       this.publishing.add(publish);

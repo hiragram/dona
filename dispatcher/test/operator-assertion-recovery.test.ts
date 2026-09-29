@@ -5,6 +5,7 @@ import path from "node:path";
 import {afterEach, test} from "node:test";
 import Database from "better-sqlite3";
 import {DispatcherDatabase,migrateDispatcherDatabase} from "../src/database.js";
+import {stableStringify} from "../src/validation.js";
 import {eventEnvelope, tempConfig} from "./helpers.js";
 
 const roots:string[]=[];
@@ -56,6 +57,82 @@ test("妥当な Result は申告と個別照合を記録して受理する",asyn
     assert.equal((raw.prepare("SELECT result_class FROM job_operator_assertion_recoveries WHERE job_id=?")
       .get(state.job.job_id) as {result_class:string}).result_class,"valid");
     assert.equal(raw.prepare("SELECT 1 FROM job_terminal_worker_stop_proofs WHERE job_id=?").get(state.job.job_id),undefined);
+  } finally {raw.close();}
+});
+
+test("公開receiptのneeds_reviewを一致するfileと申告で確定する",async()=>{
+  const state=await setup("published_result_reconciliation_required");
+  const result={schema_version:1,job_id:state.job.job_id,status:"completed" as const,summary:"完了",completed_at:new Date().toISOString()};
+  await fs.mkdir(path.dirname(state.job.result_path),{recursive:true});
+  await fs.writeFile(state.job.result_path,JSON.stringify(result),{mode:0o600});
+  const raw=new Database(state.config.databasePath);
+  try {
+    raw.prepare(`INSERT INTO job_result_publish_receipts
+      (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+      VALUES(?,?,?,?,?,?,?,'needs_review',?)`)
+      .run(state.job.job_id,digest("winner"),stableStringify(result),state.job.attempt_count,null,digest("session"),1,new Date().toISOString());
+    assert.equal(state.database.recoverWithOperatorAssertion(state.input()).status,"completed");
+    assert.equal((raw.prepare("SELECT state FROM job_result_publish_receipts WHERE job_id=?").get(state.job.job_id) as {state:string}).state,"committed");
+  } finally {raw.close();}
+});
+
+test("公開receiptのfile欠落は申告後に失敗へ確定し通知できる",async()=>{
+  const state=await setup("published_result_reconciliation_required");
+  await fs.mkdir(path.dirname(state.job.result_path),{recursive:true});
+  const temporary=`${state.job.result_path}.publish-${digest("winner")}.tmp`;
+  await fs.writeFile(temporary,"private temporary result",{mode:0o600});
+  const raw=new Database(state.config.databasePath);
+  try {
+    raw.prepare(`INSERT INTO job_result_publish_receipts
+      (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+      VALUES(?,?,?,?,?,?,?,'needs_review',?)`)
+      .run(state.job.job_id,digest("winner"),"{}",state.job.attempt_count,null,digest("session"),1,new Date().toISOString());
+    assert.equal(state.database.recoverWithOperatorAssertion(state.input()).status,"failed");
+    assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(state.job.job_id),undefined);
+    await assert.rejects(fs.stat(temporary),{code:"ENOENT"});
+  } finally {raw.close();}
+});
+
+test("公開receiptと異なるResultは申告しても受理しない",async()=>{
+  const state=await setup("published_result_reconciliation_required");
+  const result={schema_version:1,job_id:state.job.job_id,status:"completed" as const,summary:"差し替え",completed_at:new Date().toISOString()};
+  await fs.mkdir(path.dirname(state.job.result_path),{recursive:true});
+  await fs.writeFile(state.job.result_path,JSON.stringify(result),{mode:0o600});
+  const raw=new Database(state.config.databasePath);
+  try {
+    raw.prepare(`INSERT INTO job_result_publish_receipts
+      (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+      VALUES(?,?,?,?,?,?,?,'needs_review',?)`)
+      .run(state.job.job_id,digest("winner"),stableStringify({...result,summary:"元の結果"}),state.job.attempt_count,null,digest("session"),1,new Date().toISOString());
+    assert.throws(()=>state.database.recoverWithOperatorAssertion(state.input()),/operator_publish_result_mismatch/);
+    assert.equal(state.database.getJob(state.job.job_id)?.status,"needs_review");
+    assert.equal((raw.prepare("SELECT state FROM job_result_publish_receipts WHERE job_id=?").get(state.job.job_id) as {state:string}).state,"needs_review");
+  } finally {raw.close();}
+});
+
+test("DB確定後のResult file喪失も隔離して申告で棄却できる",async()=>{
+  const state=await setup("published_result_reconciliation_required");
+  const result={schema_version:1,job_id:state.job.job_id,status:"completed" as const,summary:"保存済み",completed_at:new Date().toISOString()};
+  const raw=new Database(state.config.databasePath);
+  try {
+    raw.prepare("UPDATE jobs SET status='completed',result_json=?,last_error_code=NULL WHERE job_id=?")
+      .run(stableStringify(result),state.job.job_id);
+    raw.prepare(`INSERT INTO job_result_publish_receipts
+      (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at,committed_at)
+      VALUES(?,?,?,?,?,?,?,'committed',?,?)`)
+      .run(state.job.job_id,digest("winner"),stableStringify(result),state.job.attempt_count,null,digest("session"),1,new Date().toISOString(),new Date().toISOString());
+    assert.equal(state.database.quarantineIncompletePublishedResults(),1);
+    assert.equal(state.database.getJob(state.job.job_id)?.status,"needs_review");
+    const assertion=state.database.enqueue({...eventEnvelope("terminal-file-loss"),
+      occurred_at:new Date(Date.now()+1000).toISOString(),payload:{text:"Result file喪失を確認"}}).row;
+    state.database.manualComplete(assertion.event_id);
+    const preview=state.database.inspectOperatorAssertionRecovery(state.job.job_id);
+    const input={...state.input(),assertionEventId:assertion.event_id,expectedUpdatedAt:preview.updated_at,
+      expectedCause:preview.cause!,expectedResultClass:preview.result_class,expectedResultSha256:preview.result_sha256,
+      notificationEvidenceSha256:preview.notification_evidence_sha256};
+    assert.equal(state.database.recoverWithOperatorAssertion(input,new Date(Date.now()+2000)).status,"failed");
+    assert.equal(state.database.getJob(state.job.job_id)?.result_json,null);
+    assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(state.job.job_id),undefined);
   } finally {raw.close();}
 });
 

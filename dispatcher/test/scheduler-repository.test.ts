@@ -7,6 +7,8 @@ import { afterEach, test } from "node:test";
 import Database from "better-sqlite3";
 import { envelopeFromRow } from "../src/prompt.js";
 import { DispatcherDatabase, ScheduledJobCreationError } from "../src/database.js";
+import type {AuthorizedJobResultPublish} from "../src/job-result-publish.js";
+import {stableStringify} from "../src/validation.js";
 import { migrateJobRouting } from "../src/job-routing.js";
 import { migrateScheduler } from "../src/scheduler/schema.js";
 import type { Actor, RevisionInput, Run, SchedulerRepository } from "../src/scheduler/repository.js";
@@ -528,11 +530,16 @@ test("work result通知のdelivery stateと本文retentionをjob resultへ同期
     {tool:"dona_slack.set_agent_session_status",workspace:"test",channel_id:"C_TEST",thread_ts:"1.000001",status:"suspended"},
   ],completed_at:due},notificationPath,new Date(due),deliveryEvidence(completionEventId,bodySha,"2.000009","1.000001",due,"suspended"));
   assert.equal((raw.prepare("SELECT notification_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {notification_state:string}).notification_state,"accepted");
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at,committed_at)
+    VALUES(?,?,?,?,?,?,?,'committed',?,?)`)
+    .run(job.job_id,"a".repeat(64),'{"summary":"sensitive result"}',job.attempt_count,null,"b".repeat(64),1,due,due);
   fs.mkdirSync(path.dirname(job.result_path),{recursive:true}); fs.writeFileSync(job.result_path,"sensitive result");
   const temporaryResult=`${job.result_path}.tmp`; fs.writeFileSync(temporaryResult,"partial sensitive result"); repo.purge("2026-09-12T00:01:01Z");
   assert.equal(fs.existsSync(job.result_path),false);
   assert.equal(fs.existsSync(temporaryResult),false);
   assert.equal((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(job.job_id) as {result_json:string|null}).result_json,null);
+  assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
   assert.equal((raw.prepare("SELECT result_file_deleted_at FROM job_completion_results WHERE job_id=?").get(job.job_id) as {result_file_deleted_at:string|null}).result_file_deleted_at,"2026-09-12T00:01:01Z");
   assert.equal((raw.prepare("SELECT objective FROM jobs WHERE job_id=?").get(job.job_id) as {objective:string}).objective,"[deleted]");
   assert.equal(JSON.parse((raw.prepare("SELECT payload_json FROM events WHERE event_id=?").get(run.event_id) as {payload_json:string}).payload_json).work.objective,"[deleted]");
@@ -1876,6 +1883,131 @@ test("needs_reviewのrevision本文/objectiveも7日で消去しfenceを保持",
   assert.equal((raw.prepare("SELECT count(*) AS n FROM schedule_revisions WHERE content IS NOT NULL").get() as { n: number }).n, 0);
   assert.equal((raw.prepare("SELECT count(*) AS n FROM connector_outbox WHERE status = 'needs_review' AND request_started_at IS NOT NULL").get() as { n: number }).n, 2);
   assert.equal(count(raw, "schedule_runs"), 2);
+});
+
+test("公開予約の隔離をschedule runへ同期しadminが失敗確定できる",()=>{
+  const {repo,dispatcher,raw,filename}=setup();
+  repo.create("publish_review",{...input,action:"work.read_only"},due,actor,now);
+  const run=repo.materialize("publish_review",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective:input.content!,workspace:{kind:"scratch"}},
+    path.join(path.dirname(filename),"jobs"),path.join(path.dirname(filename),"results"),new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));
+  dispatcher.beginJobDispatch(job.job_id,new Date(due));
+  dispatcher.markJobRunning(job.job_id,new Date(due));
+  const digest="a".repeat(64);
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+    VALUES(?,?,?,?,?,?,?,'reserved',?)`)
+    .run(job.job_id,digest,"{}",dispatcher.getJob(job.job_id)!.attempt_count,null,"b".repeat(64),1,due);
+  dispatcher.quarantinePublishedJobResult(job.job_id,digest);
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"needs_review");
+  assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+  raw.prepare("UPDATE jobs SET result_json=? WHERE job_id=?")
+    .run('{"status":"completed","summary":"unverified success"}',job.job_id);
+  dispatcher.reconcileScheduledRun(run.run_id,"failed",new Date(due));
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"failed");
+  assert.equal(dispatcher.getJob(job.job_id)?.result_json,null);
+  assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
+  raw.prepare("UPDATE jobs SET status='cancelled' WHERE job_id=?").run(job.job_id);
+  raw.prepare("UPDATE schedule_runs SET status='cancelled' WHERE run_id=?").run(run.run_id);
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at,committed_at)
+    VALUES(?,?,?,?,?,?,?,'committed',?,?)`)
+    .run(job.job_id,digest,"{}",dispatcher.getJob(job.job_id)!.attempt_count,null,"b".repeat(64),1,due,due);
+  assert.equal(dispatcher.quarantineIncompletePublishedResults(),1);
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"needs_review");
+  assert.equal(repo.getRun(run.run_id)?.status,"needs_review");
+});
+
+test("completion rowのない隔離済みschedule receiptとfileを7日後に消去する",()=>{
+  const {repo,dispatcher,raw,filename}=setup();
+  repo.create("orphan_publish",{...input,action:"work.read_only"},due,actor,now);
+  const run=repo.materialize("orphan_publish",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective:input.content!,workspace:{kind:"scratch"}},
+    path.join(path.dirname(filename),"jobs"),path.join(path.dirname(filename),"results"),new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));
+  dispatcher.beginJobDispatch(job.job_id,new Date(due));
+  dispatcher.markJobRunning(job.job_id,new Date(due));
+  const digest="c".repeat(64);
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+    VALUES(?,?,?,?,?,?,?,'reserved',?)`)
+    .run(job.job_id,digest,'{"summary":"private result"}',dispatcher.getJob(job.job_id)!.attempt_count,null,"d".repeat(64),1,due);
+  dispatcher.quarantinePublishedJobResult(job.job_id,digest);
+  fs.mkdirSync(path.dirname(job.result_path),{recursive:true});
+  fs.writeFileSync(job.result_path,"private result");
+  fs.writeFileSync(`${job.result_path}.publish-${digest}.tmp`,"private temp");
+  raw.prepare("UPDATE events SET result_json=? WHERE event_id=?").run('{"summary":"private event result"}',run.event_id);
+  const cutoff=`${new Date(Date.parse(dispatcher.getJob(job.job_id)!.updated_at)+604801000).toISOString().slice(0,19)}Z`;
+  const before=repo.retentionPlan(cutoff);
+  assert.equal(before.job_contents,1);
+  assert.equal(before.event_contents,1);
+  assert.equal(before.result_files,1);
+  repo.purge(cutoff);
+  assert.equal((raw.prepare("SELECT envelope_json FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id) as {envelope_json:string}).envelope_json,"{}");
+  assert.equal(fs.existsSync(job.result_path),false);
+  assert.equal(fs.existsSync(`${job.result_path}.publish-${digest}.tmp`),false);
+  assert.equal(dispatcher.getJob(job.job_id)?.objective,"[deleted]");
+  const source=dispatcher.get(run.event_id!)!;
+  assert.equal((JSON.parse(source.payload_json) as {work:{objective:string}}).work.objective,"[deleted]");
+  assert.equal(source.result_json,null);
+  assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,"published_result_retention_purged");
+  assert.equal(repo.retentionPlan(cutoff).result_files,0);
+  repo.purge(cutoff);
+  assert.equal(repo.retentionPlan(cutoff).result_files,0);
+});
+
+test("schedule固有の不受理Resultは予約receiptを残さない",()=>{
+  const {repo,dispatcher,raw,filename}=setup();
+  repo.create("invalid_publish",{...input,action:"work.read_only"},due,actor,now);
+  const run=repo.materialize("invalid_publish",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective:input.content!,workspace:{kind:"scratch"}},
+    path.join(path.dirname(filename),"jobs"),path.join(path.dirname(filename),"results"),new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));
+  dispatcher.setJobRuntime(job.job_id,"workspace-1","pane-1","session-1");
+  dispatcher.beginJobDispatch(job.job_id,new Date(due));
+  dispatcher.markJobRunning(job.job_id,new Date(due));
+  const current=dispatcher.getJob(job.job_id)!;
+  const session=JSON.stringify(["workspace-1","pane-1",job.agent_name,"session-1"]);
+  const request={schema_version:1 as const,status:"completed" as const,summary:"完了",actions:[{tool:"external"}]};
+  const candidate:AuthorizedJobResultPublish={request,envelope:{...request,job_id:job.job_id,completed_at:due},
+    canonicalDigest:"e".repeat(64),encodedBytes:100,reconcileOnly:false,
+    fence:{jobId:job.job_id,publishableStatuses:["dispatching","running"],grantGeneration:1,
+      attemptCount:current.attempt_count,paneId:"pane-1",session},assertCurrentGrant:()=>{}};
+  assert.throws(()=>dispatcher.reservePublishedJobResult(candidate),/scheduled_work_external_write_reported/);
+  assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
+});
+
+test("schedule期限直前の予約はfile確定中に期限を跨いでも受理する",()=>{
+  const {repo,dispatcher,raw,filename}=setup();
+  repo.create("deadline_publish",{...input,action:"work.read_only"},due,actor,now);
+  const run=repo.materialize("deadline_publish",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective:input.content!,workspace:{kind:"scratch"}},
+    path.join(path.dirname(filename),"jobs"),path.join(path.dirname(filename),"results"),new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));
+  dispatcher.setJobRuntime(job.job_id,"workspace-1","pane-1","session-1");
+  dispatcher.beginJobDispatch(job.job_id,new Date(due));
+  dispatcher.markJobRunning(job.job_id,new Date(due));
+  const reservedAt=new Date(Date.now()-10000).toISOString();
+  const dispatchAt=new Date(Date.now()-3602000).toISOString();
+  raw.prepare("UPDATE jobs SET dispatch_started_at=?,prompt_accepted_at=? WHERE job_id=?")
+    .run(dispatchAt,dispatchAt,job.job_id);
+  const current=dispatcher.getJob(job.job_id)!;
+  const session=JSON.stringify(["workspace-1","pane-1",job.agent_name,"session-1"]);
+  const request={schema_version:1 as const,status:"completed" as const,summary:"完了",actions:[]};
+  const envelope={...request,job_id:job.job_id,completed_at:reservedAt};
+  const candidate:AuthorizedJobResultPublish={request,envelope,canonicalDigest:"f".repeat(64),encodedBytes:100,
+    reconcileOnly:false,fence:{jobId:job.job_id,publishableStatuses:["dispatching","running"],grantGeneration:1,
+      attemptCount:current.attempt_count,paneId:"pane-1",session},assertCurrentGrant:()=>{}};
+  fs.mkdirSync(path.dirname(job.result_path),{recursive:true});
+  fs.writeFileSync(job.result_path,JSON.stringify(envelope),{mode:0o600});
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+    VALUES(?,?,?,?,?,?,?,'reserved',?)`)
+    .run(job.job_id,candidate.canonicalDigest,stableStringify(envelope),current.attempt_count,"pane-1",
+      createHash("sha256").update(session).digest("hex"),1,reservedAt);
+  assert.equal(dispatcher.commitPublishedJobResult(candidate,new Date()),"reused");
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"completed");
 });
 
 test("dona_scheduleは#11 routingへ流しlegacy scheduler eventだけを除外する", () => {

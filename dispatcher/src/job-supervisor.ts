@@ -225,6 +225,10 @@ export class JobSupervisor {
 
   start(): void {
     if (this.loopPromise) return;
+    const publishedNeedsReview = this.database.quarantineIncompletePublishedResults();
+    if (publishedNeedsReview) this.logger.warn("Published Results require reconciliation", {
+      error_code: "published_result_reconciliation_required", count: publishedNeedsReview,
+    });
     this.recoverStaleJobs();
     this.trackRecoveredCancelledWorkerCleanups();
     this.running = true;

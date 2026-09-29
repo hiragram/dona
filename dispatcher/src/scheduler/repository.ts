@@ -611,11 +611,11 @@ export class SchedulerRepository {
     utc(now); id(jobId); id(sourceEventId);
     return this.db.transaction(() => {
       const run = this.getRun(runId);
-      if (!run || !["started","needs_review"].includes(run.status) || run.job_id !== jobId || run.event_id !== sourceEventId) throw new Error("job_reference_conflict");
+      if (!run || !["started","completed","failed","cancelled","needs_review"].includes(run.status) || run.job_id !== jobId || run.event_id !== sourceEventId) throw new Error("job_reference_conflict");
       if(run.status==="needs_review") return run;
       const before = this.get(run.schedule_id)!;
       const at = [now, run.created_at, run.started_at ?? run.created_at, before.created_at, before.updated_at].sort().at(-1)!;
-      this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write' WHERE run_id=?").run(runId);
+      this.db.prepare("UPDATE schedule_runs SET status='needs_review', reason='ambiguous_write',terminal_at=NULL WHERE run_id=?").run(runId);
       if(run.revision===before.revision) {
         this.suppress(run.schedule_id, at, "cancelled");
         this.db.prepare("UPDATE schedules SET state='needs_review', updated_at=?, terminal_at=NULL WHERE schedule_id=? AND revision=? AND state NOT IN ('completed','cancelled','expired')").run(at, run.schedule_id,run.revision);
@@ -1093,6 +1093,28 @@ export class SchedulerRepository {
   retentionPlan(now: string): Record<string, number> {
     utc(now);
     const count = (sql: string, ...values: unknown[]): number => (this.db.prepare(sql).get(...values) as { count: number }).count;
+    const hasReceipts=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_result_publish_receipts'").get()!==undefined;
+    const orphanWhere=`FROM jobs j JOIN job_owner_bindings b USING(job_id)
+      WHERE json_extract(b.owner_json,'$.kind')='schedule' AND j.status='needs_review'
+        AND j.last_error_code='published_result_reconciliation_required' AND j.updated_at<=?
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id)`;
+    const orphanDue=add(now,-604800);
+    const orphanJobContents=hasReceipts?count(`SELECT count(*) AS count ${orphanWhere}
+      AND (j.result_json IS NOT NULL OR j.objective<>'[deleted]' OR EXISTS
+        (SELECT 1 FROM job_result_publish_receipts r WHERE r.job_id=j.job_id AND r.envelope_json<>'{}'))`,orphanDue):0;
+    const orphanEventContents=hasReceipts?count(`SELECT count(DISTINCT e.event_id) AS count FROM events e JOIN jobs j ON j.source_event_id=e.event_id
+      JOIN job_owner_bindings b ON b.job_id=j.job_id WHERE e.source='dona_schedule'
+      AND json_extract(b.owner_json,'$.kind')='schedule' AND j.status='needs_review'
+      AND j.last_error_code='published_result_reconciliation_required' AND j.updated_at<=?
+      AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id)
+      AND (e.result_json IS NOT NULL OR (json_extract(e.payload_json,'$.work.objective') IS NOT NULL
+        AND json_extract(e.payload_json,'$.work.objective')<>'[deleted]'))`,orphanDue):0;
+    const orphanResultFiles=hasReceipts?count(`SELECT count(*) AS count ${orphanWhere}`,orphanDue):0;
+    const orphanEventFiles=hasReceipts?count(`SELECT count(DISTINCT e.event_id) AS count FROM events e JOIN jobs j ON j.source_event_id=e.event_id
+      JOIN job_owner_bindings b ON b.job_id=j.job_id WHERE e.source='dona_schedule' AND e.result_path IS NOT NULL
+      AND json_extract(b.owner_json,'$.kind')='schedule' AND j.status='needs_review'
+      AND j.last_error_code='published_result_reconciliation_required' AND j.updated_at<=?
+      AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id)`,orphanDue):0;
     return {
       current_authorizations: count(`SELECT count(*) AS count FROM schedules s JOIN schedule_revisions r
         ON r.schedule_id=s.schedule_id AND r.revision=s.revision WHERE s.state IN ('active','paused') AND r.expires_at<=?`, now),
@@ -1133,7 +1155,7 @@ export class SchedulerRepository {
       job_contents: count(`SELECT count(*) AS count FROM jobs j WHERE (j.result_json IS NOT NULL OR j.objective<>'[deleted]') AND EXISTS
         (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.content_delete_at<=?
           AND json_extract(c.owner_json,'$.kind')='schedule') AND NOT EXISTS
-        (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=j.job_id AND newer.content_delete_at>?)`, now, now),
+        (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=j.job_id AND newer.content_delete_at>?)`, now, now)+orphanJobContents,
       event_contents: count(`SELECT count(*) AS count FROM events e WHERE e.source IN ('dona_schedule','dona_job') AND
         (e.result_json IS NOT NULL OR (e.source='dona_schedule' AND json_extract(e.payload_json,'$.work.objective') IS NOT NULL
           AND json_extract(e.payload_json,'$.work.objective')<>'[deleted]') OR (e.source='dona_job' AND
@@ -1147,10 +1169,10 @@ export class SchedulerRepository {
           (e.source='dona_job' AND EXISTS (SELECT 1 FROM job_completion_results c
             WHERE c.notification_event_id=e.event_id AND c.content_delete_at<=? AND NOT EXISTS
               (SELECT 1 FROM job_completion_results newer WHERE newer.notification_event_id=e.event_id
-                AND newer.content_delete_at>?))))`, add(now,-604800), add(now,-604800), now, now, now, now),
+                AND newer.content_delete_at>?))))`, add(now,-604800), add(now,-604800), now, now, now, now)+orphanEventContents,
       result_files: count(`SELECT count(DISTINCT c.job_id) AS count FROM job_completion_results c WHERE c.content_delete_at<=?
         AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL
-        AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=c.job_id AND newer.content_delete_at>?)`, now, now),
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=c.job_id AND newer.content_delete_at>?)`, now, now)+orphanResultFiles,
       event_result_files: count(`SELECT count(*) AS count FROM events e WHERE e.result_path IS NOT NULL AND ((e.source='dona_schedule' AND (EXISTS
         (SELECT 1 FROM schedule_runs r WHERE r.event_id=e.event_id AND r.terminal_at<=?) OR EXISTS
         (SELECT 1 FROM job_completion_results c WHERE c.source_event_id=e.event_id AND c.content_delete_at<=?
@@ -1160,7 +1182,7 @@ export class SchedulerRepository {
         (e.source='dona_job' AND EXISTS (SELECT 1 FROM job_completion_results c WHERE c.notification_event_id=e.event_id
           AND c.content_delete_at<=? AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
             WHERE newer.notification_event_id=e.event_id AND newer.content_delete_at>?))))`, add(now,-604800), now, now,
-              add(now,-604800), now, now),
+              add(now,-604800), now, now)+orphanEventFiles,
       metadata_rows: count(`SELECT count(*) AS count FROM job_completion_results c JOIN schedule_runs r
         ON r.run_id=json_extract(c.owner_json,'$.run_id') WHERE r.terminal_at<=?
           AND c.notification_state NOT IN ('pending','failed','needs_review') AND
@@ -1178,6 +1200,17 @@ export class SchedulerRepository {
     const resultFiles=this.db.prepare(`SELECT DISTINCT j.job_id,j.result_path FROM jobs j JOIN job_completion_results c USING(job_id)
       WHERE c.content_delete_at<=? AND json_extract(c.owner_json,'$.kind')='schedule' AND c.result_file_deleted_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=j.job_id AND newer.content_delete_at>?)`).all(now,now) as Array<{job_id:string;result_path:string}>;
+    const orphanFiles=this.db.prepare(`SELECT j.job_id,j.result_path FROM jobs j JOIN job_owner_bindings b USING(job_id)
+      WHERE json_extract(b.owner_json,'$.kind')='schedule' AND j.status='needs_review'
+        AND j.last_error_code='published_result_reconciliation_required' AND j.updated_at<=?
+        AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id)`)
+      .all(add(now,-604800)) as Array<{job_id:string;result_path:string}>;
+    const orphanEvents=this.db.prepare(`SELECT DISTINCT j.job_id,e.event_id,e.result_path FROM events e JOIN jobs j ON j.source_event_id=e.event_id
+      JOIN job_owner_bindings b ON b.job_id=j.job_id
+      WHERE e.source='dona_schedule' AND json_extract(b.owner_json,'$.kind')='schedule'
+        AND j.status='needs_review' AND j.last_error_code='published_result_reconciliation_required'
+        AND j.updated_at<=? AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id)`)
+      .all(add(now,-604800)) as Array<{job_id:string;event_id:string;result_path:string|null}>;
     const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e
       LEFT JOIN schedule_runs r ON r.event_id=e.event_id
       LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id OR c.notification_event_id=e.event_id
@@ -1204,6 +1237,21 @@ export class SchedulerRepository {
         WHERE job_id IN (SELECT job_id FROM job_completion_results WHERE content_delete_at <= ?
           AND json_extract(owner_json,'$.kind')='schedule')
           AND NOT EXISTS (SELECT 1 FROM job_completion_results newer WHERE newer.job_id=jobs.job_id AND newer.content_delete_at>?)`).run(now,now);
+      if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_result_publish_receipts'").get())
+        this.db.prepare(`DELETE FROM job_result_publish_receipts WHERE job_id IN
+          (SELECT job_id FROM job_completion_results WHERE content_delete_at<=?
+            AND json_extract(owner_json,'$.kind')='schedule')
+          AND NOT EXISTS (SELECT 1 FROM job_completion_results newer
+            WHERE newer.job_id=job_result_publish_receipts.job_id AND newer.content_delete_at>?)`).run(now,now);
+      for(const row of orphanFiles) {
+        this.db.prepare("UPDATE job_result_publish_receipts SET envelope_json='{}' WHERE job_id=? AND state='needs_review'")
+          .run(row.job_id);
+        this.db.prepare("UPDATE jobs SET result_json=NULL,objective='[deleted]',last_error_message=NULL WHERE job_id=?")
+          .run(row.job_id);
+      }
+      for(const row of orphanEvents)
+        this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]'),
+          result_json=NULL,last_error_message=NULL WHERE event_id=? AND source='dona_schedule'`).run(row.event_id);
       this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]'),last_error_message=NULL
         WHERE event_id IN (SELECT source_event_id FROM job_completion_results WHERE content_delete_at<=?
           AND json_extract(owner_json,'$.kind')='schedule') AND source='dona_schedule'
@@ -1260,6 +1308,16 @@ export class SchedulerRepository {
     }).immediate();
     if(this.deleteJobResult) for(const row of resultFiles) if(this.deleteJobResult(row.job_id,row.result_path)) {
       this.db.prepare("UPDATE job_completion_results SET result_file_deleted_at=? WHERE job_id=? AND result_file_deleted_at IS NULL").run(now,row.job_id);
+    }
+    if(this.deleteJobResult) for(const row of orphanFiles) {
+      const jobDeleted=this.deleteJobResult(row.job_id,row.result_path);
+      const event=orphanEvents.find(candidate=>candidate.job_id===row.job_id);
+      const eventDeleted=!event?.result_path||this.deleteJobResult(event.event_id,event.result_path);
+      if(event?.result_path&&eventDeleted)
+        this.db.prepare("UPDATE events SET result_path=NULL WHERE event_id=? AND result_path=?").run(event.event_id,event.result_path);
+      if(jobDeleted&&eventDeleted)
+        this.db.prepare(`UPDATE jobs SET last_error_code='published_result_retention_purged' WHERE job_id=?
+          AND last_error_code='published_result_reconciliation_required'`).run(row.job_id);
     }
     if(this.deleteJobResult) for(const row of eventResults) if(this.deleteJobResult(row.event_id,row.result_path)) {
       this.db.prepare("UPDATE events SET result_path=NULL WHERE event_id=? AND result_path=?").run(row.event_id,row.result_path);
