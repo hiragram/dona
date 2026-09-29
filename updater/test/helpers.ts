@@ -3,12 +3,19 @@ import os from "node:os";
 import path from "node:path";
 
 import type { UpdatePolicy } from "../src/policy.js";
-import type { ReleaseManifest } from "../src/types.js";
+import type { ReleaseManifest, RuntimeInventory } from "../src/types.js";
 import { canonicalJson } from "../src/validation.js";
 
 export const currentSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
 export const targetSha = "2".repeat(40);
 export const olderSha = "0".repeat(40);
+export const fixtureInventory: RuntimeInventory = {
+  schema_version: 1, control_plane_build_sha: targetSha,
+  dispatcher_schema: 2, app_schema: 2, dispatcher_protocol: 1, policy_version: "2026-09-03.2",
+  launchd: { dispatcher_registered: true, slack_registered: true, identity_digest: "a".repeat(64) },
+  workers: { classes: {}, exception_digest: "b".repeat(64) },
+  pending: { updates: 0, update_notifications: 0, events: 0, jobs: 0, schedules: 0, notifications: 0, digest: "c".repeat(64) },
+};
 
 export async function tempPolicy(): Promise<{ root: string; policy: UpdatePolicy }> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-updater-test-"));

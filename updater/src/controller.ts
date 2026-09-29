@@ -17,11 +17,16 @@ import type {
   ReleaseManifest,
   SchemaRollout,
   RuntimeOperationKind,
+  RuntimeInventory,
   UpdateRow,
 } from "./types.js";
-import { canonicalJson } from "./validation.js";
+import { canonicalJson, sha256 } from "./validation.js";
 
 const systemClock: Clock = { now: () => new Date() };
+class InventoryPreflightError extends Error {
+  constructor(readonly code: "inventory_snapshot_unverified" | "approved_plan_expired" |
+    "inventory_read_unavailable" | "inventory_replan_required" | "target_changed_replan_required") { super(code); }
+}
 const schemaV3BridgeSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
 const productionV2SourceSha = "7dbaab72e3387f94f6c8a2289a685b90b100d083";
 const schemaMigrationCapability = "dispatcher_v2_to_v3_online_backup_v1";
@@ -163,6 +168,15 @@ export class UpdateController {
         throw new Error("stable_updater_exact_target_schema_migration_capability_required");
       }
     }
+    this.database.expireAwaitingApproval(this.clock.now());
+    const existing = this.database.getBySourceEventId(request.source_event_id);
+    const ownRequestId = existing && !["succeeded", "failed", "rolled_back", "needs_review", "cancelled"].includes(existing.state)
+      ? existing.request_id : undefined;
+    const inventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory([request.source_event_id]), ownRequestId);
+    const confirmedInventory = this.completeRuntimeInventory(await this.runtime.runtimeInventory([request.source_event_id]), ownRequestId);
+    if (canonicalJson(confirmedInventory) !== canonicalJson(inventory)) throw new Error("runtime_inventory_unstable");
+    if (inventory.policy_version !== this.policy.policy_version || inventory.app_schema !== inventory.dispatcher_schema ||
+      inventory.dispatcher_protocol !== current.compatibility.protocol) throw new Error("runtime_inventory_identity_unverified");
     const result = this.database.createPlan(request, {
       current_sha: current.sha,
       target_sha: git.target_sha,
@@ -171,6 +185,7 @@ export class UpdateController {
       compatibility: targetManifest.compatibility,
       rollback_compatible: rollbackCompatible,
       ...(transition ? { compatibility_transition: transition } : {}),
+      inventory,
     }, this.clock.now());
     return {
       schema_version: 1,
@@ -197,6 +212,35 @@ export class UpdateController {
       state: result.row.state,
       target_sha: result.row.target_sha,
     };
+  }
+
+  async applyVerified(request: ApplyRequest): Promise<Record<string, unknown>> {
+    this.database.expireAwaitingApproval(this.clock.now());
+    const row = this.database.getByPlanId(request.plan_id);
+    if (!row || row.plan_hash !== request.plan_hash || !row.inventory_revision || !row.approval_expires_at) {
+      throw new Error("exact_plan_approval_mismatch");
+    }
+    const approvalId = await this.dispatcher.verifyApproval({
+      source_event_id: request.source_event_id,
+      original_source_event_id: row.source_event_id,
+      plan_id: row.plan_id,
+      plan_hash: row.plan_hash,
+      target_sha: row.target_sha,
+      inventory_revision: row.inventory_revision,
+      created_at: row.created_at,
+      expires_at: row.approval_expires_at,
+      approved_event_id: row.approval_event_id,
+      reply_target: JSON.parse(row.reply_target_json) as Record<string, unknown>,
+    });
+    if (approvalId !== request.approval_id) throw new Error("approval_receipt_mismatch");
+    return this.apply(request);
+  }
+
+  planStatus(planId: string): Record<string, unknown> {
+    const row = this.database.getByPlanId(planId);
+    if (!row) throw new Error("exact_plan_not_found");
+    return { schema_version: 1, request_id: row.request_id, source_event_id: row.source_event_id,
+      state: row.state, approval_event_id: row.approval_event_id, plan: this.database.readPlan(row) };
   }
 
   cancel(requestId: string, sourceEventId: string, replyTarget: PlanRequest["reply_target"], reason = "Cancelled by operator"): Record<string, unknown> {
@@ -482,6 +526,7 @@ export class UpdateController {
       return;
     }
     if (row.state === "preparing") {
+      await this.assertApprovedInventory(row);
       const activeManifest = await this.releases.readCurrentManifest();
       this.assertLease(row);
       if (activeManifest.sha !== row.current_sha) {
@@ -490,9 +535,7 @@ export class UpdateController {
       const refreshed = await this.git.refresh(row.current_sha);
       this.assertLease(row);
       if (!refreshed.target_reachable || refreshed.target_sha !== row.target_sha) {
-        // A later fast-forward is allowed only when the approved SHA remains reachable. Never follow the new tip.
-        const reachable = refreshed.target_sha !== row.target_sha && refreshed.target_reachable;
-        if (!reachable) throw new Error("approved_target_is_no_longer_reachable");
+        throw new InventoryPreflightError("target_changed_replan_required");
       }
       const existingRelease = await this.releases.releaseManifest(row.target_sha);
       this.assertLease(row);
@@ -527,6 +570,7 @@ export class UpdateController {
       row = this.database.transition(row.request_id, row.fence, "staged", "release_staged", {}, this.clock.now());
     }
     if (row.state === "staged") {
+      await this.assertApprovedInventory(row);
       if (!row.approval_event_id || !(await this.dispatcher.eventTerminal(row.approval_event_id))) {
         throw new Error("approval_event_terminal_barrier_not_met");
       }
@@ -541,7 +585,8 @@ export class UpdateController {
           }, this.clock.now());
         return;
       }
-      row = this.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started", {}, this.clock.now());
+      row = this.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started",
+        { preflight_inventory_revision: row.inventory_revision }, this.clock.now());
     }
     if (row.state === "quiescing") {
       const persistedStop = this.database.runtimeOperation(row.request_id, "stop_main_agent");
@@ -678,6 +723,15 @@ export class UpdateController {
       if (!workerAfterStop.safe) {
         await this.restoreQuiescedServices(row,
           workerAfterStop.error_code ?? "active_worker_handoff_unavailable");
+        return;
+      }
+      try {
+        await this.assertApprovedInventory(row, true);
+        this.assertLease(row);
+      } catch (error) {
+        this.assertLease(row);
+        await this.restoreQuiescedServices(row,
+          error instanceof InventoryPreflightError ? error.code : "inventory_read_unavailable");
         return;
       }
       const previousManifest = await this.releases.readCurrentManifest();
@@ -861,6 +915,41 @@ export class UpdateController {
         });
       }
     }
+  }
+
+  private async assertApprovedInventory(row: UpdateRow, afterStop = false): Promise<void> {
+    if (!row.inventory_json || !row.inventory_revision || !row.approval_expires_at ||
+      sha256(row.inventory_json) !== row.inventory_revision) throw new InventoryPreflightError("inventory_snapshot_unverified");
+    if (this.clock.now().toISOString() >= row.approval_expires_at) throw new InventoryPreflightError("approved_plan_expired");
+    let planned: RuntimeInventory;
+    try { planned = JSON.parse(row.inventory_json) as RuntimeInventory; }
+    catch { throw new InventoryPreflightError("inventory_snapshot_unverified"); }
+    let current: RuntimeInventory;
+    try {
+      if (!row.approval_event_id) throw new InventoryPreflightError("inventory_snapshot_unverified");
+      const excluded = [row.source_event_id, row.approval_event_id];
+      current = this.completeRuntimeInventory(await this.runtime.runtimeInventory(excluded, afterStop), row.request_id);
+      const confirmed = this.completeRuntimeInventory(await this.runtime.runtimeInventory(excluded, afterStop), row.request_id);
+      if (canonicalJson(confirmed) !== canonicalJson(current)) throw new InventoryPreflightError("inventory_replan_required");
+    }
+    catch (error) {
+      if (error instanceof InventoryPreflightError) throw error;
+      throw new InventoryPreflightError("inventory_read_unavailable");
+    }
+    // Terminal history outside the projection may change. Every projected
+    // workload, protocol, registration and pending notification change needs
+    // a fresh exact plan and explicit approval before service or pointer writes.
+    if (canonicalJson(current) !== canonicalJson(planned)) throw new InventoryPreflightError("inventory_replan_required");
+  }
+
+  private completeRuntimeInventory(inventory: RuntimeInventory, ownRequestId?: string): RuntimeInventory {
+    const nonterminal = this.database.nonTerminalCount();
+    if (ownRequestId && (nonterminal < 1 || !this.database.get(ownRequestId))) {
+      throw new InventoryPreflightError("inventory_snapshot_unverified");
+    }
+    return { ...inventory, pending: { ...inventory.pending,
+      updates: nonterminal - (ownRequestId ? 1 : 0),
+      update_notifications: this.database.hasUnreportedTerminalNotification() ? 1 : 0 } };
   }
 
   private async rollback(
@@ -2133,7 +2222,7 @@ export class UpdateController {
     const mutated = ["quiescing", "activating", "restarting", "verifying", "rolling_back"].includes(row.state);
     const currentVerified = !mutated && await this.currentRuntimeVerified(row);
     const terminalState = mutated || !currentVerified ? "needs_review" : "failed";
-    const errorCode = mutated
+    const errorCode = !mutated && error instanceof InventoryPreflightError ? error.code : mutated
       ? "runtime_operation_failed"
       : currentVerified
         ? "pre_activation_failed"

@@ -12,6 +12,7 @@ import type {
   CompletionDeliveryResult,
   CompletionLookupResult,
   ReleaseManifest,
+  RuntimeInventory,
   SchemaRollout,
   UpdateRow,
 } from "./types.js";
@@ -58,6 +59,7 @@ export interface ReleaseStorePort {
 }
 
 export interface RuntimePort {
+  runtimeInventory(excludedControlEventIds?: readonly string[], afterStop?: boolean): Promise<RuntimeInventory>;
   workerSafety(): Promise<{ safe: boolean; active_worker_count: number; error_code?: string }>;
   quiesceSlack(requestId: string, targetSha: string): Promise<DrainSnapshot>;
   quiesceDispatcher(requestId: string, targetSha: string): Promise<DrainSnapshot>;
@@ -82,6 +84,7 @@ export interface RuntimePort {
 
 export interface DispatcherPort {
   eventTerminal(eventId: string): Promise<boolean>;
+  verifyApproval(input: Record<string, unknown>): Promise<string>;
   safetyStatus(): Promise<{ safe: boolean; unsafe_states: string[] }>;
   deliverCompletion(outbox: OutboxRow): Promise<CompletionDeliveryResult>;
   completionLookup(outbox: OutboxRow): Promise<CompletionLookupResult>;

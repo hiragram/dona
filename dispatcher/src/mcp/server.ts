@@ -48,7 +48,6 @@ const repository = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za
 const updateRequestId = z.string().regex(/^upd_[0-9a-hjkmnp-tv-z]{26}$/);
 const updatePlanId = z.string().regex(/^plan_[0-9a-hjkmnp-tv-z]{26}$/);
 const planHash = z.string().regex(/^[0-9a-f]{64}$/);
-const approvalId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
 const scheduleId = z.string().regex(/^sch_[a-f0-9]{32}$/);
 const scheduleIdempotencyKey = z.string().min(1).max(128).regex(/^[A-Za-z0-9_:-]+$/);
 const scheduleListCursor = z.string().regex(/^(?:0|[1-9]\d{0,14}|[1-8]\d{15}|900[0-6]\d{12}|90070\d{11}|90071[0-8]\d{10}|900719[0-8]\d{9}|9007199[01]\d{8}|90071992[0-4]\d{7}|900719925[0-3]\d{6}|9007199254[0-6]\d{5}|90071992547[0-3]\d{4}|9007199254740[0-8]\d{2}|90071992547409[0-8]\d|900719925474099[01])$/);
@@ -384,7 +383,8 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
       source_event_id: eventId,
       plan_id: updatePlanId,
       plan_hash: planHash,
-      approval_id: approvalId.describe("exact planに対する人間の承認receipt ID"),
+      target_sha: z.string().regex(/^[0-9a-f]{40}$/),
+      inventory_revision: planHash,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, async (input) => {

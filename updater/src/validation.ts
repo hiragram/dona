@@ -97,6 +97,10 @@ export function parseRequestId(value: unknown): string {
   return string(value, requestIdPattern, "request_id");
 }
 
+export function parsePlanId(value: unknown): string {
+  return string(value, planIdPattern, "plan_id");
+}
+
 export function parseActivationReceipt(input: unknown): ActivationReceipt {
   const value = object(input, "activation receipt");
   exactKeys(value, [

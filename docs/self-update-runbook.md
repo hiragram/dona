@@ -30,9 +30,11 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 ## 通常update
 
 1. Donaは`plan_self_update(source_event_id)`を呼びます。
-2. 利用者はcurrent/target exact SHA、plan hash、policy、CI、互換性、rollback可否を確認します。
-3. 明示承認後だけ、Donaは`apply_self_update(source_event_id, plan_id, plan_hash, approval_id)`を呼びます。
+2. 利用者はcurrent/target exact SHA、plan hash、inventory revision、15分の承認期限、policy、CI、互換性、rollback可否を確認します。inventoryはcontrol-plane build、Dispatcher/app schema、launchd登録とplist identity、worker class、pending event/job/schedule/notificationの件数とdigestだけを返します。worker ID、objective、Result、private pathは返しません。
+3. 承認者は同じSlack threadで`承認 plan_id=<plan ID> plan_hash=<plan hash> target_sha=<target SHA> inventory_revision=<inventory revision>`と正確に送ります。Donaはその承認event IDと4値を`apply_self_update`へ渡します。Dispatcherは保存済みSlack eventのactor、発生時刻、本文とplanを照合し、承認receipt IDをserver側で生成します。Codex hostのwrite承認や任意のreceipt文字列では代替できません。
 4. acceptedは「approval受付eventとexact planをDBへcommitした」意味です。その受付Event Resultが`completed`になるまでactivationは始まりません。
+
+承認受付後、Updaterは準備開始時とquiesce直前に同じinventory projectionを再取得します。plan作成eventと承認eventは保存済みexact IDで投影から除き、その正常な完了遷移だけでplanが失効しないようにします。他のeventは件数とdigestへ残します。projectionが変わった場合は`inventory_replan_required`、読み取り失敗は`inventory_read_unavailable`、target tipの変更は`target_changed_replan_required`として、service・pointer write前に停止します。計画を自動更新・再承認せず、新しいplanを作り直してください。projection外の完了済み履歴のみが変わる場合は許容されます。schema、登録、未settle通知、worker状態の変化は許容しません。旧schemaのworkerにはepoch/protocol/Result公開capabilityの証拠がないためunknownとして集計し、live workerがある場合は既存のworker safety gateでもactivationを拒否します。
 5. updaterは新規Slack ingressとDispatcher dequeueを止め、処理中の1件と`dona-main`のidleを待ってからCodexを終了します。owner-onlyの`config/dispatcher.env`と`config/slack.env`をMCPへ接続し、target releaseから同じpaneへ新しい`dona-main`を起動した後、Dispatcher、Slack Adapterの順に再開します。
 6. `get_self_update_status`で`runtime_state`、`runtime_operations`、`notification_state`、outbox、`main_agent`のcwd/sessionを確認します。terminal通知はmain agentを経由せず、専用workerから元Slack threadへ戻ります。`notification_state: reported`になるまで次のupdateは開始されません。
 
@@ -52,7 +54,7 @@ pre-activation中の`npm ci/test/typecheck/build`は、memory上の`output_limit
 - `get_self_update_status`の`diagnostics`は新しい順に最大32件だけを返し、`diagnostics_total_count`と`diagnostics_omitted_count`で全件数と省略数を示します。各項目は`log_id`、attempt、step、redaction後byte size、`complete` / `truncated` / `write_failed` / `purged` / `missing` / `size_mismatch` / `read_error`と、最大4 KiBのredacted tailだけを含み、private absolute pathは返しません。
 - token、URL、local pathはbounded carry bufferとUTF-8 decoderを通して永続化前にredactします。DB error summary、logger、terminal outboxには従来どおり短いsummaryとopaque IDだけが入り、raw stdout/stderrは入りません。
 - temp fileのまま停止したcaptureは、SQLiteの`updater_writer_lease`をtransactionで取得し、その後にUpdater API socketを取得した単一writerのservice起動時だけ安全性を再検証して回収し、`write_failed`へ落とします。別の生存PIDがleaseを保持している場合はsocketへ触れず起動を拒否し、停止時はservice loopを止めてからleaseを解放します。crash後のdead PIDだけをCASで引き継ぎ、PID再利用など生存判定が曖昧な場合はfail closedにします。read-only CLIによるDB openはactive captureを変更しません。final file不在やsize不一致も`complete`へ丸めません。診断保存の失敗はupdate failureを成功へ変えません。
-- control DBは診断logのcontent digestとwriter leaseを含む`user_version = 7`へforward-onlyで移行します。schema 7を読めない旧stable Updaterへのbinary差戻しは行わず、stable Updaterの配布・backup・rollback確認は通常のアプリself-updateやこのPRのmergeとは別の、明示承認付きcontrol-plane更新として扱います。
+- control DBは診断logのcontent digest、writer lease、exact inventory/承認期限/preflight revisionを含む`user_version = 8`へforward-onlyで移行します。schema 8を読めない旧stable Updaterへのbinary差戻しは行わず、stable Updaterの配布・backup・rollback確認は通常のアプリself-updateやこのPRのmergeとは別の、明示承認付きcontrol-plane更新として扱います。
 - retentionは常駐serviceが60秒ごとに評価し、terminal requestだけを古い順に対象とします。active captureとnon-terminal requestを削除せず、purge後もDB recordと元byte sizeを保持します。
 
 この機能を含むアプリPRのmergeだけでは、稼働中のstable Updaterへ新しいcapture実装やDB migrationは配布されません。production control planeへの反映は、別のmaintenance window、exact SHA確認、明示承認を伴う`--upgrade-control`の責務です。
