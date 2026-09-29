@@ -26,5 +26,5 @@
 
 予約後、同じResultディレクトリのmode 600の一時fileを書いてfsyncし、共通schemaで再読してからrenameする。ディレクトリもfsyncし、final fileを再読した後、Result保存とreceiptの`committed`変更を一つのDB transactionで確定する。同じdigestの再送では予約時のenvelopeを再使用するため、Dispatcher時刻が変わってもResultは変化しない。既存のSupervisorの通知materializationを再利用し、同じjobの通知を重複作成しない。
 
-再起動時、Supervisorは`reserved`のままのreceiptと、`committed`なのにfile／DBが一致しないreceiptを`needs_review`へ隔離する。fileだけ残った状態を別Resultで上書きしたり、曖昧な受理を成功扱いしたりしない。operatorによる修復は保存済みdigest、envelope、file、job世代、通知状態の確認が必要となる。#292 の切替前は専用transportをworkerへ接続しない。
+再起動時、Supervisorは`reserved`のままのreceiptと、`committed`なのにfile／DBが一致しないreceiptを`needs_review`へ隔離する。隔離されたjobの未送信通知はenqueueしない。v2→v3のjobs再構築でもreceiptを保持する。fileだけ残った状態を別Resultで上書きしたり、曖昧な受理を成功扱いしたりしない。operatorによる修復は保存済みdigest、envelope、file、job世代、通知状態の確認が必要となる。#292 の切替前は専用transportをworkerへ接続しない。
 - artifact と action のキーは区切り文字と camelCase を正規化して資格情報・内部 runtime identity を拒否する。自由文内の引用符付き設定キー、userinfo を持つ URI、port付き loopback URL も拒否する。本文中の全 job の期限内 grant に含まれる session／pane、永続 job の objective、workspace/result path 等も値照合して拒否する。

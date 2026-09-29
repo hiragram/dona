@@ -24,6 +24,29 @@ const schemaV2Url = new URL("./fixtures/schema-v2.sql", import.meta.url);
 
 type SqliteRow = Record<string, string | number | null>;
 
+test("v2からv3へのjobs再構築で公開receiptを保持する", async () => {
+  const { root, config } = await tempConfig();
+  roots.push(root);
+  await createSchemaV2Fixture(config.databasePath);
+  const sqlite = new Database(config.databasePath);
+  try {
+    sqlite.pragma("foreign_keys = ON");
+    sqlite.exec(`CREATE TABLE job_result_publish_receipts(
+      job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+      canonical_digest TEXT NOT NULL,envelope_json TEXT NOT NULL,attempt_count INTEGER NOT NULL,
+      pane_id TEXT,session_sha256 TEXT NOT NULL,grant_generation INTEGER NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('reserved','committed','needs_review')),
+      reserved_at TEXT NOT NULL,committed_at TEXT)`);
+    sqlite.prepare(`INSERT INTO job_result_publish_receipts VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+      "job-running","a".repeat(64),"{}",1,"pane-running","b".repeat(64),1,"reserved",
+      "2026-09-03T00:00:00Z",null);
+    migrateDispatcherDatabase(sqlite,() => {},false,3);
+    assert.deepEqual(sqlite.prepare("SELECT job_id,canonical_digest,state FROM job_result_publish_receipts")
+      .get(),{ job_id: "job-running", canonical_digest: "a".repeat(64), state: "reserved" });
+    assert.equal((sqlite.pragma("foreign_key_check") as unknown[]).length,0);
+  } finally { sqlite.close(); }
+});
+
 async function createSchemaV2Fixture(databasePath: string): Promise<SqliteRow[]> {
   const fixture = new Database(databasePath);
   fixture.pragma("foreign_keys = ON");

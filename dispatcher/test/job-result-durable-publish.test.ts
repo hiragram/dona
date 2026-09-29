@@ -110,10 +110,13 @@ describe("永続Job Result公開", () => {
     try {
       const publication = candidate();
       assert.equal((await publisher.commit(publication)).outcome,"created");
+      assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === job.job_id),true);
       await fs.unlink(job.result_path);
       assert.deepEqual(await publisher.reconcile(candidate()),{ outcome: "needs_review" });
       assert.equal(database.quarantineIncompletePublishedResults(),1);
       assert.equal(database.inspectPublishedJobResult(job.job_id,publication.canonicalDigest),"needs_review");
+      assert.equal(database.listJobsNeedingNotification().some(row => row.job_id === job.job_id),false);
+      assert.throws(() => database.enqueueJobNotification(job.job_id),/published_result_reconciliation_required/);
     } finally { database.close(); }
   });
 

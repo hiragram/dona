@@ -50,6 +50,17 @@ import { canonicalJobPayloadSha256, jobCreationObjectiveBytesFromWorkspace, jobC
 const statusSql = eventStatuses.map((status) => `'${status}'`).join(", ");
 const jobStatusSql = jobStatuses.map((status) => `'${status}'`).join(", ");
 const retryDelaysMs = [5_000, 30_000, 120_000, 600_000] as const;
+const jobResultPublishReceiptSchemaSql = `CREATE TABLE IF NOT EXISTS job_result_publish_receipts(
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  canonical_digest TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL,
+  pane_id TEXT,
+  session_sha256 TEXT NOT NULL,
+  grant_generation INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('reserved','committed','needs_review')),
+  reserved_at TEXT NOT NULL,
+  committed_at TEXT)`;
 function pathOccupied(filePath: string): boolean {
   try { fs.lstatSync(filePath); return true; }
   catch (error) {
@@ -542,6 +553,10 @@ export function migrateDispatcherDatabase(
     if (hasGroups) db.exec("CREATE TEMP TABLE preserved_job_groups_v3 AS SELECT * FROM job_groups");
     const hasTerminalCleanups = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_terminal_worker_cleanups'").get() !== undefined;
     if (hasTerminalCleanups) db.exec("CREATE TEMP TABLE preserved_terminal_cleanups_v3 AS SELECT * FROM job_terminal_worker_cleanups");
+    const hasPublishReceipts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_result_publish_receipts'").get() !== undefined;
+    if (hasPublishReceipts) db.exec(`CREATE TEMP TABLE preserved_job_result_publish_receipts_v3 AS
+      SELECT * FROM job_result_publish_receipts;
+      DROP TABLE job_result_publish_receipts;`);
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -625,6 +640,9 @@ export function migrateDispatcherDatabase(
     if (hasTerminalCleanups) db.exec(`INSERT INTO job_terminal_worker_cleanups(job_id,outcome,identity_json,updated_at)
       SELECT c.job_id,c.outcome,c.identity_json,c.updated_at FROM preserved_terminal_cleanups_v3 c JOIN jobs USING(job_id);
       DROP TABLE preserved_terminal_cleanups_v3;`);
+    if (hasPublishReceipts) db.exec(`${jobResultPublishReceiptSchemaSql};
+      INSERT INTO job_result_publish_receipts SELECT * FROM preserved_job_result_publish_receipts_v3;
+      DROP TABLE preserved_job_result_publish_receipts_v3;`);
     db.exec("DROP TABLE legacy_job_stop_markers_v3");
     migrationHook("indexes_recreated");
 
@@ -751,17 +769,7 @@ export class DispatcherDatabase {
         outcome TEXT NOT NULL CHECK(outcome IN ('pending','attempting','stopped','unknown','rejected')),
         identity_json TEXT,
         updated_at TEXT NOT NULL)`);
-      this.db.exec(`CREATE TABLE IF NOT EXISTS job_result_publish_receipts(
-        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
-        canonical_digest TEXT NOT NULL,
-        envelope_json TEXT NOT NULL,
-        attempt_count INTEGER NOT NULL,
-        pane_id TEXT,
-        session_sha256 TEXT NOT NULL,
-        grant_generation INTEGER NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('reserved','committed','needs_review')),
-        reserved_at TEXT NOT NULL,
-        committed_at TEXT)`);
+      this.db.exec(jobResultPublishReceiptSchemaSql);
       // Job IDs are Herdr control names. Never move a saved name to another job.
       this.db.exec(`CREATE TRIGGER IF NOT EXISTS jobs_agent_identity_immutable
         BEFORE UPDATE OF job_id,agent_name ON jobs
@@ -1390,7 +1398,9 @@ export class DispatcherDatabase {
       SELECT j.* FROM jobs j
       JOIN job_owner_bindings b ON b.job_id=j.job_id
       LEFT JOIN job_groups g ON g.source_event_id=j.source_event_id
-      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review') AND (
+      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
+        AND NOT EXISTS (SELECT 1 FROM job_result_publish_receipts r WHERE r.job_id=j.job_id AND r.state='needs_review')
+        AND (
         (json_extract(b.owner_json,'$.kind')='schedule' AND j.completion_event_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
         OR (json_extract(b.owner_json,'$.kind')='slack_thread'
@@ -2549,6 +2559,8 @@ export class DispatcherDatabase {
   enqueueJobNotification(jobId: string, at = new Date(), notificationHook: JobNotificationHook = () => {}): EnqueueResult {
     return this.db.transaction(() => {
       const job = this.getJobRequired(jobId);
+      if (this.db.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").get(jobId))
+        throw new Error("published_result_reconciliation_required");
       this.assertJobSourceMatchesThread(jobId, job.source_event_id);
       const binding = readEventJobBinding(this.db, job.source_event_id)!;
       return binding.owner.kind === "schedule"
@@ -2686,6 +2698,8 @@ export class DispatcherDatabase {
 
   private materializeJobCompletion(jobId: string, at: Date, notificationHook: JobNotificationHook = () => {}): EnqueueResult {
     const job = this.getJobRequired(jobId);
+    if (this.db.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=? AND state='needs_review'").get(jobId))
+      throw new Error("published_result_reconciliation_required");
     this.assertJobCompletionBinding(job);
     if (!jobNotificationStatuses.has(job.status)) throw new Error("job_not_ready_for_completion");
     if (job.completion_event_id) {
