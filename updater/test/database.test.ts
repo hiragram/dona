@@ -18,6 +18,32 @@ const inventory = { schema_version: 1 as const, control_plane_build_sha: targetS
 const compatibility = { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true };
 
 describe("UpdateDatabase", () => {
+  test("computes doctor retention without writing schema 9 or requiring the schema 9 clock table", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const databasePath = path.join(policy.control_root, "updater.sqlite3");
+    const db = new UpdateDatabase(databasePath);
+    const created = db.createPlan({ source_event_id: sourceEventId, reply_target: replyTarget }, {
+      current_sha: currentSha, target_sha: targetSha, previous_sha: null,
+      policy_version: policy.policy_version, compatibility, rollback_compatible: true, inventory,
+    });
+    db.close();
+    const raw = new Database(databasePath);
+    raw.prepare("UPDATE update_requests SET state='failed',completed_at=? WHERE request_id=?")
+      .run("2026-09-01T00:00:00.000Z", created.row.request_id);
+    raw.close();
+    const readonly = new UpdateDatabase(databasePath, { readonly: true });
+    assert.deepEqual(readonly.retentionProtectedReleaseShas(new Date("2026-12-01"), 1_000), new Set([currentSha, targetSha]));
+    readonly.close();
+    const check = new Database(databasePath);
+    assert.equal((check.prepare("SELECT COUNT(*) AS count FROM update_retention_uptime").get() as {count:number}).count, 0);
+    check.exec("DROP TABLE update_retention_uptime; PRAGMA user_version = 8;");
+    check.close();
+    const legacyReadonly = new UpdateDatabase(databasePath, { readonly: true });
+    assert.deepEqual(legacyReadonly.retentionProtectedReleaseShas(new Date("2026-12-01"), 1_000), new Set([currentSha, targetSha]));
+    legacyReadonly.close();
+  });
+
   test("retains release evidence until a successful update notification is reported", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);

@@ -960,24 +960,27 @@ export class UpdateDatabase {
           AND (o.status <> 'delivered' OR o.slack_reported_at IS NULL))`)
       .all() as Array<{request_id:string;current_sha:string;target_sha:string;previous_sha:string|null;
         state:string;completed_at:string|null;notification_pending:number}>;
-    const readClock = this.db.prepare("SELECT elapsed_ms,observed_uptime_ms FROM update_retention_uptime WHERE request_id=?");
-    const writeClock = this.db.prepare(`INSERT INTO update_retention_uptime(request_id,elapsed_ms,observed_uptime_ms)
+    const clockAvailable = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='update_retention_uptime'").get() !== undefined;
+    const readClock = clockAvailable
+      ? this.db.prepare("SELECT elapsed_ms,observed_uptime_ms FROM update_retention_uptime WHERE request_id=?") : undefined;
+    const writeClock = !this.readonlyMode && clockAvailable ? this.db.prepare(`INSERT INTO update_retention_uptime(request_id,elapsed_ms,observed_uptime_ms)
       VALUES(?,?,?) ON CONFLICT(request_id) DO UPDATE SET elapsed_ms=excluded.elapsed_ms,
-      observed_uptime_ms=excluded.observed_uptime_ms`);
-    return this.db.transaction(() => {
+      observed_uptime_ms=excluded.observed_uptime_ms`) : undefined;
+    const calculate = () => {
       const protectedShas = new Set<string>();
       for (const row of rows) {
         let retain = row.completed_at === null || row.state === "needs_review" || row.notification_pending === 1;
         if (["failed", "cancelled", "rolled_back"].includes(row.state) && row.completed_at !== null) {
-          const prior = readClock.get(row.request_id) as {elapsed_ms:number;observed_uptime_ms:number}|undefined;
+          const prior = readClock?.get(row.request_id) as {elapsed_ms:number;observed_uptime_ms:number}|undefined;
           const elapsed = prior ? prior.elapsed_ms + Math.max(0, uptimeMs - prior.observed_uptime_ms) : 0;
-          writeClock.run(row.request_id, elapsed, uptimeMs);
+          writeClock?.run(row.request_id, elapsed, uptimeMs);
           retain ||= elapsed < 30 * 86_400_000;
         }
         if (retain) for (const sha of [row.current_sha,row.target_sha,row.previous_sha]) if (sha) protectedShas.add(sha);
       }
       return protectedShas;
-    })();
+    };
+    return this.readonlyMode ? calculate() : this.db.transaction(calculate)();
   }
 
   recentSuccessfulReleaseShas(limit = 2, excludedShas: ReadonlySet<string> = new Set()): Set<string> {
