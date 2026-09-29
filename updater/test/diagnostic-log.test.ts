@@ -7,7 +7,7 @@ import { afterEach, describe, test } from "node:test";
 import { DiagnosticLogStore } from "../src/diagnostic-log.js";
 import { UpdateDatabase } from "../src/database.js";
 import { ProcessRunner } from "../src/process.js";
-import { currentSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
+import { currentSha, fixtureInventory, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
 async function waitForFile(filePath: string, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -38,6 +38,7 @@ async function fixture(perLogLimit = 16 * 1024, privateRoots: readonly string[] 
     policy_version: policy.policy_version,
     compatibility: policy.compatibility,
     rollback_compatible: true,
+    inventory: fixtureInventory,
   });
   database.approve({
     source_event_id: "evt_01M2Y000000000000000000002",

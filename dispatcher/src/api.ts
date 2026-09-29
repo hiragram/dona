@@ -117,6 +117,7 @@ function projectLiveJobResponse(job:Record<string,unknown>,receipt:LiveSessionRe
 export interface ApiUpdateClient {
   plan(input: unknown): Promise<Record<string, unknown>>;
   apply(input: unknown): Promise<Record<string, unknown>>;
+  planStatus(planId: string): Promise<Record<string, unknown>>;
   status(requestId?: string): Promise<Record<string, unknown>>;
   cancel(input: unknown): Promise<Record<string, unknown>>;
 }
@@ -366,7 +367,8 @@ export class DispatcherApi {
         });
         return;
       }
-      if (url.pathname.startsWith("/v1/internal/update-events")) {
+      if (url.pathname.startsWith("/v1/internal/update-events") ||
+        url.pathname === "/v1/internal/self-update/approval-proof") {
         await this.handleInternalUpdate(request, response, url);
         return;
       }
@@ -560,13 +562,31 @@ export class DispatcherApi {
     }
     if (request.method === "POST" && url.pathname === "/v1/self-update/apply") {
       const input = await this.readJson(request) as Record<string, unknown>;
-      const keys = ["source_event_id", "plan_id", "plan_hash", "approval_id"];
+      const keys = ["source_event_id", "plan_id", "plan_hash", "target_sha", "inventory_revision"];
       if (Object.keys(input).some((key) => !keys.includes(key)) || keys.some((key) => typeof input[key] !== "string")) {
         throw new ApiRequestError(400, "invalid_request", "Apply request fields are invalid");
       }
       const event = this.updateEventContext(input.source_event_id as string);
+      const planState = await this.updates.planStatus(input.plan_id as string);
+      const plan = planState.plan as Record<string, unknown> | undefined;
+      if (planState.schema_version !== 1 || !plan || !["awaiting_approval", "approved"].includes(planState.state as string) ||
+        planState.source_event_id === event.event_id || plan.plan_id !== input.plan_id || plan.plan_hash !== input.plan_hash ||
+        plan.target_sha !== input.target_sha || plan.inventory_revision !== input.inventory_revision ||
+        typeof plan.created_at !== "string" || typeof plan.expires_at !== "string" ||
+        !Number.isFinite(Date.parse(plan.created_at)) || !Number.isFinite(Date.parse(plan.expires_at)) ||
+        Date.parse(event.occurred_at) <= Date.parse(plan.created_at) ||
+        (Date.now() >= Date.parse(plan.expires_at) &&
+          !(planState.state === "approved" && planState.approval_event_id === event.event_id))) {
+        throw new ApiRequestError(409, "exact_plan_approval_mismatch", "Approval event does not match the current exact plan");
+      }
+      const approvalId = this.verifySelfUpdateApprovalEvent(event.event_id, planState.source_event_id as string,
+        plan, JSON.parse(event.reply_target_json!) as Record<string, unknown>,
+        planState.state === "approved" && planState.approval_event_id === event.event_id);
       sendJson(response, 202, await this.updates.apply({
-        ...input,
+        source_event_id: event.event_id,
+        plan_id: plan.plan_id,
+        plan_hash: plan.plan_hash,
+        approval_id: approvalId,
         reply_target: JSON.parse(event.reply_target_json!) as Record<string, unknown>,
       }));
       return;
@@ -604,8 +624,56 @@ export class DispatcherApi {
     return event;
   }
 
+  private verifySelfUpdateApprovalEvent(eventId: string, originalEventId: string, plan: Record<string, unknown>,
+    replyTarget: Record<string, unknown>, allowExpiredReplay = false): string {
+    const event = this.updateEventContext(eventId);
+    const original = this.updateEventContext(originalEventId);
+    if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(originalEventId) || originalEventId === event.event_id ||
+      !/^plan_[0-9a-hjkmnp-tv-z]{26}$/.test(String(plan.plan_id)) ||
+      !/^[0-9a-f]{64}$/.test(String(plan.plan_hash)) ||
+      !/^[0-9a-f]{40}$/.test(String(plan.target_sha)) ||
+      !/^[0-9a-f]{64}$/.test(String(plan.inventory_revision)) ||
+      typeof plan.created_at !== "string" || typeof plan.expires_at !== "string" ||
+      !Number.isFinite(Date.parse(plan.created_at)) || !Number.isFinite(Date.parse(plan.expires_at)) ||
+      Date.parse(event.occurred_at) <= Date.parse(plan.created_at) ||
+      (Date.now() >= Date.parse(plan.expires_at) && !allowExpiredReplay) ||
+      stableStringify(JSON.parse(event.reply_target_json!)) !== stableStringify(replyTarget) ||
+      stableStringify(JSON.parse(original.reply_target_json!)) !== stableStringify(replyTarget) ||
+      Date.parse(original.occurred_at) > Date.parse(plan.created_at)) {
+      throw new ApiRequestError(409, "exact_plan_approval_mismatch", "Approval event does not match the current exact plan");
+    }
+    const subject = JSON.parse(event.subject_json) as Record<string, unknown>;
+    const originalSubject = JSON.parse(original.subject_json) as Record<string, unknown>;
+    const payload = JSON.parse(event.payload_json) as Record<string, unknown>;
+    const actor = subject.actor_id;
+    const confirmation = `承認 plan_id=${plan.plan_id} plan_hash=${plan.plan_hash} target_sha=${plan.target_sha} inventory_revision=${plan.inventory_revision}`;
+    const message = typeof payload.text === "string" ? payload.text.trim().replace(/^<@[A-Z0-9]+>\s+/, "") : "";
+    if (!/^[UW][A-Z0-9_-]{1,63}$/.test(String(actor)) || actor !== originalSubject.actor_id ||
+      payload.bot_id !== undefined || payload.subtype !== undefined ||
+      !["message", "app_mention"].includes(event.event_type) ||
+      message !== confirmation) {
+      throw new ApiRequestError(403, "explicit_approval_required", "The persisted Slack event is not an exact plan approval");
+    }
+    return createHash("sha256").update(`${event.event_id}\0${actor}\0${plan.plan_id}\0${plan.plan_hash}`).digest("hex");
+  }
+
   private async handleInternalUpdate(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     if (!(await this.authorizedUpdateRequest(request))) throw new ApiRequestError(403, "forbidden", "Internal updater authentication failed");
+    if (request.method === "POST" && url.pathname === "/v1/internal/self-update/approval-proof") {
+      const input = await this.readJson(request) as Record<string, unknown>;
+      const keys = ["source_event_id", "original_source_event_id", "plan_id", "plan_hash", "target_sha",
+        "inventory_revision", "created_at", "expires_at", "reply_target", "approved_event_id"];
+      if (Object.keys(input).length !== keys.length || Object.keys(input).some((key) => !keys.includes(key)) ||
+        typeof input.source_event_id !== "string" || typeof input.original_source_event_id !== "string" ||
+        !input.reply_target || typeof input.reply_target !== "object" || Array.isArray(input.reply_target)) {
+        throw new ApiRequestError(400, "invalid_request", "Approval proof request is invalid");
+      }
+      const approvalId = this.verifySelfUpdateApprovalEvent(input.source_event_id, input.original_source_event_id,
+        input, input.reply_target as Record<string, unknown>,
+        typeof input.approved_event_id === "string" && input.approved_event_id === input.source_event_id);
+      sendJson(response, 200, { schema_version: 1, approval_id: approvalId });
+      return;
+    }
     if (request.method === "POST" && url.pathname === "/v1/internal/update-events") {
       const envelope = parseInternalUpdateEventEnvelope(await this.readJson(request));
       const result = this.database.enqueue(envelope);

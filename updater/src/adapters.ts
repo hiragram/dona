@@ -25,11 +25,29 @@ import type {
   MainAgentStatus,
   OutboxRow,
   SchemaRollout,
+  RuntimeInventory,
 } from "./types.js";
 import { fullSha, parseCompatibilityMetadata, sha256 } from "./validation.js";
 
 const mainAgentStartupPrompt =
   "起動確認です。外部操作、ファイル変更、プロセス操作は行わず、READYとだけ返してください。";
+
+async function readOwnerFile(filePath: string, maxBytes: number, privateMode: boolean): Promise<Buffer> {
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(filePath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+    const stats = await handle.stat();
+    if (!stats.isFile() || stats.uid !== process.getuid?.() ||
+      (stats.mode & (privateMode ? 0o077 : 0o022)) !== 0 || stats.size > maxBytes) {
+      throw new Error("owner_file_identity_unverified");
+    }
+    const bytes = await handle.readFile();
+    if (bytes.length > maxBytes) throw new Error("owner_file_size_unverified");
+    return bytes;
+  } catch {
+    throw new Error("owner_file_unverified");
+  } finally { await handle?.close(); }
+}
 
 export class CommandFailureError extends Error {
   constructor(message: string, readonly result: CommandResult) { super(message); }
@@ -535,7 +553,106 @@ function shellSingleQuote(value: string): string {
 }
 
 export class RealRuntime implements RuntimePort {
-  constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner()) {}
+  constructor(private readonly policy: UpdatePolicy, private readonly runner = new ProcessRunner(),
+    private readonly launchAgentsRoot = path.join(os.homedir(), "Library", "LaunchAgents")) {}
+
+  async runtimeInventory(excludedControlEventIds: readonly string[] = [], afterStop = false): Promise<RuntimeInventory> {
+    try { return await this.readRuntimeInventory(excludedControlEventIds, afterStop); }
+    catch { throw new Error("runtime_inventory_unavailable"); }
+  }
+
+  private async readRuntimeInventory(excludedControlEventIds: readonly string[], afterStop: boolean): Promise<RuntimeInventory> {
+    if (excludedControlEventIds.length > 2 || new Set(excludedControlEventIds).size !== excludedControlEventIds.length ||
+      excludedControlEventIds.some((id) => !/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(id))) {
+      throw new Error("inventory_control_event_identity_invalid");
+    }
+    // Read every Dispatcher-owned class in one SQLite snapshot. Never return
+    // identifiers or payloads: they are used only as inputs to the digest.
+    const database = new Database(this.dispatcherDatabasePath(), { readonly: true, fileMustExist: true });
+    let state: Pick<RuntimeInventory, "dispatcher_schema" | "workers" | "pending">;
+    try {
+      database.pragma("query_only = ON");
+      state = database.transaction(() => {
+        const schema = database.pragma("user_version", { simple: true }) as number;
+        if (!Number.isSafeInteger(schema) || schema < 2 || schema > 3) throw new Error("inventory_schema_unverified");
+        const tables = new Set((database.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((row) => row.name));
+        for (const name of ["events", "jobs", ...(schema >= 3 ? ["schedules", "schedule_runs", "connector_outbox", "job_groups"] : [])]) {
+          if (!tables.has(name)) throw new Error("inventory_table_unavailable");
+        }
+        const hash = createHash("sha256");
+        const exceptions = createHash("sha256");
+        const classes: Record<string, number> = {};
+        const counts = { events: 0, jobs: 0, schedules: 0, notifications: 0 };
+        const scan = (query: string, kind: keyof typeof counts, classify?: (row: Record<string, unknown>) => void,
+          params: readonly string[] = []) => {
+          for (const row of database.prepare(query).iterate(...params) as Iterable<Record<string, unknown>>) {
+            counts[kind] += 1;
+            const encoded = JSON.stringify(row);
+            hash.update(`${encoded.length}:`).update(encoded);
+            classify?.(row);
+          }
+        };
+        const excluded = excludedControlEventIds.length ?
+          ` AND event_id NOT IN (${excludedControlEventIds.map(() => "?").join(",")})` : "";
+        scan(`SELECT event_id,status,schema_version,source,updated_at FROM events
+          WHERE status NOT IN ('completed','failed','cancelled')${excluded} ORDER BY event_id`,
+        "events", undefined, excludedControlEventIds);
+        scan("SELECT job_id,status,source,steer_state,attempt_count,herdr_workspace_id,completion_event_id,last_error_code,updated_at FROM jobs WHERE status NOT IN ('completed','failed','cancelled') OR (completion_event_id IS NULL AND herdr_workspace_id IS NOT NULL) ORDER BY job_id", "jobs", (row) => {
+          // The released DB has no owner epoch, protocol or Result publication
+          // capability columns. Label those facts unknown rather than inferring
+          // them from an agent name or the presence of a workspace ID.
+          const jobClass = `${row.status}:${row.herdr_workspace_id ? "worker" : "unstarted"}:protocol_unknown:epoch_unknown:result_capability_unknown`;
+          classes[jobClass] = (classes[jobClass] ?? 0) + 1;
+          if (row.last_error_code || row.steer_state) exceptions.update(`${row.job_id}:${row.last_error_code ?? ""}:${row.steer_state ?? ""}\n`);
+        });
+        if (schema >= 3) {
+          scan(`SELECT s.schedule_id,s.state,s.revision,s.next_due,s.updated_at,
+              r.recurrence_hash,r.policy_json,r.policy_version,r.timezone,r.tzdb_version,
+              r.authorization_revision,r.expires_at,r.action,r.content_scope,r.content_hash,r.target_json
+            FROM schedules s JOIN schedule_revisions r ON r.schedule_id=s.schedule_id AND r.revision=s.revision
+            WHERE s.state NOT IN ('cancelled','completed','expired') ORDER BY s.schedule_id`, "schedules");
+          scan("SELECT run_id,status,revision,event_id,job_id,reason FROM schedule_runs WHERE status NOT IN ('completed','failed','cancelled','skipped') ORDER BY run_id", "schedules");
+          scan("SELECT outbox_id,status,kind,run_id,content_hash,receipt_id,updated_at FROM connector_outbox WHERE status NOT IN ('sent','failed','cancelled') ORDER BY outbox_id", "notifications");
+          scan("SELECT source_event_id,notification_mode,attention_event_id,all_terminal_event_id,updated_at FROM job_groups WHERE attention_event_id IS NOT NULL OR all_terminal_event_id IS NULL ORDER BY source_event_id", "notifications");
+        }
+        return { dispatcher_schema: schema, workers: { classes, exception_digest: exceptions.digest("hex") },
+          pending: { updates: 0, update_notifications: 0, ...counts, digest: hash.digest("hex") } };
+      })();
+    } finally { database.close(); }
+    const app = await this.appSchemaState();
+    if (!app.integrity_ok || app.foreign_key_violations !== 0 || app.user_version !== state.dispatcher_schema) {
+      throw new Error("inventory_app_schema_unverified");
+    }
+    const buildSha = process.env.DONA_UPDATER_BUILD_SHA?.trim();
+    if (!buildSha || !/^[0-9a-f]{40}$/.test(buildSha)) throw new Error("inventory_control_plane_unverified");
+    const receiptPath = path.join(this.policy.control_root, "control-plane-receipt.json");
+    const controlReceipt = JSON.parse((await readOwnerFile(receiptPath, 4096, true)).toString("utf8")) as Record<string, unknown>;
+    if (controlReceipt.schema_version !== 1 || controlReceipt.build_sha !== buildSha ||
+      controlReceipt.schema_migration_capability !== "dispatcher_v2_to_v3_online_backup_v1") {
+      throw new Error("inventory_control_plane_unverified");
+    }
+    const [dispatcherRegistered, slackRegistered] = await Promise.all([this.dispatcherRegistered(), this.slackRegistered()]);
+    if (afterStop ? (dispatcherRegistered || slackRegistered) : (!dispatcherRegistered || !slackRegistered)) {
+      throw new Error("inventory_launchd_identity_unverified");
+    }
+    const identity = createHash("sha256");
+    for (const label of [this.policy.launchd.dispatcher_label, this.policy.launchd.slack_label]) {
+      const plist = path.join(this.launchAgentsRoot, `${label}.plist`);
+      const bytes = await readOwnerFile(plist, 256 * 1024, false);
+      identity.update(`${label}:${bytes.length}:`).update(bytes);
+    }
+    return {
+      schema_version: 1, control_plane_build_sha: buildSha,
+      dispatcher_schema: state.dispatcher_schema, app_schema: app.user_version,
+      dispatcher_protocol: 1, policy_version: this.policy.policy_version,
+      // Both services must be observably stopped after quiesce. Preserve the
+      // planned registration identity in the comparison projection; plist bytes
+      // and every durable workload class are still read again.
+      launchd: { dispatcher_registered: afterStop || dispatcherRegistered, slack_registered: afterStop || slackRegistered,
+        identity_digest: identity.digest("hex") },
+      workers: state.workers, pending: state.pending,
+    };
+  }
 
   async workerSafety(): Promise<{ safe: boolean; active_worker_count: number; error_code?: string }> {
     try {
@@ -1044,6 +1161,17 @@ export class RealRuntime implements RuntimePort {
 
 export class RealDispatcher implements DispatcherPort {
   constructor(private readonly policy: UpdatePolicy) {}
+
+  async verifyApproval(input: Record<string, unknown>): Promise<string> {
+    const token = (await readOwnerFile(this.policy.dispatcher_internal_token_file, 4096, true)).toString("utf8").trim();
+    if (token.length < 32) throw new Error("approval_proof_token_unavailable");
+    const response = parsedObject(await udsRequest(this.policy.dispatcher_socket, "POST",
+      "/v1/internal/self-update/approval-proof", input, this.policy.timeouts.health_ms,
+      { "x-dona-update-token": token }));
+    if (response.schema_version !== 1 || typeof response.approval_id !== "string" ||
+      !/^[0-9a-f]{64}$/.test(response.approval_id)) throw new Error("approval_proof_unverified");
+    return response.approval_id;
+  }
 
   async eventTerminal(eventId: string): Promise<boolean> {
     const response = parsedObject(await udsRequest(
