@@ -39,8 +39,6 @@ async function writeAtomic(filePath: string, body: string, mode = 0o600): Promis
 }
 
 export class ReleaseStore {
-  private cleanupCursorForWrite: { sha: string; mtime: number } | null = null;
-  private plannedCleanupCandidates: Array<{ sha: string; mtime: number }> = [];
   constructor(private readonly policy: UpdatePolicy) {}
 
   async preflight(): Promise<{ free_bytes: number; disk_floor_bytes: number; same_filesystem: true }> {
@@ -189,6 +187,13 @@ export class ReleaseStore {
   }
 
   async cleanupPlan(protectedShas: ReadonlySet<string>): Promise<string[]> {
+    return (await this.planCleanup(protectedShas)).planned.map((candidate) => candidate.sha);
+  }
+
+  private async planCleanup(protectedShas: ReadonlySet<string>): Promise<{
+    planned: Array<{ sha: string; mtime: number }>;
+    lastScanned: { sha: string; mtime: number } | null;
+  }> {
     await this.ensureRoots();
     const pointers = await this.observe();
     const candidates: Array<{ sha: string; mtime: number }> = [];
@@ -217,34 +222,31 @@ export class ReleaseStore {
     const start = cursor ? eligible.findIndex((candidate) => candidate.mtime < cursor.mtime ||
       (candidate.mtime === cursor.mtime && candidate.sha > cursor.sha)) : 0;
     const window = eligible.slice(start < 0 ? 0 : start, (start < 0 ? 0 : start) + 16);
-    const planned: string[] = [];
+    const planned: Array<{ sha: string; mtime: number }> = [];
     // Deep validation is bounded even if the release root has accumulated
     // many candidates. A later maintenance pass can pick up the remainder.
-    this.cleanupCursorForWrite = null;
-    this.plannedCleanupCandidates = [];
+    let lastScanned: { sha: string; mtime: number } | null = null;
     for (const candidate of window) {
       const { sha } = candidate;
-      this.cleanupCursorForWrite = candidate;
+      lastScanned = candidate;
       const releasePath = path.join(this.policy.release_root, sha);
       try {
         await this.scanTree(releasePath, releasePath, { deadline: performance.now() + 3_000, entries: 0 });
-        planned.push(sha);
-        this.plannedCleanupCandidates.push(candidate);
+        planned.push(candidate);
       } catch {
         // Invalid candidates remain untouched for operator inspection.
       }
       if (planned.length === 8) break;
     }
-    return planned;
+    return { planned, lastScanned };
   }
 
   async cleanup(protectedShas: ReadonlySet<string>): Promise<string[]> {
-    const planned = await this.cleanupPlan(protectedShas);
-    const lastScanned = this.cleanupCursorForWrite;
-    const plannedCandidates = [...this.plannedCleanupCandidates];
+    const { planned, lastScanned } = await this.planCleanup(protectedShas);
     const removed: string[] = [];
     const errors: string[] = [];
-    for (const [index,sha] of planned.entries()) {
+    for (const candidate of planned) {
+      const { sha } = candidate;
       const releasePath = path.join(this.policy.release_root, sha);
       try {
         await this.validateReleasePath(releasePath, sha);
@@ -260,9 +262,9 @@ export class ReleaseStore {
         errors.push(`${sha}:${error instanceof Error ? error.message : "cleanup_failed"}`);
       }
       await writeAtomic(path.join(this.policy.control_root, "release-cleanup-cursor.json"),
-        `${JSON.stringify(plannedCandidates[index])}\n`);
+        `${JSON.stringify(candidate)}\n`);
     }
-    if (lastScanned && lastScanned.sha !== plannedCandidates.at(-1)?.sha) {
+    if (lastScanned && lastScanned.sha !== planned.at(-1)?.sha) {
       await writeAtomic(path.join(this.policy.control_root, "release-cleanup-cursor.json"),
         `${JSON.stringify(lastScanned)}\n`);
     }
