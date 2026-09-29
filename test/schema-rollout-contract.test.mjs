@@ -31,7 +31,7 @@ test("schema activation names the exact installed production source", () => {
   );
   assert.deepEqual(
     [target.app_schema_read_min, target.app_schema_read_max, target.app_schema_write, target.rollback_safe],
-    [2, 3, 3, true],
+    [2, 3, 3, false],
   );
   const bridgeCompatibility = JSON.parse(execFileSync("git", ["show", `${rollout.previous_release_sha}:config/release-compatibility.json`], { encoding: "utf8" }));
   assert.deepEqual(bridgeCompatibility, previous);

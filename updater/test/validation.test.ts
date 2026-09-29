@@ -18,7 +18,7 @@ describe("fixed self-update surface", () => {
       app_schema_read_min: 2,
       app_schema_read_max: 3,
       app_schema_write: 3,
-      rollback_safe: true,
+      rollback_safe: false,
     });
     const examplePolicy = JSON.parse(
       await fs.readFile(new URL("../../config/update-policy.example.json", import.meta.url), "utf8"),

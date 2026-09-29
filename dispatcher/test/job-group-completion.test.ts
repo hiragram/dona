@@ -505,6 +505,40 @@ describe("通常groupのResult統合", () => {
     database.close();
   });
 
+  test("旧groupの配送claim解消直後にall-terminal保留を記録する", async () => {
+    const {database,source,job,config}=await oneJobGroup("Ev-old-attention-claim");
+    database.saveJobResult(job.job_id,{schema_version:1,job_id:job.job_id,status:"failed",
+      summary:"失敗",completed_at:"2026-09-05T00:00:30.000Z"},job.result_path);
+    sealSource(database,source.event_id,`${config.resultsDir}/source.json`);
+    const attention=database.enqueueJobNotification(job.job_id);
+    database.beginDispatch(attention.row.event_id,`${config.resultsDir}/attention.json`);
+    database.markWaiting(attention.row.event_id);
+    database.saveCompleted(attention.row.event_id,{schema_version:1,event_id:attention.row.event_id,
+      status:"completed",summary:"投稿済み",completed_at:"2026-09-05T00:01:00.000Z",
+      actions:[{tool:"dona_slack.post_message",workspace_id:"T_TEST",channel_id:"C_TEST",
+        thread_ts:"1756722030.123456",message_ts:"123.456"},
+        {tool:"dona_slack.set_agent_session_status",workspace_id:"T_TEST",channel_id:"C_TEST",
+          thread_ts:"1756722030.123456",status:"suspended"}]},
+      `${config.resultsDir}/attention.json`);
+    const raw=new Database(config.databasePath);
+    raw.prepare("UPDATE jobs SET created_at='2026-09-03T00:00:00.000Z' WHERE job_id=?").run(job.job_id);
+    raw.close();
+    const hash="b".repeat(64),expectedUpdatedAt=database.get(attention.row.event_id)!.updated_at;
+    const {request,claimToken}=database.claimAttentionDeliveryReconciliation(source.event_id,attention.row.event_id,
+      expectedUpdatedAt,"123.456",hash);
+    database.resolveFailedJobAttention(source.event_id,job.job_id,attention.row.event_id,
+      database.getJob(job.job_id)!.updated_at);
+    assert.equal(database.notificationReconciliationPreview().candidates.some(row=>
+      row.job_id===job.job_id && row.group_transition==="all_terminal"),false);
+    database.recordVerifiedAttentionDelivery(source.event_id,attention.row.event_id,expectedUpdatedAt,claimToken,
+      {...request,posted_at:"2026-09-05T00:01:00.000Z",reply_broadcast:false,
+        identity_block_verified:true,session_status:"suspended"});
+    assert.equal(database.getJobGroup(source.event_id)?.all_terminal_event_id,null);
+    assert.equal(database.notificationReconciliationPreview().candidates.some(row=>
+      row.job_id===job.job_id && row.group_transition==="all_terminal" && row.decision==="held"),true);
+    database.close();
+  });
+
   test("複数publisherの古い候補とclaim途中のrollbackは単一attentionへ収束する", async () => {
     const setup = await oneJobGroup("Ev-attention-publishers");
     const {database,source,job,config} = setup;
