@@ -1193,7 +1193,9 @@ test("scheduled failed Resultを保存前にredactionし通常Slack Resultのret
   const slack=createScheduledJob(dispatcher, raw, {source_event_id:event.event_id,objective:"通常job",workspace:{kind:"scratch"}},"/tmp/jobs","/tmp/results",new Date(due)).row;
   dispatcher.beginJobPreparation(slack.job_id,new Date(due)); dispatcher.beginJobDispatch(slack.job_id,new Date(due)); dispatcher.markJobRunning(slack.job_id,new Date(due));
   dispatcher.saveJobResult(slack.job_id,{schema_version:1,job_id:slack.job_id,status:"completed",summary:"通常",output:{format:"markdown",text:"保持"},completed_at:due},slack.result_path);
-  dispatcher.enqueueJobNotification(slack.job_id,new Date("2026-09-20T00:00:00Z")); repo.purge("2026-09-21T00:00:00Z");
+  assert.throws(()=>dispatcher.enqueueJobNotification(slack.job_id,new Date("2026-09-20T00:00:00Z")),
+    /historical_notification_requires_reconciliation/);
+  repo.purge("2026-09-21T00:00:00Z");
   assert.notEqual((raw.prepare("SELECT result_json FROM jobs WHERE job_id=?").get(slack.job_id) as {result_json:string|null}).result_json,null);
 });
 
