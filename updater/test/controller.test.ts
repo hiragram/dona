@@ -20,7 +20,7 @@ import type {
   SchemaRollout,
   UpdateRow,
 } from "../src/types.js";
-import { currentSha, fixtureInventory, installPointers, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
+import { currentSha, fixtureInventory, installPointers, installRelease, logger, manifest, olderSha, removeTree, targetSha, tempPolicy } from "./helpers.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map(removeTree)));
@@ -2125,6 +2125,37 @@ describe("UpdateController isolated end-to-end", () => {
         (f.policy.diagnostic_retention_days + 1) * 86_400_000));
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "purged");
+    f.database.close();
+  });
+
+  test("periodic release maintenance advances beyond invalid candidates after clock reversal", async () => {
+    const f = await fixture();
+    for (let index = 1; index <= 17; index++) {
+      const sha = index.toString(16).padStart(40, "0");
+      const candidate = await installRelease(f.policy, sha);
+      await fs.symlink("/tmp", path.join(candidate, "outside"));
+      const date = new Date(Date.UTC(2020, 0, index));
+      await fs.utimes(candidate, date, date);
+    }
+    const safe = await installRelease(f.policy, "d".repeat(40));
+    await fs.utimes(safe, new Date("2019-01-01"), new Date("2019-01-01"));
+    await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    await f.controller.maintainReleaseRetention();
+    assert.equal((await fs.lstat(safe)).isDirectory(), true);
+    f.advance(-60_000);
+    await f.controller.maintainReleaseRetention();
+    await assert.rejects(fs.lstat(safe), { code: "ENOENT" });
+    assert.equal((await f.store.observe()).current_sha, currentSha);
+    assert.equal((await f.store.observe()).previous_sha, olderSha);
+    f.database.close();
+  });
+
+  test("release maintenance stops when current pointer is missing", async () => {
+    const f = await fixture();
+    const candidate = await installRelease(f.policy, "d".repeat(40));
+    await fs.unlink(f.policy.current_pointer);
+    await f.controller.maintainReleaseRetention();
+    assert.equal((await fs.lstat(candidate)).isDirectory(), true);
     f.database.close();
   });
 

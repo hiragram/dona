@@ -18,6 +18,102 @@ const inventory = { schema_version: 1 as const, control_plane_build_sha: targetS
 const compatibility = { protocol: 1, config: 1, app_schema_read_min: 2, app_schema_read_max: 2, app_schema_write: 2, rollback_safe: true };
 
 describe("UpdateDatabase", () => {
+  test("computes doctor retention without writing schema 9 or requiring the schema 9 clock table", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const databasePath = path.join(policy.control_root, "updater.sqlite3");
+    const db = new UpdateDatabase(databasePath);
+    const created = db.createPlan({ source_event_id: sourceEventId, reply_target: replyTarget }, {
+      current_sha: currentSha, target_sha: targetSha, previous_sha: null,
+      policy_version: policy.policy_version, compatibility, rollback_compatible: true, inventory,
+    });
+    db.close();
+    const raw = new Database(databasePath);
+    raw.prepare("UPDATE update_requests SET state='failed',completed_at=? WHERE request_id=?")
+      .run("2026-09-01T00:00:00.000Z", created.row.request_id);
+    raw.close();
+    const readonly = new UpdateDatabase(databasePath, { readonly: true });
+    assert.deepEqual(readonly.retentionProtectedReleaseShas(new Date("2026-12-01"), 1_000), new Set([currentSha, targetSha]));
+    readonly.close();
+    const check = new Database(databasePath);
+    assert.equal((check.prepare("SELECT COUNT(*) AS count FROM update_retention_uptime").get() as {count:number}).count, 0);
+    check.exec("DROP TABLE update_retention_uptime; PRAGMA user_version = 8;");
+    check.close();
+    const legacyReadonly = new UpdateDatabase(databasePath, { readonly: true });
+    assert.deepEqual(legacyReadonly.retentionProtectedReleaseShas(new Date("2026-12-01"), 1_000), new Set([currentSha, targetSha]));
+    legacyReadonly.close();
+  });
+
+  test("retains release evidence until a successful update notification is reported", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const db = new UpdateDatabase(path.join(policy.control_root, "updater.sqlite3"));
+    const created = db.createPlan({ source_event_id: sourceEventId, reply_target: replyTarget }, {
+      current_sha: currentSha, target_sha: targetSha, previous_sha: null,
+      policy_version: policy.policy_version, compatibility, rollback_compatible: true, inventory,
+    }, new Date("2026-09-02T00:00:00.000Z"));
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set([currentSha, targetSha]));
+    const raw = new Database(path.join(policy.control_root, "updater.sqlite3"));
+    raw.prepare("UPDATE update_requests SET state='succeeded',completed_at=? WHERE request_id=?")
+      .run("2026-09-02T00:01:00.000Z", created.row.request_id);
+    raw.prepare(`INSERT INTO update_outbox(outbox_id,request_id,external_event_id,payload_json,status,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?)`).run("outbox_test",created.row.request_id,"update:test:terminal","{}","pending",
+        "2026-09-02T00:01:00.000Z","2026-09-02T00:01:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set([currentSha, targetSha]));
+    raw.prepare("UPDATE update_outbox SET status='delivered',slack_reported_at=? WHERE outbox_id='outbox_test'")
+      .run("2026-09-02T00:02:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set());
+    raw.prepare("UPDATE update_requests SET state='rolled_back' WHERE request_id=?").run(created.row.request_id);
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-09-20"), 1_000), new Set([currentSha, targetSha]));
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-10-20"), 1_000), new Set([currentSha, targetSha]));
+    raw.prepare("UPDATE update_outbox SET slack_reported_at=? WHERE outbox_id='outbox_test'")
+      .run("2026-10-20T00:00:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-10-20T00:01:00.000Z"), 1_001), new Set([currentSha, targetSha]));
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-11-20"), 30 * 86_400_000 + 1_001), new Set());
+    const expired = raw.prepare("SELECT elapsed_ms,observed_uptime_ms FROM update_retention_uptime WHERE request_id=?")
+      .get(created.row.request_id);
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-12-20"), 60 * 86_400_000 + 1_001), new Set());
+    assert.deepEqual(raw.prepare("SELECT elapsed_ms,observed_uptime_ms FROM update_retention_uptime WHERE request_id=?")
+      .get(created.row.request_id), expired);
+    raw.prepare("UPDATE update_requests SET state='succeeded' WHERE request_id=?").run(created.row.request_id);
+    assert.deepEqual(db.recentSuccessfulReleaseShas(), new Set([targetSha]));
+    raw.prepare("UPDATE update_outbox SET status='needs_review' WHERE outbox_id='outbox_test'").run();
+    raw.prepare(`INSERT INTO update_outbox(outbox_id,request_id,external_event_id,payload_json,status,
+      created_at,updated_at) VALUES(?,?,?,?,?,?,?)`).run(
+        "outbox_clock_reversed",created.row.request_id,"update:test:clock-reversed","{}","pending",
+        "2026-09-01T23:00:00.000Z","2026-09-01T23:00:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set([currentSha, targetSha]));
+    raw.prepare("UPDATE update_outbox SET status='delivered',slack_reported_at=? WHERE outbox_id='outbox_clock_reversed'")
+      .run("2026-09-03T00:01:00.000Z");
+    raw.prepare(`INSERT INTO update_outbox(outbox_id,request_id,external_event_id,payload_json,status,
+      created_at,updated_at,slack_reported_at) VALUES(?,?,?,?,?,?,?,?)`).run(
+        "outbox_corrected",created.row.request_id,"update:test:corrected","{}","delivered",
+        "2026-09-03T00:00:00.000Z","2026-09-03T00:00:00.000Z","2026-09-03T00:01:00.000Z");
+    assert.deepEqual(db.retentionProtectedReleaseShas(), new Set());
+    raw.close();
+    db.close();
+  });
+
+  test("selects distinct successful releases by insertion order across clock reversal", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    const databasePath = path.join(policy.control_root, "updater.sqlite3");
+    const db = new UpdateDatabase(databasePath);
+    const raw = new Database(databasePath);
+    const insert = raw.prepare(`INSERT INTO update_requests(request_id,source_event_id,reply_target_json,state,
+      current_sha,target_sha,plan_id,plan_hash,policy_version,compatibility_json,rollback_compatible,
+      created_at,updated_at,completed_at) VALUES(?,?, '{}','succeeded',?,?,?,'hash','policy','{}',1,?,?,?)`);
+    const older = "1".repeat(40);
+    const newer = "2".repeat(40);
+    insert.run("request-1","event-1",currentSha,older,"plan-1","2026-09-03","2026-09-03","2026-09-03");
+    insert.run("request-2","event-2",currentSha,newer,"plan-2","2026-09-02","2026-09-02","2026-09-02");
+    insert.run("request-3","event-3",currentSha,newer,"plan-3","2026-09-01","2026-09-01","2026-09-01");
+    assert.deepEqual(db.recentSuccessfulReleaseShas(1), new Set([newer]));
+    assert.deepEqual(db.recentSuccessfulReleaseShas(1,new Set([newer])), new Set([older]));
+    raw.close();
+    db.close();
+  });
+
   test("persists the exact inventory and rejects expired approval while retaining terminal evidence", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
@@ -115,7 +211,7 @@ describe("UpdateDatabase", () => {
     db.close();
   });
 
-  test("atomically migrates the released schema 1 database through schema 8", async () => {
+  test("atomically migrates the released schema 1 database through schema 9", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
@@ -127,7 +223,8 @@ describe("UpdateDatabase", () => {
         state TEXT NOT NULL
       );
       CREATE TABLE update_outbox (
-        outbox_id TEXT PRIMARY KEY
+        outbox_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL
       );
       PRAGMA user_version = 1;
     `);
@@ -147,7 +244,9 @@ describe("UpdateDatabase", () => {
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'updater_writer_lease'").get());
     const diagnosticColumns = migrated.pragma("table_info(update_diagnostic_logs)") as Array<{ name: string }>;
     assert.ok(diagnosticColumns.some((column) => column.name === "content_sha256"));
-    assert.equal(migrated.pragma("user_version", { simple: true }), 8);
+    assert.equal(migrated.pragma("user_version", { simple: true }), 9);
+    assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE name='update_outbox_request_latest_idx'").get());
+    assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE name='update_retention_uptime'").get());
     migrated.close();
   });
 
@@ -182,9 +281,9 @@ describe("UpdateDatabase", () => {
     const databasePath = path.join(policy.control_root, "updater.sqlite3");
     await fs.mkdir(policy.control_root, { recursive: true });
     const raw = new Database(databasePath);
-    raw.pragma("user_version = 9");
+    raw.pragma("user_version = 10");
     raw.close();
-    assert.throws(() => new UpdateDatabase(databasePath, { readonly: true }), /newer than supported schema 8/);
+    assert.throws(() => new UpdateDatabase(databasePath, { readonly: true }), /newer than supported schema 9/);
   });
 
   test("binds idempotent approval to the exact plan and detects payload mismatch", async () => {
