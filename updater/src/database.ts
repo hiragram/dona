@@ -931,14 +931,18 @@ export class UpdateDatabase {
     return this.db.prepare("SELECT * FROM update_requests ORDER BY created_at DESC LIMIT ?").all(limit) as UpdateRow[];
   }
 
-  retentionProtectedReleaseShas(): Set<string> {
+  retentionProtectedReleaseShas(at = new Date()): Set<string> {
     // Unresolved attempts and notifications can still require either side of
-    // the update for rollback, reconciliation, or a completion report.
+    // the update for rollback, reconciliation, or a completion report. Keep
+    // terminal rollback evidence for a bounded 30-day review window.
+    const terminalEvidenceCutoff = new Date(at.getTime() - 30 * 86_400_000).toISOString();
     const rows = this.db.prepare(`SELECT current_sha,target_sha,previous_sha FROM update_requests r
-      WHERE r.state <> 'succeeded' OR EXISTS (
+      WHERE r.completed_at IS NULL OR r.state='needs_review' OR
+        (r.state IN ('failed','cancelled','rolled_back') AND r.completed_at>=?) OR EXISTS (
         SELECT 1 FROM update_outbox o WHERE o.request_id=r.request_id
+          AND o.superseded_by_outbox_id IS NULL
           AND (o.status <> 'delivered' OR o.slack_reported_at IS NULL))`)
-      .all() as Array<{current_sha:string;target_sha:string;previous_sha:string|null}>;
+      .all(terminalEvidenceCutoff) as Array<{current_sha:string;target_sha:string;previous_sha:string|null}>;
     return new Set(rows.flatMap((row) => [row.current_sha,row.target_sha,...(row.previous_sha?[row.previous_sha]:[])]));
   }
 

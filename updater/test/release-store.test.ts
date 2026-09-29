@@ -37,13 +37,32 @@ describe("ReleaseStore", () => {
     for (const sha of candidates) await installRelease(policy, sha);
     const protectedShas = new Set([currentSha, "0".repeat(40)]);
     const plan = await store.cleanupPlan(protectedShas);
-    assert.equal(plan.length, 9);
+    assert.equal(plan.length, 8);
     assert.equal(plan.includes(invalidSha), false);
     const removed = await store.cleanup(protectedShas);
     assert.equal(removed.length, 8);
+    assert.equal((await store.cleanup(protectedShas)).length, 1);
     assert.equal((await store.observe()).current_sha, currentSha);
     assert.equal((await store.observe()).previous_sha, "0".repeat(40));
     assert.equal((await fs.lstat(invalid)).isDirectory(), true);
+  });
+
+  test("accepts symlinks and hardlinks contained in a published release", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const store = new ReleaseStore(policy);
+    const candidateSha = "3".repeat(40);
+    const release = await installRelease(policy, candidateSha);
+    await fs.writeFile(path.join(release, "binary"), "release", { mode: 0o600 });
+    await fs.link(path.join(release, "binary"), path.join(release, "binary-alias"));
+    await fs.symlink("binary", path.join(release, "binary-link"));
+    await fs.utimes(release, new Date("2020-01-01"), new Date("2020-01-01"));
+    for (const sha of ["4".repeat(40), "5".repeat(40), "6".repeat(40)]) await installRelease(policy, sha);
+    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    assert.ok((await store.cleanupPlan(protectedShas)).includes(candidateSha));
+    assert.ok((await store.cleanup(protectedShas)).includes(candidateSha));
+    await assert.rejects(fs.lstat(release), { code: "ENOENT" });
   });
 
   test("publishes an immutable release and atomically activates and rolls it back", async () => {

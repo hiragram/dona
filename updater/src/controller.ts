@@ -309,7 +309,7 @@ export class UpdateController {
       this.git.refresh(current.sha),
       this.runtime.mainAgentStatus(path.join(this.policy.release_root, current.sha)),
     ]);
-    const protectedShas = this.database.retentionProtectedReleaseShas();
+    const protectedShas = this.database.retentionProtectedReleaseShas(this.clock.now());
     protectedShas.add(current.sha);
     if (previous) protectedShas.add(previous.sha);
     return {
@@ -908,7 +908,7 @@ export class UpdateController {
       }, this.clock.now());
       this.logger.info("Update succeeded", { request_id: row.request_id, target_sha: row.target_sha, fence: row.fence });
       try {
-        const protectedShas = this.database.retentionProtectedReleaseShas();
+        const protectedShas = this.database.retentionProtectedReleaseShas(this.clock.now());
         protectedShas.add(row.target_sha);
         protectedShas.add(row.current_sha);
         await this.releases.cleanup(protectedShas);

@@ -37,6 +37,9 @@ describe("UpdateDatabase", () => {
     raw.prepare("UPDATE update_outbox SET status='delivered',slack_reported_at=? WHERE outbox_id='outbox_test'")
       .run("2026-09-02T00:02:00.000Z");
     assert.deepEqual(db.retentionProtectedReleaseShas(), new Set());
+    raw.prepare("UPDATE update_requests SET state='rolled_back' WHERE request_id=?").run(created.row.request_id);
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-09-20")), new Set([currentSha, targetSha]));
+    assert.deepEqual(db.retentionProtectedReleaseShas(new Date("2026-10-20")), new Set());
     raw.close();
     db.close();
   });

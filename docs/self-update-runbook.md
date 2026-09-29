@@ -137,6 +137,6 @@ legacy compatibilityとして、`job_key`省略時の`legacy-default`、`duplica
 
 ## Retention
 
-current、previous、active attemptを常に保護し、それ以外の直近2 successful releaseも残します。disk floor 2 GiB未満ではstageを開始しません。`doctor`はcleanup候補をdry-run表示し、success後cleanupはSHA形式・realpath containment・owner/modeを再検証したreleaseだけを対象にします。
+current、previous、active attempt、needs_review、未報告かつ未supersedeの通知が参照するreleaseを保護し、failed/cancelled/rolled_backのrelease証拠はterminal後30日間保護します。それ以外の直近2 releaseも残します。disk floor 2 GiB未満ではstageを開始しません。`doctor`は最大8件のcleanup候補をdry-run表示し、success後cleanupはSHA形式・realpath containment・owner/mode・内部linkを再検証したreleaseだけを対象にします。候補のdeep scanは1回あたり最大16件です。
 
 診断logのretentionはrelease retentionとは別です。policyの`diagnostic_log_limit_bytes`、`diagnostic_aggregate_limit_bytes`、`diagnostic_retention_days`を使い、terminal requestのfinalized logだけをpurgeします。

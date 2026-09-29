@@ -191,7 +191,6 @@ export class ReleaseStore {
       try {
         await this.validateReleasePath(releasePath, name);
         await this.readManifest(releasePath);
-        await this.validateRemovalTree(releasePath);
         candidates.push({ sha: name, mtime: (await fs.stat(releasePath)).mtimeMs });
       } catch {
         // An invalid release is quarantined by omission. It must not prevent
@@ -199,19 +198,32 @@ export class ReleaseStore {
       }
     }
     candidates.sort((left, right) => right.mtime - left.mtime);
-    return candidates.slice(this.policy.retain_successful).map(({ sha }) => sha);
+    const planned: string[] = [];
+    // Deep validation is bounded even if the release root has accumulated
+    // many candidates. A later maintenance pass can pick up the remainder.
+    for (const { sha } of candidates.slice(this.policy.retain_successful, this.policy.retain_successful + 16)) {
+      const releasePath = path.join(this.policy.release_root, sha);
+      try {
+        await this.scanTree(releasePath, releasePath, { deadline: Date.now() + 3_000, entries: 0 });
+        planned.push(sha);
+      } catch {
+        // Invalid candidates remain untouched for operator inspection.
+      }
+      if (planned.length === 8) break;
+    }
+    return planned;
   }
 
   async cleanup(protectedShas: ReadonlySet<string>): Promise<string[]> {
     const planned = await this.cleanupPlan(protectedShas);
     const removed: string[] = [];
     const errors: string[] = [];
-    for (const sha of planned.slice(0, 8)) {
+    for (const sha of planned) {
       const releasePath = path.join(this.policy.release_root, sha);
       try {
         await this.validateReleasePath(releasePath, sha);
         await this.readManifest(releasePath);
-        await this.validateRemovalTree(releasePath);
+        await this.scanTree(releasePath, releasePath, { deadline: Date.now() + 3_000, entries: 0 });
         const pointers = await this.observe();
         if (protectedShas.has(sha) || pointers.current_sha === sha || pointers.previous_sha === sha) continue;
         await this.makeMutableForRemoval(releasePath);
@@ -296,9 +308,9 @@ export class ReleaseStore {
     }
   }
 
-  private async scanTree(root: string, current: string): Promise<void> {
+  private async scanTree(root: string, current: string, budget?: { deadline: number; entries: number }): Promise<void> {
     const hardlinks = new Map<string, { expectedLinks: number; paths: string[] }>();
-    await this.scanTreeEntry(root, current, hardlinks);
+    await this.scanTreeEntry(root, current, hardlinks, budget);
     for (const [inode, observation] of hardlinks) {
       if (observation.paths.length !== observation.expectedLinks) {
         throw new Error("staging_owner_permissions_or_hardlink_invalid");
@@ -317,7 +329,11 @@ export class ReleaseStore {
     root: string,
     current: string,
     hardlinks: Map<string, { expectedLinks: number; paths: string[] }>,
+    budget?: { deadline: number; entries: number },
   ): Promise<void> {
+    if (budget && (++budget.entries > 100_000 || Date.now() > budget.deadline)) {
+      throw new Error("cleanup_tree_scan_budget_exceeded");
+    }
     const stats = await fs.lstat(current);
     if (stats.isSymbolicLink()) {
       const resolved = await fs.realpath(current);
@@ -331,7 +347,7 @@ export class ReleaseStore {
     if (stats.isDirectory()) {
       const children = await fs.readdir(current);
       if (stats.nlink > 2 + children.length) throw new Error("staging_owner_permissions_or_hardlink_invalid");
-      for (const child of children) await this.scanTreeEntry(root, path.join(current, child), hardlinks);
+      for (const child of children) await this.scanTreeEntry(root, path.join(current, child), hardlinks, budget);
       return;
     }
     if (!stats.isFile() || stats.nlink < 1) throw new Error("staging_owner_permissions_or_hardlink_invalid");
@@ -388,7 +404,7 @@ export class ReleaseStore {
 
   private async makeMutableForRemoval(current: string): Promise<void> {
     const stats = await fs.lstat(current);
-    if (stats.isSymbolicLink()) throw new Error("cleanup_symlink_rejected");
+    if (stats.isSymbolicLink()) return;
     if (stats.isDirectory()) {
       await fs.chmod(current, 0o700);
       for (const child of await fs.readdir(current)) await this.makeMutableForRemoval(path.join(current, child));
@@ -397,16 +413,4 @@ export class ReleaseStore {
     }
   }
 
-  private async validateRemovalTree(current: string): Promise<void> {
-    const stats = await fs.lstat(current);
-    if (stats.isSymbolicLink() || stats.uid !== process.getuid?.() || (stats.mode & 0o022) !== 0) {
-      throw new Error("cleanup_tree_owner_or_permissions_invalid");
-    }
-    if (stats.isFile()) {
-      if (stats.nlink !== 1) throw new Error("cleanup_tree_hardlink_invalid");
-      return;
-    }
-    if (!stats.isDirectory()) throw new Error("cleanup_tree_type_invalid");
-    for (const child of await fs.readdir(current)) await this.validateRemovalTree(path.join(current, child));
-  }
 }
