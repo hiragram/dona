@@ -1,3 +1,4 @@
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -33,6 +34,7 @@ async function writeAtomic(filePath: string, body: string, mode = 0o600): Promis
 }
 
 export class ReleaseStore {
+  private cleanupCursorForWrite: { sha: string; mtime: number } | null = null;
   constructor(private readonly policy: UpdatePolicy) {}
 
   async preflight(): Promise<{ free_bytes: number; disk_floor_bytes: number; same_filesystem: true }> {
@@ -197,11 +199,19 @@ export class ReleaseStore {
         // safe candidates from being reported, or count toward retention.
       }
     }
-    candidates.sort((left, right) => right.mtime - left.mtime);
+    candidates.sort((left, right) => right.mtime - left.mtime || left.sha.localeCompare(right.sha));
+    const eligible = candidates.slice(this.policy.retain_successful);
+    const cursor = await this.readCleanupCursor();
+    const start = cursor ? eligible.findIndex((candidate) => candidate.mtime < cursor.mtime ||
+      (candidate.mtime === cursor.mtime && candidate.sha > cursor.sha)) : 0;
+    const window = eligible.slice(start < 0 ? 0 : start, (start < 0 ? 0 : start) + 16);
     const planned: string[] = [];
     // Deep validation is bounded even if the release root has accumulated
     // many candidates. A later maintenance pass can pick up the remainder.
-    for (const { sha } of candidates.slice(this.policy.retain_successful, this.policy.retain_successful + 16)) {
+    this.cleanupCursorForWrite = null;
+    for (const candidate of window) {
+      const { sha } = candidate;
+      this.cleanupCursorForWrite = candidate;
       const releasePath = path.join(this.policy.release_root, sha);
       try {
         await this.scanTree(releasePath, releasePath, { deadline: Date.now() + 3_000, entries: 0 });
@@ -216,6 +226,10 @@ export class ReleaseStore {
 
   async cleanup(protectedShas: ReadonlySet<string>): Promise<string[]> {
     const planned = await this.cleanupPlan(protectedShas);
+    if (this.cleanupCursorForWrite) await writeAtomic(
+      path.join(this.policy.control_root, "release-cleanup-cursor.json"),
+      `${JSON.stringify(this.cleanupCursorForWrite)}\n`,
+    );
     const removed: string[] = [];
     const errors: string[] = [];
     for (const sha of planned) {
@@ -280,11 +294,34 @@ export class ReleaseStore {
 
   private async readManifest(releasePath: string): Promise<ReleaseManifest> {
     const manifestPath = path.join(releasePath, "release-manifest.json");
-    const stats = await fs.lstat(manifestPath);
-    if (!stats.isFile() || stats.isSymbolicLink()) throw new Error("release manifest is not a regular file");
-    const manifest = parseReleaseManifest(JSON.parse(await fs.readFile(manifestPath, "utf8")));
+    const handle = await fs.open(manifestPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    let manifest: ReleaseManifest;
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.size > 65_536) throw new Error("release_manifest_size_or_type_invalid");
+      manifest = parseReleaseManifest(JSON.parse(await handle.readFile("utf8")));
+    } finally {
+      await handle.close();
+    }
     if (path.basename(releasePath) !== manifest.sha) throw new Error("release manifest SHA does not match its directory");
     return manifest;
+  }
+
+  private async readCleanupCursor(): Promise<{ sha: string; mtime: number } | null> {
+    const file = path.join(this.policy.control_root, "release-cleanup-cursor.json");
+    let handle: fs.FileHandle;
+    try { handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+    try {
+      if ((await handle.stat()).size > 256) throw new Error("release_cleanup_cursor_invalid");
+      const value: unknown = JSON.parse(await handle.readFile("utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value) ||
+        Object.keys(value).sort().join(",") !== "mtime,sha") throw new Error("release_cleanup_cursor_invalid");
+      const cursor = value as { sha: unknown; mtime: unknown };
+      if (typeof cursor.sha !== "string" || !/^[0-9a-f]{40}$/.test(cursor.sha) ||
+        typeof cursor.mtime !== "number" || !Number.isFinite(cursor.mtime)) throw new Error("release_cleanup_cursor_invalid");
+      return cursor as { sha: string; mtime: number };
+    } finally { await handle.close(); }
   }
 
   private async validateReleasePath(releasePath: string, expectedSha?: string): Promise<string> {

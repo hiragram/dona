@@ -940,6 +940,8 @@ export class UpdateDatabase {
       WHERE r.completed_at IS NULL OR r.state='needs_review' OR
         (r.state IN ('failed','cancelled','rolled_back') AND r.completed_at>=?) OR EXISTS (
         SELECT 1 FROM update_outbox o WHERE o.request_id=r.request_id
+          AND o.outbox_id=(SELECT newest.outbox_id FROM update_outbox newest
+            WHERE newest.request_id=r.request_id ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1)
           AND o.superseded_by_outbox_id IS NULL
           AND (o.status <> 'delivered' OR o.slack_reported_at IS NULL))`)
       .all(terminalEvidenceCutoff) as Array<{current_sha:string;target_sha:string;previous_sha:string|null}>;

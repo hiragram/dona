@@ -65,6 +65,39 @@ describe("ReleaseStore", () => {
     await assert.rejects(fs.lstat(release), { code: "ENOENT" });
   });
 
+  test("continues past invalid cleanup windows after restart", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    for (const sha of ["e".repeat(40), "f".repeat(40)]) await installRelease(policy, sha);
+    for (let index = 1; index <= 17; index++) {
+      const sha = index.toString(16).padStart(40, "0");
+      const candidate = await installRelease(policy, sha);
+      await fs.symlink("/tmp", path.join(candidate, "outside"));
+      const date = new Date(Date.UTC(2020, 0, index));
+      await fs.utimes(candidate, date, date);
+    }
+    const safeSha = "d".repeat(40);
+    const safe = await installRelease(policy, safeSha);
+    await fs.utimes(safe, new Date("2019-01-01"), new Date("2019-01-01"));
+    const protectedShas = new Set([currentSha, "0".repeat(40)]);
+    assert.deepEqual(await new ReleaseStore(policy).cleanup(protectedShas), []);
+    assert.ok((await new ReleaseStore(policy).cleanup(protectedShas)).includes(safeSha));
+    await assert.rejects(fs.lstat(safe), { code: "ENOENT" });
+  });
+
+  test("rejects an oversized manifest before parsing cleanup candidates", async () => {
+    const { root, policy } = await tempPolicy();
+    roots.push(root);
+    await installPointers(policy);
+    const sha = "a".repeat(40);
+    const candidate = await installRelease(policy, sha);
+    await fs.writeFile(path.join(candidate, "release-manifest.json"), "x".repeat(65_537));
+    const store = new ReleaseStore(policy);
+    await assert.rejects(store.releaseManifest(sha), /release_manifest_size_or_type_invalid/);
+    assert.deepEqual(await store.cleanupPlan(new Set([currentSha, "0".repeat(40)])), []);
+  });
+
   test("publishes an immutable release and atomically activates and rolls it back", async () => {
     const { root, policy } = await tempPolicy();
     roots.push(root);
