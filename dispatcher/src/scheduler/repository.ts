@@ -1183,6 +1183,12 @@ export class SchedulerRepository {
         AND j.last_error_code='published_result_reconciliation_required' AND j.updated_at<=?
         AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id)`)
       .all(add(now,-604800)) as Array<{job_id:string;result_path:string}>;
+    const orphanEvents=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e JOIN jobs j ON j.source_event_id=e.event_id
+      JOIN job_owner_bindings b ON b.job_id=j.job_id
+      WHERE e.source='dona_schedule' AND json_extract(b.owner_json,'$.kind')='schedule'
+        AND j.status='needs_review' AND j.last_error_code='published_result_reconciliation_required'
+        AND j.updated_at<=? AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id)`)
+      .all(add(now,-604800)) as Array<{event_id:string;result_path:string|null}>;
     const eventResults=this.db.prepare(`SELECT DISTINCT e.event_id,e.result_path FROM events e
       LEFT JOIN schedule_runs r ON r.event_id=e.event_id
       LEFT JOIN job_completion_results c ON c.source_event_id=e.event_id OR c.notification_event_id=e.event_id
@@ -1220,6 +1226,9 @@ export class SchedulerRepository {
         this.db.prepare("UPDATE jobs SET result_json=NULL,objective='[deleted]',last_error_message=NULL WHERE job_id=?")
           .run(row.job_id);
       }
+      for(const row of orphanEvents)
+        this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]'),
+          result_json=NULL,last_error_message=NULL WHERE event_id=? AND source='dona_schedule'`).run(row.event_id);
       this.db.prepare(`UPDATE events SET payload_json=json_set(payload_json,'$.work.objective','[deleted]'),last_error_message=NULL
         WHERE event_id IN (SELECT source_event_id FROM job_completion_results WHERE content_delete_at<=?
           AND json_extract(owner_json,'$.kind')='schedule') AND source='dona_schedule'
@@ -1278,6 +1287,8 @@ export class SchedulerRepository {
       this.db.prepare("UPDATE job_completion_results SET result_file_deleted_at=? WHERE job_id=? AND result_file_deleted_at IS NULL").run(now,row.job_id);
     }
     if(this.deleteJobResult) for(const row of orphanFiles) this.deleteJobResult(row.job_id,row.result_path);
+    if(this.deleteJobResult) for(const row of orphanEvents) if(row.result_path&&this.deleteJobResult(row.event_id,row.result_path))
+      this.db.prepare("UPDATE events SET result_path=NULL WHERE event_id=? AND result_path=?").run(row.event_id,row.result_path);
     if(this.deleteJobResult) for(const row of eventResults) if(this.deleteJobResult(row.event_id,row.result_path)) {
       this.db.prepare("UPDATE events SET result_path=NULL WHERE event_id=? AND result_path=?").run(row.event_id,row.result_path);
     }

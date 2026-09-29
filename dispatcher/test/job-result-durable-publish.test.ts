@@ -153,6 +153,20 @@ describe("永続Job Result公開", () => {
     } finally {database.close();}
   });
 
+  test("隔離時に未送信の完了通知を無効化する",async()=>{
+    const {database,job,candidate,publisher}=await fixture();
+    try {
+      await publisher.commit(candidate());
+      const notice=database.enqueueJobNotification(job.job_id).row;
+      assert.equal(notice.status,"queued");
+      await fs.unlink(job.result_path);
+      assert.equal(database.quarantineIncompletePublishedResults(),1);
+      assert.equal(database.get(notice.event_id)?.status,"completed");
+      assert.equal(database.get(notice.event_id)?.last_error_code,"job_result_superseded");
+      assert.equal(database.getJob(job.job_id)?.completion_event_id,null);
+    } finally {database.close();}
+  });
+
   for (const point of ["after_reserve","before_rename","after_rename","before_db_commit","after_db_commit"] as const) {
     test(`${point}の応答喪失をreceiptで照合する`, async () => {
       const { database, job, candidate } = await fixture();

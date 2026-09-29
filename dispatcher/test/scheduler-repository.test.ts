@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import { envelopeFromRow } from "../src/prompt.js";
 import { DispatcherDatabase, ScheduledJobCreationError } from "../src/database.js";
 import type {AuthorizedJobResultPublish} from "../src/job-result-publish.js";
+import {stableStringify} from "../src/validation.js";
 import { migrateJobRouting } from "../src/job-routing.js";
 import { migrateScheduler } from "../src/scheduler/schema.js";
 import type { Actor, RevisionInput, Run, SchedulerRepository } from "../src/scheduler/repository.js";
@@ -1931,12 +1932,16 @@ test("completion rowのない隔離済みschedule receiptとfileを7日後に消
   fs.mkdirSync(path.dirname(job.result_path),{recursive:true});
   fs.writeFileSync(job.result_path,"private result");
   fs.writeFileSync(`${job.result_path}.publish-${digest}.tmp`,"private temp");
+  raw.prepare("UPDATE events SET result_json=? WHERE event_id=?").run('{"summary":"private event result"}',run.event_id);
   const cutoff=`${new Date(Date.parse(dispatcher.getJob(job.job_id)!.updated_at)+604801000).toISOString().slice(0,19)}Z`;
   repo.purge(cutoff);
   assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
   assert.equal(fs.existsSync(job.result_path),false);
   assert.equal(fs.existsSync(`${job.result_path}.publish-${digest}.tmp`),false);
   assert.equal(dispatcher.getJob(job.job_id)?.objective,"[deleted]");
+  const source=dispatcher.get(run.event_id!)!;
+  assert.equal((JSON.parse(source.payload_json) as {work:{objective:string}}).work.objective,"[deleted]");
+  assert.equal(source.result_json,null);
 });
 
 test("schedule固有の不受理Resultは予約receiptを残さない",()=>{
@@ -1958,6 +1963,38 @@ test("schedule固有の不受理Resultは予約receiptを残さない",()=>{
       attemptCount:current.attempt_count,paneId:"pane-1",session},assertCurrentGrant:()=>{}};
   assert.throws(()=>dispatcher.reservePublishedJobResult(candidate),/scheduled_work_external_write_reported/);
   assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(job.job_id),undefined);
+});
+
+test("schedule期限直前の予約はfile確定中に期限を跨いでも受理する",()=>{
+  const {repo,dispatcher,raw,filename}=setup();
+  repo.create("deadline_publish",{...input,action:"work.read_only"},due,actor,now);
+  const run=repo.materialize("deadline_publish",1,due,later,due,actor).run;
+  const job=createScheduledJob(dispatcher,raw,{source_event_id:run.event_id!,objective:input.content!,workspace:{kind:"scratch"}},
+    path.join(path.dirname(filename),"jobs"),path.join(path.dirname(filename),"results"),new Date(due)).row;
+  dispatcher.beginJobPreparation(job.job_id,new Date(due));
+  dispatcher.setJobRuntime(job.job_id,"workspace-1","pane-1","session-1");
+  dispatcher.beginJobDispatch(job.job_id,new Date(due));
+  dispatcher.markJobRunning(job.job_id,new Date(due));
+  const reservedAt=new Date(Date.now()-10000).toISOString();
+  const dispatchAt=new Date(Date.now()-3602000).toISOString();
+  raw.prepare("UPDATE jobs SET dispatch_started_at=?,prompt_accepted_at=? WHERE job_id=?")
+    .run(dispatchAt,dispatchAt,job.job_id);
+  const current=dispatcher.getJob(job.job_id)!;
+  const session=JSON.stringify(["workspace-1","pane-1",job.agent_name,"session-1"]);
+  const request={schema_version:1 as const,status:"completed" as const,summary:"完了",actions:[]};
+  const envelope={...request,job_id:job.job_id,completed_at:reservedAt};
+  const candidate:AuthorizedJobResultPublish={request,envelope,canonicalDigest:"f".repeat(64),encodedBytes:100,
+    reconcileOnly:false,fence:{jobId:job.job_id,publishableStatuses:["dispatching","running"],grantGeneration:1,
+      attemptCount:current.attempt_count,paneId:"pane-1",session},assertCurrentGrant:()=>{}};
+  fs.mkdirSync(path.dirname(job.result_path),{recursive:true});
+  fs.writeFileSync(job.result_path,JSON.stringify(envelope),{mode:0o600});
+  raw.prepare(`INSERT INTO job_result_publish_receipts
+    (job_id,canonical_digest,envelope_json,attempt_count,pane_id,session_sha256,grant_generation,state,reserved_at)
+    VALUES(?,?,?,?,?,?,?,'reserved',?)`)
+    .run(job.job_id,candidate.canonicalDigest,stableStringify(envelope),current.attempt_count,"pane-1",
+      createHash("sha256").update(session).digest("hex"),1,reservedAt);
+  assert.equal(dispatcher.commitPublishedJobResult(candidate,new Date()),"reused");
+  assert.equal(dispatcher.getJob(job.job_id)?.status,"completed");
 });
 
 test("dona_scheduleは#11 routingへ流しlegacy scheduler eventだけを除外する", () => {

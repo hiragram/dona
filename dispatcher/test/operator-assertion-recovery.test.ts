@@ -78,6 +78,9 @@ test("公開receiptのneeds_reviewを一致するfileと申告で確定する",a
 
 test("公開receiptのfile欠落は申告後に失敗へ確定し通知できる",async()=>{
   const state=await setup("published_result_reconciliation_required");
+  await fs.mkdir(path.dirname(state.job.result_path),{recursive:true});
+  const temporary=`${state.job.result_path}.publish-${digest("winner")}.tmp`;
+  await fs.writeFile(temporary,"private temporary result",{mode:0o600});
   const raw=new Database(state.config.databasePath);
   try {
     raw.prepare(`INSERT INTO job_result_publish_receipts
@@ -86,6 +89,7 @@ test("公開receiptのfile欠落は申告後に失敗へ確定し通知できる
       .run(state.job.job_id,digest("winner"),"{}",state.job.attempt_count,null,digest("session"),1,new Date().toISOString());
     assert.equal(state.database.recoverWithOperatorAssertion(state.input()).status,"failed");
     assert.equal(raw.prepare("SELECT 1 FROM job_result_publish_receipts WHERE job_id=?").get(state.job.job_id),undefined);
+    await assert.rejects(fs.stat(temporary),{code:"ENOENT"});
   } finally {raw.close();}
 });
 
