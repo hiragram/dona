@@ -1,6 +1,10 @@
 # GitHub Projects DonaのIssue着手・提出手順
 
-対象は [Dona Project](https://github.com/users/hiragram/projects/1/views/1)（owner `hiragram`、Project number `1`）の既存Issue item。view番号をProject番号やitem IDとして使わない。この手順は通常の読み取り、更新直前の再確認、更新後の再読で運用する。厳密なCAS、Dispatcher永続claim/lockの追加や、その未実装を理由とする停止は不要。
+移行先は [Dona Project](https://github.com/orgs/reirei-lab/projects/4)（owner `reirei-lab`、Project number `4`、ID `PVT_kwDOEPyLNM4BlJjH`）。2026-09-30の確認ではitemは0件で、旧[個人Project](https://github.com/users/hiragram/projects/1)には120件ある。既存Issueを移送済みとは扱わない。対象Issueが新Projectにない場合、この手順による着手・担当更新は止め、移行状況をDonaへ報告する。view番号をProject番号やitem IDとして使わない。この手順は通常の読み取り、更新直前の再確認、更新後の再読で運用する。厳密なCAS、Dispatcher永続claim/lockの追加や、その未実装を理由とする停止は不要。
+
+## 新規Issueの自動追加と移行境界
+
+`.github/workflows/add-new-issues-to-project.yml`はIssueの`opened`時だけ新Projectへ追加する。既存Issueはこのworkflowでは移送されない。`ADD_TO_PROJECT_PAT`のsecret名と更新時刻は確認できるが、secretの権限・ownerは読み取れないため、新Projectへの追加成功は次のIssue起票後にActions runとProject itemの両方で照合する。Project標準workflowの有効化だけでは、repositoryのIssueに対するauto-add設定やPATの実効権限を証明できない。新旧Projectの既存itemを一括移送する操作は別途計画する。
 
 ## 対象と権限を確認する
 
@@ -12,14 +16,14 @@
 最初に最小のread-only確認を行う。
 
 ```sh
-gh project field-list 1 --owner hiragram --format json
+gh project field-list 4 --owner reirei-lab --format json
 ```
 
 失敗時はcommand、exit code、秘密を除いたerror、実行環境の確認範囲を記録する。`read:project`不足はその環境の観測結果として報告し、ユーザーのterminalも同じ認証だと断定しない。tokenや環境変数の値を表示せず、`auth refresh` / `auth switch`や認証設定変更を自動実行しない。読み取り成功だけでwrite権限ありと断定しない。
 
-成功した場合は`gh project view 1 --owner hiragram --format json`でtitle、URL、Project IDを照合し、fieldsのID・型とsingle-select optionsのID・名前を取得する。`Dona Job ID`は`TEXT`、`Status`は`SINGLE_SELECT`で、`Todo`、`In Progress`、`Merge Ready`が既存optionとして一意に存在することを確認する。CLI出力に型がなければGraphQLの`ProjectV2.fields`から`ProjectV2Field` / `ProjectV2SingleSelectField`の`dataType`を取得する。field一覧がlimitで切れていればlimitを増やすかpaginationし、欠落を不存在と誤認しない。IDを資料へ推測で固定せず、その実行時の取得値を使う。
+成功した場合は`gh project view 4 --owner reirei-lab --format json`でtitle、URL、Project IDを照合し、fieldsのID・型とsingle-select optionsのID・名前を取得する。`Dona Job ID`は`TEXT`、`Status`は`SINGLE_SELECT`で、`Todo`、`In Progress`、`Merge Ready`が既存optionとして一意に存在することを確認する。CLI出力に型がなければGraphQLの`ProjectV2.fields`から`ProjectV2Field` / `ProjectV2SingleSelectField`の`dataType`を取得する。field一覧がlimitで切れていればlimitを増やすかpaginationし、欠落を不存在と誤認しない。IDを資料へ推測で固定せず、その実行時の取得値を使う。
 
-`gh project item-list 1 --owner hiragram --format json`から対象IssueのURL・repository・numberを照合してitem IDを得る。既定limitは30なので、見つからない場合は全件取得またはGraphQL paginationを完了してから未登録と判断する。draft item、PR item、同名の別Issueで代用しない。
+`gh project item-list 4 --owner reirei-lab --format json`から対象IssueのURL・repository・numberを照合してitem IDを得る。既定limitは30なので、見つからない場合は全件取得またはGraphQL paginationを完了してから未登録と判断する。draft item、PR item、同名の別Issueで代用しない。
 
 Project/item未登録、field/optionの欠落・型違い、権限不足では勝手に作成・設定変更しない。対象Issueへの着手がこの確認に依存する場合は未着手としてDonaへ返す。対象Issueのない文書・Skill修正PRなど独立して許可された作業は続行し、Projectsのlive確認・書込未検証を報告する。
 
