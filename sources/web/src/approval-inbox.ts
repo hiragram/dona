@@ -77,6 +77,7 @@ export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1),
 export const approvalInboxDetailSchema = z.strictObject({ codec_version: z.literal(1), item: approvalInboxItemSchema });
 const detailBindingSchema = z.strictObject({request_id: id, presentation_ref: id, presentation_revision: revision,
   audience_principal_id: id, persisted_display_fingerprint: hash, presentation_display_fingerprint: hash,
+  supervisor_binding_id: id, binding_revision: revision,
   persisted_action_hash: hash, presentation_action_hash: hash,
   content_key_version: revision, content_signed_at: utc,
   persisted_content_mac: hash, presentation_content_mac: hash});
@@ -90,13 +91,7 @@ export type ApprovalDetailKey = z.infer<typeof detailKeySchema>;
 /** Server-only MAC of the literal presentation. Never place it in a browser response. */
 export function computeApprovalPrivateContentMac(item: ApprovalInboxItem, key: ApprovalDetailKey): string {
   const material = detailKeySchema.parse(key);
-  const content = {request_id: item.request_id, operation: item.operation, requester_actor_id: item.requester_actor_id,
-    audience_principal_id: item.audience_principal_id, risk: item.risk, risk_reason: item.risk_reason,
-    opaque_action_id: item.opaque_action_id, expires_at: item.expires_at,
-    requester: item.requester, operation_summary: item.operation_summary,
-    presentation_ref: item.presentation_ref, presentation_revision: item.presentation_revision,
-    display_codec_version: item.display_codec_version, exact_target: item.exact_target,
-    exact_draft: item.exact_draft, resolved_mentions: item.resolved_mentions};
+  const content = approvalInboxItemSchema.parse(item);
   return createHmac("sha256", material.secret).update("dona.web.approval.detail.v1\0")
     .update(JSON.stringify([material.version, item.instance_id, item.exact_target.workspace_id])).update("\0")
     .update(JSON.stringify(content), "utf8").digest("hex");
@@ -245,6 +240,8 @@ export interface ApprovalInboxAuthority {
   detail(requestId: string): Promise<unknown>;
   /** Protected key lookup; never returns key material to the browser. */
   detailContentKey(version: number): Promise<unknown>;
+  /** Protected server clock read after the durable detail read. */
+  protectedNow(): Promise<unknown>;
 }
 
 /** No default authority or decision transport exists while Epic #26 is incomplete. */
@@ -260,7 +257,9 @@ export class ApprovalInboxAdapter {
     try {
       const detail = authorityDetailSchema.parse(await this.authority.detail(id.parse(requestId)));
       assertDetailScope(detail.item, readScopeSchema.parse(currentScope));
-      if (detail.item.state !== "pending") throw Error();
+      const now = utc.parse(await this.authority.protectedNow());
+      if (detail.item.state !== "pending" || Date.parse(detail.item.created_at) > Date.parse(now)
+        || Date.parse(now) >= Date.parse(detail.item.expires_at)) throw Error();
       if (detail.item.request_id !== requestId) throw Error();
       const key = detailKeySchema.parse(await this.authority.detailContentKey(detail.binding.content_key_version));
       const signed = Date.parse(detail.binding.content_signed_at);
@@ -274,6 +273,10 @@ export class ApprovalInboxAdapter {
         || detail.binding.presentation_revision !== detail.item.presentation_revision
         || detail.binding.audience_principal_id !== detail.item.audience_principal_id
         || detail.binding.audience_principal_id !== currentScope.principal_id
+        || detail.binding.supervisor_binding_id !== detail.item.supervisor_binding_id
+        || detail.binding.supervisor_binding_id !== currentScope.supervisor_binding_id
+        || detail.binding.binding_revision !== detail.item.binding_revision
+        || detail.binding.binding_revision !== currentScope.binding_revision
         || detail.binding.persisted_display_fingerprint !== detail.item.display_fingerprint
         || detail.binding.presentation_display_fingerprint !== detail.item.display_fingerprint
         || detail.binding.persisted_action_hash !== detail.binding.presentation_action_hash
