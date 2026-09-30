@@ -89,10 +89,14 @@ export const approvalAuthorityEvidenceSchema = z.strictObject({
   challenge_ref: id, challenge_state: z.literal("unused"), challenge_created_at: utc, challenge_expires_at: utc,
   challenge_request_id: id, challenge_decision: z.enum(["approve", "reject"]),
   challenge_action_hash: hash, challenge_display_fingerprint: hash, challenge_presentation_revision: revision,
-  challenge_principal_id: id, challenge_session_ref: id, challenge_instance_id: id, challenge_tenant_id: id,
+  challenge_request_revision: revision, challenge_presentation_ref: id, challenge_display_codec_version: z.literal(1),
+  challenge_principal_id: id, challenge_session_ref: id, challenge_session_generation: revision,
+  challenge_authz_revision: revision, challenge_instance_id: id, challenge_tenant_id: id,
   challenge_workspace_id: id, challenge_supervisor_binding_id: id,
   challenge_binding_revision: revision, challenge_credential_id: id, challenge_credential_revision: revision,
-  challenge_policy_revision: revision,
+  challenge_policy_revision: revision, challenge_requester_authorization_revision: revision,
+  challenge_target_workspace_id: id, challenge_visibility_revision: revision,
+  challenge_resource_snapshot_hash: hash,
   credential_id: id, credential_revision: revision, credential_state: z.literal("active"),
   credential_non_backup: z.literal(true), user_verified: z.literal(true),
   credential_stored_sign_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -160,7 +164,12 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || evidence.challenge_action_hash !== evidence.persisted_action_hash
       || evidence.challenge_display_fingerprint !== evidence.display_fingerprint
       || evidence.challenge_presentation_revision !== evidence.presentation_revision
+      || evidence.challenge_request_revision !== evidence.request_revision
+      || evidence.challenge_presentation_ref !== evidence.presentation_ref
+      || evidence.challenge_display_codec_version !== evidence.display_codec_version
       || evidence.challenge_principal_id !== evidence.principal_id || evidence.challenge_session_ref !== evidence.session_ref
+      || evidence.challenge_session_generation !== evidence.session_generation
+      || evidence.challenge_authz_revision !== evidence.authz_revision
       || evidence.challenge_instance_id !== evidence.instance_id || evidence.challenge_tenant_id !== evidence.tenant_id
       || evidence.challenge_workspace_id !== evidence.workspace_id
       || evidence.challenge_supervisor_binding_id !== evidence.supervisor_binding_id
@@ -168,6 +177,10 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || evidence.challenge_credential_id !== evidence.credential_id
       || evidence.challenge_credential_revision !== evidence.credential_revision
       || evidence.challenge_policy_revision !== evidence.policy_revision
+      || evidence.challenge_requester_authorization_revision !== evidence.requester_authorization_revision
+      || evidence.challenge_target_workspace_id !== evidence.target_workspace_id
+      || evidence.challenge_visibility_revision !== evidence.visibility_revision
+      || evidence.challenge_resource_snapshot_hash !== evidence.current_resource_snapshot_hash
       || !timingSafeEqual(requested, current) || !timingSafeEqual(action, presented)
       || !timingSafeEqual(Buffer.from(evidence.persisted_resource_snapshot_hash, "hex"),
         Buffer.from(evidence.current_resource_snapshot_hash, "hex"))
