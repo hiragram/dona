@@ -106,6 +106,19 @@ export async function cleanupInstallStaging(releaseRoot, stagingDir) {
     if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid() ||
       (stats.mode & 0o077) !== 0) throw new Error("Refusing to clean an unsafe staging directory");
   }
+  // A failed rename can leave the staged children sealed at 0500. Restore write
+  // permission only within the verified staging tree before removing it.
+  async function restoreDirectoryWrite(directory) {
+    const stats = await fs.lstat(directory);
+    if (!stats.isDirectory() || stats.isSymbolicLink() || stats.uid !== process.getuid()) {
+      throw new Error("Refusing to clean an unsafe staging descendant");
+    }
+    await fs.chmod(directory, 0o700);
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      if (entry.isDirectory()) await restoreDirectoryWrite(path.join(directory, entry.name));
+    }
+  }
+  await restoreDirectoryWrite(stagingDir);
   await fs.rm(stagingDir, { recursive: true, force: true });
 }
 

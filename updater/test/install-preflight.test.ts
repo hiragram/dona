@@ -665,6 +665,13 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /再送せず照合が必要です/);
   assert.doesNotMatch(source, /for attempt in 1 2/);
   assert.match(source, /control-attempt-ledger\.mjs" create/);
+  const stagedSeal = source.indexOf('find "$STAGING_DIR" -type f -exec chmod 400 {} +');
+  const stagedDirectories = source.indexOf('find "$STAGING_DIR" -mindepth 1 -type d -exec chmod 500 {} +');
+  const releaseRename = source.indexOf('/bin/mv "$STAGING_DIR" "$FINAL_RELEASE"');
+  const releaseRootSeal = source.indexOf('chmod 500 "$FINAL_RELEASE"', releaseRename);
+  const publishedCheck = source.indexOf('validate-published-release', releaseRename);
+  assert.ok(stagedSeal >= 0 && stagedSeal < stagedDirectories &&
+    stagedDirectories < releaseRename && releaseRename < releaseRootSeal && releaseRootSeal < publishedCheck);
   assert.match(source, /record_control_phase updater_stop_intent bootout_updater/);
   assert.match(source, /record_control_phase updater_start_intent bootstrap_updater/);
   assert.doesNotMatch(source, /launchctl bootstrap[^\n]*\|\| true/);
@@ -1061,7 +1068,7 @@ test("an existing immutable release is reusable only with the exact control-plan
 test("staging requires complete builds and matching lockfiles before immutable publication", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-staged-release-"));
   const sha = "c".repeat(40);
-  const release = path.join(root, sha);
+  let release = path.join(root, ".staging", "install.ABC123");
   const components = ["dispatcher", "sources/slack", "updater"];
   try {
     for (const component of components) {
@@ -1097,6 +1104,9 @@ test("staging requires complete builds and matching lockfiles before immutable p
     }
     await fs.chmod(path.join(release, "sources"), 0o500);
     await fs.chmod(path.join(release, "release-manifest.json"), 0o400);
+    const published = path.join(root, sha);
+    await fs.rename(release, published);
+    release = published;
     await fs.chmod(release, 0o500);
     await run("validate-published-release", release, sha, digest);
     await fs.chmod(path.join(release, "updater", "dist", "cli.js"), 0o600);
@@ -1215,6 +1225,11 @@ test("failed install cleanup removes only the generated staging directory", asyn
     ]);
     await Promise.all([fs.chmod(releaseRoot, 0o700), fs.chmod(path.join(releaseRoot, ".staging"), 0o700),
       fs.chmod(stagingDir, 0o700)]);
+    const sealedChild = path.join(stagingDir, "updater", "dist");
+    await fs.mkdir(sealedChild, { recursive: true });
+    await fs.writeFile(path.join(sealedChild, "cli.js"), "sealed", { mode: 0o400 });
+    await fs.chmod(sealedChild, 0o500);
+    await fs.chmod(path.dirname(sealedChild), 0o500);
     await run("cleanup-staging", releaseRoot, stagingDir);
     await assert.rejects(fs.stat(stagingDir), { code: "ENOENT" });
     assert.equal((await fs.stat(sibling)).isDirectory(), true);
