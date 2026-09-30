@@ -45,7 +45,7 @@ describe("永続Job Result公開", () => {
       assert.equal((await fs.stat(job.result_path)).mode & 0o077,0);
       assert.equal(database.getJob(job.job_id)?.status,"completed");
       assert.deepEqual(database.jobResultPublishSnapshot().jobs,
-        { terminal_without_receipt: 0, published_terminal: 1, running: 0, needs_review: 0 });
+        { terminal_receipt_absent_or_purged: 0, published_terminal: 1, running: 0, needs_review: 0 });
       assert.deepEqual(database.jobResultPublishSnapshot().receipts,
         { reserved: 0, committed: 1, needs_review: 0 });
       assert.deepEqual(await publisher.reconcile(candidate()),{ outcome: "reused", receipt_id: first.canonicalDigest });

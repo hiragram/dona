@@ -95,11 +95,15 @@ describe("DispatcherApi", () => {
       assert.equal(result.status, 200);
       assert.deepEqual(result.body, {
         schema_version: 1,
-        jobs: { terminal_without_receipt: 0, published_terminal: 0, running: 0, needs_review: 1 },
+        jobs: { terminal_receipt_absent_or_purged: 0, published_terminal: 0, running: 0, needs_review: 1 },
         receipts: { reserved: 0, committed: 0, needs_review: 0 },
-        failures: { invalid_result: 1, result_missing: 0, published_result_reconciliation_required: 0 },
+        current_failures: { invalid_result: 1, result_missing: 0, published_result_reconciliation_required: 0 },
       });
       assert.doesNotMatch(JSON.stringify(result.body), /PRIVATE|Ev-publish|job_/);
+      database.recordInvalidResultAgentStopped(job.job_id);
+      const afterTransition = await request(config.socketPath, "GET", "/metrics/job-result-publish");
+      assert.equal((afterTransition.body.current_failures as { invalid_result: number }).invalid_result, 0);
+      assert.equal((afterTransition.body.jobs as { needs_review: number }).needs_review, 1);
     } finally { await api.stop(); database.close(); }
   });
   test("live session opt-inをthreadへbindしdurable receiptを再読する",async()=>{
