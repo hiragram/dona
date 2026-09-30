@@ -94,6 +94,7 @@ export const approvalAuthorityEvidenceSchema = z.strictObject({
   assertion_sign_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   counter_unsupported_registration_proven: z.boolean(), credential_counter_cas_succeeded: z.literal(true),
   target_visible: z.literal(true), target_shared: z.literal(false), visibility_revision: revision,
+  target_workspace_id: id,
   persisted_resource_snapshot_hash: hash, current_resource_snapshot_hash: hash,
   policy_revision: revision, requester_authorization_revision: revision,
   created_at: utc, expires_at: utc,
@@ -142,6 +143,7 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
         ? evidence.assertion_sign_count <= evidence.credential_stored_sign_count
         : !evidence.counter_unsupported_registration_proven)
       || evidence.visibility_revision !== scope.visibility_revision
+      || evidence.target_workspace_id !== scope.workspace_id
       || evidence.audience_principal_id !== scope.principal_id
       || candidate.request_id !== evidence.request_id || candidate.operation !== evidence.operation
       || candidate.decision !== evidence.decision || candidate.display_codec_version !== evidence.display_codec_version
@@ -163,6 +165,7 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || !timingSafeEqual(Buffer.from(evidence.persisted_resource_snapshot_hash, "hex"),
         Buffer.from(evidence.current_resource_snapshot_hash, "hex"))
       || Date.parse(evidence.created_at) >= Date.parse(evidence.expires_at)
+      || Date.parse(evidence.created_at) > Date.parse(at)
       || Date.parse(evidence.expires_at) - Date.parse(evidence.created_at) > 15 * 60_000
       || Date.parse(at) >= Date.parse(evidence.expires_at)
       || Date.parse(evidence.challenge_expires_at) > Date.parse(evidence.expires_at)
@@ -189,22 +192,24 @@ export class ApprovalInboxAdapter {
     try { return approvalInboxSchema.parse(await this.authority.list(nextCursor === null ? null : cursor.parse(nextCursor))); }
     catch { throw new ApprovalInboxUnavailable(); }
   }
-  async detail(requestId: string): Promise<z.infer<typeof approvalInboxDetailSchema>> {
+  async detail(requestId: string, currentWorkspaceId: string): Promise<z.infer<typeof approvalInboxDetailSchema>> {
     if (!this.authority) throw new ApprovalInboxUnavailable();
     try {
       const detail = approvalInboxDetailSchema.parse(await this.authority.detail(id.parse(requestId)));
-      if (detail.item.request_id !== requestId) throw Error();
+      if (detail.item.request_id !== requestId || detail.item.exact_target.workspace_id !== id.parse(currentWorkspaceId)) throw Error();
       return detail;
     } catch { throw new ApprovalInboxUnavailable(); }
   }
 }
 
 /** Text-only view model for list, detail, and the human confirmation screen. */
-export function approvalInboxView(itemInput: unknown, now: string) {
+export function approvalInboxView(itemInput: unknown, now: string, currentWorkspaceId: string) {
   try {
     const item = approvalInboxItemSchema.parse(itemInput);
     const at = utc.parse(now);
-    const canStartChallenge = item.state === "pending" && Date.parse(at) < Date.parse(item.expires_at);
+    if (item.exact_target.workspace_id !== id.parse(currentWorkspaceId)) throw Error();
+    const canStartChallenge = item.state === "pending" && Date.parse(item.created_at) <= Date.parse(at)
+      && Date.parse(at) < Date.parse(item.expires_at);
     return Object.freeze({
       title: item.operation_summary, operationKind: item.operation, exactTarget: item.exact_target, exactDraft: item.exact_draft,
       resolvedMentions: item.resolved_mentions, opaqueActionId: item.opaque_action_id,
@@ -220,18 +225,20 @@ const html = (value: string) => value.replace(/[&<>"']/g, char =>
 
 /** Inert list/detail/confirm markup. The decision ceremony is deliberately
  * absent until the durable Web presentation and WebAuthn receipt API exist. */
-export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: unknown | null, now: string): string {
+export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: unknown | null,
+  now: string, currentWorkspaceId: string): string {
   try {
     const page = approvalInboxSchema.parse(input);
     const items = page.items;
     const selected = selectedDetailInput === null ? null : approvalInboxDetailSchema.parse(selectedDetailInput).item;
     const rows = items.map(item => {
       const at = utc.parse(now);
-      const status = item.state === "pending" && Date.parse(at) < Date.parse(item.expires_at) ? "確認準備中" : "再確認が必要";
+      const status = item.state === "pending" && Date.parse(item.created_at) <= Date.parse(at)
+        && Date.parse(at) < Date.parse(item.expires_at) ? "確認準備中" : "再確認が必要";
       return `<li><span>${html(item.operation_summary)}</span><span>${html(item.requester)}</span><span>${html(status)}</span></li>`;
     }).join("");
     const detail = selected === null ? "" : (() => {
-      const view = approvalInboxView(selected, now);
+      const view = approvalInboxView(selected, now, currentWorkspaceId);
       return `<section aria-labelledby="approval-detail-title"><h2 id="approval-detail-title">承認内容の確認</h2>`
         + `<dl><dt>操作種別</dt><dd>${html(view.operationKind)}</dd><dt>概要</dt><dd>${html(view.title)}</dd>`
         + `<dt>対象workspace ID</dt><dd>${html(view.exactTarget.workspace_id)}</dd>`
