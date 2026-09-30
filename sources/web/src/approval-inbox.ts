@@ -6,6 +6,7 @@ const revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const utc = z.string().refine(value => Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value);
 const hash = z.string().regex(/^[0-9a-f]{64}$/);
 const cursor = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+const operation = z.literal("slack.post_thread_reply.v1");
 const safeText = z.string().min(1).max(240).refine(value =>
   value === value.trim() && !value.includes("  ")
   && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Zs}]/u.test(value.replaceAll(" ", ""))
@@ -13,27 +14,34 @@ const safeText = z.string().min(1).max(240).refine(value =>
 
 /** Display data from a verified approval repository, never the action payload. */
 export const approvalInboxItemSchema = z.strictObject({
-  request_id: id, requester: safeText, risk: z.enum(["elevated", "critical"]),
+  request_id: id, operation, requester: safeText, risk: z.enum(["elevated", "critical"]),
   operation_summary: safeText, exact_target: safeText, display_fingerprint: hash, created_at: utc, expires_at: utc,
-  request_revision: revision, presentation_revision: revision,
+  request_revision: revision, presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
   state: z.enum(["pending", "approved", "rejected", "expired", "needs_review"]),
-}).refine(item => Date.parse(item.created_at) < Date.parse(item.expires_at));
+}).refine(item => Date.parse(item.created_at) < Date.parse(item.expires_at)
+  && Date.parse(item.expires_at) - Date.parse(item.created_at) <= 15 * 60_000);
 export type ApprovalInboxItem = z.infer<typeof approvalInboxItemSchema>;
 export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1), items: z.array(approvalInboxItemSchema).max(50), next_cursor: cursor.nullable() })
   .refine(value => new Set(value.items.map(item => item.request_id)).size === value.items.length);
+export const approvalInboxDetailSchema = z.strictObject({ codec_version: z.literal(1), item: approvalInboxItemSchema });
 
 /** The browser confirms only a candidate. The authority must reread durable state. */
 export const approvalDecisionCandidateSchema = z.strictObject({
-  codec_version: z.literal(1), request_id: id, decision: z.enum(["approve", "reject"]),
-  expected_request_revision: revision, expected_presentation_revision: revision, expected_display_fingerprint: hash,
+  codec_version: z.literal(1), display_codec_version: z.literal(1), request_id: id, operation,
+  decision: z.enum(["approve", "reject"]), expected_request_revision: revision,
+  expected_presentation_ref: id, expected_presentation_revision: revision, expected_display_fingerprint: hash,
 });
 export type ApprovalDecisionCandidate = z.infer<typeof approvalDecisionCandidateSchema>;
 export const approvalAuthorityEvidenceSchema = z.strictObject({
   principal_id: id, instance_id: id, tenant_id: id, workspace_id: id, binding_revision: revision,
+  session_ref: id, session_generation: revision, authz_revision: revision,
   role: z.literal("supervisor"), step_up_verified: z.literal(true), csrf_verified: z.literal(true),
-  request_id: id, decision: z.enum(["approve", "reject"]), display_fingerprint: hash,
+  request_id: id, operation, decision: z.enum(["approve", "reject"]), display_fingerprint: hash,
   persisted_action_hash: hash, presentation_action_hash: hash, request_revision: revision,
-  presentation_revision: revision, expires_at: utc,
+  presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
+  presentation_status: z.literal("synchronized_sent"), audience_principal_id: id,
+  policy_revision: revision, requester_authorization_revision: revision,
+  created_at: utc, expires_at: utc,
   state: z.literal("pending"), consumed: z.literal(false),
 });
 export type ApprovalAuthorityEvidence = z.infer<typeof approvalAuthorityEvidenceSchema>;
@@ -46,11 +54,15 @@ export class ApprovalInboxUnavailable extends Error {
  * Evidence must be computed by a server authority from the current principal,
  * protected clock and persisted request in the decision transaction. */
 export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenceInput: unknown,
-  expectedScope: { principal_id: string; instance_id: string; tenant_id: string; workspace_id: string; binding_revision: number }, now: string): ApprovalDecisionCandidate {
+  expectedScope: { principal_id: string; instance_id: string; tenant_id: string; workspace_id: string; binding_revision: number;
+    session_ref: string; session_generation: number; authz_revision: number; policy_revision: number;
+    requester_authorization_revision: number }, now: string): ApprovalDecisionCandidate {
   try {
     const candidate = approvalDecisionCandidateSchema.parse(candidateInput);
     const evidence = approvalAuthorityEvidenceSchema.parse(evidenceInput);
-    const scope = z.strictObject({ principal_id: id, instance_id: id, tenant_id: id, workspace_id: id, binding_revision: revision }).parse(expectedScope);
+    const scope = z.strictObject({ principal_id: id, instance_id: id, tenant_id: id, workspace_id: id,
+      binding_revision: revision, session_ref: id, session_generation: revision, authz_revision: revision,
+      policy_revision: revision, requester_authorization_revision: revision }).parse(expectedScope);
     const at = utc.parse(now);
     const requested = Buffer.from(candidate.expected_display_fingerprint, "hex");
     const current = Buffer.from(evidence.display_fingerprint, "hex");
@@ -59,10 +71,19 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
     if (evidence.principal_id !== scope.principal_id || evidence.instance_id !== scope.instance_id
       || evidence.tenant_id !== scope.tenant_id || evidence.workspace_id !== scope.workspace_id
       || evidence.binding_revision !== scope.binding_revision
-      || candidate.request_id !== evidence.request_id || candidate.decision !== evidence.decision
+      || evidence.session_ref !== scope.session_ref || evidence.session_generation !== scope.session_generation
+      || evidence.authz_revision !== scope.authz_revision || evidence.policy_revision !== scope.policy_revision
+      || evidence.requester_authorization_revision !== scope.requester_authorization_revision
+      || evidence.audience_principal_id !== scope.principal_id
+      || candidate.request_id !== evidence.request_id || candidate.operation !== evidence.operation
+      || candidate.decision !== evidence.decision || candidate.display_codec_version !== evidence.display_codec_version
       || candidate.expected_request_revision !== evidence.request_revision
+      || candidate.expected_presentation_ref !== evidence.presentation_ref
       || candidate.expected_presentation_revision !== evidence.presentation_revision
-      || !timingSafeEqual(requested, current) || !timingSafeEqual(action, presented) || Date.parse(at) >= Date.parse(evidence.expires_at)) throw Error();
+      || !timingSafeEqual(requested, current) || !timingSafeEqual(action, presented)
+      || Date.parse(evidence.created_at) >= Date.parse(evidence.expires_at)
+      || Date.parse(evidence.expires_at) - Date.parse(evidence.created_at) > 15 * 60_000
+      || Date.parse(at) >= Date.parse(evidence.expires_at)) throw Error();
     return candidate;
   } catch { throw new ApprovalInboxUnavailable(); }
 }
@@ -81,12 +102,12 @@ export class ApprovalInboxAdapter {
     try { return approvalInboxSchema.parse(await this.authority.list(nextCursor === null ? null : cursor.parse(nextCursor))); }
     catch { throw new ApprovalInboxUnavailable(); }
   }
-  async detail(requestId: string): Promise<ApprovalInboxItem> {
+  async detail(requestId: string): Promise<z.infer<typeof approvalInboxDetailSchema>> {
     if (!this.authority) throw new ApprovalInboxUnavailable();
     try {
-      const item = approvalInboxItemSchema.parse(await this.authority.detail(id.parse(requestId)));
-      if (item.request_id !== requestId) throw Error();
-      return item;
+      const detail = approvalInboxDetailSchema.parse(await this.authority.detail(id.parse(requestId)));
+      if (detail.item.request_id !== requestId) throw Error();
+      return detail;
     } catch { throw new ApprovalInboxUnavailable(); }
   }
 }
@@ -101,8 +122,9 @@ export function approvalInboxView(itemInput: unknown, now: string) {
       title: item.operation_summary, exactTarget: item.exact_target, requester: item.requester, risk: item.risk,
       displayFingerprint: item.display_fingerprint, createdAt: item.created_at, expiresAt: item.expires_at,
       status: canConfirm ? "確認可能" : "再確認が必要", canConfirm,
-      candidate: canConfirm ? Object.freeze({codec_version: 1 as const, request_id: item.request_id,
-        expected_request_revision: item.request_revision, expected_presentation_revision: item.presentation_revision,
+      candidate: canConfirm ? Object.freeze({codec_version: 1 as const, display_codec_version: item.display_codec_version,
+        request_id: item.request_id, operation: item.operation, expected_request_revision: item.request_revision,
+        expected_presentation_ref: item.presentation_ref, expected_presentation_revision: item.presentation_revision,
         expected_display_fingerprint: item.display_fingerprint}) : null,
     });
   } catch { throw new ApprovalInboxUnavailable(); }
@@ -113,12 +135,11 @@ const html = (value: string) => value.replace(/[&<>"']/g, char =>
 
 /** Inert list/detail/confirm markup. The decision ceremony is deliberately
  * absent until the durable Web presentation and WebAuthn receipt API exist. */
-export function renderApprovalInboxPreview(input: unknown, selectedId: string | null, now: string): string {
+export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: unknown | null, now: string): string {
   try {
     const page = approvalInboxSchema.parse(input);
     const items = page.items;
-    const selected = selectedId === null ? null : items.find(item => item.request_id === id.parse(selectedId));
-    if (selectedId !== null && !selected) throw Error();
+    const selected = selectedDetailInput === null ? null : approvalInboxDetailSchema.parse(selectedDetailInput).item;
     const rows = items.map(item => {
       const view = approvalInboxView(item, now);
       return `<li><span>${html(view.title)}</span><span>${html(view.requester)}</span><span>${html(view.status)}</span></li>`;

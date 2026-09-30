@@ -5,19 +5,28 @@ import { ApprovalInboxAdapter, ApprovalInboxUnavailable, approvalInboxView,
 import { authorizeWebRoute, matchWebRoute } from "../src/routes.js";
 
 const item = {
-  request_id: "request_1", requester: "依頼者", risk: "critical" as const,
+  request_id: "request_1", operation: "slack.post_thread_reply.v1" as const,
+  requester: "依頼者", risk: "critical" as const,
   operation_summary: "限定された操作", exact_target: "対象_1", display_fingerprint: "a".repeat(64),
   created_at: "2026-09-30T00:00:00.000Z", expires_at: "2026-09-30T00:15:00.000Z",
-  request_revision: 1, presentation_revision: 2, state: "pending" as const,
+  request_revision: 1, presentation_ref: "presentation_1", presentation_revision: 2,
+  display_codec_version: 1 as const, state: "pending" as const,
 };
-const candidate = { codec_version: 1, request_id: item.request_id, decision: "approve",
-  expected_request_revision: item.request_revision, expected_presentation_revision: item.presentation_revision, expected_display_fingerprint: item.display_fingerprint };
+const candidate = { codec_version: 1, display_codec_version: 1, request_id: item.request_id,
+  operation: item.operation, decision: "approve", expected_request_revision: item.request_revision,
+  expected_presentation_ref: item.presentation_ref, expected_presentation_revision: item.presentation_revision,
+  expected_display_fingerprint: item.display_fingerprint };
 const evidence = { principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1", workspace_id: "workspace_1",
-  binding_revision: 2, role: "supervisor", step_up_verified: true, csrf_verified: true,
-  request_id: item.request_id, decision: "approve", display_fingerprint: item.display_fingerprint,
+  binding_revision: 2, session_ref: "session_1", session_generation: 3, authz_revision: 4,
+  role: "supervisor", step_up_verified: true, csrf_verified: true,
+  request_id: item.request_id, operation: item.operation, decision: "approve", display_fingerprint: item.display_fingerprint,
   persisted_action_hash: "b".repeat(64), presentation_action_hash: "b".repeat(64), request_revision: 1, presentation_revision: 2,
-  expires_at: item.expires_at, state: "pending", consumed: false };
-const scope = { principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1", workspace_id: "workspace_1", binding_revision: 2 };
+  presentation_ref: item.presentation_ref, display_codec_version: 1, presentation_status: "synchronized_sent",
+  audience_principal_id: "principal_1", policy_revision: 5, requester_authorization_revision: 6,
+  created_at: item.created_at, expires_at: item.expires_at, state: "pending", consumed: false };
+const scope = { principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1", workspace_id: "workspace_1",
+  binding_revision: 2, session_ref: "session_1", session_generation: 3, authz_revision: 4,
+  policy_revision: 5, requester_authorization_revision: 6 };
 const now = "2026-09-30T00:10:00.000Z";
 
 test("approval list route requires bound supervisor read scope", () => {
@@ -29,10 +38,13 @@ test("approval list route requires bound supervisor read scope", () => {
 
 test("inbox stays unavailable without a verified authority and rejects unsafe projection", async () => {
   await assert.rejects(new ApprovalInboxAdapter().list(), ApprovalInboxUnavailable);
-  const adapter = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [item], next_cursor: null}), detail: async () => item});
+  const adapter = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [item], next_cursor: null}), detail: async () => ({codec_version: 1, item})});
   assert.deepEqual(await adapter.list(), {codec_version: 1, items: [item], next_cursor: null});
-  assert.deepEqual(await adapter.detail(item.request_id), item);
+  assert.deepEqual(await adapter.detail(item.request_id), {codec_version: 1, item});
   await assert.rejects(adapter.detail("other"), ApprovalInboxUnavailable);
+  const oldDetail = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [], next_cursor: null}),
+    detail: async () => ({codec_version: 2, item})});
+  await assert.rejects(oldDetail.detail(item.request_id), ApprovalInboxUnavailable);
   const leaking = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [{...item, secret: "private"}], next_cursor: null}), detail: async () => item});
   await assert.rejects(leaking.list(), ApprovalInboxUnavailable);
   const duplicate = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [item, {...item, exact_target: "別対象"}], next_cursor: null}), detail: async () => item});
@@ -64,6 +76,8 @@ test("detail and confirmation disable stale or terminal requests", () => {
   assert.equal(approvalInboxView({...item, exact_target: "対象😀"}, now).exactTarget, "対象😀");
   assert.equal(approvalInboxView(item, item.expires_at).canConfirm, false);
   assert.equal(approvalInboxView({...item, state: "approved"}, now).candidate, null);
+  assert.throws(() => approvalInboxView({...item, expires_at: "2026-09-30T00:15:00.001Z"}, now), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, operation: "self_update.v1"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, operation_summary: "unsafe\ntext"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, exact_target: "safe\u202Eunsafe"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, exact_target: "safe\u00A0unsafe"}, now), ApprovalInboxUnavailable);
@@ -76,24 +90,33 @@ test("detail and confirmation disable stale or terminal requests", () => {
 
 test("preview escapes untrusted summary and never enables a decision", () => {
   const markup = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: [{...item,
-    operation_summary: '<img src=x onerror=alert(1)>'}]}, item.request_id, now);
+    operation_summary: '<img src=x onerror=alert(1)>'}]}, {codec_version: 1,
+    item: {...item, operation_summary: '<img src=x onerror=alert(1)>'}}, now);
   assert.ok(markup.includes('&lt;img src=x onerror=alert(1)&gt;'));
   assert.ok(!markup.includes('<img'));
   assert.ok(markup.includes('<button type="button" disabled>承認</button>'));
   assert.ok(!markup.includes("b".repeat(64)));
   assert.ok(markup.includes("<pre>対象_1</pre>"));
+  const later = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
+    {codec_version: 1, item: {...item, exact_target: "次ページの対象"}}, now);
+  assert.ok(later.includes("次ページの対象"));
 });
 
 test("server preflight rejects forged, expired, consumed and cross-scope evidence", () => {
   assert.deepEqual(assertApprovalDecisionCandidate(candidate, evidence, scope, now), candidate);
   for (const changed of [
     {...candidate, expected_display_fingerprint: "b".repeat(64)}, {...candidate, expected_request_revision: 2},
-    {...candidate, expected_presentation_revision: 3},
+    {...candidate, expected_presentation_revision: 3}, {...candidate, expected_presentation_ref: "other"},
+    {...candidate, display_codec_version: 2}, {...candidate, operation: "self_update.v1"},
     {...candidate, request_id: "other"},
   ]) assert.throws(() => assertApprovalDecisionCandidate(changed, evidence, scope, now), ApprovalInboxUnavailable);
   for (const changed of [
     {...evidence, decision: "reject"}, {...evidence, step_up_verified: false}, {...evidence, csrf_verified: false},
     {...evidence, persisted_action_hash: "c".repeat(64)},
+    {...evidence, presentation_status: "delivery_pending"}, {...evidence, audience_principal_id: "other"},
+    {...evidence, session_ref: "other"}, {...evidence, session_generation: 2}, {...evidence, authz_revision: 2},
+    {...evidence, policy_revision: 4}, {...evidence, requester_authorization_revision: 5},
+    {...evidence, expires_at: "2026-09-30T00:15:00.001Z"},
     {...evidence, consumed: true}, {...evidence, state: "approved"},
     {...evidence, tenant_id: "other"}, {...evidence, workspace_id: "other"}, {...evidence, binding_revision: 3},
   ]) assert.throws(() => assertApprovalDecisionCandidate(candidate, changed, scope, now), ApprovalInboxUnavailable);
