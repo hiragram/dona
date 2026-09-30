@@ -79,7 +79,7 @@ export function matchWebRoute(method:unknown,target:unknown):WebRoute {
   for(const definition of definitions){
     const match=definition.method===method?definition.pattern.exec(pathname):null;
     if(!match)continue;
-    if(queryAt>=0 && !["login_callback","job_list"].includes(definition.id))throw new WebRouteError();
+    if(queryAt>=0 && !["login_callback","job_list","approval_list"].includes(definition.id))throw new WebRouteError();
     return {id:definition.id,method:definition.method,gate:definition.gate,capability:definition.capability,
       activity:definition.activity,resource:definition.resourceKind?{kind:definition.resourceKind,id:match[1]!}:null};
   }
