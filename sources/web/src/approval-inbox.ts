@@ -14,6 +14,7 @@ const safeText = z.string().min(1).max(240).refine(value =>
   && new TextDecoder("utf-8", {fatal: true}).decode(new TextEncoder().encode(value)) === value);
 const literalText = z.string().min(1).max(4096).refine(value =>
   new TextDecoder("utf-8", {fatal: true}).decode(new TextEncoder().encode(value)) === value);
+const exactDraft = literalText.max(3000);
 const ambiguousDisplay = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Zs}]/u;
 const exactTargetSchema = z.strictObject({workspace_id: id, channel_id: id,
   thread_ts: z.string().regex(/^\d{10}\.\d{6}$/), display_name: literalText});
@@ -61,7 +62,7 @@ export const approvalInboxItemSchema = z.strictObject({
   request_id: id, operation, requester: safeText, requester_actor_id: id,
   presentation_requester_actor_id: id, risk: z.enum(["elevated", "critical"]), risk_reason: safeText,
   opaque_action_id: id, operation_summary: safeText, exact_target: exactTargetSchema,
-  exact_draft: literalText, resolved_mentions: z.array(z.strictObject({target_id: slackUserId, display: literalText})).max(3)
+  exact_draft: exactDraft, resolved_mentions: z.array(z.strictObject({target_id: slackUserId, display: literalText})).max(3)
     .refine(mentions => new Set(mentions.map(mention => mention.target_id)).size === mentions.length),
   display_fingerprint: hash, created_at: utc, expires_at: utc,
   request_revision: revision, presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
@@ -83,6 +84,7 @@ const verifiedDetails = new WeakMap<object, string>();
 /** Server-only digest of the literal content. Never place it in a browser response. */
 export function computeApprovalPrivateContentDigest(item: ApprovalInboxItem): string {
   const content = {request_id: item.request_id, operation: item.operation, requester_actor_id: item.requester_actor_id,
+    risk_reason: item.risk_reason,
     presentation_ref: item.presentation_ref, presentation_revision: item.presentation_revision,
     display_codec_version: item.display_codec_version, exact_target: item.exact_target,
     exact_draft: item.exact_draft, resolved_mentions: item.resolved_mentions};

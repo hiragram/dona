@@ -151,6 +151,9 @@ test("detail and confirmation disable stale or terminal requests", async () => {
     {...item, resolved_mentions: [{target_id: "channel_1", display: "担当者"}]},
   ]) await assert.rejects(verifiedDetail(row, detailBinding()), ApprovalInboxUnavailable);
   await assert.rejects(verifiedDetail({...item, exact_draft: "差し替え", resolved_mentions: []}, detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail({...item, risk_reason: "通常の投稿"}, detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail({...item, exact_draft: "あ".repeat(3001)}, detailBinding()), ApprovalInboxUnavailable);
+  assert.equal(approvalInboxView(await verifiedDetail({...item, exact_draft: "あ".repeat(3000)}), now, readScope).exactDraft.length, 3000);
   await assert.rejects(verifiedDetail(item, {...detailBinding(), presentation_content_digest: "d".repeat(64)}), ApprovalInboxUnavailable);
 });
 
