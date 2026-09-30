@@ -86,7 +86,8 @@ export const approvalAuthorityEvidenceSchema = z.strictObject({
   challenge_request_id: id, challenge_decision: z.enum(["approve", "reject"]),
   challenge_action_hash: hash, challenge_display_fingerprint: hash, challenge_presentation_revision: revision,
   challenge_principal_id: id, challenge_session_ref: id, challenge_instance_id: id, challenge_tenant_id: id,
-  challenge_workspace_id: id, challenge_binding_revision: revision, challenge_credential_id: id,
+  challenge_workspace_id: id, challenge_supervisor_binding_id: id,
+  challenge_binding_revision: revision, challenge_credential_id: id,
   challenge_policy_revision: revision,
   credential_id: id, credential_revision: revision, credential_state: z.literal("active"),
   credential_non_backup: z.literal(true), user_verified: z.literal(true),
@@ -158,6 +159,7 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || evidence.challenge_principal_id !== evidence.principal_id || evidence.challenge_session_ref !== evidence.session_ref
       || evidence.challenge_instance_id !== evidence.instance_id || evidence.challenge_tenant_id !== evidence.tenant_id
       || evidence.challenge_workspace_id !== evidence.workspace_id
+      || evidence.challenge_supervisor_binding_id !== evidence.supervisor_binding_id
       || evidence.challenge_binding_revision !== evidence.binding_revision
       || evidence.challenge_credential_id !== evidence.credential_id
       || evidence.challenge_policy_revision !== evidence.policy_revision
