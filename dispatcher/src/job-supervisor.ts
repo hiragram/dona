@@ -143,7 +143,7 @@ export class JobSupervisor {
         if(!absent) return;
         const listed=absent?await this.runtime.listAgents(this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs)):undefined;
         if(listed&&terminalAgentAbsentFromList(listed,agentName))
-          this.database.finishTerminalWorkerCleanup(job.job_id,"pending","unknown");
+          this.database.finishTerminalWorkerCleanup(job.job_id,"pending","stopped");
         return;
       }
       if(this.database.getJob(job.job_id)?.agent_name!==agentName) {
@@ -166,7 +166,7 @@ export class JobSupervisor {
       if(!observed.ok&&!observed.timedOut&&!observed.aborted&&["agent_not_found","agent_not_running"].includes(observed.errorCode??"")) {
         const listed=await this.runtime.listAgents?.(this.abortController.signal,Math.min(2_000,this.config.jobCommandTimeoutMs));
         if(listed&&terminalAgentAbsentFromList(listed,agentName)) {
-          this.database.finishTerminalWorkerCleanup(job.job_id,"attempting","unknown");
+          this.database.finishTerminalWorkerCleanup(job.job_id,"attempting","stopped");
           return;
         }
       }

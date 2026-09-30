@@ -1877,7 +1877,7 @@ describe("JobSupervisor", () => {
     }),{...config,queuePollMs:5},logger,()=>undefined);
     supervisor.start();
     const raw=new Database(config.databasePath);
-    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="unknown");
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
     assert.equal(sends,1);
     await supervisor.stop(); raw.close(); database.close();
   });
@@ -1898,7 +1898,7 @@ describe("JobSupervisor", () => {
         async listAgents(){return {...ok("done"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
       }),{...config,queuePollMs:5},logger,()=>undefined);
       supervisor.start(); const raw=new Database(config.databasePath);
-      await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="unknown");
+      await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
       assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
     }
   });
@@ -1919,7 +1919,7 @@ describe("JobSupervisor", () => {
       async listAgents(){return {...ok("done"),stdout:JSON.stringify({result:{type:"agent_list",agents:[]}})};},
     }),{...config,queuePollMs:5},logger,()=>undefined);
     supervisor.start();const raw=new Database(config.databasePath);
-    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="unknown");
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
     assert.equal(sends,0);await supervisor.stop();raw.close();reopened.close();
   });
   test("terminal cleanup records an ambiguous send timeout once", async () => {
@@ -1960,7 +1960,7 @@ describe("JobSupervisor", () => {
     assert.equal((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome,"pending");
     assert.equal(sends,0);
     transient=false;
-    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="unknown");
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
     assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
   });
   test("terminal cleanup observation does not delay notification publishing", async () => {
@@ -2004,7 +2004,7 @@ describe("JobSupervisor", () => {
     assert.equal(sends,0);
     assert.equal((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome,"pending");
     state="idle";
-    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="unknown");
+    await waitFor(()=>((raw.prepare("SELECT outcome FROM job_terminal_worker_cleanups WHERE job_id=?").get(job.job_id) as {outcome:string}).outcome)==="stopped");
     assert.equal(sends,1);await supervisor.stop();raw.close();database.close();
   });
   test("terminal cleanup excludes an in-flight steer from claim", async () => {

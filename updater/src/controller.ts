@@ -24,7 +24,7 @@ import { canonicalJson } from "./validation.js";
 const systemClock: Clock = { now: () => new Date() };
 const schemaV3BridgeSha = "61bc86f71726ce1f44fc3500e524203626cf869a";
 const productionV2SourceSha = "7dbaab72e3387f94f6c8a2289a685b90b100d083";
-const schemaMigrationCapability = "dispatcher_v2_to_v3_online_backup_v1";
+const schemaMigrationCapability = "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1";
 const schemaV3ActivationRollout: SchemaRollout = {
   schema_version: 1,
   phase: "activation",

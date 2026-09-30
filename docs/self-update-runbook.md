@@ -55,6 +55,8 @@ pre-activation中の`npm ci/test/typecheck/build`は、memory上の`output_limit
 - control DBは診断logのcontent digestとwriter leaseを含む`user_version = 7`へforward-onlyで移行します。schema 7を読めない旧stable Updaterへのbinary差戻しは行わず、stable Updaterの配布・backup・rollback確認は通常のアプリself-updateやこのPRのmergeとは別の、明示承認付きcontrol-plane更新として扱います。
 - retentionは常駐serviceが60秒ごとに評価し、terminal requestだけを古い順に対象とします。active captureとnon-terminal requestを削除せず、purge後もDB recordと元byte sizeを保持します。
 
+terminal workerのdrain契約もstable Updaterの実装に依存する。旧版のstable Updaterは新しいtargetの`required_control_plane_capability`を受け入れない。guarded `--upgrade-control`でexact target SHAのstable Updaterとreceiptを先に配置し、新しいplanとactivation前のcapability照合が成功した場合だけ切替へ進む。PR mergeや通常self-updateをcontrol-plane更新の代用にしない。
+
 この機能を含むアプリPRのmergeだけでは、稼働中のstable Updaterへ新しいcapture実装やDB migrationは配布されません。production control planeへの反映は、別のmaintenance window、exact SHA確認、明示承認を伴う`--upgrade-control`の責務です。
 
 Codex hostのwrite approvalは、停止時間・target・migrationを理解したbusiness approvalの代替ではありません。
@@ -117,7 +119,7 @@ previous Dispatcherと全Slack workspaceのprevious SHA healthまで確認でき
 
 schema rolloutは通常の単発self-updateへ混ぜない。production source `7dbaab72e3387f94f6c8a2289a685b90b100d083`は`config/release-compatibility.production-v2.json`どおりschema 2だけをread/writeするため、schema-v3 targetへの通常rollback互換性はない。`config/update-compatibility-transitions.json`へsource SHA、source/target compatibility、previous release contract、必要なcontrol-plane capabilityをexactに固定し、plannerとactivation直前の双方で同じtransitionを検証する。移行失敗時はv2 pointer rollbackを推測せず、Online Backup receiptと停止下restore境界へ従う。
 
-schema activation前には、同じexact SHAから`--upgrade-control`されたstable updaterのhealthとowner-only `control-plane-receipt.json`が一致し、capability `dispatcher_v2_to_v3_online_backup_v1`を示すことも必須とする。不明・旧updaterではplan時とpointer切替直前の双方で拒否する。これはproduction更新の許可ではなく、実行には別途exact planの明示承認が必要である。
+schema activation前には、同じexact SHAから`--upgrade-control`されたstable updaterのhealthとowner-only `control-plane-receipt.json`が一致し、capability `dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1`を示すことも必須とする。不明・旧updaterではplan時とpointer切替直前の双方で拒否する。これはproduction更新の許可ではなく、実行には別途exact planの明示承認が必要である。
 
 migration/activation planは次の順序を崩さない。
 
