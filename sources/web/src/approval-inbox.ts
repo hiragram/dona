@@ -16,6 +16,9 @@ const literalText = z.string().min(1).max(4096).refine(value =>
 const ambiguousDisplay = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Zs}]/u;
 const exactTargetSchema = z.strictObject({workspace_id: id, channel_id: id,
   thread_ts: z.string().regex(/^\d{10}\.\d{6}$/), display_name: literalText});
+const readScopeSchema = z.strictObject({principal_id: id, instance_id: id, tenant_id: id, workspace_id: id,
+  supervisor_binding_id: id, binding_revision: revision});
+export type ApprovalInboxReadScope = z.infer<typeof readScopeSchema>;
 const fingerprintProjectionSchema = z.strictObject({opaque_action_id: id, operation, exact_target: exactTargetSchema,
   risk: z.enum(["elevated", "critical"]), expires_at: utc, presentation_revision: revision});
 /** Canonical non-secret plan projection, with fixed field order and UTF-8 bytes. */
@@ -50,6 +53,7 @@ export const approvalInboxListItemSchema = z.strictObject({request_id: id, opera
   operation_summary: safeText, risk: z.enum(["elevated", "critical"]), created_at: utc, expires_at: utc, state}).refine(temporal);
 /** Display data from a verified approval repository, never the action payload. */
 export const approvalInboxItemSchema = z.strictObject({
+  audience_principal_id: id, instance_id: id, tenant_id: id, supervisor_binding_id: id, binding_revision: revision,
   request_id: id, operation, requester: safeText, risk: z.enum(["elevated", "critical"]), risk_reason: safeText,
   opaque_action_id: id, operation_summary: safeText, exact_target: exactTargetSchema,
   exact_draft: literalText, resolved_mentions: z.array(z.strictObject({target_id: id, display: literalText})).max(3)
@@ -87,7 +91,7 @@ export const approvalAuthorityEvidenceSchema = z.strictObject({
   challenge_action_hash: hash, challenge_display_fingerprint: hash, challenge_presentation_revision: revision,
   challenge_principal_id: id, challenge_session_ref: id, challenge_instance_id: id, challenge_tenant_id: id,
   challenge_workspace_id: id, challenge_supervisor_binding_id: id,
-  challenge_binding_revision: revision, challenge_credential_id: id,
+  challenge_binding_revision: revision, challenge_credential_id: id, challenge_credential_revision: revision,
   challenge_policy_revision: revision,
   credential_id: id, credential_revision: revision, credential_state: z.literal("active"),
   credential_non_backup: z.literal(true), user_verified: z.literal(true),
@@ -162,6 +166,7 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || evidence.challenge_supervisor_binding_id !== evidence.supervisor_binding_id
       || evidence.challenge_binding_revision !== evidence.binding_revision
       || evidence.challenge_credential_id !== evidence.credential_id
+      || evidence.challenge_credential_revision !== evidence.credential_revision
       || evidence.challenge_policy_revision !== evidence.policy_revision
       || !timingSafeEqual(requested, current) || !timingSafeEqual(action, presented)
       || !timingSafeEqual(Buffer.from(evidence.persisted_resource_snapshot_hash, "hex"),
@@ -194,22 +199,29 @@ export class ApprovalInboxAdapter {
     try { return approvalInboxSchema.parse(await this.authority.list(nextCursor === null ? null : cursor.parse(nextCursor))); }
     catch { throw new ApprovalInboxUnavailable(); }
   }
-  async detail(requestId: string, currentWorkspaceId: string): Promise<z.infer<typeof approvalInboxDetailSchema>> {
+  async detail(requestId: string, currentScope: ApprovalInboxReadScope): Promise<z.infer<typeof approvalInboxDetailSchema>> {
     if (!this.authority) throw new ApprovalInboxUnavailable();
     try {
       const detail = approvalInboxDetailSchema.parse(await this.authority.detail(id.parse(requestId)));
-      if (detail.item.request_id !== requestId || detail.item.exact_target.workspace_id !== id.parse(currentWorkspaceId)) throw Error();
+      assertDetailScope(detail.item, readScopeSchema.parse(currentScope));
+      if (detail.item.request_id !== requestId) throw Error();
       return detail;
     } catch { throw new ApprovalInboxUnavailable(); }
   }
 }
 
 /** Text-only view model for list, detail, and the human confirmation screen. */
-export function approvalInboxView(itemInput: unknown, now: string, currentWorkspaceId: string) {
+function assertDetailScope(item: ApprovalInboxItem, scope: ApprovalInboxReadScope): void {
+  if (item.audience_principal_id !== scope.principal_id || item.instance_id !== scope.instance_id
+    || item.tenant_id !== scope.tenant_id || item.exact_target.workspace_id !== scope.workspace_id
+    || item.supervisor_binding_id !== scope.supervisor_binding_id
+    || item.binding_revision !== scope.binding_revision) throw new ApprovalInboxUnavailable();
+}
+export function approvalInboxView(itemInput: unknown, now: string, currentScope: ApprovalInboxReadScope) {
   try {
     const item = approvalInboxItemSchema.parse(itemInput);
     const at = utc.parse(now);
-    if (item.exact_target.workspace_id !== id.parse(currentWorkspaceId)) throw Error();
+    assertDetailScope(item, readScopeSchema.parse(currentScope));
     const canStartChallenge = item.state === "pending" && Date.parse(item.created_at) <= Date.parse(at)
       && Date.parse(at) < Date.parse(item.expires_at);
     return Object.freeze({
@@ -228,7 +240,7 @@ const html = (value: string) => value.replace(/[&<>"']/g, char =>
 /** Inert list/detail/confirm markup. The decision ceremony is deliberately
  * absent until the durable Web presentation and WebAuthn receipt API exist. */
 export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: unknown | null,
-  now: string, currentWorkspaceId: string): string {
+  now: string, currentScope: ApprovalInboxReadScope): string {
   try {
     const page = approvalInboxSchema.parse(input);
     const items = page.items;
@@ -240,7 +252,7 @@ export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: 
       return `<li><span>${html(item.operation_summary)}</span><span>${html(item.requester)}</span><span>${html(status)}</span></li>`;
     }).join("");
     const detail = selected === null ? "" : (() => {
-      const view = approvalInboxView(selected, now, currentWorkspaceId);
+      const view = approvalInboxView(selected, now, currentScope);
       return `<section aria-labelledby="approval-detail-title"><h2 id="approval-detail-title">承認内容の確認</h2>`
         + `<dl><dt>操作種別</dt><dd>${html(view.operationKind)}</dd><dt>概要</dt><dd>${html(view.title)}</dd>`
         + `<dt>対象workspace ID</dt><dd>${html(view.exactTarget.workspace_id)}</dd>`
@@ -253,7 +265,7 @@ export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: 
         + `<dt>依頼者</dt><dd>${html(view.requester)}</dd><dt>リスク</dt><dd>${html(view.risk)}</dd>`
         + `<dt>リスク理由</dt><dd>${html(view.riskReason)}</dd>`
         + `<dt>表示用指紋</dt><dd>${html(view.displayFingerprint)}</dd><dt>作成</dt><dd>${html(view.createdAt)}</dd>`
-        + `<dt>期限</dt><dd>${html(view.expiresAt)}</dd></dl><p>\\n・\\t・\\u{...} は投稿内容の制御文字を表します。決定操作は準備中です。</p>`
+        + `<dt>期限</dt><dd>${html(view.expiresAt)}</dd></dl><p>\\\\ は文字どおりのbackslash、\\nは改行、\\tはtab、\\u{...}はその他の制御・不可視文字を表します。決定操作は準備中です。</p>`
         + `<button type="button" disabled>承認</button><button type="button" disabled>却下</button></section>`;
     })();
     return `<section aria-labelledby="approval-list-title"><h1 id="approval-list-title">承認待ち</h1><ul>${rows}</ul>`
