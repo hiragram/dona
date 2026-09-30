@@ -20,7 +20,7 @@
         "rollback_safe": true
       },
       "previous_release_contract": "release-compatibility.production-v2.json",
-      "required_control_plane_capability": "dispatcher_v2_to_v3_online_backup_v1"
+      "required_control_plane_capability": "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1"
     }
   ]
 }

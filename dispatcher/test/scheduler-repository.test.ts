@@ -363,14 +363,14 @@ test("scheduled jobのneeds_reviewをscheduleへ伝播しadmin reconciliationを
   assert.equal(dispatcher.updateSafetyStatus().active_worker_count,1);
   dispatcher.markJobRuntimeCleaned(job.job_id);
   assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,null);
-  assert.equal(dispatcher.updateSafetyStatus().active_worker_count,0);
+  assert.equal(dispatcher.updateSafetyStatus().active_worker_count,1);
   for (const code of ["terminal_steer_worker_unverified","cancel_worker_unverified"]) {
     raw.prepare("UPDATE jobs SET herdr_workspace_id='workspace-reconcile',last_error_code=? WHERE job_id=?")
       .run(code,job.job_id);
     assert.equal(dispatcher.updateSafetyStatus().active_worker_count,1);
     dispatcher.markJobRuntimeCleaned(job.job_id);
     assert.equal(dispatcher.getJob(job.job_id)?.last_error_code,null);
-    assert.equal(dispatcher.updateSafetyStatus().active_worker_count,0);
+    assert.equal(dispatcher.updateSafetyStatus().active_worker_count,1);
   }
   assert.equal((raw.prepare("SELECT work_state FROM job_completion_results WHERE job_id=?").get(job.job_id) as {work_state:string}).work_state, "failed");
   assert.equal(dispatcher.get(oldNotification)?.last_error_code,"job_result_superseded");

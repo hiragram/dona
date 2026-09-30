@@ -437,7 +437,7 @@ const [target, sha] = process.argv.slice(1);
 fs.writeFileSync(target, `${JSON.stringify({
   schema_version: 1,
   build_sha: sha,
-  schema_migration_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  schema_migration_capability: "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1",
   verified_at: new Date().toISOString(),
 })}\n`, { flag: "wx", mode: 0o600 });
 ' "$CONTROL_RECEIPT_TMP" "$INSTALL_SHA"

@@ -224,7 +224,7 @@ test("installer exposes the guarded control-plane upgrade mode", async () => {
   assert.match(source, /control-plane-receipt\.json/);
   assert.doesNotMatch(source, /\.control-plane-receipt\.json\.tmp/);
   assert.match(source, /control-plane-receipt\.json\.\$\$\.\$RANDOM\.tmp/);
-  assert.match(source, /dispatcher_v2_to_v3_online_backup_v1/);
+  assert.match(source, /dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1/);
   assert.match(source, /updater\.previous\.sqlite3/);
   assert.match(source, /dev\.dona\.dispatcher\.previous\.plist/);
   assert.match(source, /dev\.dona\.dispatcher\.next\.plist/);

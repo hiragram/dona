@@ -15,7 +15,7 @@ test("schema activation names the exact installed production source", () => {
     multi_job_enabled: true,
     previous_release_sha: "7dbaab72e3387f94f6c8a2289a685b90b100d083",
     previous_release_contract: "release-compatibility.production-v2.json",
-    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1",
     migration: {
       from_schema: 2,
       to_schema: 3,

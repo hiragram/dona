@@ -4,6 +4,8 @@
 
 旧Dispatcherが`job recover-operator-assertion`を持たず、`needs_review` jobを`update-safety`の危険状態に数える場合、通常self-updateと`--upgrade-control`はいずれも先へ進めない。後者も旧Dispatcherの`drain-status`が`unsafe_states`空を要求するためである。この手順は同一schema v3のreleaseへ停止下で切り替え、既存の回復CLIを使えるようにする。自動の安全判定を偽装せず、operatorによる停止申告とjob単位の副作用・通知確認を監査記録に残す。
 
+現行のdrain契約では、準備済みjobはoperator assertionでterminalへ回復してもunsafeに残る。この手順のruntime bootstrapとSlack Adapter再開は、そのjobが残る限り完了できない。対象に準備済みjobがある場合はこのbootstrapを開始せず、[保守reset / upgrade手順](maintenance-reset-upgrade.md)で独立世代への切替を計画する。旧世代の停止証拠や配信証拠を生成したことにはしない。
+
 この文書は操作の承認ではない。service停止、pointer、DB、Result、Updater、Herdrの変更は明示承認されたmaintenance windowでのみ実行する。停止済みという人間の申告はoperator判断として扱い、機械的な全worker停止receiptへ変換しない。申告後に生成されたjobは別途判定する。
 
 ## 事前固定
@@ -290,7 +292,7 @@ env DOTENV_CONFIG_PATH="$dispatcher_env" \
 
 ## runtime bootstrapとrollback
 
-回復後、全対象のterminal statusと監査記録を確認する。残る危険状態の原因が一意に説明できなければ停止を維持する。現在の`runtime/current`の旧SHAを`runtime/previous`へ保存してから、`runtime/current`を対象releaseへ同一filesystem上の一時symlinkから切り替える。macOS `mv -f`はdestination symlinkをdirectoryとして追跡するため、`mv -fh`でsymlink自体を置換する。停止中のUpdaterを旧build SHAで起動・確認した後、Dispatcherを起動する。Dispatcherのversioned healthと`/v1/admin/update-safety`が対象SHA・`safe: true`・`unsafe_states: []`を示すまでSlack Adapterを起動しない。失敗時はbootstrapを試みたDispatcherとSlack Adapterを再停止・照合する。Slack起動後に両serviceのhealth、DB schema 3、socket/PIDの新世代、通知重複なしを再読する。`dona-main`のcwd/sessionが旧releaseなら**完全なruntime更新とは報告しない**。この手順はHerdr agentの再作成権限を含まない。
+回復後、全対象のterminal statusと監査記録を確認する。準備済みjobがdrainに残る場合は`safe: true`を期待せず、Slack Adapter再開へ進まない。独立世代への保守reset / upgradeを別途計画する。残る危険状態の原因が一意に説明できなければ停止を維持する。現在の`runtime/current`の旧SHAを`runtime/previous`へ保存してから、`runtime/current`を対象releaseへ同一filesystem上の一時symlinkから切り替える。macOS `mv -f`はdestination symlinkをdirectoryとして追跡するため、`mv -fh`でsymlink自体を置換する。停止中のUpdaterを旧build SHAで起動・確認した後、Dispatcherを起動する。Dispatcherのversioned healthと`/v1/admin/update-safety`が対象SHA・`safe: true`・`unsafe_states: []`を示すまでSlack Adapterを起動しない。失敗時はbootstrapを試みたDispatcherとSlack Adapterを再停止・照合する。Slack起動後に両serviceのhealth、DB schema 3、socket/PIDの新世代、通知重複なしを再読する。`dona-main`のcwd/sessionが旧releaseなら**完全なruntime更新とは報告しない**。この手順はHerdr agentの再作成権限を含まない。
 
 ```sh
 set -euo pipefail

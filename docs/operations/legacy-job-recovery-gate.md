@@ -8,13 +8,15 @@
 
 ## 利用者の手動停止申告を扱う場合
 
-利用者が待機中のCodexプロセスを手動終了し、残る異常状態jobを停止済みと扱う判断を明示した場合、その判断は`operator_assertion`として記録する。これは停止に関する運用上の受容判断であり、`session_absent`、`job_terminal_worker_stop_proofs`、独立したmaintenance fence receiptへ変換しない。申告だけで既存の`maintenance_fence_receipt_required`を通過させない。個別の照合と監査記録が完了したjobだけ、Dispatcher・Updaterの安全判定で別証拠として評価する。
+利用者が待機中のCodexプロセスを手動終了し、残る異常状態jobを停止済みと扱う判断を明示した場合、その判断は`operator_assertion`として記録する。これは停止に関する運用上の受容判断であり、`session_absent`、`job_terminal_worker_stop_proofs`、独立したmaintenance fence receiptへ変換しない。申告だけで既存の`maintenance_fence_receipt_required`を通過させない。個別の照合と監査記録はResult・通知の回復判断に限る。準備済みjobのworker停止は証明しないため、Dispatcher・Updaterのdrain判定を解除しない。
 
 監査記録には、申告元event ID、保存済み申告者actor ID、申告受信時刻、申告本文のdigest、実際の停止時刻が不明ならその事実、候補job IDと各`updated_at`、申告を候補へ適用した判断時刻、証拠クラス、残余リスクを含める。復旧判断の権限は保存済みSlack eventのactorが対象jobのactorと一致する`job_owner` roleに限定し、tenant/workspace/channel/jobのscopeをwrite直前に検証して記録する。CLI実行者のローカルprincipalは実行履歴として別に記録し、それ自体を停止判断の権限とはみなさない。候補はその時点のdurable stateから再取得し、過去の件数を固定しない。申告後に作成・再開したworkerは申告の対象と推定しない。記録は元のResultやDBの停止proofを上書きせず、追記とread-backができる別の監査成果物にする。
 
 申告を使って旧jobを解決する経路を実装する場合は、machine proof経路と異なる明示的なoperator decisionとして設計する。対象job・認証済みoperator・申告時点・Result file identity・DB状態・通知・group・副作用の証跡をwrite直前に再照合し、どの不確実性をoperatorが受容したかをjob単位で記録する。`jobs.updated_at`はworker identityの変更を必ずしも表さない。現行Dona sessionの単一writer契約では、`needs_review` jobは通常のpreparation / prompt / steerの対象にならない。対象jobの状態・時刻・steer状態を同じtransactionで再確認し、申告後の状態変更があれば拒否する。この契約外の手動Herdr起動までは観測できないため、operatorが残余リスクとして受容する。妥当なfinalだけを共有validatorと正規の受理経路へ渡し、無効・欠落finalから成功Resultを生成しない。配送済み・未送信・応答不明の通知を別々に扱い、曖昧な送信を自動再試行しない。旧jobを解決しても、残るrunning workerやUpdater自身の`needs_review`を解決済みとみなさず、双方の安全判定を再読する。
 
 `job inspect-operator-recovery`と`job recover-operator-assertion`は、個別の照合と監査付きoperator decisionを実行する。既存の`--worker-stopped-reviewed`は申告の監査記録を作らない。productionのDB、Result、worker、Updaterを直接変更しない。
+
+新規jobについても、Result受理後の`idle` / `done`やagent名による`agent_not_found`を停止証拠へ変換しない。取消・steer競合で得た同じ名前ベースの観測も停止証拠には使わない。旧版が保存した`job_terminal_worker_stop_proofs`と`legacy_job_agents_to_stop.stopped_at`も出所を証明できないため、DispatcherとUpdaterのdrain判定では無効とする。準備を開始したjobは、後のworkspace cleanupがHerdr workspace IDを消しても`attempt_count`でdrain gateに残す。Resultの受理と通知生成はworker停止より先に進み得る。現行Herdr APIには保存済みagent session identityを条件にしたatomicなstop/closeがなく、`pane.close`はpane IDのみを対象とするため、照会とcloseの間にagentが入れ替わる可能性を排除できない。Codex CLIの`resume <SESSION_ID>`は対話sessionを再開する入口だが、Dispatcherの同一job所有権、Resultの重複受理防止、通知、Herdr再接続を束ねた復旧契約ではない。自動停止・自動resumeはこの契約が揃うまで行わない。
 
 `dispatcher/src/maintenance-fence.ts`には署名済みreceiptのDona側検証契約を実装した。これはsynthetic receiptを使う契約テスト用であり、現在のoperator復旧CLIには接続していない。現行Herdr 0.8.2の`agent list` / `workspace list`は表示用一覧で、全session・pane・process treeの完全性watermarkや、一覧から停止まで同一世代で再生成を禁止するatomic操作を返さない。`agent get`の`idle` / `done` / `agent_not_found`も停止の証明ではない。従って現行APIだけでproviderを構成してreceiptを発行してはならない。
 
@@ -59,4 +61,4 @@ jobごとに外部副作用、通知の配送・曖昧性、正常finalの受理
 
 `result_path_exists`とworker準備前のjobはResult collisionをworker出力とみなさず拒否する。台帳には停止の証拠クラス`operator_assertion`、実停止時刻が`unknown`であること、機械停止未観測とDona session外でのworker再生成未検証という受容リスクを記録する。
 
-妥当Resultは共有schemaで検証して元のResultを受理する。無効・欠落Resultは成功を捏造せず`failed`へ確定する。通知・groupの既存状態が曖昧な場合はwriteを拒否し、配信済み通知を再送しない。回復結果は`job_operator_assertion_recoveries`へ追記され、machine stop proofや旧停止markerは作らない。安全判定はこの台帳と現在のterminal状態・`updated_at`が一致するjobだけを別証拠として扱う。残るrunning job、未解決通知、Updater自身の`needs_review`は引き続き阻害条件である。
+妥当Resultは共有schemaで検証して元のResultを受理する。無効・欠落Resultは成功を捏造せず`failed`へ確定する。通知・groupの既存状態が曖昧な場合はwriteを拒否し、配信済み通知を再送しない。回復結果は`job_operator_assertion_recoveries`へ追記され、machine stop proofや旧停止markerは作らない。この台帳と現在のterminal状態・`updated_at`の一致は回復判断の照合に使う。準備済みjobはoperator assertion後もDispatcher・Updaterのdrain判定に残る。残るrunning job、未解決通知、Updater自身の`needs_review`は引き続き阻害条件である。

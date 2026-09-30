@@ -109,7 +109,7 @@ test("申告以降の状態変更、Result差し替え、異なるworkspaceを�
     /scope_or_time_mismatch/);
 });
 
-test("旧shared grantは申告の監査記録と終状態が一致する場合だけ安全判定を通す",async()=>{
+test("旧shared grantは申告後も機械停止証拠がなければ安全判定を通さない",async()=>{
   const state=await setup();
   const raw=new Database(state.config.databasePath);
   try {raw.prepare("INSERT INTO legacy_job_agents_to_stop(job_id) VALUES(?)").run(state.job.job_id);}
@@ -117,7 +117,7 @@ test("旧shared grantは申告の監査記録と終状態が一致する場合�
   assert.equal(state.database.updateSafetyStatus().safe,false);
   const row=state.database.recoverWithOperatorAssertion(state.input());
   assert.equal(row.status,"failed");
-  assert.equal(state.database.updateSafetyStatus().safe,true);
+  assert.equal(state.database.updateSafetyStatus().safe,false);
   const verify=new Database(state.config.databasePath);
   try {
     assert.equal((verify.prepare("SELECT stopped_at FROM legacy_job_agents_to_stop WHERE job_id=?")

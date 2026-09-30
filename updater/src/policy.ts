@@ -189,7 +189,7 @@ export function parsePolicy(input: unknown): UpdatePolicy {
       parsed.from.app_schema_read_min > 2 || parsed.from.app_schema_read_max < 2 ||
       parsed.to.app_schema_read_min > 2 || parsed.to.app_schema_read_max < 3 ||
       !parsed.from.rollback_safe || !parsed.to.rollback_safe ||
-      parsed.required_control_plane_capability !== "dispatcher_v2_to_v3_online_backup_v1") {
+      parsed.required_control_plane_capability !== "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1") {
       throw new ValidationError(`compatibility_transitions[${index}] is not a supported v2 to v3 migration`);
     }
     return parsed;

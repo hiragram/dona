@@ -65,7 +65,7 @@ describe("fixed self-update surface", () => {
         from: policy.compatibility,
         to: { ...policy.compatibility, app_schema_read_max: 3, app_schema_write: 3 },
         previous_release_contract: "release-compatibility.v2-v3-bridge.json",
-        required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+        required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1",
       };
       assert.deepEqual(parsePolicy({ ...policy, compatibility_transitions: [transition] }).compatibility_transitions, [transition]);
       assert.throws(() => parsePolicy({ ...policy, compatibility_transitions: [transition, transition] }), /duplicates/);

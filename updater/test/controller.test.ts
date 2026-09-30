@@ -36,7 +36,7 @@ const activationRollout: SchemaRollout = {
   multi_job_enabled: true,
   previous_release_sha: "61bc86f71726ce1f44fc3500e524203626cf869a",
   previous_release_contract: "release-compatibility.v2-v3-bridge.json",
-  required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+  required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1",
   migration: {
     from_schema: 2,
     to_schema: 3,
@@ -113,7 +113,7 @@ test("非互換transitionはrollback不可と提示しtarget異常時に旧runti
     from: sourceCompatibility,
     to: targetCompatibility,
     previous_release_contract: "release-compatibility.v2-v3-bridge.json",
-    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_v1",
+    required_control_plane_capability: "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1",
   }];
   f.git.targetCompatibility = targetCompatibility;
   f.git.targetRollout = { ...activationRollout, previous_release_sha: currentSha };
@@ -127,7 +127,7 @@ test("非互換transitionはrollback不可と提示しtarget異常時に旧runti
     f.policy.compatibility_transitions[0],
   );
   const preflight = result.preflight as Record<string, unknown>;
-  assert.equal(preflight.control_plane_capability, "dispatcher_v2_to_v3_online_backup_v1");
+  assert.equal(preflight.control_plane_capability, "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1");
   assert.equal(preflight.schema_migration_control_plane_sha, targetSha);
   f.build.compatibility = targetCompatibility;
   f.runtime.setHealthCompatibility(currentSha,sourceCompatibility);
@@ -308,7 +308,7 @@ class FakeRuntime implements RuntimePort {
   async schemaMigrationCapability(capability: string) {
     this.calls.push("schemaMigrationCapability");
     return {
-      ready: this.schemaMigrationReady && capability === "dispatcher_v2_to_v3_online_backup_v1",
+      ready: this.schemaMigrationReady && capability === "dispatcher_v2_to_v3_online_backup_terminal_worker_drain_v1",
       build_sha: this.schemaMigrationReady ? this.schemaMigrationBuildSha : null,
     };
   }
@@ -2208,7 +2208,7 @@ describe("UpdateController isolated end-to-end", () => {
 
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "complete");
-    f.advance(40 * 86_400_000);
+    f.advance(365 * 86_400_000);
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "purged");
     f.database.close();
