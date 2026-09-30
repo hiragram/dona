@@ -74,6 +74,20 @@ export type ApprovalInboxItem = z.infer<typeof approvalInboxItemSchema>;
 export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1), items: z.array(approvalInboxListItemSchema).max(50), next_cursor: cursor.nullable() })
   .refine(value => new Set(value.items.map(item => item.request_id)).size === value.items.length);
 export const approvalInboxDetailSchema = z.strictObject({ codec_version: z.literal(1), item: approvalInboxItemSchema });
+const detailBindingSchema = z.strictObject({request_id: id, presentation_ref: id, presentation_revision: revision,
+  persisted_action_hash: hash, presentation_action_hash: hash,
+  persisted_content_digest: hash, presentation_content_digest: hash});
+const authorityDetailSchema = z.strictObject({codec_version: z.literal(1), item: approvalInboxItemSchema,
+  binding: detailBindingSchema});
+const verifiedDetails = new WeakMap<object, string>();
+/** Server-only digest of the literal content. Never place it in a browser response. */
+export function computeApprovalPrivateContentDigest(item: ApprovalInboxItem): string {
+  const content = {request_id: item.request_id, operation: item.operation, requester_actor_id: item.requester_actor_id,
+    presentation_ref: item.presentation_ref, presentation_revision: item.presentation_revision,
+    display_codec_version: item.display_codec_version, exact_target: item.exact_target,
+    exact_draft: item.exact_draft, resolved_mentions: item.resolved_mentions};
+  return createHash("sha256").update(JSON.stringify(content), "utf8").digest("hex");
+}
 
 /** The browser confirms only a candidate. The authority must reread durable state. */
 export const approvalDecisionCandidateSchema = z.strictObject({
@@ -127,6 +141,7 @@ export class ApprovalInboxUnavailable extends Error {
  * protected clock and persisted request in the decision transaction. */
 export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenceInput: unknown,
   expectedScope: { principal_id: string; instance_id: string; tenant_id: string; workspace_id: string;
+    route_request_id: string;
     supervisor_binding_id: string; binding_revision: number;
     session_ref: string; session_generation: number; authz_revision: number; policy_revision: number;
     requester_authorization_revision: number; requester_actor_id: string; challenge_ref: string; credential_id: string;
@@ -135,6 +150,7 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
     const candidate = approvalDecisionCandidateSchema.parse(candidateInput);
     const evidence = approvalAuthorityEvidenceSchema.parse(evidenceInput);
     const scope = z.strictObject({ principal_id: id, instance_id: id, tenant_id: id, workspace_id: id,
+      route_request_id: id,
       supervisor_binding_id: id, binding_revision: revision, session_ref: id, session_generation: revision, authz_revision: revision,
       policy_revision: revision, requester_authorization_revision: revision, requester_actor_id: id, challenge_ref: id,
       credential_id: id, credential_revision: revision,
@@ -163,6 +179,8 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || evidence.visibility_revision !== scope.visibility_revision
       || evidence.target_workspace_id !== scope.workspace_id
       || evidence.audience_principal_id !== scope.principal_id
+      || candidate.request_id !== scope.route_request_id || evidence.request_id !== scope.route_request_id
+      || evidence.challenge_request_id !== scope.route_request_id
       || candidate.request_id !== evidence.request_id || candidate.operation !== evidence.operation
       || candidate.decision !== evidence.decision || candidate.display_codec_version !== evidence.display_codec_version
       || candidate.expected_request_revision !== evidence.request_revision
@@ -225,10 +243,23 @@ export class ApprovalInboxAdapter {
   async detail(requestId: string, currentScope: ApprovalInboxReadScope): Promise<z.infer<typeof approvalInboxDetailSchema>> {
     if (!this.authority) throw new ApprovalInboxUnavailable();
     try {
-      const detail = approvalInboxDetailSchema.parse(await this.authority.detail(id.parse(requestId)));
+      const detail = authorityDetailSchema.parse(await this.authority.detail(id.parse(requestId)));
       assertDetailScope(detail.item, readScopeSchema.parse(currentScope));
       if (detail.item.request_id !== requestId) throw Error();
-      return detail;
+      const content = computeApprovalPrivateContentDigest(detail.item);
+      if (detail.binding.request_id !== detail.item.request_id
+        || detail.binding.presentation_ref !== detail.item.presentation_ref
+        || detail.binding.presentation_revision !== detail.item.presentation_revision
+        || detail.binding.persisted_action_hash !== detail.binding.presentation_action_hash
+        || detail.binding.persisted_content_digest !== content
+        || detail.binding.presentation_content_digest !== content) throw Error();
+      Object.freeze(detail.item.exact_target);
+      detail.item.resolved_mentions.forEach(Object.freeze);
+      Object.freeze(detail.item.resolved_mentions);
+      Object.freeze(detail.item);
+      const verified = Object.freeze({codec_version: 1 as const, item: detail.item});
+      verifiedDetails.set(verified, content);
+      return verified;
     } catch { throw new ApprovalInboxUnavailable(); }
   }
 }
@@ -241,9 +272,11 @@ function assertDetailScope(item: ApprovalInboxItem, scope: ApprovalInboxReadScop
     || item.binding_revision !== scope.binding_revision || item.visibility_revision !== scope.visibility_revision
     || item.resource_snapshot_hash !== scope.resource_snapshot_hash) throw new ApprovalInboxUnavailable();
 }
-export function approvalInboxView(itemInput: unknown, now: string, currentScope: ApprovalInboxReadScope) {
+export function approvalInboxView(detailInput: unknown, now: string, currentScope: ApprovalInboxReadScope) {
   try {
-    const item = approvalInboxItemSchema.parse(itemInput);
+    if (typeof detailInput !== "object" || detailInput === null) throw Error();
+    const item = approvalInboxDetailSchema.parse(detailInput).item;
+    if (verifiedDetails.get(detailInput) !== computeApprovalPrivateContentDigest(item)) throw Error();
     const at = utc.parse(now);
     assertDetailScope(item, readScopeSchema.parse(currentScope));
     const canStartChallenge = item.state === "pending" && Date.parse(item.created_at) <= Date.parse(at)
@@ -268,7 +301,7 @@ export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: 
   try {
     const page = approvalInboxSchema.parse(input);
     const items = page.items;
-    const selected = selectedDetailInput === null ? null : approvalInboxDetailSchema.parse(selectedDetailInput).item;
+    const selected = selectedDetailInput === null ? null : selectedDetailInput;
     const rows = items.map(item => {
       const at = utc.parse(now);
       const status = item.state === "pending" && Date.parse(item.created_at) <= Date.parse(at)

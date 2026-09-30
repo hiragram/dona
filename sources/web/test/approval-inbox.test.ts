@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ApprovalInboxAdapter, ApprovalInboxUnavailable, approvalInboxView, encodeApprovalDisplay,
-  assertApprovalDecisionCandidate, computeApprovalDisplayFingerprint, renderApprovalInboxPreview } from "../src/approval-inbox.js";
+  assertApprovalDecisionCandidate, computeApprovalDisplayFingerprint, computeApprovalPrivateContentDigest,
+  renderApprovalInboxPreview, approvalInboxItemSchema } from "../src/approval-inbox.js";
 import { authorizeWebRoute, matchWebRoute } from "../src/routes.js";
 
 const itemBase = {
@@ -62,12 +63,23 @@ const evidence = { principal_id: "principal_1", instance_id: "instance_1", tenan
   persisted_resource_snapshot_hash: "c".repeat(64), current_resource_snapshot_hash: "c".repeat(64),
   created_at: item.created_at, expires_at: item.expires_at, state: "pending", consumed: false };
 const scope = { principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1", workspace_id: "workspace_1",
+  route_request_id: "request_1",
   supervisor_binding_id: "binding_1",
   binding_revision: 2, session_ref: "session_1", session_generation: 3, authz_revision: 4,
   policy_revision: 5, requester_authorization_revision: 6, requester_actor_id: "actor_1",
   challenge_ref: "challenge_1", credential_id: "credential_1", credential_revision: 7,
   credential_stored_sign_count: 4, visibility_revision: 8 };
 const now = "2026-09-30T00:10:00.000Z";
+const detailBinding = (row: unknown = item) => {
+  const parsed = approvalInboxItemSchema.parse(row);
+  const digest = computeApprovalPrivateContentDigest(parsed);
+  return {request_id: parsed.request_id, presentation_ref: parsed.presentation_ref,
+    presentation_revision: parsed.presentation_revision, persisted_action_hash: "b".repeat(64),
+    presentation_action_hash: "b".repeat(64), persisted_content_digest: digest, presentation_content_digest: digest};
+};
+const verifiedDetail = (row: unknown = item, binding: unknown = detailBinding(row)) =>
+  new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [], next_cursor: null}),
+    detail: async () => ({codec_version: 1, item: row, binding})}).detail(item.request_id, readScope);
 
 test("approval list route requires bound supervisor read scope", () => {
   const route = matchWebRoute("GET", "/api/approvals?cursor=opaque");
@@ -78,7 +90,7 @@ test("approval list route requires bound supervisor read scope", () => {
 
 test("inbox stays unavailable without a verified authority and rejects unsafe projection", async () => {
   await assert.rejects(new ApprovalInboxAdapter().list(), ApprovalInboxUnavailable);
-  const adapter = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [listItem], next_cursor: null}), detail: async () => ({codec_version: 1, item})});
+  const adapter = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [listItem], next_cursor: null}), detail: async () => ({codec_version: 1, item, binding: detailBinding()})});
   assert.deepEqual(await adapter.list(), {codec_version: 1, items: [listItem], next_cursor: null});
   assert.deepEqual(await adapter.detail(item.request_id, readScope), {codec_version: 1, item});
   await assert.rejects(adapter.detail("other", readScope), ApprovalInboxUnavailable);
@@ -87,7 +99,7 @@ test("inbox stays unavailable without a verified authority and rejects unsafe pr
   await assert.rejects(adapter.detail(item.request_id, {...readScope, visibility_revision: 9}), ApprovalInboxUnavailable);
   await assert.rejects(adapter.detail(item.request_id, {...readScope, resource_snapshot_hash: "d".repeat(64)}), ApprovalInboxUnavailable);
   const oldDetail = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [], next_cursor: null}),
-    detail: async () => ({codec_version: 2, item})});
+    detail: async () => ({codec_version: 2, item, binding: detailBinding()})});
   await assert.rejects(oldDetail.detail(item.request_id, readScope), ApprovalInboxUnavailable);
   const leaking = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [{...listItem, exact_draft: "private"}], next_cursor: null}), detail: async () => item});
   await assert.rejects(leaking.list(), ApprovalInboxUnavailable);
@@ -115,34 +127,37 @@ test("inbox keeps a bounded continuation contract instead of hiding later reques
   await assert.rejects(oversized.list(), ApprovalInboxUnavailable);
 });
 
-test("detail and confirmation disable stale or terminal requests", () => {
-  assert.equal(approvalInboxView(item, now, readScope).canStartChallenge, true);
-  assert.equal("candidate" in approvalInboxView(item, now, readScope), false);
-  assert.equal(approvalInboxView(withFingerprint({...item, exact_target: {...item.exact_target, display_name: "対象😀"}}), now, readScope).exactTarget.display_name, "対象😀");
-  assert.throws(() => approvalInboxView({...item, exact_target: {...item.exact_target, display_name: "別の対象"}}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView(item, now, {...readScope, principal_id: "other"}), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, target_shared: true}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, presentation_requester_actor_id: "other"}, now, readScope), ApprovalInboxUnavailable);
-  assert.equal(approvalInboxView(item, item.expires_at, readScope).canStartChallenge, false);
-  assert.equal(approvalInboxView(withFingerprint({...item, created_at: "2026-09-30T00:11:00.000Z"}), now, readScope).canStartChallenge, false);
-  assert.equal(approvalInboxView({...item, state: "approved"}, now, readScope).canStartChallenge, false);
-  assert.throws(() => approvalInboxView({...item, expires_at: "2026-09-30T00:15:00.001Z"}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, operation: "self_update.v1"}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, operation_summary: "unsafe\ntext"}, now, readScope), ApprovalInboxUnavailable);
-  assert.equal(approvalInboxView(withFingerprint({...item, exact_target: {...item.exact_target, display_name: "safe\u202Eunsafe"}}), now, readScope).exactTarget.display_name, "safe\u202Eunsafe");
-  assert.throws(() => approvalInboxView({...item, operation_summary: "操作  A"}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, operation_summary: " 操作"}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, exact_target: {...item.exact_target, display_name: "対象\ud800名"}}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, resolved_mentions: Array.from({length: 4}, (_, i) =>
-    ({target_id: `U${i + 1}`, display: "担当者"}))}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, resolved_mentions: [item.resolved_mentions[0], item.resolved_mentions[0]]}, now, readScope), ApprovalInboxUnavailable);
-  assert.throws(() => approvalInboxView({...item, resolved_mentions: [{target_id: "channel_1", display: "担当者"}]}, now, readScope), ApprovalInboxUnavailable);
+test("detail and confirmation disable stale or terminal requests", async () => {
+  const verified = await verifiedDetail();
+  assert.equal(approvalInboxView(verified, now, readScope).canStartChallenge, true);
+  assert.equal("candidate" in approvalInboxView(verified, now, readScope), false);
+  assert.equal(approvalInboxView(await verifiedDetail(withFingerprint({...item, exact_target: {...item.exact_target, display_name: "対象😀"}})), now, readScope).exactTarget.display_name, "対象😀");
+  assert.throws(() => approvalInboxView(item, now, readScope), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView(structuredClone(verified), now, readScope), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView(verified, now, {...readScope, principal_id: "other"}), ApprovalInboxUnavailable);
+  assert.equal(approvalInboxView(verified, item.expires_at, readScope).canStartChallenge, false);
+  assert.equal(approvalInboxView(await verifiedDetail(withFingerprint({...item, created_at: "2026-09-30T00:11:00.000Z"})), now, readScope).canStartChallenge, false);
+  assert.equal(approvalInboxView(await verifiedDetail({...item, state: "approved"}), now, readScope).canStartChallenge, false);
+  assert.equal(approvalInboxView(await verifiedDetail(withFingerprint({...item, exact_target: {...item.exact_target, display_name: "safe\u202Eunsafe"}})), now, readScope).exactTarget.display_name, "safe\u202Eunsafe");
+  for (const row of [
+    {...item, exact_target: {...item.exact_target, display_name: "別の対象"}},
+    {...item, target_shared: true}, {...item, presentation_requester_actor_id: "other"},
+    {...item, expires_at: "2026-09-30T00:15:00.001Z"}, {...item, operation: "self_update.v1"},
+    {...item, operation_summary: "unsafe\ntext"}, {...item, operation_summary: "操作  A"},
+    {...item, operation_summary: " 操作"},
+    {...item, exact_target: {...item.exact_target, display_name: "対象\ud800名"}},
+    {...item, resolved_mentions: Array.from({length: 4}, (_, i) => ({target_id: `U${i + 1}`, display: "担当者"}))},
+    {...item, resolved_mentions: [item.resolved_mentions[0], item.resolved_mentions[0]]},
+    {...item, resolved_mentions: [{target_id: "channel_1", display: "担当者"}]},
+  ]) await assert.rejects(verifiedDetail(row, detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail({...item, exact_draft: "差し替え", resolved_mentions: []}, detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail(item, {...detailBinding(), presentation_content_digest: "d".repeat(64)}), ApprovalInboxUnavailable);
 });
 
-test("preview escapes untrusted summary and never enables a decision", () => {
+test("preview escapes untrusted summary and never enables a decision", async () => {
   const markup = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: [{...listItem,
-    operation_summary: '<img src=x onerror=alert(1)>'}]}, {codec_version: 1,
-    item: {...item, operation_summary: '<img src=x onerror=alert(1)>'}}, now, readScope);
+    operation_summary: '<img src=x onerror=alert(1)>'}]}, await verifiedDetail({...item,
+    operation_summary: '<img src=x onerror=alert(1)>'}), now, readScope);
   assert.ok(markup.includes('&lt;img src=x onerror=alert(1)&gt;'));
   assert.ok(!markup.includes('<img'));
   assert.ok(markup.includes('<button type="button" disabled>承認</button>'));
@@ -162,22 +177,24 @@ test("preview escapes untrusted summary and never enables a decision", () => {
   assert.ok(futureList.includes("再確認が必要"));
   assert.ok(!futureList.includes("確認準備中"));
   const literal = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
-    {codec_version: 1, item: withFingerprint({...item, exact_draft: "line1\nline2\\\t\u202E",
-      exact_target: {...item.exact_target, display_name: "safe\u00A0unsafe"}})}, now, readScope);
+    await verifiedDetail(withFingerprint({...item, exact_draft: "line1\nline2\\\t\u202E",
+      exact_target: {...item.exact_target, display_name: "safe\u00A0unsafe"}})), now, readScope);
   assert.ok(literal.includes("line1\\nline2\\\\\\t\\u{202E}"));
   assert.ok(literal.includes("safe\\u{00A0}unsafe"));
   assert.ok(!literal.includes("line1\nline2"));
   const spacedMention = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
-    {codec_version: 1, item: {...item, resolved_mentions: [{target_id: "U123", display: " 担当  者 "}]}}, now, readScope);
+    await verifiedDetail({...item, resolved_mentions: [{target_id: "U123", display: " 担当  者 "}]}), now, readScope);
   assert.ok(spacedMention.includes("<pre> 担当  者 </pre>"));
   assert.equal(encodeApprovalDisplay("😀\\\n\t\u202E"), "😀\\\\\\n\\t\\u{202E}");
   const later = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
-    {codec_version: 1, item: withFingerprint({...item, exact_target: {...item.exact_target, display_name: "次ページの対象"}})}, now, readScope);
+    await verifiedDetail(withFingerprint({...item, exact_target: {...item.exact_target, display_name: "次ページの対象"}})), now, readScope);
   assert.ok(later.includes("次ページの対象"));
 });
 
 test("server preflight rejects forged, expired, consumed and cross-scope evidence", () => {
   assert.deepEqual(assertApprovalDecisionCandidate(candidate, evidence, scope, now), candidate);
+  assert.throws(() => assertApprovalDecisionCandidate(candidate, evidence,
+    {...scope, route_request_id: "other"}, now), ApprovalInboxUnavailable);
   const noCounter = {...evidence, credential_stored_sign_count: 0, assertion_sign_count: 0,
     counter_unsupported_registration_proven: true};
   assert.deepEqual(assertApprovalDecisionCandidate(candidate, noCounter,
