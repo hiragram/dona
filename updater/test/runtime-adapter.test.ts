@@ -140,6 +140,7 @@ async function listen(
   service: "dispatcher" | "slack_adapter",
   requests: unknown[],
   pendingDrainResponses = 0,
+  healthStatus: "ready" | "not_ready" = "ready",
 ): Promise<http.Server> {
   await fs.mkdir(path.dirname(socketPath), { recursive: true });
   let remainingPending = pendingDrainResponses;
@@ -147,7 +148,7 @@ async function listen(
     if (request.url === "/health/version") {
       const body = JSON.stringify({
         schema_version: 1,
-        status: "ready",
+        status: healthStatus,
         service,
         build_sha: targetSha,
         protocol: 1,
@@ -158,7 +159,8 @@ async function listen(
         config: 1,
         ...(service === "slack_adapter" ? { workspaces_ready: true } : {}),
       });
-      response.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+      response.writeHead(healthStatus === "ready" ? 200 : 503,
+        { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
       response.end(body);
       return;
     }
@@ -187,6 +189,23 @@ async function listen(
   });
   return server;
 }
+
+test("RealRuntime observes a versioned 503 not_ready service as live during quiesce", async () => {
+  const { root, policy } = await tempPolicy();
+  const requests: unknown[] = [];
+  const dispatcher = await listen(policy.dispatcher_socket, "dispatcher", requests, 0, "not_ready");
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    const health = await runtime.dispatcherHealth();
+    assert.equal(health.observed, true);
+    assert.equal(health.live, true);
+    assert.equal(health.ready, false);
+    assert.equal(health.build_sha, targetSha);
+  } finally {
+    await new Promise<void>((resolve) => dispatcher.close(() => resolve()));
+    await removeTree(root);
+  }
+});
 
 test("RealRuntime uses typed UDS handshakes and fixed launchctl argv without live process access", async () => {
   const { root, policy } = await tempPolicy();
@@ -278,6 +297,35 @@ test("RealRuntime keeps legacy name-based stop markers unsafe", async () => {
     stopped.prepare("UPDATE legacy_job_agents_to_stop SET stopped_at='2026-09-25T00:00:00Z'").run();
     stopped.close();
     assert.equal((await runtime.workerSafety()).active_worker_count, 1);
+  } finally { await removeTree(root); }
+});
+
+test("RealRuntime keeps an operator assertion outside machine stop proof", async () => {
+  const { root, policy } = await tempPolicy();
+  await fs.mkdir(policy.config_root, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(policy.config_root, "dispatcher.env"), "", { mode: 0o600 });
+  const databasePath = path.join(root, "Dona", "dona.sqlite3");
+  const database = new Database(databasePath);
+  database.exec(`CREATE TABLE jobs (job_id TEXT, status TEXT NOT NULL, updated_at TEXT,
+    steer_state TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, herdr_workspace_id TEXT,
+    last_error_code TEXT, dispatch_started_at TEXT, prompt_accepted_at TEXT);
+    CREATE TABLE legacy_job_agents_to_stop (job_id TEXT, stopped_at TEXT);
+    CREATE TABLE job_operator_assertion_recoveries (job_id TEXT, final_status TEXT, final_updated_at TEXT)`);
+  database.prepare("INSERT INTO jobs (job_id,status,updated_at,herdr_workspace_id) VALUES ('legacy','failed','t1','agent')").run();
+  database.prepare("INSERT INTO legacy_job_agents_to_stop VALUES ('legacy',NULL)").run();
+  database.close();
+  await fs.chmod(databasePath, 0o600);
+  const runtime = new RealRuntime(policy, new RecordingRunner() as unknown as ProcessRunner);
+  try {
+    assert.equal((await runtime.workerSafety()).safe, false);
+    const recorded = new Database(databasePath);
+    recorded.prepare("INSERT INTO job_operator_assertion_recoveries VALUES ('legacy','failed','t1')").run();
+    recorded.close();
+    assert.equal((await runtime.workerSafety()).safe, false);
+    const changed = new Database(databasePath);
+    changed.prepare("UPDATE jobs SET updated_at='t2' WHERE job_id='legacy'").run();
+    changed.close();
+    assert.equal((await runtime.workerSafety()).safe, false);
   } finally { await removeTree(root); }
 });
 
@@ -523,4 +571,34 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
   } finally {
     await removeTree(root);
   }
+});
+
+test("保守bridgeは通常main adapterを通して世代固有MCPを必須接続で起動する", async () => {
+  const bridgeUrl = new URL('../../scripts/maintenance/main_bridge.mjs', import.meta.url).href;
+  const {operate} = await import(bridgeUrl);
+  const {root,policy} = await tempPolicy();
+  try {
+    const release = path.join(policy.release_root,targetSha);
+    await fs.mkdir(path.join(release,'.codex'),{recursive:true});
+    await fs.writeFile(path.join(release,'.codex/config.toml'),'');
+    await fs.mkdir(policy.config_root,{recursive:true,mode:0o700});
+    for (const name of ['dispatcher','slack']) await fs.writeFile(path.join(policy.config_root,`${name}.env`),'',{mode:0o600});
+    const oldRelease=path.join(policy.release_root,'1'.repeat(40));
+    const recorder=new AgentRunner(oldRelease);
+    class BridgeProcess { run(executable:string,args:readonly string[],options:RunOptions) { return recorder.run(executable,args,options); } }
+    const old=await operate({action:'status',release:oldRelease},policy,RealRuntime,BridgeProcess);
+    assert.equal(old.session_id,'session-old');
+    assert.equal((await operate({action:'stop',expected:old},policy,RealRuntime,BridgeProcess)).outcome,'stopped');
+    const started=await operate({action:'start',release,pane:old.pane_id,previous_session:old.session_id},policy,RealRuntime,BridgeProcess);
+    assert.equal(started.outcome,'started');
+    assert.equal(started.observation.session_id,'session-new');
+    const call=recorder.calls.find(c=>c.args[2]==='agent'&&c.args[3]==='start')!;
+    for (const [server,name] of [['dona_dispatcher','dispatcher'],['dona_slack','slack']]) {
+      assert.ok(call.args.includes(`mcp_servers.${server}.required=true`));
+      assert.ok(call.args.includes(`mcp_servers.${server}.args=${JSON.stringify([path.join(policy.config_root,`mcp-${name}.mjs`)])}`));
+      assert.ok(call.args.includes(`mcp_servers.${server}.command=${JSON.stringify(policy.executables.node)}`));
+    }
+    assert.equal(recorder.calls.filter(c=>c.args[3]==='start').length,1);
+    assert.equal(recorder.calls.some(c=>c.args.includes('session')&&c.args.includes('kill')),false);
+  } finally { await removeTree(root); }
 });

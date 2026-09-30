@@ -38,6 +38,8 @@ cleanなcanonical main checkoutで明示的に実行します。installerはfetc
 
 ### 稼働中のbackground worker
 
+旧Dispatcherがoperator回復CLIを持たず、残存`needs_review`が通常更新とcontrol-plane更新の両方を塞ぐ場合は、[停止下bootstrap手順](operations/offline-recovery-bootstrap.md)でexact releaseをstageし、承認済みmaintenance windowに限って復旧する。
+
 現行のrelease間には、Herdr agent identityとjob単位のresult grantを次のDispatcherへ引き継いだことを証明するreceiptがありません。このため、`running`、`blocked`、`needs_review`等のworkerが残る場合は、isolated result pathでも更新を継続しません。stable Updaterはquiesce前とDispatcher drain後にowner-privateなjob DBを再読し、handoff不能または観測不能ならservice停止、schema migration、pointer切替より前に停止します。workerをcancel/closeしたり、promptを再送したりしません。
 
 Dispatcherの`update-safety`と`drain-status`に出るworker件数と`unsafe_states`は集計値だけです。`active_worker_handoff_unavailable`ならworkerのterminal Resultとnotificationを通常のDispatcherで回収・確認してから、新しいexact planで再開します。`worker_state_unverified`や`jobs.handoff_observation_unknown`ではDBの所有者、状態、healthを読み取りで照合し、更新writeを反復しません。稼働workerを跨ぐ更新は、release間のidentity・grant・terminal ownerを検証するhandoff契約とprocess境界テストが完成するまで未対応です。
@@ -77,6 +79,8 @@ reconcileはpointer、receipt、DB fence/checkpoint、保存済みruntime intent
 セルフアップデート通知の重複防止は、Slack Appのcustom message metadata schemaに依存しません。通知本文を表示するsection blockの`block_id`へ決定論的な`notification_id`を埋め、同じBotの投稿だけをthread全pageから照合します。このfieldは通常のmessage read/write権限で永続化・再読できるため、manifest変更、`metadata.message:read`、App再認可、外部状態のattestationは不要です。
 
 maintenance windowを確保し、cleanな最新main checkoutで次を実行します。`needs_review`はterminalなので存在してもよいですが、未承認planを含む非terminal requestが1件でもあれば拒否します。
+
+世代別installを更新する場合は、対象の既存rootを第二引数へ絶対パスで明示します（例: `./scripts/install-self-update.sh --upgrade-control "$HOME/.dona/g/<generation>"`）。installerはそのrootの既存policy、current pointer、Updater/Dispatcher plistを照合し、別のinstallを指す場合は停止前に拒否します。既定installを更新する場合は従来どおり引数を省略します。対象rootを推測せず、稼働中plistと照合してから指定してください。
 
 ```sh
 ./scripts/install-self-update.sh --upgrade-control

@@ -317,6 +317,8 @@ class FakeRuntime implements RuntimePort {
   wrongTargetOnce = false;
   dispatcherWrongShaPersistent = false;
   dispatcherWrongShaAfterSlackStart = false;
+  dispatcherWrongShaDuringQuiesce = false;
+  slackWrongShaDuringQuiesce = false;
   wrongSlackOnce = false;
   dispatcherStartUnknownOnce = false;
   mainWaitStatus: MainAgentObservation["status"] = "idle";
@@ -342,6 +344,7 @@ class FakeRuntime implements RuntimePort {
   private dispatcherLive = true;
   private slackLive = true;
   slackQuiescing = false;
+  slackStopsDuringQuiesce = false;
   dispatcherQuiescing = false;
   slackDrainStatusThrows = false;
   slackHealthUnreadyWhenQuiescing = false;
@@ -359,12 +362,17 @@ class FakeRuntime implements RuntimePort {
     this.slackLive = false;
   }
   simulateDispatcherStopped(): void { this.dispatcherLive = false; }
+  simulateDispatcherRestarted(): void { this.dispatcherLive = true; }
   simulateSlackRestarted(): void { this.slackLive = true; }
   setHealthCompatibility(sha: string, compatibility: Compatibility): void {
     this.healthCompatibility.set(sha, compatibility);
   }
   async quiesceSlack(): Promise<DrainSnapshot> {
     this.calls.push("quiesceSlack");
+    if (this.slackStopsDuringQuiesce) {
+      this.slackLive = false;
+      throw new Error("slack_socket_closed_during_quiesce");
+    }
     if (this.slackRestartedDuringDrain ||
         (this.slackRestartedDuringRollbackDrain && this.mainAgentSha === targetSha)) {
       this.slackQuiescing = false;
@@ -529,6 +537,9 @@ class FakeRuntime implements RuntimePort {
     }
     if (!this.dispatcherLive) return this.health("dispatcher", null, false, false);
     const current = (await this.store.observe()).current_sha;
+    if (this.dispatcherWrongShaDuringQuiesce && current === currentSha) {
+      return this.health("dispatcher", "f".repeat(40), false);
+    }
     if ((this.dispatcherWrongShaPersistent || (this.dispatcherWrongShaAfterSlackStart && this.slackLive)) && current === targetSha) {
       return this.health("dispatcher", "f".repeat(40), true);
     }
@@ -545,6 +556,9 @@ class FakeRuntime implements RuntimePort {
     }
     if (!this.slackLive) return { ...this.health("slack_adapter", null, false, false), workspaces_ready: false };
     const current = (await this.store.observe()).current_sha;
+    if (this.slackWrongShaDuringQuiesce && current === currentSha) {
+      return this.health("slack_adapter", "f".repeat(40), false);
+    }
     if (this.wrongSlackOnce && current === targetSha) {
       this.wrongSlackOnce = false;
       return { ...this.health("slack_adapter", "f".repeat(40), true), workspaces_ready: true };
@@ -626,7 +640,7 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
-  test("restores the current Dispatcher when a worker appears during drain", async () => {
+  test("does not restart a Dispatcher with an active worker during drain", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
     const plan = planned.plan as { plan_id: string; plan_hash: string };
@@ -634,10 +648,12 @@ describe("UpdateController isolated end-to-end", () => {
       plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-drain-race" });
     f.dispatcher.terminal = true;
     f.runtime.dispatcherDrainIncomplete = true;
+    f.runtime.slackHealthUnreadyWhenQuiescing = true;
     await f.controller.processNext();
-    assert.equal(f.database.get(planned.request_id as string)?.state, "failed");
-    assert.equal(f.database.get(planned.request_id as string)?.last_error_code, "dispatcher_drain_incomplete");
-    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "startDispatcher", "startSlack"]);
+    assert.equal(f.database.get(planned.request_id as string)?.state, "needs_review");
+    assert.equal(f.database.get(planned.request_id as string)?.last_error_code,
+      "quiesce_recovery_dispatcher_health_failed");
+    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "quiesceDispatcher", "startSlack"]);
     assert.equal((await f.store.observe()).current_sha, currentSha);
     f.database.close();
   });
@@ -649,6 +665,7 @@ describe("UpdateController isolated end-to-end", () => {
       plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-dispatcher-restarted" });
     f.dispatcher.terminal = true;
     f.runtime.dispatcherRestartedDuringDrain = true;
+    f.runtime.slackHealthUnreadyWhenQuiescing = true;
     await f.controller.processNext();
     const row = f.database.get(planned.request_id as string)!;
     assert.equal(row.state, "failed", JSON.stringify({ error: row.last_error_code, calls: f.runtime.calls,
@@ -859,6 +876,270 @@ describe("UpdateController isolated end-to-end", () => {
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_slack")?.phase, "observed");
     f.database.close();
   });
+  test("reconciles accepted service stops after a quiesce restart without repeating bootout", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stop-reconcile" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    for (const [kind, service] of [["stop_slack", "slack_adapter"], ["stop_dispatcher", "dispatcher"]] as const) {
+      f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, currentSha, null);
+      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "accepted", null, { exit_code: 0 });
+    }
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.activeWorkerCount = 1;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.runtimeOperation(row.request_id, "stop_slack")?.phase, "observed");
+    assert.equal(f.database.runtimeOperation(row.request_id, "stop_dispatcher")?.phase, "observed");
+    assert.equal(f.runtime.calls.includes("stopSlack"), false);
+    assert.equal(f.runtime.calls.includes("stopDispatcher"), false);
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "active_worker_handoff_unavailable");
+    f.database.close();
+  });
+  test("restores the old runtime when Slack reappears after a persisted stop", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stop-race" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    for (const [kind, service] of [["stop_slack", "slack_adapter"], ["stop_dispatcher", "dispatcher"]] as const) {
+      f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, currentSha, null);
+      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, {});
+    }
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.simulateSlackRestarted();
+    f.runtime.slackStopsDuringQuiesce = true;
+    f.runtime.activeWorkerCount = 1;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.runtimeOperation(row.request_id, "stop_slack")?.phase, "observed");
+    assert.equal(f.runtime.calls.includes("quiesceSlack"), false);
+    assert.equal(f.runtime.calls.includes("stopSlack"), false);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "slack_adapter_reappeared_after_stop");
+    f.database.close();
+  });
+  test("waits for an accepted Slack stop without treating its live socket as a restart", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stop-pending" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_slack", "slack_adapter", currentSha, null);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_slack", "accepted", null, { exit_code: 0 });
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "quiescing");
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "stop_slack_acceptance_unknown");
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    assert.equal(f.runtime.calls.includes("quiesceSlack"), false);
+    assert.equal(f.runtime.calls.includes("stopSlack"), false);
+    f.database.close();
+  });
+  test("restores the main agent immediately after a rejected Slack stop", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-stop-rejected" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_slack", "slack_adapter", currentSha, null);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_slack", "rejected", null, { exit_code: 1 });
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.simulateSlackRestarted();
+    f.runtime.simulateDispatcherRestarted();
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    assert.equal(f.runtime.calls.includes(`startMainAgent:${currentSha}`), true);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    assert.equal(f.runtime.calls.includes("startDispatcher"), false);
+    f.database.close();
+  });
+  test("restores the old runtime when Dispatcher reappears after a persisted stop", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-dispatcher-restart" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    for (const [kind, service] of [["stop_slack", "slack_adapter"], ["stop_dispatcher", "dispatcher"]] as const) {
+      f.database.prepareRuntimeOperation(row.request_id, row.fence, kind, service, currentSha, null);
+      f.database.recordRuntimeOperation(row.request_id, row.fence, kind, "observed", null, {});
+    }
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.simulateDispatcherRestarted();
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    assert.equal(f.database.get(row.request_id)?.last_error_code, "dispatcher_reappeared_after_stop");
+    assert.equal(f.runtime.calls.includes("quiesceDispatcher"), false);
+    assert.equal(f.runtime.calls.includes("stopDispatcher"), false);
+    assert.equal(f.runtime.calls.includes("startDispatcher"), false);
+    assert.equal(f.runtime.calls.includes(`startMainAgent:${currentSha}`), true);
+    f.database.close();
+  });
+  for (const service of ["slack_adapter", "dispatcher"] as const) {
+    test(`refuses to quiesce a live ${service} with a different SHA`, async () => {
+      const f = await fixture();
+      const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+      const plan = planned.plan as { plan_id: string; plan_hash: string };
+      f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+        plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: `human-approval-wrong-${service}` });
+      f.dispatcher.terminal = true;
+      if (service === "dispatcher") f.runtime.dispatcherWrongShaDuringQuiesce = true;
+      else f.runtime.slackWrongShaDuringQuiesce = true;
+      f.runtime.slackHealthUnreadyWhenQuiescing = true;
+      await f.controller.processNext();
+      assert.equal(f.database.get(planned.request_id as string)?.state, "needs_review");
+      assert.equal(f.database.get(planned.request_id as string)?.last_error_code,
+        service === "dispatcher" ? "quiesce_recovery_dispatcher_health_failed" :
+          "quiesce_recovery_slack_health_failed");
+      assert.equal((await f.store.observe()).current_sha, currentSha);
+      assert.equal(f.runtime.calls.includes(service === "dispatcher" ? "quiesceDispatcher" : "quiesceSlack"), false);
+      if (service === "dispatcher") assert.equal(f.runtime.calls.includes("startSlack"), true);
+      else assert.equal(f.runtime.calls.includes("startDispatcher"), false);
+      f.database.close();
+    });
+  }
+  test("keeps bounded main-agent reconciliation after a Slack quiesce exception", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-quiesce-error" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.simulateSlackRestarted();
+    f.runtime.simulateDispatcherRestarted();
+    f.runtime.mainStartUnknownOnce = true;
+    f.runtime.quiesceSlack = async () => { throw new Error("quiesce_socket_lost"); };
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "quiescing");
+    assert.equal(f.database.get(row.request_id)?.last_error_code,
+      "rollback_main_agent_start_acceptance_unknown");
+    assert.equal(f.runtime.calls.includes("startDispatcher"), false);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    f.database.close();
+  });
+  test("does not stop the main agent when a persisted Slack stop is still registered", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-transient-health" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_slack", "slack_adapter", currentSha, null);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_slack", "accepted", null, { exit_code: 0 });
+    f.runtime.slackHealthUnavailableOnce = true;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.runtime.calls.includes("stopMainAgent"), false);
+    assert.equal(f.runtime.calls.includes("stopSlack"), false);
+    assert.equal(f.database.get(row.request_id)?.state, "failed");
+    f.database.close();
+  });
+  test("restores the stopped main agent when Slack registration cannot be read", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-slack-registration-error" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_slack", "slack_adapter", currentSha, null);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_slack", "accepted", null, { exit_code: 0 });
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.slackRegistrationThrowsOnCall = 1;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "needs_review");
+    assert.equal(f.runtime.calls.includes("startDispatcher"), true);
+    assert.equal(f.runtime.calls.includes(`startMainAgent:${currentSha}`), true);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    f.database.close();
+  });
+  test("restores stopped current components without touching a foreign Slack Adapter", async () => {
+    const f = await fixture();
+    const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
+    const plan = planned.plan as { plan_id: string; plan_hash: string };
+    f.controller.apply({ source_event_id: approvalEventId, reply_target: replyTarget,
+      plan_id: plan.plan_id, plan_hash: plan.plan_hash, approval_id: "human-approval-foreign-slack" });
+    let row = f.database.claim(planned.request_id as string, "controller-test", f.policy.timeouts.lease_ms,
+      new Date("2026-09-02T00:00:00.000Z"))!;
+    row = f.database.transition(row.request_id, row.fence, "staged", "release_staged");
+    row = f.database.transition(row.request_id, row.fence, "quiescing", "runtime_quiesce_started");
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "w1:p1", currentSha,
+      `session-${currentSha}`);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_main_agent", "observed", null, {});
+    f.database.prepareRuntimeOperation(row.request_id, row.fence, "stop_slack", "slack_adapter", currentSha, null);
+    f.database.recordRuntimeOperation(row.request_id, row.fence, "stop_slack", "observed", null, {});
+    f.runtime.simulateStoppedRuntime();
+    f.runtime.simulateSlackRestarted();
+    f.runtime.slackWrongShaDuringQuiesce = true;
+    f.runtime.rotateMainAgentSessionOnStart = true;
+    f.advance(f.policy.timeouts.lease_ms + 1);
+    await f.controller.processNext();
+    assert.equal(f.database.get(row.request_id)?.state, "needs_review");
+    assert.equal(f.runtime.calls.includes("startDispatcher"), true);
+    assert.equal(f.runtime.calls.includes(`startMainAgent:${currentSha}`), true);
+    assert.equal(f.runtime.calls.includes("startSlack"), false);
+    assert.equal(f.runtime.calls.includes("quiesceSlack"), false);
+    f.database.close();
+  });
   test("restores stopped current runtime when activation recovery has no restart intent", async () => {
     const f = await fixture();
     const planned = await f.controller.plan({ source_event_id: sourceEventId, reply_target: replyTarget });
@@ -968,9 +1249,9 @@ describe("UpdateController isolated end-to-end", () => {
     f.runtime.forwardSlackDrainIncomplete = true;
     await f.controller.processNext();
     const row = f.database.get(planned.request_id as string)!;
-    assert.equal(row.state, "failed");
-    assert.equal(row.last_error_code, "slack_adapter_drain_incomplete");
-    assert.deepEqual(f.runtime.calls, ["quiesceSlack", "startSlack"]);
+    assert.equal(row.state, "needs_review");
+    assert.equal(row.last_error_code, "quiesce_recovery_slack_health_failed");
+    assert.deepEqual(f.runtime.calls, ["quiesceSlack"]);
     assert.equal(f.database.runtimeOperation(row.request_id, "restart_current_dispatcher"), undefined);
     f.database.close();
   });

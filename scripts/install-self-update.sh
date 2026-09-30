@@ -4,8 +4,24 @@ set -euo pipefail
 SCRIPT_DIR=${0:A:h}
 REPOSITORY_DIR=${SCRIPT_DIR:h}
 MODE=${1:-}
-BASE_DIR="$HOME/Library/Application Support/Dona"
-CONTROL_ROOT="$BASE_DIR/update-control"
+TARGET_ROOT=${2:-}
+if [[ -n "$TARGET_ROOT" ]]; then
+  if [[ ( "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ) || $# -ne 2 || "$TARGET_ROOT" != /* || "$TARGET_ROOT" == */ || ! -d "$TARGET_ROOT" || -L "$TARGET_ROOT" ]]; then
+    print -u2 -- "--upgrade-controlまたは--stage-recoveryの既存absolute target rootだけを指定できます。"
+    exit 2
+  fi
+  BASE_DIR="$TARGET_ROOT"
+  CONTROL_ROOT="$BASE_DIR/control"
+else
+  if [[ $# -gt 1 ]]; then print -u2 -- "modeとtarget rootの組み合わせが不正です。"; exit 2; fi
+  BASE_DIR="$HOME/Library/Application Support/Dona"
+  CONTROL_ROOT="$BASE_DIR/update-control"
+fi
+if [[ -n "$TARGET_ROOT" ]]; then
+  DISPATCHER_SOCKET="$BASE_DIR/run/d.sock"
+else
+  DISPATCHER_SOCKET="$BASE_DIR/run/dispatcher.sock"
+fi
 RUNTIME_ROOT="$BASE_DIR/runtime"
 RELEASE_ROOT="$RUNTIME_ROOT/releases"
 CONFIG_ROOT="$BASE_DIR/config"
@@ -62,7 +78,7 @@ bootstrap_dispatcher_reconciled() {
     exit_code=$?
   fi
   if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
-    "$BASE_DIR/run/dispatcher.sock" "$expected_sha" 30000; then
+    "$DISPATCHER_SOCKET" "$expected_sha" 30000; then
     print -u2 -- "${context}ではlaunchctlがexit ${exit_code}を返しましたが、exact SHAの起動済み状態を確認しました。"
     return 0
   fi
@@ -115,7 +131,7 @@ restore_control_plane() {
     local dispatcher_bootout_exit=0
     if [[ "$DISPATCHER_PLIST_SWAPPED" != "1" ]] && [[ -n "${ACTIVE_DISPATCHER_SHA:-}" ]] && \
       $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
-        "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 2000; then
+        "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" 2000; then
       DISPATCHER_RESTORE_REQUIRED=0
       return 0
     fi
@@ -136,7 +152,7 @@ restore_control_plane() {
     fi
     if [[ -z "${ACTIVE_DISPATCHER_SHA:-}" ]] || \
       ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha \
-        "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 30000; then
+        "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" 30000; then
       print -u2 "旧Dispatcherの復旧healthを確認できません。backup: $CONTROL_BACKUP_ROOT"
       return 1
     fi
@@ -146,9 +162,10 @@ restore_control_plane() {
   return 0
 }
 
-if [[ "$MODE" != "--check" && "$MODE" != "--install" && "$MODE" != "--bootstrap" && "$MODE" != "--upgrade-control" ]]; then
-  print -u2 "Usage: $0 --check | --install | --bootstrap | --upgrade-control"
+if [[ "$MODE" != "--check" && "$MODE" != "--install" && "$MODE" != "--bootstrap" && "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]]; then
+  print -u2 "Usage: $0 --check | --install | --bootstrap | --upgrade-control [existing-absolute-target-root] | --stage-recovery [existing-absolute-target-root]"
   print -u2 -- "--checkはtemplateのみ検証し、--installは初期配置、--bootstrapは初回起動、--upgrade-controlは停止確認付きでstable control-planeを更新します。"
+  print -u2 -- "--stage-recoveryはCI検証済みreleaseだけを配置し、service、pointer、DB、Updaterは変更しません。"
   exit 2
 fi
 
@@ -172,7 +189,10 @@ cleanup_temp() {
 }
 trap cleanup_temp EXIT
 
-$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA"
+$NODE_PATH "$SCRIPT_DIR/render-self-update-templates.mjs" "$INSTALL_TMP/rendered" "$INSTALL_SHA" "$BASE_DIR" "${TARGET_ROOT:+generation}"
+if [[ -n "$TARGET_ROOT" ]]; then
+  EXPECTED_OLD_UPDATER_SHA=$(/usr/bin/python3 "$SCRIPT_DIR/validate-generation-install-target.py" "$BASE_DIR" "$INSTALL_TMP/rendered" "$LAUNCH_AGENTS_DIR" "$MODE")
+fi
 /usr/bin/plutil -lint "$INSTALL_TMP/rendered/dev.dona.updater.plist" \
   "$INSTALL_TMP/rendered/dev.dona.dispatcher.plist" \
   "$INSTALL_TMP/rendered/dev.dona.slack-adapter.plist"
@@ -191,7 +211,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
     fi
   done
   if ! /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
-    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$BASE_DIR/run/dispatcher.sock"
+    $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-socket-unused "$DISPATCHER_SOCKET"
   fi
   if ! /bin/launchctl print "$DOMAIN/dev.dona.updater" >/dev/null 2>&1; then
     /bin/launchctl bootstrap "$DOMAIN" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
@@ -209,7 +229,7 @@ if [[ "$MODE" == "--bootstrap" ]]; then
 fi
 
 if [[ "$(uname -s)" != "Darwin" || "$UID" == "0" ]]; then
-  print -u2 -- "--installと--upgrade-controlは非rootのmacOS GUI userだけで実行できます。"
+  print -u2 -- "--install、--upgrade-control、--stage-recoveryは非rootのmacOS GUI userだけで実行できます。"
   exit 1
 fi
 if ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-remote \
@@ -233,11 +253,13 @@ fi
 $GH_PATH api --method GET "repos/hiragram/dona/commits/$INSTALL_SHA/check-runs" -f per_page=100 > "$INSTALL_TMP/check-runs.json"
 $NODE_PATH -e '
 const runs = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).check_runs ?? [];
-for (const name of ["Verify dispatcher", "Verify sources/slack", "Verify updater"]) {
-  if (!runs.some((run) => run.name === name && run.status === "completed" && run.conclusion === "success" && run.app?.slug === "github-actions")) {
+for (const name of ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"]) {
+  const candidates = runs.filter((run) => run.name === name && run.head_sha === process.argv[2] && run.app?.slug === "github-actions");
+  const latest = candidates.sort((a, b) => b.id - a.id)[0];
+  if (!latest || latest.status !== "completed" || latest.conclusion !== "success") {
     throw new Error(`Required trusted check is not successful: ${name}`);
   }
-}' "$INSTALL_TMP/check-runs.json"
+}' "$INSTALL_TMP/check-runs.json" "$INSTALL_SHA"
 if [[ "$MODE" == "--install" && -e "$CONTROL_ROOT/updater" ]]; then
   print -u2 "stable updaterは既にinstall済みです。updater自身の上書き更新は実施しません。"
   exit 1
@@ -247,8 +269,14 @@ if [[ "$MODE" == "--upgrade-control" && ! -d "$CONTROL_ROOT/updater" ]]; then
   exit 1
 fi
 umask 077
-mkdir -p "$CONTROL_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT" "$LAUNCH_AGENTS_DIR"
-chmod 700 "$BASE_DIR" "$CONTROL_ROOT" "$RUNTIME_ROOT" "$RELEASE_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT"
+if [[ "$MODE" == "--stage-recovery" ]]; then
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || { print -u2 "既存release rootを確認できません。"; exit 1; }
+  mkdir -p "$RELEASE_ROOT/.staging"
+  chmod 700 "$RELEASE_ROOT/.staging"
+else
+  mkdir -p "$CONTROL_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT" "$LAUNCH_AGENTS_DIR"
+  chmod 700 "$BASE_DIR" "$CONTROL_ROOT" "$RUNTIME_ROOT" "$RELEASE_ROOT" "$RELEASE_ROOT/.staging" "$CONFIG_ROOT" "$LOG_ROOT"
+fi
 STAGING_DIR=$(mktemp -d "$RELEASE_ROOT/.staging/install.XXXXXX")
 $GIT_PATH -C "$REPOSITORY_DIR" archive --format=tar --output="$INSTALL_TMP/release.tar" "$INSTALL_SHA"
 /usr/bin/tar -xf "$INSTALL_TMP/release.tar" -C "$STAGING_DIR"
@@ -279,7 +307,7 @@ NPM_VERSION=$($NPM_PATH --version)
 $NODE_PATH "$SCRIPT_DIR/write-release-manifest.mjs" "$STAGING_DIR" "$INSTALL_SHA" "$NPM_VERSION" "2026-09-03.2"
 FINAL_RELEASE="$RELEASE_ROOT/$INSTALL_SHA"
 if [[ -e "$FINAL_RELEASE" ]]; then
-  if [[ "$MODE" != "--upgrade-control" ]] || \
+  if [[ "$MODE" != "--upgrade-control" && "$MODE" != "--stage-recovery" ]] || \
     ! $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" validate-existing-release \
       "$FINAL_RELEASE" "$STAGING_DIR" "$INSTALL_SHA"; then
     print -u2 "release $INSTALL_SHA は既に存在し、今回のmodeでは再利用できません。上書きしません。"
@@ -291,9 +319,13 @@ if [[ -e "$FINAL_RELEASE" ]]; then
 else
   /bin/mv "$STAGING_DIR" "$FINAL_RELEASE"
   STAGING_DIR=
+fi
+find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
+find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
 
-  find "$FINAL_RELEASE" -type f -exec chmod 400 {} +
-  find "$FINAL_RELEASE" -type d -exec chmod 500 {} +
+if [[ "$MODE" == "--stage-recovery" ]]; then
+  print "検証済みimmutable release $INSTALL_SHA を配置しました。service、pointer、DB、Updaterは変更していません。"
+  exit 0
 fi
 
 if [[ "$MODE" == "--upgrade-control" ]]; then
@@ -303,6 +335,10 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     exit 1
   fi
   OLD_UPDATER_SHA=$($NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" assert-control-upgrade-safe "$UPDATER_SOCKET")
+  if [[ -n "$TARGET_ROOT" && "$OLD_UPDATER_SHA" != "$EXPECTED_OLD_UPDATER_SHA" ]]; then
+    print -u2 "稼働中Updaterと保存済みplistのSHAが一致しないため、停止しません。"
+    exit 1
+  fi
   if [[ ! -f "$CONTROL_ROOT/updater.sqlite3" ]]; then
     print -u2 "updater databaseを確認できないため、stable updaterを停止しません。"
     exit 1
@@ -369,7 +405,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
     exit 1
   fi
   DISPATCHER_RESTORE_REQUIRED=1
-  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$BASE_DIR/run/dispatcher.sock" "$INSTALL_SHA"
+  $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" quiesce-dispatcher "$DISPATCHER_SOCKET" "$INSTALL_SHA"
   if ! /bin/launchctl bootout "$DOMAIN/dev.dona.dispatcher"; then
     if /bin/launchctl print "$DOMAIN/dev.dona.dispatcher" >/dev/null 2>&1; then
       print -u2 "Dispatcherの停止受理を確認できないため、plistを更新しません。"
@@ -391,7 +427,7 @@ if [[ "$MODE" == "--upgrade-control" ]]; then
   /bin/mv "$BACKUP_ROOT/policy.next.json" "$CONTROL_ROOT/policy.json"
   /bin/mv "$BACKUP_ROOT/dev.dona.updater.next.plist" "$LAUNCH_AGENTS_DIR/dev.dona.updater.plist"
 
-  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$BASE_DIR/run/dispatcher.sock" "$ACTIVE_DISPATCHER_SHA" 30000 && \
+  if $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-dispatcher-sha "$DISPATCHER_SOCKET" "$ACTIVE_DISPATCHER_SHA" 30000 && \
     bootstrap_updater_reconciled "新しいstable updaterの登録" "$INSTALL_SHA" && \
     $NODE_PATH "$SCRIPT_DIR/self-update-install-preflight.mjs" wait-updater-sha "$UPDATER_SOCKET" "$INSTALL_SHA" 30000 3; then
     CONTROL_RECEIPT_TMP="$CONTROL_ROOT/.control-plane-receipt.json.$$.$RANDOM.tmp"

@@ -100,6 +100,7 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - status変更に失敗しても、Slack返信自体が安全に実行できるなら処理を続けてよい。ただし失敗をResult Envelopeの`summary`へ記録し、結果が曖昧なstatus変更を自動再試行しない。
 - 返信先の標準は`reply_target`で示されたスレッドとする。
 - 通常のSlackチャンネルスレッドへ`post_message`で返信するときは、固定された`reply_target.channel_id`と`reply_target.thread_ts`に対して`reply_broadcast: true`にし、チャンネルにも表示する。DM、グループDM、`dona_job`や`dona_update`の通知、schedule通知は`reply_broadcast: false`にする。宛先を変更したり、秘密情報や未確認のworker結果を広く開示したりしない。
+- `source: "dona_job"`の結果を`post_message`で通知する場合は、保存済み`reply_target`と現在の通知`event_id`を照合し、tool引数`event_id`へその通知IDを渡す。元の委任event IDを示す`source_event_id`で代用しない。通常jobにはschedule専用の`authorize_job_notification`を呼ばない。
 - 確認・受領だけで十分なら、短い返信または適切なリアクションを選べる。
 - `@channel`、`@here`、多数のユーザーへのメンションは、明示的に求められない限り使わない。
 - 秘密情報、token、private download URL、ローカルの秘密情報をSlackへ投稿しない。

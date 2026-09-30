@@ -21,7 +21,11 @@ const command = (name, fallback) => {
     throw new Error(`Required executable not found: ${name}`);
   }
 };
-const base = path.join(os.homedir(), "Library", "Application Support", "Dona");
+const base = process.argv[4] ?? path.join(os.homedir(), "Library", "Application Support", "Dona");
+const generation = process.argv[5] === "generation";
+if (!path.isAbsolute(base) || path.normalize(base) !== base || (process.argv[5] && !generation)) {
+  throw new Error("Invalid target root");
+}
 const values = {
   NODE: fs.realpathSync(process.execPath),
   NPM: command("npm"),
@@ -29,7 +33,7 @@ const values = {
   GIT: command("git", "/usr/bin/git"),
   HERDR: command("herdr"),
   CODEX: command("codex"),
-  CONTROL_ROOT: path.join(base, "update-control"),
+  CONTROL_ROOT: path.join(base, generation ? "control" : "update-control"),
   RUNTIME_ROOT: path.join(base, "runtime"),
   CONFIG_ROOT: path.join(base, "config"),
   LOG_ROOT: path.join(base, "logs"),
@@ -69,8 +73,8 @@ const policy = {
   release_root: path.join(values.RUNTIME_ROOT, "releases"),
   current_pointer: path.join(values.RUNTIME_ROOT, "current"),
   previous_pointer: path.join(values.RUNTIME_ROOT, "previous"),
-  dispatcher_socket: path.join(base, "run", "dispatcher.sock"),
-  slack_socket: path.join(base, "run", "slack-adapter.sock"),
+  dispatcher_socket: path.join(base, "run", generation ? "d.sock" : "dispatcher.sock"),
+  slack_socket: path.join(base, "run", generation ? "s.sock" : "slack-adapter.sock"),
   dispatcher_internal_token_file: path.join(values.CONTROL_ROOT, "dispatcher.token"),
   main_agent: { session: "dona", name: "dona-main", minimum_herdr_version: "0.8.2" },
   launchd: { dispatcher_label: "dev.dona.dispatcher", slack_label: "dev.dona.slack-adapter" },
@@ -87,7 +91,7 @@ const policy = {
   diagnostic_retention_days: 14,
   disk_floor_bytes: 2147483648,
   retain_successful: 2,
-  required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater"],
+  required_checks: ["Verify dispatcher", "Verify sources/slack", "Verify updater", "Verify self-hosted macOS"],
   require_verified_signature: false,
   compatibility,
   compatibility_transitions: transitionFile.transitions,
