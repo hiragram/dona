@@ -255,6 +255,34 @@ process.exit(1);
     database.close();
   });
 
+  test("start応答にsession IDがなくてもexact agentのread-only照合から保存する", async () => {
+    const { root, config: baseConfig } = await tempConfig(); roots.push(root);
+    const executable=path.join(root,"herdr-session-read.mjs");
+    const marker=path.join(root,"started");
+    const calls=path.join(root,"calls.jsonl");
+    await fs.writeFile(executable,`#!/usr/bin/env node
+import fs from "node:fs";
+const args=process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+"\\n");
+if(args[2]==="agent"&&args[3]==="get") {
+  if(!fs.existsSync(${JSON.stringify(marker)})){console.error(JSON.stringify({error:{code:"agent_not_found"}}));process.exit(1);}
+  console.log(JSON.stringify({result:{agent:{agent_name:args[4],workspace_id:"w1",pane_id:"w1:p1",agent_session:{kind:"id",value:"session-2"},agent_status:"idle",state_change_seq:1}}}));process.exit(0);
+}
+if(args[2]==="workspace"&&args[3]==="create"){console.log(JSON.stringify({result:{workspace_id:"w1",pane_id:"w1:p1"}}));process.exit(0);}
+if(args[2]==="agent"&&args[3]==="start"){fs.writeFileSync(${JSON.stringify(marker)},"1");console.log(JSON.stringify({result:{agent:{agent_status:"idle"}}}));process.exit(0);}
+process.exit(2);
+`,{mode:0o700});
+    const config={...baseConfig,herdrPath:executable};
+    const database=new DispatcherDatabase(config.databasePath);
+    const source=database.enqueue(eventEnvelope("Ev-session-read")).row;
+    const job=database.createJob({source_event_id:source.event_id,objective:"調査",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
+    const prepared=await new HerdrJobAgentRuntime(config).prepare(job);
+    assert.deepEqual(prepared,{herdrWorkspaceId:"w1",herdrPaneId:"w1:p1",herdrAgentSessionId:"session-2"});
+    const argv=(await fs.readFile(calls,"utf8")).trim().split("\n").map(line=>JSON.parse(line) as string[]);
+    assert.deepEqual(argv.filter(args=>args[2]==="agent").map(args=>args[3]).slice(-2),["start","get"]);
+    database.close();
+  });
+
   test("表示ラベルをscratch workspaceだけへ単一argvで渡しagent identityを維持する", async () => {
     const { root, config } = await tempConfig();
     roots.push(root);

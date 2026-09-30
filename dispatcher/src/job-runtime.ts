@@ -401,7 +401,16 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       throw commandError("Herdr agent start failed", started!);
     }
     const herdrWorkspaceId=String(workspaceId),herdrPaneId=String(paneId);
-    const herdrAgentSessionId=agentSessionIdFromIdentity(started.agentIdentity,herdrWorkspaceId,herdrPaneId,row.agent_name);
+    let herdrAgentSessionId=agentSessionIdFromIdentity(started.agentIdentity,herdrWorkspaceId,herdrPaneId,row.agent_name);
+    // Some Herdr start responses acknowledge creation without returning the
+    // session identity. Read the exact agent before dispatching the prompt;
+    // never infer an identity from the workspace or pane alone.
+    if (!herdrAgentSessionId) {
+      // A failed read must not turn an already-started agent into a retryable
+      // preparation failure, which could create a second worker.
+      const observed=await this.get(row.agent_name,signal).catch(()=>undefined);
+      if (observed?.ok) herdrAgentSessionId=agentSessionIdFromIdentity(observed.agentIdentity,herdrWorkspaceId,herdrPaneId,row.agent_name);
+    }
     return { herdrWorkspaceId, herdrPaneId, ...(herdrAgentSessionId?{herdrAgentSessionId}:{}) };
   }
 
