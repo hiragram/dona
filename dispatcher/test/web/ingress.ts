@@ -181,6 +181,8 @@ test("command・read・SSE・approvalは同じcurrent principal filterと追加g
  assert.deepEqual(run(requesterRoles,requesterScopes,"POST","/api/jobs",{},5).result,{status:"denied",reason:"csrf_invalid"});
  const submitted=run(requesterRoles,requesterScopes,"POST","/api/jobs",{csrf_verified:true},6);
  assert.equal(submitted.result.status,"succeeded");assert.equal(submitted.next.sessions[0]!.state.last_activity_at,contexts.now);
+ assert.equal(run(supervisorRoles,supervisorScopes,"GET","/api/approvals?cursor=opaque",{},11).result.status,"succeeded");
+ assert.deepEqual(run(requesterRoles,requesterScopes,"GET","/api/approvals",{},12).result,{status:"denied",reason:"scope_denied"});
  assert.equal(run(supervisorRoles,supervisorScopes,"GET","/api/approvals/request_1",{},7).result.status,"succeeded");
  assert.deepEqual(run(supervisorRoles,supervisorScopes,"POST","/api/approvals/request_1/decision",{csrf_verified:true},8).result,{status:"denied",reason:"step_up_required"});
  assert.equal(run(supervisorRoles,supervisorScopes,"POST","/api/approvals/request_1/decision",{csrf_verified:true,step_up_verified:true},9).result.status,"succeeded");

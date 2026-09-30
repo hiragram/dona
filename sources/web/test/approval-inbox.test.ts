@@ -6,7 +6,7 @@ import { authorizeWebRoute, matchWebRoute } from "../src/routes.js";
 
 const item = {
   request_id: "request_1", operation: "slack.post_thread_reply.v1" as const,
-  requester: "依頼者", risk: "critical" as const,
+  requester: "依頼者", risk: "critical" as const, risk_reason: "明示mentionを含む外部投稿",
   opaque_action_id: "action_1", operation_summary: "限定された操作", exact_target: "対象_1",
   exact_draft: "投稿本文", resolved_mentions: [{target_id: "user_1", display: "担当者"}],
   display_fingerprint: "a".repeat(64),
@@ -25,16 +25,19 @@ const evidence = { principal_id: "principal_1", instance_id: "instance_1", tenan
   persisted_action_hash: "b".repeat(64), presentation_action_hash: "b".repeat(64), request_revision: 1, presentation_revision: 2,
   presentation_ref: item.presentation_ref, display_codec_version: 1, presentation_status: "synchronized_sent",
   audience_principal_id: "principal_1", policy_revision: 5, requester_authorization_revision: 6,
-  challenge_ref: "challenge_1", challenge_state: "unused", challenge_expires_at: "2026-09-30T00:11:00.000Z",
+  challenge_ref: "challenge_1", challenge_state: "unused", challenge_created_at: "2026-09-30T00:09:00.000Z",
+  challenge_expires_at: "2026-09-30T00:11:00.000Z",
   credential_id: "credential_1", credential_revision: 7, credential_state: "active",
-  credential_non_backup: true, user_verified: true,
+  credential_non_backup: true, user_verified: true, credential_stored_sign_count: 4, assertion_sign_count: 5,
+  counter_unsupported_registration_proven: false, credential_counter_cas_succeeded: true,
   target_visible: true, target_shared: false, visibility_revision: 8,
   persisted_resource_snapshot_hash: "c".repeat(64), current_resource_snapshot_hash: "c".repeat(64),
   created_at: item.created_at, expires_at: item.expires_at, state: "pending", consumed: false };
 const scope = { principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1", workspace_id: "workspace_1",
   binding_revision: 2, session_ref: "session_1", session_generation: 3, authz_revision: 4,
   policy_revision: 5, requester_authorization_revision: 6,
-  challenge_ref: "challenge_1", credential_id: "credential_1", credential_revision: 7, visibility_revision: 8 };
+  challenge_ref: "challenge_1", credential_id: "credential_1", credential_revision: 7,
+  credential_stored_sign_count: 4, visibility_revision: 8 };
 const now = "2026-09-30T00:10:00.000Z";
 
 test("approval list route requires bound supervisor read scope", () => {
@@ -91,6 +94,9 @@ test("detail and confirmation disable stale or terminal requests", () => {
   assert.throws(() => approvalInboxView({...item, operation_summary: "操作  A"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, operation_summary: " 操作"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, exact_target: "対象\ud800名"}, now), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, resolved_mentions: Array.from({length: 4}, (_, i) =>
+    ({target_id: `user_${i}`, display: "担当者"}))}, now), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, resolved_mentions: [item.resolved_mentions[0], item.resolved_mentions[0]]}, now), ApprovalInboxUnavailable);
 });
 
 test("preview escapes untrusted summary and never enables a decision", () => {
@@ -105,6 +111,7 @@ test("preview escapes untrusted summary and never enables a decision", () => {
   assert.ok(markup.includes("<pre>投稿本文</pre>"));
   assert.ok(markup.includes("担当者 (user_1)"));
   assert.ok(markup.includes("action_1"));
+  assert.ok(markup.includes("明示mentionを含む外部投稿"));
   const literal = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
     {codec_version: 1, item: {...item, exact_draft: "line1\nline2\\\t\u202E", exact_target: "safe\u00A0unsafe"}}, now);
   assert.ok(literal.includes("line1\\nline2\\\\\\t\\u{202E}"));
@@ -118,6 +125,13 @@ test("preview escapes untrusted summary and never enables a decision", () => {
 
 test("server preflight rejects forged, expired, consumed and cross-scope evidence", () => {
   assert.deepEqual(assertApprovalDecisionCandidate(candidate, evidence, scope, now), candidate);
+  const noCounter = {...evidence, credential_stored_sign_count: 0, assertion_sign_count: 0,
+    counter_unsupported_registration_proven: true};
+  assert.deepEqual(assertApprovalDecisionCandidate(candidate, noCounter,
+    {...scope, credential_stored_sign_count: 0}, now), candidate);
+  assert.throws(() => assertApprovalDecisionCandidate(candidate,
+    {...noCounter, counter_unsupported_registration_proven: false},
+    {...scope, credential_stored_sign_count: 0}, now), ApprovalInboxUnavailable);
   for (const changed of [
     {...candidate, expected_display_fingerprint: "b".repeat(64)}, {...candidate, expected_request_revision: 2},
     {...candidate, expected_presentation_revision: 3}, {...candidate, expected_presentation_ref: "other"},
@@ -132,7 +146,11 @@ test("server preflight rejects forged, expired, consumed and cross-scope evidenc
     {...evidence, session_ref: "other"}, {...evidence, session_generation: 2}, {...evidence, authz_revision: 2},
     {...evidence, policy_revision: 4}, {...evidence, requester_authorization_revision: 5},
     {...evidence, challenge_state: "consumed"}, {...evidence, challenge_expires_at: now},
+    {...evidence, challenge_created_at: "2026-09-30T00:08:59.999Z"},
+    {...evidence, challenge_expires_at: "2026-09-30T00:11:00.001Z"},
     {...evidence, credential_revision: 8}, {...evidence, credential_state: "revoked"},
+    {...evidence, assertion_sign_count: 4}, {...evidence, assertion_sign_count: 0},
+    {...evidence, credential_counter_cas_succeeded: false},
     {...evidence, target_visible: false}, {...evidence, target_shared: true},
     {...evidence, visibility_revision: 9}, {...evidence, current_resource_snapshot_hash: "d".repeat(64)},
     {...evidence, expires_at: "2026-09-30T00:15:00.001Z"},

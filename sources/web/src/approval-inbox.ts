@@ -32,9 +32,10 @@ export function encodeApprovalDisplay(value: unknown): string {
 
 /** Display data from a verified approval repository, never the action payload. */
 export const approvalInboxItemSchema = z.strictObject({
-  request_id: id, operation, requester: safeText, risk: z.enum(["elevated", "critical"]),
+  request_id: id, operation, requester: safeText, risk: z.enum(["elevated", "critical"]), risk_reason: safeText,
   opaque_action_id: id, operation_summary: safeText, exact_target: literalText,
-  exact_draft: literalText, resolved_mentions: z.array(z.strictObject({target_id: id, display: literalText})).max(32),
+  exact_draft: literalText, resolved_mentions: z.array(z.strictObject({target_id: id, display: literalText})).max(3)
+    .refine(mentions => new Set(mentions.map(mention => mention.target_id)).size === mentions.length),
   display_fingerprint: hash, created_at: utc, expires_at: utc,
   request_revision: revision, presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
   state: z.enum(["pending", "approved", "rejected", "expired", "needs_review"]),
@@ -61,9 +62,12 @@ export const approvalAuthorityEvidenceSchema = z.strictObject({
   persisted_action_hash: hash, presentation_action_hash: hash, request_revision: revision,
   presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
   presentation_status: z.literal("synchronized_sent"), audience_principal_id: id,
-  challenge_ref: id, challenge_state: z.literal("unused"), challenge_expires_at: utc,
+  challenge_ref: id, challenge_state: z.literal("unused"), challenge_created_at: utc, challenge_expires_at: utc,
   credential_id: id, credential_revision: revision, credential_state: z.literal("active"),
   credential_non_backup: z.literal(true), user_verified: z.literal(true),
+  credential_stored_sign_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  assertion_sign_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  counter_unsupported_registration_proven: z.boolean(), credential_counter_cas_succeeded: z.literal(true),
   target_visible: z.literal(true), target_shared: z.literal(false), visibility_revision: revision,
   persisted_resource_snapshot_hash: hash, current_resource_snapshot_hash: hash,
   policy_revision: revision, requester_authorization_revision: revision,
@@ -83,14 +87,16 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
   expectedScope: { principal_id: string; instance_id: string; tenant_id: string; workspace_id: string; binding_revision: number;
     session_ref: string; session_generation: number; authz_revision: number; policy_revision: number;
     requester_authorization_revision: number; challenge_ref: string; credential_id: string;
-    credential_revision: number; visibility_revision: number }, now: string): ApprovalDecisionCandidate {
+    credential_revision: number; credential_stored_sign_count: number; visibility_revision: number }, now: string): ApprovalDecisionCandidate {
   try {
     const candidate = approvalDecisionCandidateSchema.parse(candidateInput);
     const evidence = approvalAuthorityEvidenceSchema.parse(evidenceInput);
     const scope = z.strictObject({ principal_id: id, instance_id: id, tenant_id: id, workspace_id: id,
       binding_revision: revision, session_ref: id, session_generation: revision, authz_revision: revision,
       policy_revision: revision, requester_authorization_revision: revision, challenge_ref: id,
-      credential_id: id, credential_revision: revision, visibility_revision: revision }).parse(expectedScope);
+      credential_id: id, credential_revision: revision,
+      credential_stored_sign_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      visibility_revision: revision }).parse(expectedScope);
     const at = utc.parse(now);
     const requested = Buffer.from(candidate.expected_display_fingerprint, "hex");
     const current = Buffer.from(evidence.display_fingerprint, "hex");
@@ -104,6 +110,10 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || evidence.requester_authorization_revision !== scope.requester_authorization_revision
       || evidence.challenge_ref !== scope.challenge_ref || evidence.credential_id !== scope.credential_id
       || evidence.credential_revision !== scope.credential_revision
+      || evidence.credential_stored_sign_count !== scope.credential_stored_sign_count
+      || ((evidence.credential_stored_sign_count !== 0 || evidence.assertion_sign_count !== 0)
+        ? evidence.assertion_sign_count <= evidence.credential_stored_sign_count
+        : !evidence.counter_unsupported_registration_proven)
       || evidence.visibility_revision !== scope.visibility_revision
       || evidence.audience_principal_id !== scope.principal_id
       || candidate.request_id !== evidence.request_id || candidate.operation !== evidence.operation
@@ -119,6 +129,10 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || Date.parse(evidence.expires_at) - Date.parse(evidence.created_at) > 15 * 60_000
       || Date.parse(at) >= Date.parse(evidence.expires_at)
       || Date.parse(evidence.challenge_expires_at) > Date.parse(evidence.expires_at)
+      || Date.parse(evidence.challenge_created_at) < Date.parse(evidence.created_at)
+      || Date.parse(evidence.challenge_created_at) > Date.parse(at)
+      || Date.parse(evidence.challenge_created_at) >= Date.parse(evidence.challenge_expires_at)
+      || Date.parse(evidence.challenge_expires_at) - Date.parse(evidence.challenge_created_at) > 2 * 60_000
       || Date.parse(at) >= Date.parse(evidence.challenge_expires_at)) throw Error();
     return candidate;
   } catch { throw new ApprovalInboxUnavailable(); }
@@ -157,7 +171,7 @@ export function approvalInboxView(itemInput: unknown, now: string) {
     return Object.freeze({
       title: item.operation_summary, exactTarget: item.exact_target, exactDraft: item.exact_draft,
       resolvedMentions: item.resolved_mentions, opaqueActionId: item.opaque_action_id,
-      requester: item.requester, risk: item.risk,
+      requester: item.requester, risk: item.risk, riskReason: item.risk_reason,
       displayFingerprint: item.display_fingerprint, createdAt: item.created_at, expiresAt: item.expires_at,
       status: canConfirm ? "確認可能" : "再確認が必要", canConfirm,
       candidate: canConfirm ? Object.freeze({codec_version: 1 as const, display_codec_version: item.display_codec_version,
@@ -190,6 +204,7 @@ export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: 
         + `<dt>解決済みmention</dt><dd><ul>${view.resolvedMentions.map(mention =>
           `<li>${html(encodeApprovalDisplay(mention.display))} (${html(mention.target_id)})</li>`).join("")}</ul></dd>`
         + `<dt>依頼者</dt><dd>${html(view.requester)}</dd><dt>リスク</dt><dd>${html(view.risk)}</dd>`
+        + `<dt>リスク理由</dt><dd>${html(view.riskReason)}</dd>`
         + `<dt>表示用指紋</dt><dd>${html(view.displayFingerprint)}</dd><dt>作成</dt><dd>${html(view.createdAt)}</dd>`
         + `<dt>期限</dt><dd>${html(view.expiresAt)}</dd></dl><p>\\n・\\t・\\u{...} は投稿内容の制御文字を表します。決定操作は準備中です。</p>`
         + `<button type="button" disabled>承認</button><button type="button" disabled>却下</button></section>`;
