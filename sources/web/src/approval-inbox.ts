@@ -14,7 +14,9 @@ const safeText = z.string().min(1).max(240).refine(value =>
 const literalText = z.string().min(1).max(4096).refine(value =>
   new TextDecoder("utf-8", {fatal: true}).decode(new TextEncoder().encode(value)) === value);
 const ambiguousDisplay = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Zs}]/u;
-const fingerprintProjectionSchema = z.strictObject({opaque_action_id: id, operation, exact_target: literalText,
+const exactTargetSchema = z.strictObject({workspace_id: id, channel_id: id,
+  thread_ts: z.string().regex(/^\d{10}\.\d{6}$/), display_name: literalText});
+const fingerprintProjectionSchema = z.strictObject({opaque_action_id: id, operation, exact_target: exactTargetSchema,
   risk: z.enum(["elevated", "critical"]), expires_at: utc, presentation_revision: revision});
 /** Canonical non-secret plan projection, with fixed field order and UTF-8 bytes. */
 export function computeApprovalDisplayFingerprint(input: unknown): string {
@@ -39,22 +41,28 @@ export function encodeApprovalDisplay(value: unknown): string {
   } catch { throw new ApprovalInboxUnavailable(); }
 }
 
+const state = z.enum(["pending", "approved", "rejected", "expired", "needs_review"]);
+const temporal = (item: {created_at: string; expires_at: string}) =>
+  Date.parse(item.created_at) < Date.parse(item.expires_at)
+  && Date.parse(item.expires_at) - Date.parse(item.created_at) <= 15 * 60_000;
+/** Minimal list data; private target and draft require a separate current detail read. */
+export const approvalInboxListItemSchema = z.strictObject({request_id: id, operation, requester: safeText,
+  operation_summary: safeText, risk: z.enum(["elevated", "critical"]), created_at: utc, expires_at: utc, state}).refine(temporal);
 /** Display data from a verified approval repository, never the action payload. */
 export const approvalInboxItemSchema = z.strictObject({
   request_id: id, operation, requester: safeText, risk: z.enum(["elevated", "critical"]), risk_reason: safeText,
-  opaque_action_id: id, operation_summary: safeText, exact_target: literalText,
+  opaque_action_id: id, operation_summary: safeText, exact_target: exactTargetSchema,
   exact_draft: literalText, resolved_mentions: z.array(z.strictObject({target_id: id, display: literalText})).max(3)
     .refine(mentions => new Set(mentions.map(mention => mention.target_id)).size === mentions.length),
   display_fingerprint: hash, created_at: utc, expires_at: utc,
   request_revision: revision, presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
-  state: z.enum(["pending", "approved", "rejected", "expired", "needs_review"]),
-}).refine(item => Date.parse(item.created_at) < Date.parse(item.expires_at)
-  && Date.parse(item.expires_at) - Date.parse(item.created_at) <= 15 * 60_000
+  state,
+}).refine(item => temporal(item)
   && item.display_fingerprint === computeApprovalDisplayFingerprint({opaque_action_id: item.opaque_action_id,
     operation: item.operation, exact_target: item.exact_target, risk: item.risk,
     expires_at: item.expires_at, presentation_revision: item.presentation_revision}));
 export type ApprovalInboxItem = z.infer<typeof approvalInboxItemSchema>;
-export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1), items: z.array(approvalInboxItemSchema).max(50), next_cursor: cursor.nullable() })
+export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1), items: z.array(approvalInboxListItemSchema).max(50), next_cursor: cursor.nullable() })
   .refine(value => new Set(value.items.map(item => item.request_id)).size === value.items.length);
 export const approvalInboxDetailSchema = z.strictObject({ codec_version: z.literal(1), item: approvalInboxItemSchema });
 
@@ -75,6 +83,11 @@ export const approvalAuthorityEvidenceSchema = z.strictObject({
   presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
   presentation_status: z.literal("synchronized_sent"), audience_principal_id: id,
   challenge_ref: id, challenge_state: z.literal("unused"), challenge_created_at: utc, challenge_expires_at: utc,
+  challenge_request_id: id, challenge_decision: z.enum(["approve", "reject"]),
+  challenge_action_hash: hash, challenge_display_fingerprint: hash, challenge_presentation_revision: revision,
+  challenge_principal_id: id, challenge_session_ref: id, challenge_instance_id: id, challenge_tenant_id: id,
+  challenge_workspace_id: id, challenge_binding_revision: revision, challenge_credential_id: id,
+  challenge_policy_revision: revision,
   credential_id: id, credential_revision: revision, credential_state: z.literal("active"),
   credential_non_backup: z.literal(true), user_verified: z.literal(true),
   credential_stored_sign_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -136,6 +149,16 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || candidate.expected_presentation_ref !== evidence.presentation_ref
       || candidate.expected_presentation_revision !== evidence.presentation_revision
       || candidate.expected_challenge_ref !== evidence.challenge_ref
+      || evidence.challenge_request_id !== evidence.request_id || evidence.challenge_decision !== evidence.decision
+      || evidence.challenge_action_hash !== evidence.persisted_action_hash
+      || evidence.challenge_display_fingerprint !== evidence.display_fingerprint
+      || evidence.challenge_presentation_revision !== evidence.presentation_revision
+      || evidence.challenge_principal_id !== evidence.principal_id || evidence.challenge_session_ref !== evidence.session_ref
+      || evidence.challenge_instance_id !== evidence.instance_id || evidence.challenge_tenant_id !== evidence.tenant_id
+      || evidence.challenge_workspace_id !== evidence.workspace_id
+      || evidence.challenge_binding_revision !== evidence.binding_revision
+      || evidence.challenge_credential_id !== evidence.credential_id
+      || evidence.challenge_policy_revision !== evidence.policy_revision
       || !timingSafeEqual(requested, current) || !timingSafeEqual(action, presented)
       || !timingSafeEqual(Buffer.from(evidence.persisted_resource_snapshot_hash, "hex"),
         Buffer.from(evidence.current_resource_snapshot_hash, "hex"))
@@ -203,14 +226,18 @@ export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: 
     const items = page.items;
     const selected = selectedDetailInput === null ? null : approvalInboxDetailSchema.parse(selectedDetailInput).item;
     const rows = items.map(item => {
-      const view = approvalInboxView(item, now);
-      return `<li><span>${html(view.title)}</span><span>${html(view.requester)}</span><span>${html(view.status)}</span></li>`;
+      const at = utc.parse(now);
+      const status = item.state === "pending" && Date.parse(at) < Date.parse(item.expires_at) ? "確認準備中" : "再確認が必要";
+      return `<li><span>${html(item.operation_summary)}</span><span>${html(item.requester)}</span><span>${html(status)}</span></li>`;
     }).join("");
     const detail = selected === null ? "" : (() => {
       const view = approvalInboxView(selected, now);
       return `<section aria-labelledby="approval-detail-title"><h2 id="approval-detail-title">承認内容の確認</h2>`
         + `<dl><dt>操作種別</dt><dd>${html(view.operationKind)}</dd><dt>概要</dt><dd>${html(view.title)}</dd>`
-        + `<dt>対象</dt><dd><pre>${html(encodeApprovalDisplay(view.exactTarget))}</pre></dd>`
+        + `<dt>対象workspace ID</dt><dd>${html(view.exactTarget.workspace_id)}</dd>`
+        + `<dt>対象channel ID</dt><dd>${html(view.exactTarget.channel_id)}</dd>`
+        + `<dt>対象thread timestamp</dt><dd>${html(view.exactTarget.thread_ts)}</dd>`
+        + `<dt>対象表示名</dt><dd><pre>${html(encodeApprovalDisplay(view.exactTarget.display_name))}</pre></dd>`
         + `<dt>Action ID</dt><dd>${html(view.opaqueActionId)}</dd><dt>投稿本文</dt><dd><pre>${html(encodeApprovalDisplay(view.exactDraft))}</pre></dd>`
         + `<dt>解決済みmention</dt><dd><ul>${view.resolvedMentions.map(mention =>
           `<li><pre>${html(encodeApprovalDisplay(mention.display))}</pre> (${html(mention.target_id)})</li>`).join("")}</ul></dd>`
