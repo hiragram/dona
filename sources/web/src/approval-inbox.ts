@@ -89,11 +89,11 @@ const detailKeySchema = z.strictObject({purpose: z.literal("web_approval_detail"
   secret: z.instanceof(Uint8Array).refine(value => value.byteLength === 32)});
 export type ApprovalDetailKey = z.infer<typeof detailKeySchema>;
 /** Server-only MAC of the literal presentation. Never place it in a browser response. */
-export function computeApprovalPrivateContentMac(item: ApprovalInboxItem, key: ApprovalDetailKey): string {
+function privateContentMac(item: ApprovalInboxItem, key: ApprovalDetailKey, signedAt: string): string {
   const material = detailKeySchema.parse(key);
   const content = approvalInboxItemSchema.parse(item);
   return createHmac("sha256", material.secret).update("dona.web.approval.detail.v1\0")
-    .update(JSON.stringify([material.version, item.instance_id, item.exact_target.workspace_id])).update("\0")
+    .update(JSON.stringify([material.version, utc.parse(signedAt), item.instance_id, item.exact_target.workspace_id])).update("\0")
     .update(JSON.stringify(content), "utf8").digest("hex");
 }
 
@@ -257,9 +257,7 @@ export class ApprovalInboxAdapter {
     try {
       const detail = authorityDetailSchema.parse(await this.authority.detail(id.parse(requestId)));
       assertDetailScope(detail.item, readScopeSchema.parse(currentScope));
-      const now = utc.parse(await this.authority.protectedNow());
-      if (detail.item.state !== "pending" || Date.parse(detail.item.created_at) > Date.parse(now)
-        || Date.parse(now) >= Date.parse(detail.item.expires_at)) throw Error();
+      if (detail.item.state !== "pending") throw Error();
       if (detail.item.request_id !== requestId) throw Error();
       const key = detailKeySchema.parse(await this.authority.detailContentKey(detail.binding.content_key_version));
       const signed = Date.parse(detail.binding.content_signed_at);
@@ -267,7 +265,7 @@ export class ApprovalInboxAdapter {
         || key.state === "revoked" || signed < Date.parse(key.activated_at)
         || signed >= Date.parse(key.signing_expires_at)
         || Date.parse(key.signing_expires_at) - Date.parse(key.activated_at) > 90 * 86400_000) throw Error();
-      const content = computeApprovalPrivateContentMac(detail.item, key);
+      const content = privateContentMac(detail.item, key, detail.binding.content_signed_at);
       if (detail.binding.request_id !== detail.item.request_id
         || detail.binding.presentation_ref !== detail.item.presentation_ref
         || detail.binding.presentation_revision !== detail.item.presentation_revision
@@ -282,6 +280,10 @@ export class ApprovalInboxAdapter {
         || detail.binding.persisted_action_hash !== detail.binding.presentation_action_hash
         || !timingSafeEqual(Buffer.from(detail.binding.persisted_content_mac, "hex"), Buffer.from(content, "hex"))
         || !timingSafeEqual(Buffer.from(detail.binding.presentation_content_mac, "hex"), Buffer.from(content, "hex"))) throw Error();
+      const now = utc.parse(await this.authority.protectedNow());
+      if (Date.parse(detail.item.created_at) > Date.parse(now)
+        || Date.parse(now) >= Date.parse(detail.item.expires_at)
+        || Date.parse(detail.binding.content_signed_at) > Date.parse(now)) throw Error();
       Object.freeze(detail.item.exact_target);
       detail.item.resolved_mentions.forEach(Object.freeze);
       Object.freeze(detail.item.resolved_mentions);

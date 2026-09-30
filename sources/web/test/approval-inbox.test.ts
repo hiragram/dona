@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import {createHmac} from "node:crypto";
 import test from "node:test";
 import { ApprovalInboxAdapter, ApprovalInboxUnavailable, approvalInboxView, encodeApprovalDisplay,
-  assertApprovalDecisionCandidate, computeApprovalDisplayFingerprint, computeApprovalPrivateContentMac,
+  assertApprovalDecisionCandidate, computeApprovalDisplayFingerprint,
   renderApprovalInboxPreview, approvalInboxItemSchema } from "../src/approval-inbox.js";
 import { authorizeWebRoute, matchWebRoute } from "../src/routes.js";
 
@@ -77,7 +78,9 @@ const detailKey = {purpose: "web_approval_detail" as const, version: 1, state: "
   secret: Buffer.alloc(32, 7)};
 const detailBinding = (row: unknown = item) => {
   const parsed = approvalInboxItemSchema.parse(row);
-  const mac = computeApprovalPrivateContentMac(parsed, detailKey);
+  const mac = createHmac("sha256", detailKey.secret).update("dona.web.approval.detail.v1\0")
+    .update(JSON.stringify([detailKey.version, parsed.created_at, parsed.instance_id, parsed.exact_target.workspace_id]))
+    .update("\0").update(JSON.stringify(parsed), "utf8").digest("hex");
   return {request_id: parsed.request_id, presentation_ref: parsed.presentation_ref,
     audience_principal_id: parsed.audience_principal_id,
     supervisor_binding_id: parsed.supervisor_binding_id, binding_revision: parsed.binding_revision,
@@ -153,6 +156,12 @@ test("detail and confirmation disable stale or terminal requests", async () => {
     detail: async () => ({codec_version: 1, item, binding: detailBinding()}),
     detailContentKey: async () => detailKey, protectedNow: async () => item.expires_at});
   await assert.rejects(expiredAuthority.detail(item.request_id, readScope), ApprovalInboxUnavailable);
+  let keyLoaded = false;
+  const crossedExpiry = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [], next_cursor: null}),
+    detail: async () => ({codec_version: 1, item, binding: detailBinding()}),
+    detailContentKey: async () => { keyLoaded = true; return detailKey; },
+    protectedNow: async () => { assert.equal(keyLoaded, true); return item.expires_at; }});
+  await assert.rejects(crossedExpiry.detail(item.request_id, readScope), ApprovalInboxUnavailable);
   await assert.rejects(verifiedDetail(withFingerprint({...item, created_at: "2026-09-30T00:11:00.000Z"})), ApprovalInboxUnavailable);
   await assert.rejects(verifiedDetail({...item, state: "approved"}), ApprovalInboxUnavailable);
   assert.equal(approvalInboxView(await verifiedDetail(withFingerprint({...item, exact_target: {...item.exact_target, display_name: "safe\u202Eunsafe"}})), now, readScope).exactTarget.display_name, "safe\u202Eunsafe");
@@ -187,6 +196,11 @@ test("detail and confirmation disable stale or terminal requests", async () => {
       detail: async () => ({codec_version: 1, item, binding: detailBinding()}), detailContentKey: async () => key, protectedNow: async () => now});
     await assert.rejects(adapter.detail(item.request_id, readScope), ApprovalInboxUnavailable);
   }
+  const verifyOnly = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [], next_cursor: null}),
+    detail: async () => ({codec_version: 1, item, binding: detailBinding()}),
+    detailContentKey: async () => ({...detailKey, state: "verification_only"}), protectedNow: async () => now});
+  assert.equal((await verifyOnly.detail(item.request_id, readScope)).item.request_id, item.request_id);
+  await assert.rejects(verifiedDetail(item, {...detailBinding(), content_signed_at: "2026-09-30T00:00:00.001Z"}), ApprovalInboxUnavailable);
 });
 
 test("preview escapes untrusted summary and never enables a decision", async () => {
