@@ -4,7 +4,7 @@
 
 Dispatcher は専用公開 request の検証、capability、永続 receipt、read-only reconcile を実装している。通常の worker 起動、prompt、Supervisor の Result 取り込みは旧 `result_path` 方式を使う。接続済み FD の worker 配送と新規 job の version gate は未配線であり、現時点で専用公開を本番有効化しない。
 
-`GET /metrics/job-result-publish` は Dispatcher の既存 Unix socket に対する読み取り専用集計である。`jobs` は終端時に receipt が存在しない（旧方式または retention 後で識別不能）件数、receipt が現存する終端件数、実行中、`needs_review` の現在値を示す。`receipts` は現存する `reserved` / `committed` / `needs_review` の件数、`current_failures` は現在 `needs_review` である `invalid_result` / `result_missing` / `published_result_reconciliation_required` の件数を示す。job ID、本文、capability、path、URL、任意のエラー文は返さない。いずれも現在値であり、retention や operator 解決により減少する。typed rejection の履歴、旧方式と retention 後の専用公開の識別、成功率は表さない。operator は個別の認可済み job 照会と durable な監査記録を併用する。
+`GET /metrics/job-result-publish` は Dispatcher の既存 Unix socket に対する読み取り専用集計である。`jobs` は終端時に receipt が存在しない（旧方式または retention 後で識別不能）件数、receipt が現存する終端件数、公開可能な `dispatching`、`running`、`needs_review` の現在値を示す。`receipts` は現存する `reserved` / `committed` / `needs_review` の件数、`current_failures` は現在 `needs_review` である `invalid_result` / `result_missing` / `published_result_reconciliation_required` の件数を示す。job ID、本文、capability、path、URL、任意のエラー文は返さない。いずれも現在値であり、retention や operator 解決により減少する。typed rejection の履歴、旧方式と retention 後の専用公開の識別、成功率は表さない。operator は個別の認可済み job 照会と durable な監査記録を併用する。
 
 ## 切替前に確認すること
 

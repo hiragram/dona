@@ -88,6 +88,12 @@ describe("DispatcherApi", () => {
     const job = database.createJob({ source_event_id: event.event_id, objective: "PRIVATE_OBJECTIVE", workspace: { kind: "scratch" } },
       config.jobsWorkspaceRoot, config.jobResultsDir).row;
     database.markJobNeedsReview(job.job_id, "invalid_result", "PRIVATE_ERROR");
+    const dispatchEvent = database.enqueue(eventEnvelope("Ev-publish-dispatching")).row;
+    const dispatchJob = database.createJob({ source_event_id: dispatchEvent.event_id, objective: "PRIVATE_DISPATCH", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    database.beginJobPreparation(dispatchJob.job_id);
+    database.setJobRuntime(dispatchJob.job_id, "private-workspace", "private-pane", "private-session");
+    database.beginJobDispatch(dispatchJob.job_id);
     const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
     await api.start();
     try {
@@ -95,7 +101,7 @@ describe("DispatcherApi", () => {
       assert.equal(result.status, 200);
       assert.deepEqual(result.body, {
         schema_version: 1,
-        jobs: { terminal_receipt_absent_or_purged: 0, published_terminal: 0, running: 0, needs_review: 1 },
+        jobs: { terminal_receipt_absent_or_purged: 0, published_terminal: 0, dispatching: 1, running: 0, needs_review: 1 },
         receipts: { reserved: 0, committed: 0, needs_review: 0 },
         current_failures: { invalid_result: 1, result_missing: 0, published_result_reconciliation_required: 0 },
       });
