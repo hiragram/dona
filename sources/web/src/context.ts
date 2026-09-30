@@ -13,8 +13,10 @@ export const contextIdentitySchema = z.strictObject({
 });
 export type ContextIdentity = z.infer<typeof contextIdentitySchema>;
 const requestSchema = z.strictObject({ method:z.enum(["GET","POST"]), route_id:id, body_digest:digest,
+  target_digest:digest.optional(),
   resource:z.strictObject({kind:z.enum(["job","approval"]),id}).nullable(),
-}).refine(value => matchesRouteBinding(value.route_id,value.method,value.resource));
+}).refine(value => matchesRouteBinding(value.route_id,value.method,value.resource)
+  && (value.route_id === "approval_list") === (value.target_digest !== undefined));
 export type ContextRequest = z.infer<typeof requestSchema>;
 const claimsSchema = z.strictObject({
   codec_version:z.literal(1), audience:z.literal("dona.dispatcher.web-ingress"),
@@ -56,7 +58,8 @@ export function requestBodyDigest(bytes:Uint8Array):string {
  * target and body, before URL normalization or resource authorization. */
 export function ingressContextRequest(method:unknown,target:unknown,body:Uint8Array):ContextRequest {
   return guard(()=>{const route=matchWebRoute(method,target);
-    return requestSchema.parse({method:route.method,route_id:route.id,resource:route.resource,body_digest:requestBodyDigest(body)});});
+    return requestSchema.parse({method:route.method,route_id:route.id,resource:route.resource,body_digest:requestBodyDigest(body),
+      ...(route.id === "approval_list" ? {target_digest:createHash("sha256").update(String(target), "utf8").digest("hex")} : {})});});
 }
 /** Caller supplies a freshly introspected, current verified session and a protected
  * clock. route_id comes from a fixed local route table, never a browser header. */

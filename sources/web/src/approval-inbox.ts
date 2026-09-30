@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
@@ -78,19 +78,28 @@ export const approvalInboxDetailSchema = z.strictObject({ codec_version: z.liter
 const detailBindingSchema = z.strictObject({request_id: id, presentation_ref: id, presentation_revision: revision,
   audience_principal_id: id, persisted_display_fingerprint: hash, presentation_display_fingerprint: hash,
   persisted_action_hash: hash, presentation_action_hash: hash,
-  persisted_content_digest: hash, presentation_content_digest: hash});
+  content_key_version: revision, content_signed_at: utc,
+  persisted_content_mac: hash, presentation_content_mac: hash});
 const authorityDetailSchema = z.strictObject({codec_version: z.literal(1), item: approvalInboxItemSchema,
   binding: detailBindingSchema});
 const verifiedDetails = new WeakMap<object, string>();
-/** Server-only digest of the literal content. Never place it in a browser response. */
-export function computeApprovalPrivateContentDigest(item: ApprovalInboxItem): string {
+const detailKeySchema = z.strictObject({purpose: z.literal("web_approval_detail"), version: revision,
+  state: z.enum(["active", "verification_only", "revoked"]), activated_at: utc, signing_expires_at: utc,
+  secret: z.instanceof(Uint8Array).refine(value => value.byteLength === 32)});
+export type ApprovalDetailKey = z.infer<typeof detailKeySchema>;
+/** Server-only MAC of the literal presentation. Never place it in a browser response. */
+export function computeApprovalPrivateContentMac(item: ApprovalInboxItem, key: ApprovalDetailKey): string {
+  const material = detailKeySchema.parse(key);
   const content = {request_id: item.request_id, operation: item.operation, requester_actor_id: item.requester_actor_id,
     audience_principal_id: item.audience_principal_id, risk: item.risk, risk_reason: item.risk_reason,
     opaque_action_id: item.opaque_action_id, expires_at: item.expires_at,
+    requester: item.requester, operation_summary: item.operation_summary,
     presentation_ref: item.presentation_ref, presentation_revision: item.presentation_revision,
     display_codec_version: item.display_codec_version, exact_target: item.exact_target,
     exact_draft: item.exact_draft, resolved_mentions: item.resolved_mentions};
-  return createHash("sha256").update(JSON.stringify(content), "utf8").digest("hex");
+  return createHmac("sha256", material.secret).update("dona.web.approval.detail.v1\0")
+    .update(JSON.stringify([material.version, item.instance_id, item.exact_target.workspace_id])).update("\0")
+    .update(JSON.stringify(content), "utf8").digest("hex");
 }
 
 /** The browser confirms only a candidate. The authority must reread durable state. */
@@ -234,6 +243,8 @@ export interface ApprovalInboxAuthority {
   /** Authenticated server-side repository read with current binding and visibility. */
   list(cursor: string | null): Promise<unknown>;
   detail(requestId: string): Promise<unknown>;
+  /** Protected key lookup; never returns key material to the browser. */
+  detailContentKey(version: number): Promise<unknown>;
 }
 
 /** No default authority or decision transport exists while Epic #26 is incomplete. */
@@ -249,8 +260,15 @@ export class ApprovalInboxAdapter {
     try {
       const detail = authorityDetailSchema.parse(await this.authority.detail(id.parse(requestId)));
       assertDetailScope(detail.item, readScopeSchema.parse(currentScope));
+      if (detail.item.state !== "pending") throw Error();
       if (detail.item.request_id !== requestId) throw Error();
-      const content = computeApprovalPrivateContentDigest(detail.item);
+      const key = detailKeySchema.parse(await this.authority.detailContentKey(detail.binding.content_key_version));
+      const signed = Date.parse(detail.binding.content_signed_at);
+      if (key.purpose !== "web_approval_detail" || key.version !== detail.binding.content_key_version
+        || key.state === "revoked" || signed < Date.parse(key.activated_at)
+        || signed >= Date.parse(key.signing_expires_at)
+        || Date.parse(key.signing_expires_at) - Date.parse(key.activated_at) > 90 * 86400_000) throw Error();
+      const content = computeApprovalPrivateContentMac(detail.item, key);
       if (detail.binding.request_id !== detail.item.request_id
         || detail.binding.presentation_ref !== detail.item.presentation_ref
         || detail.binding.presentation_revision !== detail.item.presentation_revision
@@ -259,14 +277,14 @@ export class ApprovalInboxAdapter {
         || detail.binding.persisted_display_fingerprint !== detail.item.display_fingerprint
         || detail.binding.presentation_display_fingerprint !== detail.item.display_fingerprint
         || detail.binding.persisted_action_hash !== detail.binding.presentation_action_hash
-        || detail.binding.persisted_content_digest !== content
-        || detail.binding.presentation_content_digest !== content) throw Error();
+        || !timingSafeEqual(Buffer.from(detail.binding.persisted_content_mac, "hex"), Buffer.from(content, "hex"))
+        || !timingSafeEqual(Buffer.from(detail.binding.presentation_content_mac, "hex"), Buffer.from(content, "hex"))) throw Error();
       Object.freeze(detail.item.exact_target);
       detail.item.resolved_mentions.forEach(Object.freeze);
       Object.freeze(detail.item.resolved_mentions);
       Object.freeze(detail.item);
       const verified = Object.freeze({codec_version: 1 as const, item: detail.item});
-      verifiedDetails.set(verified, content);
+      verifiedDetails.set(verified, JSON.stringify(detail.item));
       return verified;
     } catch { throw new ApprovalInboxUnavailable(); }
   }
@@ -284,9 +302,10 @@ export function approvalInboxView(detailInput: unknown, now: string, currentScop
   try {
     if (typeof detailInput !== "object" || detailInput === null) throw Error();
     const item = approvalInboxDetailSchema.parse(detailInput).item;
-    if (verifiedDetails.get(detailInput) !== computeApprovalPrivateContentDigest(item)) throw Error();
+    if (verifiedDetails.get(detailInput) !== JSON.stringify(item)) throw Error();
     const at = utc.parse(now);
     assertDetailScope(item, readScopeSchema.parse(currentScope));
+    if (item.state !== "pending" || Date.parse(at) >= Date.parse(item.expires_at)) throw Error();
     const canStartChallenge = item.state === "pending" && Date.parse(item.created_at) <= Date.parse(at)
       && Date.parse(at) < Date.parse(item.expires_at);
     return Object.freeze({
