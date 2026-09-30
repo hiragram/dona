@@ -7,13 +7,14 @@ const utc = z.string().refine(value => Number.isFinite(Date.parse(value)) && new
 const hash = z.string().regex(/^[0-9a-f]{64}$/);
 const cursor = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const safeText = z.string().min(1).max(240).refine(value =>
-  !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Zs}]/u.test(value.replaceAll(" ", "")));
-const targetText = safeText.refine(value => value === value.trim() && !value.includes("  "));
+  value === value.trim() && !value.includes("  ")
+  && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Zs}]/u.test(value.replaceAll(" ", ""))
+  && new TextDecoder("utf-8", {fatal: true}).decode(new TextEncoder().encode(value)) === value);
 
 /** Display data from a verified approval repository, never the action payload. */
 export const approvalInboxItemSchema = z.strictObject({
   request_id: id, requester: safeText, risk: z.enum(["elevated", "critical"]),
-  operation_summary: safeText, exact_target: targetText, display_fingerprint: hash, created_at: utc, expires_at: utc,
+  operation_summary: safeText, exact_target: safeText, display_fingerprint: hash, created_at: utc, expires_at: utc,
   request_revision: revision, presentation_revision: revision,
   state: z.enum(["pending", "approved", "rejected", "expired", "needs_review"]),
 }).refine(item => Date.parse(item.created_at) < Date.parse(item.expires_at));

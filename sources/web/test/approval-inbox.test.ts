@@ -61,6 +61,7 @@ test("inbox keeps a bounded continuation contract instead of hiding later reques
 
 test("detail and confirmation disable stale or terminal requests", () => {
   assert.equal(approvalInboxView(item, now).canConfirm, true);
+  assert.equal(approvalInboxView({...item, exact_target: "対象😀"}, now).exactTarget, "対象😀");
   assert.equal(approvalInboxView(item, item.expires_at).canConfirm, false);
   assert.equal(approvalInboxView({...item, state: "approved"}, now).candidate, null);
   assert.throws(() => approvalInboxView({...item, operation_summary: "unsafe\ntext"}, now), ApprovalInboxUnavailable);
@@ -68,6 +69,9 @@ test("detail and confirmation disable stale or terminal requests", () => {
   assert.throws(() => approvalInboxView({...item, exact_target: "safe\u00A0unsafe"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, exact_target: "safe  unsafe"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, exact_target: " safe"}, now), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, operation_summary: "操作  A"}, now), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, operation_summary: " 操作"}, now), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, exact_target: "対象\ud800名"}, now), ApprovalInboxUnavailable);
 });
 
 test("preview escapes untrusted summary and never enables a decision", () => {
