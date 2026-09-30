@@ -14,7 +14,7 @@ const candidate = { codec_version: 1, request_id: item.request_id, decision: "ap
   expected_revision: item.revision, expected_display_fingerprint: item.display_fingerprint };
 const evidence = { principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1",
   binding_revision: 2, role: "supervisor", step_up_verified: true, csrf_verified: true,
-  request_id: item.request_id, display_fingerprint: item.display_fingerprint,
+  request_id: item.request_id, decision: "approve", display_fingerprint: item.display_fingerprint,
   persisted_action_hash: "b".repeat(64), presentation_action_hash: "b".repeat(64), revision: 1,
   expires_at: item.expires_at, state: "pending", consumed: false };
 const scope = { principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1", binding_revision: 2 };
@@ -35,6 +35,8 @@ test("inbox stays unavailable without a verified authority and rejects unsafe pr
   await assert.rejects(adapter.detail("other"), ApprovalInboxUnavailable);
   const leaking = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [{...item, secret: "private"}]}), detail: async () => item});
   await assert.rejects(leaking.list(), ApprovalInboxUnavailable);
+  const duplicate = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [item, {...item, exact_target: "別対象"}]}), detail: async () => item});
+  await assert.rejects(duplicate.list(), ApprovalInboxUnavailable);
 });
 
 test("detail and confirmation disable stale or terminal requests", () => {
@@ -43,6 +45,7 @@ test("detail and confirmation disable stale or terminal requests", () => {
   assert.equal(approvalInboxView({...item, state: "approved"}, now).candidate, null);
   assert.throws(() => approvalInboxView({...item, operation_summary: "unsafe\ntext"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, exact_target: "safe\u202Eunsafe"}, now), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, exact_target: "safe\u00A0unsafe"}, now), ApprovalInboxUnavailable);
 });
 
 test("preview escapes untrusted summary and never enables a decision", () => {
@@ -61,7 +64,7 @@ test("server preflight rejects forged, expired, consumed and cross-scope evidenc
     {...candidate, request_id: "other"},
   ]) assert.throws(() => assertApprovalDecisionCandidate(changed, evidence, scope, now), ApprovalInboxUnavailable);
   for (const changed of [
-    {...evidence, step_up_verified: false}, {...evidence, csrf_verified: false},
+    {...evidence, decision: "reject"}, {...evidence, step_up_verified: false}, {...evidence, csrf_verified: false},
     {...evidence, persisted_action_hash: "c".repeat(64)},
     {...evidence, consumed: true}, {...evidence, state: "approved"},
     {...evidence, tenant_id: "other"}, {...evidence, binding_revision: 3},

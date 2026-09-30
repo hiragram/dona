@@ -6,7 +6,7 @@ const revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const utc = z.string().refine(value => Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value);
 const hash = z.string().regex(/^[0-9a-f]{64}$/);
 const safeText = z.string().min(1).max(240).refine(value =>
-  !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u.test(value));
+  !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Zs}]/u.test(value.replaceAll(" ", "")));
 
 /** Display data from a verified approval repository, never the action payload. */
 export const approvalInboxItemSchema = z.strictObject({
@@ -15,7 +15,8 @@ export const approvalInboxItemSchema = z.strictObject({
   revision, state: z.enum(["pending", "approved", "rejected", "expired", "needs_review"]),
 }).refine(item => Date.parse(item.created_at) < Date.parse(item.expires_at));
 export type ApprovalInboxItem = z.infer<typeof approvalInboxItemSchema>;
-export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1), items: z.array(approvalInboxItemSchema).max(50) });
+export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1), items: z.array(approvalInboxItemSchema).max(50) })
+  .refine(value => new Set(value.items.map(item => item.request_id)).size === value.items.length);
 
 /** The browser confirms only a candidate. The authority must reread durable state. */
 export const approvalDecisionCandidateSchema = z.strictObject({
@@ -26,7 +27,8 @@ export type ApprovalDecisionCandidate = z.infer<typeof approvalDecisionCandidate
 export const approvalAuthorityEvidenceSchema = z.strictObject({
   principal_id: id, instance_id: id, tenant_id: id, binding_revision: revision,
   role: z.literal("supervisor"), step_up_verified: z.literal(true), csrf_verified: z.literal(true),
-  request_id: id, display_fingerprint: hash, persisted_action_hash: hash, presentation_action_hash: hash, revision, expires_at: utc,
+  request_id: id, decision: z.enum(["approve", "reject"]), display_fingerprint: hash,
+  persisted_action_hash: hash, presentation_action_hash: hash, revision, expires_at: utc,
   state: z.literal("pending"), consumed: z.literal(false),
 });
 export type ApprovalAuthorityEvidence = z.infer<typeof approvalAuthorityEvidenceSchema>;
@@ -51,7 +53,8 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
     const presented = Buffer.from(evidence.presentation_action_hash, "hex");
     if (evidence.principal_id !== scope.principal_id || evidence.instance_id !== scope.instance_id
       || evidence.tenant_id !== scope.tenant_id || evidence.binding_revision !== scope.binding_revision
-      || candidate.request_id !== evidence.request_id || candidate.expected_revision !== evidence.revision
+      || candidate.request_id !== evidence.request_id || candidate.decision !== evidence.decision
+      || candidate.expected_revision !== evidence.revision
       || !timingSafeEqual(requested, current) || !timingSafeEqual(action, presented) || Date.parse(at) >= Date.parse(evidence.expires_at)) throw Error();
     return candidate;
   } catch { throw new ApprovalInboxUnavailable(); }
