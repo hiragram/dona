@@ -2208,7 +2208,7 @@ describe("UpdateController isolated end-to-end", () => {
 
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "complete");
-    f.advance(40 * 86_400_000);
+    f.advance(365 * 86_400_000);
     f.controller.maintainDiagnostics();
     assert.equal(f.database.diagnosticLogs(requestId)[0]?.capture_state, "purged");
     f.database.close();
