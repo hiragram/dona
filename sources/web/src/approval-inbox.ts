@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
@@ -14,6 +14,15 @@ const safeText = z.string().min(1).max(240).refine(value =>
 const literalText = z.string().min(1).max(4096).refine(value =>
   new TextDecoder("utf-8", {fatal: true}).decode(new TextEncoder().encode(value)) === value);
 const ambiguousDisplay = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Zs}]/u;
+const fingerprintProjectionSchema = z.strictObject({opaque_action_id: id, operation, exact_target: literalText,
+  risk: z.enum(["elevated", "critical"]), expires_at: utc, presentation_revision: revision});
+/** Canonical non-secret plan projection, with fixed field order and UTF-8 bytes. */
+export function computeApprovalDisplayFingerprint(input: unknown): string {
+  try {
+    const value = fingerprintProjectionSchema.parse(input);
+    return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+  } catch { throw new ApprovalInboxUnavailable(); }
+}
 
 /** Version 1 reversible display codec from ADR 0002. Caller HTML-escapes the output. */
 export function encodeApprovalDisplay(value: unknown): string {
@@ -40,7 +49,10 @@ export const approvalInboxItemSchema = z.strictObject({
   request_revision: revision, presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
   state: z.enum(["pending", "approved", "rejected", "expired", "needs_review"]),
 }).refine(item => Date.parse(item.created_at) < Date.parse(item.expires_at)
-  && Date.parse(item.expires_at) - Date.parse(item.created_at) <= 15 * 60_000);
+  && Date.parse(item.expires_at) - Date.parse(item.created_at) <= 15 * 60_000
+  && item.display_fingerprint === computeApprovalDisplayFingerprint({opaque_action_id: item.opaque_action_id,
+    operation: item.operation, exact_target: item.exact_target, risk: item.risk,
+    expires_at: item.expires_at, presentation_revision: item.presentation_revision}));
 export type ApprovalInboxItem = z.infer<typeof approvalInboxItemSchema>;
 export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1), items: z.array(approvalInboxItemSchema).max(50), next_cursor: cursor.nullable() })
   .refine(value => new Set(value.items.map(item => item.request_id)).size === value.items.length);
@@ -55,7 +67,7 @@ export const approvalDecisionCandidateSchema = z.strictObject({
 });
 export type ApprovalDecisionCandidate = z.infer<typeof approvalDecisionCandidateSchema>;
 export const approvalAuthorityEvidenceSchema = z.strictObject({
-  principal_id: id, instance_id: id, tenant_id: id, workspace_id: id, binding_revision: revision,
+  principal_id: id, instance_id: id, tenant_id: id, workspace_id: id, supervisor_binding_id: id, binding_revision: revision,
   session_ref: id, session_generation: revision, authz_revision: revision,
   role: z.literal("supervisor"), step_up_verified: z.literal(true), csrf_verified: z.literal(true),
   request_id: id, operation, decision: z.enum(["approve", "reject"]), display_fingerprint: hash,
@@ -84,7 +96,8 @@ export class ApprovalInboxUnavailable extends Error {
  * Evidence must be computed by a server authority from the current principal,
  * protected clock and persisted request in the decision transaction. */
 export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenceInput: unknown,
-  expectedScope: { principal_id: string; instance_id: string; tenant_id: string; workspace_id: string; binding_revision: number;
+  expectedScope: { principal_id: string; instance_id: string; tenant_id: string; workspace_id: string;
+    supervisor_binding_id: string; binding_revision: number;
     session_ref: string; session_generation: number; authz_revision: number; policy_revision: number;
     requester_authorization_revision: number; challenge_ref: string; credential_id: string;
     credential_revision: number; credential_stored_sign_count: number; visibility_revision: number }, now: string): ApprovalDecisionCandidate {
@@ -92,7 +105,7 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
     const candidate = approvalDecisionCandidateSchema.parse(candidateInput);
     const evidence = approvalAuthorityEvidenceSchema.parse(evidenceInput);
     const scope = z.strictObject({ principal_id: id, instance_id: id, tenant_id: id, workspace_id: id,
-      binding_revision: revision, session_ref: id, session_generation: revision, authz_revision: revision,
+      supervisor_binding_id: id, binding_revision: revision, session_ref: id, session_generation: revision, authz_revision: revision,
       policy_revision: revision, requester_authorization_revision: revision, challenge_ref: id,
       credential_id: id, credential_revision: revision,
       credential_stored_sign_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -104,6 +117,7 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
     const presented = Buffer.from(evidence.presentation_action_hash, "hex");
     if (evidence.principal_id !== scope.principal_id || evidence.instance_id !== scope.instance_id
       || evidence.tenant_id !== scope.tenant_id || evidence.workspace_id !== scope.workspace_id
+      || evidence.supervisor_binding_id !== scope.supervisor_binding_id
       || evidence.binding_revision !== scope.binding_revision
       || evidence.session_ref !== scope.session_ref || evidence.session_generation !== scope.session_generation
       || evidence.authz_revision !== scope.authz_revision || evidence.policy_revision !== scope.policy_revision
