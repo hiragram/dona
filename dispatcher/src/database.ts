@@ -705,6 +705,33 @@ export function migrateDispatcherDatabase(
 }
 
 export class DispatcherDatabase {
+  /** Bounded, read-only rollout counters. Never project job IDs or Result content. */
+  jobResultPublishSnapshot(): {
+    jobs: Record<"terminal_receipt_absent_or_purged" | "published_terminal" | "dispatching" | "running" | "needs_review", number>;
+    receipts: Record<"reserved" | "committed" | "needs_review", number>;
+    current_failures: Record<"invalid_result" | "result_missing" | "published_result_reconciliation_required", number>;
+  } {
+    const jobs = { terminal_receipt_absent_or_purged: 0, published_terminal: 0, dispatching: 0, running: 0, needs_review: 0 };
+    const receipts = { reserved: 0, committed: 0, needs_review: 0 };
+    const current_failures = { invalid_result: 0, result_missing: 0, published_result_reconciliation_required: 0 };
+    for (const row of this.db.prepare(`SELECT
+      CASE WHEN j.status IN ('completed','failed','cancelled') THEN
+        CASE WHEN r.job_id IS NULL THEN 'terminal_receipt_absent_or_purged' ELSE 'published_terminal' END
+      WHEN j.status='dispatching' THEN 'dispatching'
+      WHEN j.status='running' THEN 'running'
+      WHEN j.status='needs_review' THEN 'needs_review' ELSE NULL END AS bucket,
+      COUNT(*) AS count FROM jobs j LEFT JOIN job_result_publish_receipts r USING(job_id)
+      GROUP BY bucket`).all() as Array<{ bucket: keyof typeof jobs | null; count: number }>) {
+      if (row.bucket !== null) jobs[row.bucket] = row.count;
+    }
+    for (const row of this.db.prepare("SELECT state,COUNT(*) AS count FROM job_result_publish_receipts GROUP BY state")
+      .all() as Array<{ state: keyof typeof receipts; count: number }>) receipts[row.state] = row.count;
+    for (const row of this.db.prepare(`SELECT last_error_code AS code,COUNT(*) AS count FROM jobs
+      WHERE status='needs_review' AND last_error_code IN
+        ('invalid_result','result_missing','published_result_reconciliation_required')
+      GROUP BY last_error_code`).all() as Array<{ code: keyof typeof current_failures; count: number }> ) current_failures[row.code] = row.count;
+    return { jobs, receipts, current_failures };
+  }
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
   private readonly schemaWrite: 2 | 3;

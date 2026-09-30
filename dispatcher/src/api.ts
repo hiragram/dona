@@ -241,6 +241,10 @@ export class DispatcherApi {
           scheduler: this.database.scheduler.operationalSnapshot(new Date().toISOString().replace(/\.\d{3}Z$/, "Z")) });
         return;
       }
+      if (request.method === "GET" && url.pathname === "/metrics/job-result-publish") {
+        sendJson(response, 200, { schema_version: 1, ...this.database.jobResultPublishSnapshot() });
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/health/version") {
         const health = this.readiness();
         const appSchema = this.database.schemaCompatibility();
