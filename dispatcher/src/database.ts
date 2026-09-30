@@ -61,6 +61,11 @@ const jobResultPublishReceiptSchemaSql = `CREATE TABLE IF NOT EXISTS job_result_
   state TEXT NOT NULL CHECK(state IN ('reserved','committed','needs_review')),
   reserved_at TEXT NOT NULL,
   committed_at TEXT)`;
+// This marker outlives a receipt. Absence also covers jobs created before the
+// marker existed, so it must never be presented as proof of legacy publishing.
+const jobResultPublishMarkerSchemaSql = `CREATE TABLE IF NOT EXISTS job_result_publish_markers(
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  mode TEXT NOT NULL CHECK(mode='dedicated'))`;
 function pathOccupied(filePath: string): boolean {
   try { fs.lstatSync(filePath); return true; }
   catch (error) {
@@ -557,6 +562,10 @@ export function migrateDispatcherDatabase(
     if (hasPublishReceipts) db.exec(`CREATE TEMP TABLE preserved_job_result_publish_receipts_v3 AS
       SELECT * FROM job_result_publish_receipts;
       DROP TABLE job_result_publish_receipts;`);
+    const hasPublishMarkers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_result_publish_markers'").get() !== undefined;
+    if (hasPublishMarkers) db.exec(`CREATE TEMP TABLE preserved_job_result_publish_markers_v3 AS
+      SELECT * FROM job_result_publish_markers;
+      DROP TABLE job_result_publish_markers;`);
     const jobsHasKey = (db.pragma("table_info(jobs)") as Array<{ name: string }>).some(({ name }) => name === "job_key");
     db.exec(`
       CREATE TABLE jobs_v3 (
@@ -643,6 +652,9 @@ export function migrateDispatcherDatabase(
     if (hasPublishReceipts) db.exec(`${jobResultPublishReceiptSchemaSql};
       INSERT INTO job_result_publish_receipts SELECT * FROM preserved_job_result_publish_receipts_v3;
       DROP TABLE preserved_job_result_publish_receipts_v3;`);
+    if (hasPublishMarkers) db.exec(`${jobResultPublishMarkerSchemaSql};
+      INSERT INTO job_result_publish_markers SELECT * FROM preserved_job_result_publish_markers_v3;
+      DROP TABLE preserved_job_result_publish_markers_v3;`);
     db.exec("DROP TABLE legacy_job_stop_markers_v3");
     migrationHook("indexes_recreated");
 
@@ -707,20 +719,23 @@ export function migrateDispatcherDatabase(
 export class DispatcherDatabase {
   /** Bounded, read-only rollout counters. Never project job IDs or Result content. */
   jobResultPublishSnapshot(): {
-    jobs: Record<"terminal_receipt_absent_or_purged" | "published_terminal" | "dispatching" | "running" | "needs_review", number>;
+    jobs: Record<"terminal_receipt_absent_or_purged" | "published_terminal" | "published_receipt_purged" | "dispatching" | "running" | "needs_review", number>;
     receipts: Record<"reserved" | "committed" | "needs_review", number>;
     current_failures: Record<"invalid_result" | "result_missing" | "published_result_reconciliation_required", number>;
   } {
-    const jobs = { terminal_receipt_absent_or_purged: 0, published_terminal: 0, dispatching: 0, running: 0, needs_review: 0 };
+    const jobs = { terminal_receipt_absent_or_purged: 0, published_terminal: 0, published_receipt_purged: 0, dispatching: 0, running: 0, needs_review: 0 };
     const receipts = { reserved: 0, committed: 0, needs_review: 0 };
     const current_failures = { invalid_result: 0, result_missing: 0, published_result_reconciliation_required: 0 };
     for (const row of this.db.prepare(`SELECT
       CASE WHEN j.status IN ('completed','failed','cancelled') THEN
-        CASE WHEN r.job_id IS NULL THEN 'terminal_receipt_absent_or_purged' ELSE 'published_terminal' END
+        CASE WHEN r.job_id IS NOT NULL THEN 'published_terminal'
+          WHEN m.job_id IS NOT NULL THEN 'published_receipt_purged'
+          ELSE 'terminal_receipt_absent_or_purged' END
       WHEN j.status='dispatching' THEN 'dispatching'
       WHEN j.status='running' THEN 'running'
       WHEN j.status='needs_review' THEN 'needs_review' ELSE NULL END AS bucket,
       COUNT(*) AS count FROM jobs j LEFT JOIN job_result_publish_receipts r USING(job_id)
+        LEFT JOIN job_result_publish_markers m ON m.job_id=j.job_id
       GROUP BY bucket`).all() as Array<{ bucket: keyof typeof jobs | null; count: number }>) {
       if (row.bucket !== null) jobs[row.bucket] = row.count;
     }
@@ -797,6 +812,10 @@ export class DispatcherDatabase {
         identity_json TEXT,
         updated_at TEXT NOT NULL)`);
       this.db.exec(jobResultPublishReceiptSchemaSql);
+      this.db.exec(jobResultPublishMarkerSchemaSql);
+      // Existing dedicated Results are identifiable while their receipts remain.
+      this.db.exec(`INSERT OR IGNORE INTO job_result_publish_markers(job_id,mode)
+        SELECT job_id,'dedicated' FROM job_result_publish_receipts`);
       // Job IDs are Herdr control names. Never move a saved name to another job.
       this.db.exec(`CREATE TRIGGER IF NOT EXISTS jobs_agent_identity_immutable
         BEFORE UPDATE OF job_id,agent_name ON jobs
@@ -2370,6 +2389,8 @@ export class DispatcherDatabase {
         .run(job.job_id,candidate.canonicalDigest,stableStringify(candidate.envelope),candidate.fence.attemptCount,
           candidate.fence.paneId,createHash("sha256").update(candidate.fence.session).digest("hex"),
           candidate.fence.grantGeneration,new Date().toISOString());
+      this.db.prepare("INSERT OR IGNORE INTO job_result_publish_markers(job_id,mode) VALUES(?,'dedicated')")
+        .run(job.job_id);
       return { outcome: "reserved", envelope: candidate.envelope, fresh: true };
     }).immediate();
   }
