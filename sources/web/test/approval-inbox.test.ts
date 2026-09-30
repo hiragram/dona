@@ -89,11 +89,12 @@ test("inbox keeps a bounded continuation contract instead of hiding later reques
 });
 
 test("detail and confirmation disable stale or terminal requests", () => {
-  assert.equal(approvalInboxView(item, now).canConfirm, true);
+  assert.equal(approvalInboxView(item, now).canStartChallenge, true);
+  assert.equal("candidate" in approvalInboxView(item, now), false);
   assert.equal(approvalInboxView(withFingerprint({...item, exact_target: "対象😀"}), now).exactTarget, "対象😀");
   assert.throws(() => approvalInboxView({...item, exact_target: "別の対象"}, now), ApprovalInboxUnavailable);
-  assert.equal(approvalInboxView(item, item.expires_at).canConfirm, false);
-  assert.equal(approvalInboxView({...item, state: "approved"}, now).candidate, null);
+  assert.equal(approvalInboxView(item, item.expires_at).canStartChallenge, false);
+  assert.equal(approvalInboxView({...item, state: "approved"}, now).canStartChallenge, false);
   assert.throws(() => approvalInboxView({...item, expires_at: "2026-09-30T00:15:00.001Z"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, operation: "self_update.v1"}, now), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, operation_summary: "unsafe\ntext"}, now), ApprovalInboxUnavailable);
@@ -116,14 +117,18 @@ test("preview escapes untrusted summary and never enables a decision", () => {
   assert.ok(!markup.includes("b".repeat(64)));
   assert.ok(markup.includes("<pre>対象_1</pre>"));
   assert.ok(markup.includes("<pre>投稿本文</pre>"));
-  assert.ok(markup.includes("担当者 (user_1)"));
+  assert.ok(markup.includes("<pre>担当者</pre> (user_1)"));
   assert.ok(markup.includes("action_1"));
+  assert.ok(markup.includes("<dd>slack.post_thread_reply.v1</dd>"));
   assert.ok(markup.includes("明示mentionを含む外部投稿"));
   const literal = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
     {codec_version: 1, item: withFingerprint({...item, exact_draft: "line1\nline2\\\t\u202E", exact_target: "safe\u00A0unsafe"})}, now);
   assert.ok(literal.includes("line1\\nline2\\\\\\t\\u{202E}"));
   assert.ok(literal.includes("safe\\u{00A0}unsafe"));
   assert.ok(!literal.includes("line1\nline2"));
+  const spacedMention = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
+    {codec_version: 1, item: {...item, resolved_mentions: [{target_id: "user_1", display: " 担当  者 "}]}}, now);
+  assert.ok(spacedMention.includes("<pre> 担当  者 </pre>"));
   assert.equal(encodeApprovalDisplay("😀\\\n\t\u202E"), "😀\\\\\\n\\t\\u{202E}");
   const later = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
     {codec_version: 1, item: withFingerprint({...item, exact_target: "次ページの対象"})}, now);

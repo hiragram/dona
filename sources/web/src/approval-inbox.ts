@@ -181,17 +181,13 @@ export function approvalInboxView(itemInput: unknown, now: string) {
   try {
     const item = approvalInboxItemSchema.parse(itemInput);
     const at = utc.parse(now);
-    const canConfirm = item.state === "pending" && Date.parse(at) < Date.parse(item.expires_at);
+    const canStartChallenge = item.state === "pending" && Date.parse(at) < Date.parse(item.expires_at);
     return Object.freeze({
-      title: item.operation_summary, exactTarget: item.exact_target, exactDraft: item.exact_draft,
+      title: item.operation_summary, operationKind: item.operation, exactTarget: item.exact_target, exactDraft: item.exact_draft,
       resolvedMentions: item.resolved_mentions, opaqueActionId: item.opaque_action_id,
       requester: item.requester, risk: item.risk, riskReason: item.risk_reason,
       displayFingerprint: item.display_fingerprint, createdAt: item.created_at, expiresAt: item.expires_at,
-      status: canConfirm ? "確認可能" : "再確認が必要", canConfirm,
-      candidate: canConfirm ? Object.freeze({codec_version: 1 as const, display_codec_version: item.display_codec_version,
-        request_id: item.request_id, operation: item.operation, expected_request_revision: item.request_revision,
-        expected_presentation_ref: item.presentation_ref, expected_presentation_revision: item.presentation_revision,
-        expected_display_fingerprint: item.display_fingerprint}) : null,
+      status: canStartChallenge ? "確認準備中" : "再確認が必要", canStartChallenge,
     });
   } catch { throw new ApprovalInboxUnavailable(); }
 }
@@ -213,10 +209,11 @@ export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: 
     const detail = selected === null ? "" : (() => {
       const view = approvalInboxView(selected, now);
       return `<section aria-labelledby="approval-detail-title"><h2 id="approval-detail-title">承認内容の確認</h2>`
-        + `<dl><dt>操作</dt><dd>${html(view.title)}</dd><dt>対象</dt><dd><pre>${html(encodeApprovalDisplay(view.exactTarget))}</pre></dd>`
+        + `<dl><dt>操作種別</dt><dd>${html(view.operationKind)}</dd><dt>概要</dt><dd>${html(view.title)}</dd>`
+        + `<dt>対象</dt><dd><pre>${html(encodeApprovalDisplay(view.exactTarget))}</pre></dd>`
         + `<dt>Action ID</dt><dd>${html(view.opaqueActionId)}</dd><dt>投稿本文</dt><dd><pre>${html(encodeApprovalDisplay(view.exactDraft))}</pre></dd>`
         + `<dt>解決済みmention</dt><dd><ul>${view.resolvedMentions.map(mention =>
-          `<li>${html(encodeApprovalDisplay(mention.display))} (${html(mention.target_id)})</li>`).join("")}</ul></dd>`
+          `<li><pre>${html(encodeApprovalDisplay(mention.display))}</pre> (${html(mention.target_id)})</li>`).join("")}</ul></dd>`
         + `<dt>依頼者</dt><dd>${html(view.requester)}</dd><dt>リスク</dt><dd>${html(view.risk)}</dd>`
         + `<dt>リスク理由</dt><dd>${html(view.riskReason)}</dd>`
         + `<dt>表示用指紋</dt><dd>${html(view.displayFingerprint)}</dd><dt>作成</dt><dd>${html(view.createdAt)}</dd>`
