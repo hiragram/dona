@@ -45,7 +45,7 @@ describe("永続Job Result公開", () => {
       assert.equal((await fs.stat(job.result_path)).mode & 0o077,0);
       assert.equal(database.getJob(job.job_id)?.status,"completed");
       assert.deepEqual(database.jobResultPublishSnapshot().jobs,
-        { terminal_receipt_absent_or_purged: 0, published_terminal: 1, dispatching: 0, running: 0, needs_review: 0 });
+        { terminal_receipt_absent_or_purged: 0, published_terminal: 1, published_receipt_purged: 0, dispatching: 0, running: 0, needs_review: 0 });
       assert.deepEqual(database.jobResultPublishSnapshot().receipts,
         { reserved: 0, committed: 1, needs_review: 0 });
       assert.deepEqual(await publisher.reconcile(candidate()),{ outcome: "reused", receipt_id: first.canonicalDigest });
@@ -61,6 +61,22 @@ describe("永続Job Result公開", () => {
       assert.equal(firstNotice.row.event_id,secondNotice.row.event_id);
       assert.equal(database.quarantineIncompletePublishedResults(),0);
     } finally { database.close(); }
+  });
+
+  test("receipt保持期間の後も専用公開の方式markerを保持する", async () => {
+    const { database, candidate, publisher, config } = await fixture();
+    try {
+      assert.equal((await publisher.commit(candidate())).outcome,"created");
+      database.close();
+      const raw = new Database(config.databasePath);
+      try { raw.prepare("DELETE FROM job_result_publish_receipts").run(); }
+      finally { raw.close(); }
+      const reopened = new DispatcherDatabase(config.databasePath);
+      try {
+        assert.equal(reopened.jobResultPublishSnapshot().jobs.published_receipt_purged,1);
+        assert.equal(reopened.jobResultPublishSnapshot().jobs.terminal_receipt_absent_or_purged,0);
+      } finally { reopened.close(); }
+    } finally { /* Database closed before reopening. */ }
   });
 
   test("rename後のDB失敗を再起動時に隔離し、read-only照合で成功と誤認しない", async () => {

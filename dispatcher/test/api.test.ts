@@ -101,7 +101,7 @@ describe("DispatcherApi", () => {
       assert.equal(result.status, 200);
       assert.deepEqual(result.body, {
         schema_version: 1,
-        jobs: { terminal_receipt_absent_or_purged: 0, published_terminal: 0, dispatching: 1, running: 0, needs_review: 1 },
+        jobs: { terminal_receipt_absent_or_purged: 0, published_terminal: 0, published_receipt_purged: 0, dispatching: 1, running: 0, needs_review: 1 },
         receipts: { reserved: 0, committed: 0, needs_review: 0 },
         current_failures: { invalid_result: 1, result_missing: 0, published_result_reconciliation_required: 0 },
       });
