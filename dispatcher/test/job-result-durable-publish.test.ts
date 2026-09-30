@@ -44,6 +44,10 @@ describe("永続Job Result公開", () => {
       assert.deepEqual(await readJobResultEnvelope(job.result_path,job.job_id),first.envelope);
       assert.equal((await fs.stat(job.result_path)).mode & 0o077,0);
       assert.equal(database.getJob(job.job_id)?.status,"completed");
+      assert.deepEqual(database.jobResultPublishSnapshot().jobs,
+        { terminal_without_receipt: 0, published_terminal: 1, running: 0, needs_review: 0 });
+      assert.deepEqual(database.jobResultPublishSnapshot().receipts,
+        { reserved: 0, committed: 1, needs_review: 0 });
       assert.deepEqual(await publisher.reconcile(candidate()),{ outcome: "reused", receipt_id: first.canonicalDigest });
       assert.deepEqual(await publisher.commit(candidate()),{ outcome: "reused", receipt_id: first.canonicalDigest });
       assert.deepEqual(await publisher.reconcile(candidate("別の結果")),{ outcome: "conflict" });
@@ -68,6 +72,7 @@ describe("永続Job Result公開", () => {
       await assert.rejects(publisher.commit(publication),/injected_commit_failure/);
       assert.deepEqual(await readJobResultEnvelope(job.result_path,job.job_id),publication.envelope);
       assert.deepEqual(await publisher.reconcile(candidate()),{ outcome: "needs_review" });
+      assert.equal(database.jobResultPublishSnapshot().receipts.needs_review,1);
       database.close();
       const reopened = new DispatcherDatabase(config.databasePath);
       try {

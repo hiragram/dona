@@ -81,6 +81,27 @@ function requestAndDropResponseBody(socketPath: string, route: string, body: unk
 }
 
 describe("DispatcherApi", () => {
+  test("Job Result rollout metrics are bounded and omit private job data", async () => {
+    const { root, config } = await tempConfig(); roots.push(root);
+    const database = new DispatcherDatabase(config.databasePath);
+    const event = database.enqueue(eventEnvelope("Ev-publish-metrics")).row;
+    const job = database.createJob({ source_event_id: event.event_id, objective: "PRIVATE_OBJECTIVE", workspace: { kind: "scratch" } },
+      config.jobsWorkspaceRoot, config.jobResultsDir).row;
+    database.markJobNeedsReview(job.job_id, "invalid_result", "PRIVATE_ERROR");
+    const api = new DispatcherApi(database, { isRunning: () => true, wake() {} }, jobs, config, logger);
+    await api.start();
+    try {
+      const result = await request(config.socketPath, "GET", "/metrics/job-result-publish");
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, {
+        schema_version: 1,
+        jobs: { terminal_without_receipt: 0, published_terminal: 0, running: 0, needs_review: 1 },
+        receipts: { reserved: 0, committed: 0, needs_review: 0 },
+        failures: { invalid_result: 1, result_missing: 0, published_result_reconciliation_required: 0 },
+      });
+      assert.doesNotMatch(JSON.stringify(result.body), /PRIVATE|Ev-publish|job_/);
+    } finally { await api.stop(); database.close(); }
+  });
   test("live session opt-inをthreadへbindしdurable receiptを再読する",async()=>{
     const {root,config}=await tempConfig();roots.push(root);const database=new DispatcherDatabase(config.databasePath);
     const source=database.enqueue(eventEnvelope("Ev-live-api")).row;
