@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+const slackUserId = z.string().regex(/^[UW][A-Z0-9]+$/);
 const revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const utc = z.string().refine(value => Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value);
 const hash = z.string().regex(/^[0-9a-f]{64}$/);
@@ -17,7 +18,8 @@ const ambiguousDisplay = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Poi
 const exactTargetSchema = z.strictObject({workspace_id: id, channel_id: id,
   thread_ts: z.string().regex(/^\d{10}\.\d{6}$/), display_name: literalText});
 const readScopeSchema = z.strictObject({principal_id: id, instance_id: id, tenant_id: id, workspace_id: id,
-  supervisor_binding_id: id, binding_revision: revision});
+  supervisor_binding_id: id, binding_revision: revision, visibility_revision: revision,
+  resource_snapshot_hash: hash});
 export type ApprovalInboxReadScope = z.infer<typeof readScopeSchema>;
 const fingerprintProjectionSchema = z.strictObject({opaque_action_id: id, operation, exact_target: exactTargetSchema,
   risk: z.enum(["elevated", "critical"]), expires_at: utc, presentation_revision: revision});
@@ -54,14 +56,17 @@ export const approvalInboxListItemSchema = z.strictObject({request_id: id, opera
 /** Display data from a verified approval repository, never the action payload. */
 export const approvalInboxItemSchema = z.strictObject({
   audience_principal_id: id, instance_id: id, tenant_id: id, supervisor_binding_id: id, binding_revision: revision,
-  request_id: id, operation, requester: safeText, risk: z.enum(["elevated", "critical"]), risk_reason: safeText,
+  target_visible: z.literal(true), target_shared: z.literal(false), visibility_revision: revision,
+  resource_snapshot_hash: hash,
+  request_id: id, operation, requester: safeText, requester_actor_id: id,
+  presentation_requester_actor_id: id, risk: z.enum(["elevated", "critical"]), risk_reason: safeText,
   opaque_action_id: id, operation_summary: safeText, exact_target: exactTargetSchema,
-  exact_draft: literalText, resolved_mentions: z.array(z.strictObject({target_id: id, display: literalText})).max(3)
+  exact_draft: literalText, resolved_mentions: z.array(z.strictObject({target_id: slackUserId, display: literalText})).max(3)
     .refine(mentions => new Set(mentions.map(mention => mention.target_id)).size === mentions.length),
   display_fingerprint: hash, created_at: utc, expires_at: utc,
   request_revision: revision, presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
   state,
-}).refine(item => temporal(item)
+}).refine(item => temporal(item) && item.requester_actor_id === item.presentation_requester_actor_id
   && item.display_fingerprint === computeApprovalDisplayFingerprint({opaque_action_id: item.opaque_action_id,
     operation: item.operation, exact_target: item.exact_target, risk: item.risk,
     expires_at: item.expires_at, presentation_revision: item.presentation_revision}));
@@ -83,11 +88,13 @@ export const approvalAuthorityEvidenceSchema = z.strictObject({
   session_ref: id, session_generation: revision, authz_revision: revision,
   role: z.literal("supervisor"), step_up_verified: z.literal(true), csrf_verified: z.literal(true),
   request_id: id, operation, decision: z.enum(["approve", "reject"]), display_fingerprint: hash,
+  requester_actor_id: id, presentation_requester_actor_id: id,
   persisted_action_hash: hash, presentation_action_hash: hash, request_revision: revision,
   presentation_ref: id, presentation_revision: revision, display_codec_version: z.literal(1),
   presentation_status: z.literal("synchronized_sent"), audience_principal_id: id,
   challenge_ref: id, challenge_state: z.literal("unused"), challenge_created_at: utc, challenge_expires_at: utc,
   challenge_request_id: id, challenge_decision: z.enum(["approve", "reject"]),
+  challenge_requester_actor_id: id,
   challenge_action_hash: hash, challenge_display_fingerprint: hash, challenge_presentation_revision: revision,
   challenge_request_revision: revision, challenge_presentation_ref: id, challenge_display_codec_version: z.literal(1),
   challenge_principal_id: id, challenge_session_ref: id, challenge_session_generation: revision,
@@ -122,14 +129,14 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
   expectedScope: { principal_id: string; instance_id: string; tenant_id: string; workspace_id: string;
     supervisor_binding_id: string; binding_revision: number;
     session_ref: string; session_generation: number; authz_revision: number; policy_revision: number;
-    requester_authorization_revision: number; challenge_ref: string; credential_id: string;
+    requester_authorization_revision: number; requester_actor_id: string; challenge_ref: string; credential_id: string;
     credential_revision: number; credential_stored_sign_count: number; visibility_revision: number }, now: string): ApprovalDecisionCandidate {
   try {
     const candidate = approvalDecisionCandidateSchema.parse(candidateInput);
     const evidence = approvalAuthorityEvidenceSchema.parse(evidenceInput);
     const scope = z.strictObject({ principal_id: id, instance_id: id, tenant_id: id, workspace_id: id,
       supervisor_binding_id: id, binding_revision: revision, session_ref: id, session_generation: revision, authz_revision: revision,
-      policy_revision: revision, requester_authorization_revision: revision, challenge_ref: id,
+      policy_revision: revision, requester_authorization_revision: revision, requester_actor_id: id, challenge_ref: id,
       credential_id: id, credential_revision: revision,
       credential_stored_sign_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
       visibility_revision: revision }).parse(expectedScope);
@@ -145,6 +152,8 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || evidence.session_ref !== scope.session_ref || evidence.session_generation !== scope.session_generation
       || evidence.authz_revision !== scope.authz_revision || evidence.policy_revision !== scope.policy_revision
       || evidence.requester_authorization_revision !== scope.requester_authorization_revision
+      || evidence.requester_actor_id !== scope.requester_actor_id
+      || evidence.presentation_requester_actor_id !== evidence.requester_actor_id
       || evidence.challenge_ref !== scope.challenge_ref || evidence.credential_id !== scope.credential_id
       || evidence.credential_revision !== scope.credential_revision
       || evidence.credential_stored_sign_count !== scope.credential_stored_sign_count
@@ -161,6 +170,7 @@ export function assertApprovalDecisionCandidate(candidateInput: unknown, evidenc
       || candidate.expected_presentation_revision !== evidence.presentation_revision
       || candidate.expected_challenge_ref !== evidence.challenge_ref
       || evidence.challenge_request_id !== evidence.request_id || evidence.challenge_decision !== evidence.decision
+      || evidence.challenge_requester_actor_id !== evidence.requester_actor_id
       || evidence.challenge_action_hash !== evidence.persisted_action_hash
       || evidence.challenge_display_fingerprint !== evidence.display_fingerprint
       || evidence.challenge_presentation_revision !== evidence.presentation_revision
@@ -228,7 +238,8 @@ function assertDetailScope(item: ApprovalInboxItem, scope: ApprovalInboxReadScop
   if (item.audience_principal_id !== scope.principal_id || item.instance_id !== scope.instance_id
     || item.tenant_id !== scope.tenant_id || item.exact_target.workspace_id !== scope.workspace_id
     || item.supervisor_binding_id !== scope.supervisor_binding_id
-    || item.binding_revision !== scope.binding_revision) throw new ApprovalInboxUnavailable();
+    || item.binding_revision !== scope.binding_revision || item.visibility_revision !== scope.visibility_revision
+    || item.resource_snapshot_hash !== scope.resource_snapshot_hash) throw new ApprovalInboxUnavailable();
 }
 export function approvalInboxView(itemInput: unknown, now: string, currentScope: ApprovalInboxReadScope) {
   try {
@@ -240,7 +251,7 @@ export function approvalInboxView(itemInput: unknown, now: string, currentScope:
     return Object.freeze({
       title: item.operation_summary, operationKind: item.operation, exactTarget: item.exact_target, exactDraft: item.exact_draft,
       resolvedMentions: item.resolved_mentions, opaqueActionId: item.opaque_action_id,
-      requester: item.requester, risk: item.risk, riskReason: item.risk_reason,
+      requester: item.requester, requesterActorId: item.requester_actor_id, risk: item.risk, riskReason: item.risk_reason,
       displayFingerprint: item.display_fingerprint, createdAt: item.created_at, expiresAt: item.expires_at,
       status: canStartChallenge ? "確認準備中" : "再確認が必要", canStartChallenge,
     });
@@ -275,7 +286,8 @@ export function renderApprovalInboxPreview(input: unknown, selectedDetailInput: 
         + `<dt>Action ID</dt><dd>${html(view.opaqueActionId)}</dd><dt>投稿本文</dt><dd><pre>${html(encodeApprovalDisplay(view.exactDraft))}</pre></dd>`
         + `<dt>解決済みmention</dt><dd><ul>${view.resolvedMentions.map(mention =>
           `<li><pre>${html(encodeApprovalDisplay(mention.display))}</pre> (${html(mention.target_id)})</li>`).join("")}</ul></dd>`
-        + `<dt>依頼者</dt><dd>${html(view.requester)}</dd><dt>リスク</dt><dd>${html(view.risk)}</dd>`
+        + `<dt>依頼者</dt><dd>${html(view.requester)}</dd><dt>依頼者actor ID</dt><dd>${html(view.requesterActorId)}</dd>`
+        + `<dt>リスク</dt><dd>${html(view.risk)}</dd>`
         + `<dt>リスク理由</dt><dd>${html(view.riskReason)}</dd>`
         + `<dt>表示用指紋</dt><dd>${html(view.displayFingerprint)}</dd><dt>作成</dt><dd>${html(view.createdAt)}</dd>`
         + `<dt>期限</dt><dd>${html(view.expiresAt)}</dd></dl><p>\\\\ は文字どおりのbackslash、\\nは改行、\\tはtab、\\u{...}はその他の制御・不可視文字を表します。決定操作は準備中です。</p>`

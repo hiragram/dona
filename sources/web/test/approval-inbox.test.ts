@@ -7,11 +7,13 @@ import { authorizeWebRoute, matchWebRoute } from "../src/routes.js";
 const itemBase = {
   audience_principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1",
   supervisor_binding_id: "binding_1", binding_revision: 2,
+  target_visible: true, target_shared: false, visibility_revision: 8, resource_snapshot_hash: "c".repeat(64),
   request_id: "request_1", operation: "slack.post_thread_reply.v1" as const,
-  requester: "依頼者", risk: "critical" as const, risk_reason: "明示mentionを含む外部投稿",
+  requester: "依頼者", requester_actor_id: "actor_1", presentation_requester_actor_id: "actor_1",
+  risk: "critical" as const, risk_reason: "明示mentionを含む外部投稿",
   opaque_action_id: "action_1", operation_summary: "限定された操作",
   exact_target: {workspace_id: "workspace_1", channel_id: "channel_1", thread_ts: "1730000000.000001", display_name: "対象_1"},
-  exact_draft: "投稿本文", resolved_mentions: [{target_id: "user_1", display: "担当者"}],
+  exact_draft: "投稿本文", resolved_mentions: [{target_id: "U123", display: "担当者"}],
   created_at: "2026-09-30T00:00:00.000Z", expires_at: "2026-09-30T00:15:00.000Z",
   request_revision: 1, presentation_ref: "presentation_1", presentation_revision: 2,
   display_codec_version: 1 as const, state: "pending" as const,
@@ -22,7 +24,8 @@ const withFingerprint = <T extends typeof itemBase>(value: T) =>
     expires_at: value.expires_at, presentation_revision: value.presentation_revision})});
 const item = withFingerprint(itemBase);
 const readScope = {principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1",
-  workspace_id: "workspace_1", supervisor_binding_id: "binding_1", binding_revision: 2};
+  workspace_id: "workspace_1", supervisor_binding_id: "binding_1", binding_revision: 2,
+  visibility_revision: 8, resource_snapshot_hash: "c".repeat(64)};
 const listItem = {request_id: item.request_id, operation: item.operation, requester: item.requester,
   operation_summary: item.operation_summary, risk: item.risk,
   created_at: item.created_at, expires_at: item.expires_at, state: item.state};
@@ -35,12 +38,14 @@ const evidence = { principal_id: "principal_1", instance_id: "instance_1", tenan
   binding_revision: 2, session_ref: "session_1", session_generation: 3, authz_revision: 4,
   role: "supervisor", step_up_verified: true, csrf_verified: true,
   request_id: item.request_id, operation: item.operation, decision: "approve", display_fingerprint: item.display_fingerprint,
+  requester_actor_id: "actor_1", presentation_requester_actor_id: "actor_1",
   persisted_action_hash: "b".repeat(64), presentation_action_hash: "b".repeat(64), request_revision: 1, presentation_revision: 2,
   presentation_ref: item.presentation_ref, display_codec_version: 1, presentation_status: "synchronized_sent",
   audience_principal_id: "principal_1", policy_revision: 5, requester_authorization_revision: 6,
   challenge_ref: "challenge_1", challenge_state: "unused", challenge_created_at: "2026-09-30T00:09:00.000Z",
   challenge_expires_at: "2026-09-30T00:11:00.000Z",
   challenge_request_id: item.request_id, challenge_decision: "approve",
+  challenge_requester_actor_id: "actor_1",
   challenge_action_hash: "b".repeat(64), challenge_display_fingerprint: item.display_fingerprint,
   challenge_presentation_revision: 2, challenge_request_revision: 1, challenge_presentation_ref: "presentation_1",
   challenge_display_codec_version: 1, challenge_principal_id: "principal_1", challenge_session_ref: "session_1",
@@ -59,7 +64,7 @@ const evidence = { principal_id: "principal_1", instance_id: "instance_1", tenan
 const scope = { principal_id: "principal_1", instance_id: "instance_1", tenant_id: "tenant_1", workspace_id: "workspace_1",
   supervisor_binding_id: "binding_1",
   binding_revision: 2, session_ref: "session_1", session_generation: 3, authz_revision: 4,
-  policy_revision: 5, requester_authorization_revision: 6,
+  policy_revision: 5, requester_authorization_revision: 6, requester_actor_id: "actor_1",
   challenge_ref: "challenge_1", credential_id: "credential_1", credential_revision: 7,
   credential_stored_sign_count: 4, visibility_revision: 8 };
 const now = "2026-09-30T00:10:00.000Z";
@@ -79,6 +84,8 @@ test("inbox stays unavailable without a verified authority and rejects unsafe pr
   await assert.rejects(adapter.detail("other", readScope), ApprovalInboxUnavailable);
   await assert.rejects(adapter.detail(item.request_id, {...readScope, workspace_id: "other"}), ApprovalInboxUnavailable);
   await assert.rejects(adapter.detail(item.request_id, {...readScope, principal_id: "other"}), ApprovalInboxUnavailable);
+  await assert.rejects(adapter.detail(item.request_id, {...readScope, visibility_revision: 9}), ApprovalInboxUnavailable);
+  await assert.rejects(adapter.detail(item.request_id, {...readScope, resource_snapshot_hash: "d".repeat(64)}), ApprovalInboxUnavailable);
   const oldDetail = new ApprovalInboxAdapter({list: async () => ({codec_version: 1, items: [], next_cursor: null}),
     detail: async () => ({codec_version: 2, item})});
   await assert.rejects(oldDetail.detail(item.request_id, readScope), ApprovalInboxUnavailable);
@@ -114,6 +121,8 @@ test("detail and confirmation disable stale or terminal requests", () => {
   assert.equal(approvalInboxView(withFingerprint({...item, exact_target: {...item.exact_target, display_name: "対象😀"}}), now, readScope).exactTarget.display_name, "対象😀");
   assert.throws(() => approvalInboxView({...item, exact_target: {...item.exact_target, display_name: "別の対象"}}, now, readScope), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView(item, now, {...readScope, principal_id: "other"}), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, target_shared: true}, now, readScope), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, presentation_requester_actor_id: "other"}, now, readScope), ApprovalInboxUnavailable);
   assert.equal(approvalInboxView(item, item.expires_at, readScope).canStartChallenge, false);
   assert.equal(approvalInboxView(withFingerprint({...item, created_at: "2026-09-30T00:11:00.000Z"}), now, readScope).canStartChallenge, false);
   assert.equal(approvalInboxView({...item, state: "approved"}, now, readScope).canStartChallenge, false);
@@ -125,8 +134,9 @@ test("detail and confirmation disable stale or terminal requests", () => {
   assert.throws(() => approvalInboxView({...item, operation_summary: " 操作"}, now, readScope), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, exact_target: {...item.exact_target, display_name: "対象\ud800名"}}, now, readScope), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, resolved_mentions: Array.from({length: 4}, (_, i) =>
-    ({target_id: `user_${i}`, display: "担当者"}))}, now, readScope), ApprovalInboxUnavailable);
+    ({target_id: `U${i + 1}`, display: "担当者"}))}, now, readScope), ApprovalInboxUnavailable);
   assert.throws(() => approvalInboxView({...item, resolved_mentions: [item.resolved_mentions[0], item.resolved_mentions[0]]}, now, readScope), ApprovalInboxUnavailable);
+  assert.throws(() => approvalInboxView({...item, resolved_mentions: [{target_id: "channel_1", display: "担当者"}]}, now, readScope), ApprovalInboxUnavailable);
 });
 
 test("preview escapes untrusted summary and never enables a decision", () => {
@@ -141,7 +151,8 @@ test("preview escapes untrusted summary and never enables a decision", () => {
   assert.ok(markup.includes("channel_1"));
   assert.ok(markup.includes("1730000000.000001"));
   assert.ok(markup.includes("<pre>投稿本文</pre>"));
-  assert.ok(markup.includes("<pre>担当者</pre> (user_1)"));
+  assert.ok(markup.includes("<pre>担当者</pre> (U123)"));
+  assert.ok(markup.includes("actor_1"));
   assert.ok(markup.includes("action_1"));
   assert.ok(markup.includes("<dd>slack.post_thread_reply.v1</dd>"));
   assert.ok(markup.includes("明示mentionを含む外部投稿"));
@@ -157,7 +168,7 @@ test("preview escapes untrusted summary and never enables a decision", () => {
   assert.ok(literal.includes("safe\\u{00A0}unsafe"));
   assert.ok(!literal.includes("line1\nline2"));
   const spacedMention = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
-    {codec_version: 1, item: {...item, resolved_mentions: [{target_id: "user_1", display: " 担当  者 "}]}}, now, readScope);
+    {codec_version: 1, item: {...item, resolved_mentions: [{target_id: "U123", display: " 担当  者 "}]}}, now, readScope);
   assert.ok(spacedMention.includes("<pre> 担当  者 </pre>"));
   assert.equal(encodeApprovalDisplay("😀\\\n\t\u202E"), "😀\\\\\\n\\t\\u{202E}");
   const later = renderApprovalInboxPreview({codec_version: 1, next_cursor: null, items: []},
@@ -187,6 +198,7 @@ test("server preflight rejects forged, expired, consumed and cross-scope evidenc
     {...evidence, presentation_status: "delivery_pending"}, {...evidence, audience_principal_id: "other"},
     {...evidence, session_ref: "other"}, {...evidence, session_generation: 2}, {...evidence, authz_revision: 2},
     {...evidence, policy_revision: 4}, {...evidence, requester_authorization_revision: 5},
+    {...evidence, requester_actor_id: "other"}, {...evidence, challenge_requester_actor_id: "other"},
     {...evidence, challenge_state: "consumed"}, {...evidence, challenge_expires_at: now},
     {...evidence, challenge_created_at: "2026-09-30T00:08:59.999Z"},
     {...evidence, created_at: "2026-09-30T00:10:00.001Z", challenge_created_at: "2026-09-30T00:10:00.001Z"},
