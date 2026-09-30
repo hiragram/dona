@@ -19,7 +19,9 @@ const itemBase = {
   request_revision: 1, presentation_ref: "presentation_1", presentation_revision: 2,
   display_codec_version: 1 as const, state: "pending" as const,
 };
-const withFingerprint = <T extends typeof itemBase>(value: T) =>
+const withFingerprint = <T extends Pick<typeof itemBase,
+  "opaque_action_id" | "operation" | "exact_target" | "expires_at" | "presentation_revision"> &
+  {risk: "elevated" | "critical"}>(value: T) =>
   ({...value, display_fingerprint: computeApprovalDisplayFingerprint({opaque_action_id: value.opaque_action_id,
     operation: value.operation, exact_target: value.exact_target, risk: value.risk,
     expires_at: value.expires_at, presentation_revision: value.presentation_revision})});
@@ -74,6 +76,9 @@ const detailBinding = (row: unknown = item) => {
   const parsed = approvalInboxItemSchema.parse(row);
   const digest = computeApprovalPrivateContentDigest(parsed);
   return {request_id: parsed.request_id, presentation_ref: parsed.presentation_ref,
+    audience_principal_id: parsed.audience_principal_id,
+    persisted_display_fingerprint: parsed.display_fingerprint,
+    presentation_display_fingerprint: parsed.display_fingerprint,
     presentation_revision: parsed.presentation_revision, persisted_action_hash: "b".repeat(64),
     presentation_action_hash: "b".repeat(64), persisted_content_digest: digest, presentation_content_digest: digest};
 };
@@ -152,6 +157,11 @@ test("detail and confirmation disable stale or terminal requests", async () => {
   ]) await assert.rejects(verifiedDetail(row, detailBinding()), ApprovalInboxUnavailable);
   await assert.rejects(verifiedDetail({...item, exact_draft: "差し替え", resolved_mentions: []}, detailBinding()), ApprovalInboxUnavailable);
   await assert.rejects(verifiedDetail({...item, risk_reason: "通常の投稿"}, detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail(withFingerprint({...item, risk: "elevated"}), detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail(withFingerprint({...item, opaque_action_id: "other"}), detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail(withFingerprint({...item, expires_at: "2026-09-30T00:14:00.000Z"}), detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail({...item, audience_principal_id: "other"}, detailBinding()), ApprovalInboxUnavailable);
+  await assert.rejects(verifiedDetail(item, {...detailBinding(), audience_principal_id: "other"}), ApprovalInboxUnavailable);
   await assert.rejects(verifiedDetail({...item, exact_draft: "あ".repeat(3001)}, detailBinding()), ApprovalInboxUnavailable);
   assert.equal(approvalInboxView(await verifiedDetail({...item, exact_draft: "あ".repeat(3000)}), now, readScope).exactDraft.length, 3000);
   await assert.rejects(verifiedDetail(item, {...detailBinding(), presentation_content_digest: "d".repeat(64)}), ApprovalInboxUnavailable);

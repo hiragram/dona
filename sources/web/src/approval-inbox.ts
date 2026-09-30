@@ -76,6 +76,7 @@ export const approvalInboxSchema = z.strictObject({ codec_version: z.literal(1),
   .refine(value => new Set(value.items.map(item => item.request_id)).size === value.items.length);
 export const approvalInboxDetailSchema = z.strictObject({ codec_version: z.literal(1), item: approvalInboxItemSchema });
 const detailBindingSchema = z.strictObject({request_id: id, presentation_ref: id, presentation_revision: revision,
+  audience_principal_id: id, persisted_display_fingerprint: hash, presentation_display_fingerprint: hash,
   persisted_action_hash: hash, presentation_action_hash: hash,
   persisted_content_digest: hash, presentation_content_digest: hash});
 const authorityDetailSchema = z.strictObject({codec_version: z.literal(1), item: approvalInboxItemSchema,
@@ -84,7 +85,8 @@ const verifiedDetails = new WeakMap<object, string>();
 /** Server-only digest of the literal content. Never place it in a browser response. */
 export function computeApprovalPrivateContentDigest(item: ApprovalInboxItem): string {
   const content = {request_id: item.request_id, operation: item.operation, requester_actor_id: item.requester_actor_id,
-    risk_reason: item.risk_reason,
+    audience_principal_id: item.audience_principal_id, risk: item.risk, risk_reason: item.risk_reason,
+    opaque_action_id: item.opaque_action_id, expires_at: item.expires_at,
     presentation_ref: item.presentation_ref, presentation_revision: item.presentation_revision,
     display_codec_version: item.display_codec_version, exact_target: item.exact_target,
     exact_draft: item.exact_draft, resolved_mentions: item.resolved_mentions};
@@ -252,6 +254,10 @@ export class ApprovalInboxAdapter {
       if (detail.binding.request_id !== detail.item.request_id
         || detail.binding.presentation_ref !== detail.item.presentation_ref
         || detail.binding.presentation_revision !== detail.item.presentation_revision
+        || detail.binding.audience_principal_id !== detail.item.audience_principal_id
+        || detail.binding.audience_principal_id !== currentScope.principal_id
+        || detail.binding.persisted_display_fingerprint !== detail.item.display_fingerprint
+        || detail.binding.presentation_display_fingerprint !== detail.item.display_fingerprint
         || detail.binding.persisted_action_hash !== detail.binding.presentation_action_hash
         || detail.binding.persisted_content_digest !== content
         || detail.binding.presentation_content_digest !== content) throw Error();
