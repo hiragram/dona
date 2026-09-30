@@ -57,3 +57,9 @@ Web session・固定route・ingress contextの追加契約は [運用文書](../
 ## Job command
 
 `POST /api/jobs`と`POST /api/jobs/:job_id/cancel`は、online照合済みsessionから署名したingress contextを固定command UDSへ渡す。browserの`request_id`はそのままjob keyにせず、保護鍵とverified bindingからserver側idempotency keyを導出する。durable receipt、owner照合、応答喪失時のreconcile、typed errorの詳細は[Web command API運用契約](../../docs/operations/web-command-api.md)を参照する。
+
+## Approval inbox の準備境界
+
+`approval-inbox.ts` は Issue #145 の部分対応として、認可済みの表示用 projection、一覧・詳細・確認画面の不活性な表示、decision 候補と server 側再検証に必要な型を定義する。内部 action hash は画面へ出さず、ADR 0002 の `display_fingerprint` だけを表示する。projection の余分な field、別 request ID、期限切れ、消費済み、principal・tenant・instance・binding の不一致は拒否する。
+
+`ApprovalInboxAdapter` は認証済み authority を注入しなければ利用できない。現時点で Web approval の HTTP handler、WebAuthn ceremony、durable presentation/challenge、decision/receipt transport は接続していない。一覧 route の宣言だけでは取得できず、preview の承認・却下ボタンは無効である。Epic #26 の #18/#23、Web presentation と one-shot receipt が揃い、server の同一監査 transaction で current principal、role、step-up、CSRF、scope、persisted action hash、期限、未消費状態を再確認できるまで safe-off を維持する。表示用 fingerprint や browser candidate を承認の正本にしない。
