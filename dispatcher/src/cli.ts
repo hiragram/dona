@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import os from "node:os";
+import fs from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 
 import { loadConfig } from "./config.js";
@@ -12,7 +13,7 @@ import { HerdrJobAgentRuntime } from "./job-runtime.js";
 import { JobSupervisor } from "./job-supervisor.js";
 import { createLogger } from "./logger.js";
 import { liveSessionReceiptRetentionSeconds } from "./live-session.js";
-import { inventoryJobArtifacts, inventorySizeIsComplete, readJobArtifactInventoryPage } from "./job-artifact-inventory.js";
+import { inventoryJobArtifacts, inventoryPageMetrics, inventorySizeIsComplete, readJobArtifactInventoryPage } from "./job-artifact-inventory.js";
 
 function projectLiveJob(row: Record<string, unknown>): Record<string, unknown> {
   const safeKeys = [
@@ -86,9 +87,19 @@ async function main(): Promise<void> {
     const artifacts = [];
     const budget = { entries: 0, deadline: performance.now() + 3_000 };
     for (const row of selected) artifacts.push(await inventoryJobArtifacts(row, config, budget));
+    const freeSpace = await Promise.all([config.jobsWorkspaceRoot, config.jobResultsDir].map(async (root) => {
+      try {
+        const stats = await fs.statfs(root, { bigint: true });
+        return { free_bytes: (stats.bavail * stats.bsize).toString(), error: null };
+      } catch (error) {
+        return { free_bytes: null, error: (error as NodeJS.ErrnoException).code ?? "statfs_failed" };
+      }
+    }));
     console.log(JSON.stringify({ schema_version: 1, dry_run: true, artifacts,
       next_cursor: rows.length > limit ? String(selected.at(-1)?.artifact_cursor) : null,
       size_is_complete: inventorySizeIsComplete(artifacts),
+      page_metrics: inventoryPageMetrics(artifacts),
+      free_space: { workspace: freeSpace[0], results: freeSpace[1] },
     }, null, 2));
     return;
   }
