@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 
-export function mainArguments(args, policy) {
+export function mainArguments(args, policy, mcpRoot = policy.config_root) {
   if (!(args[2] === 'agent' && args[3] === 'start')) return args;
   if (args[0] !== '--session' || args[1] !== 'dona' || args[4] !== 'dona-main') throw Error('main_scope');
   const extra = [];
   for (const [server, file] of [['dona_dispatcher', 'dispatcher'], ['dona_slack', 'slack']]) {
     for (const [key, value] of Object.entries({command:policy.executables.node,
-      args:[path.join(policy.config_root, `mcp-${file}.mjs`)], cwd:policy.config_root, required:true, enabled:true})) {
+      args:[path.join(mcpRoot, `mcp-${file}.mjs`)], cwd:policy.config_root, required:true, enabled:true})) {
       extra.push('-c', `mcp_servers.${server}.${key}=${JSON.stringify(value)}`);
     }
   }
@@ -19,7 +19,7 @@ export function mainArguments(args, policy) {
 export async function operate(request, policy, Runtime, Process) {
   const process = new Process();
   const runtime = new Runtime(policy, {run:(executable,args,options) =>
-    process.run(executable, mainArguments(args, policy), options)});
+    process.run(executable, mainArguments(args, policy, request.mcp_root), options)});
   if (request.action === 'status') return runtime.mainAgentStatus(request.release);
   if (request.action === 'stop') return runtime.stopMainAgent(request.expected);
   if (request.action === 'start') return runtime.startMainAgent(request.pane, request.release, request.previous_session);

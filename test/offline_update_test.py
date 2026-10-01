@@ -1,0 +1,209 @@
+"""停止更新の順序、crash再開、復旧境界を本番に触れず検証する。"""
+import copy
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parents[1]/'scripts/maintenance'))
+import offline_update as m
+
+
+def proc(pid, parent=1, state='S', start='Thu Oct 1 12:00:00 2026'):
+    return dict(pid=pid, parent=parent, uid=os.getuid(), state=state, start=start)
+
+
+class ProcessTests(unittest.TestCase):
+    def test_freezes_parent_before_enumerating_children_and_kills_reverse_order(self):
+        root, child, newcomer, unrelated = 800001, 800002, 800003, 800004
+        table = {root: proc(root), child: proc(child,root), unrelated: proc(unrelated)}
+        saved, signals = [], []
+        def send(pid, sig):
+            self.assertIn(pid, [p['pid'] for p in saved[-1]])
+            signals.append((pid,sig))
+            if sig == signal.SIGSTOP:
+                table[pid]['state'] = 'T'
+                if pid == root: table[newcomer] = proc(newcomer, root)
+            else: table.pop(pid)
+        m.ProcessStop(lambda rows:saved.append(copy.deepcopy(rows)), lambda:copy.deepcopy(table), send, lambda _:None).stop([table[root]], [])
+        self.assertEqual(signals, [(root,signal.SIGSTOP),(child,signal.SIGSTOP),(newcomer,signal.SIGSTOP),
+                                   (newcomer,signal.SIGKILL),(child,signal.SIGKILL),(root,signal.SIGKILL)])
+        self.assertEqual(list(table), [unrelated])
+
+    def test_crash_resume_kills_recorded_orphan_but_not_reused_pid(self):
+        orphan = proc(800001)
+        reused = proc(800002,start='Fri Oct 2 12:00:00 2026')
+        table = {800001:orphan,800002:reused}
+        signals=[]
+        def send(pid,sig):
+            signals.append(pid)
+            if sig == signal.SIGSTOP: table[pid]['state']='T'
+            else: table.pop(pid)
+        m.ProcessStop(lambda _:None, lambda:copy.deepcopy(table), send).stop([], [orphan, proc(800002)])
+        self.assertEqual(signals,[800001,800001])
+        self.assertIn(800002,table)
+
+    def test_current_runner_is_never_stopped(self):
+        own=proc(os.getpid())
+        with self.assertRaisesRegex(RuntimeError,'process_stop_scope'):
+            m.ProcessStop(lambda _:None, lambda:{own['pid']:own}, lambda *_:self.fail()).stop([own],[])
+
+    def test_real_process_tree_stops_without_touching_sibling(self):
+        root = subprocess.Popen([sys.executable,'-u','-c',
+            'import subprocess,sys,time; p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"]); print(p.pid,flush=True); time.sleep(60)'],stdout=subprocess.PIPE)
+        sibling = subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])
+        child = int(root.stdout.readline())
+        try:
+            saved=[]
+            m.ProcessStop(lambda rows:saved.append(rows)).stop([m.process_table()[root.pid]],[])
+            root.wait(timeout=5)
+            self.assertIsNone(sibling.poll())
+            self.assertIn(child,[p['pid'] for p in saved[-1]])
+        finally:
+            for p in (root,sibling):
+                if p.poll() is None: p.kill()
+                p.wait(timeout=5)
+            root.stdout.close()
+
+
+class FakeRunner(m.Runner):
+    def __init__(self, phase='prepared', fail=None):
+        self.journal={'phase':phase,'steps':[]}
+        self.policy={'executables':{'herdr':'herdr'}}
+        self.calls=[]
+        self.fail=fail
+    def hit(self,name):
+        self.calls.append(name)
+        if self.fail == name: raise RuntimeError(name)
+    def record(self,phase=None,**fields):
+        if phase: self.journal['phase']=phase
+        self.journal.update(fields)
+    def validate(self): self.hit('validate')
+    def validate_source(self): self.hit('validate_source')
+    def stop(self): self.hit('stop')
+    def backup(self): self.hit('backup'); self.record('backed_up')
+    def migrate(self): self.hit('migrate')
+    def install(self): self.hit('install')
+    def start_main(self): self.hit('main')
+    def start_service(self,label): self.hit(label)
+    def health(self): self.hit('health')
+    def restore(self): self.hit('restore'); self.record('rolled_back')
+
+
+class ExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.patch=patch.object(m,'herdr_root',return_value=[]);self.patch.start()
+    def tearDown(self): self.patch.stop()
+    def test_success_orders_stop_backup_migrate_main_and_services(self):
+        runner=FakeRunner();runner.execute()
+        self.assertEqual(runner.calls,['validate','validate_source','stop','validate_source','backup','migrate','install','main',
+                                     'dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater','health'])
+        self.assertEqual(runner.journal['phase'],'succeeded')
+    def test_each_pre_activation_failure_restores(self):
+        for step in ('backup','migrate','install','main'):
+            with self.subTest(step=step):
+                runner=FakeRunner(fail=step)
+                with self.assertRaises(RuntimeError):runner.execute()
+                self.assertEqual(runner.journal['phase'],'rolled_back')
+    def test_stop_failure_never_modifies_database_or_claims_rollback(self):
+        runner=FakeRunner(fail='stop')
+        with self.assertRaises(RuntimeError):runner.execute()
+        self.assertEqual(runner.journal['phase'],'stopping')
+        self.assertNotIn('backup',runner.calls);self.assertNotIn('restore',runner.calls)
+    def test_activation_failure_never_restores_database(self):
+        for step in ('dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater','health'):
+            with self.subTest(step=step):
+                runner=FakeRunner(fail=step)
+                with self.assertRaises(RuntimeError):runner.execute()
+                self.assertTrue(runner.journal['activation_started'])
+                self.assertNotIn('restore',runner.calls)
+                runner.fail=None;runner.calls=[];runner.execute()
+                self.assertEqual(runner.journal['phase'],'succeeded')
+                self.assertNotIn('backup',runner.calls);self.assertNotIn('migrate',runner.calls)
+    def test_crash_at_migration_intent_resumes_without_replacing_backup(self):
+        runner=FakeRunner('migrating');runner.execute()
+        self.assertNotIn('backup',runner.calls)
+        self.assertIn('migrate',runner.calls)
+    def test_completed_run_only_checks_health(self):
+        runner=FakeRunner('succeeded');runner.execute()
+        self.assertEqual(runner.calls,['health'])
+    def test_unknown_phase_is_not_success(self):
+        runner=FakeRunner('bogus')
+        with self.assertRaisesRegex(RuntimeError,'unknown_phase'):runner.execute()
+    def test_failed_seal_before_stop_does_not_stop_services(self):
+        runner=FakeRunner(fail='validate')
+        with self.assertRaises(RuntimeError):runner.execute()
+        self.assertNotIn('stop',runner.calls)
+
+
+class RestoreTests(unittest.TestCase):
+    def fixture(self, root):
+        runner=object.__new__(m.Runner)
+        runner.run=root
+        (root/'rollback').mkdir()
+        runner.plan={'rollback_seal':m.common.tree_seal(root/'rollback')}
+        runner.inv={'databases':[str(root/'absent')]*4}
+        runner.journal={'phase':'migrating','steps':[]}
+        runner.stop=lambda:None
+        runner.install=lambda **_:None
+        runner.start_main=lambda **_:None
+        runner.start_service=lambda *_:None
+        runner.health=lambda **_:None
+        runner.migrate=lambda **_:None
+        return runner
+
+    def test_corrupt_backup_is_rejected_before_any_database_is_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=self.fixture(root)
+            backup=root/'backup';backup.mkdir()
+            source=root/'db';source.write_bytes(b'new-state')
+            saved=backup/'db-0';saved.write_bytes(b'old-state')
+            m.atomic(backup/'index.json',m.encode([{'source':str(source),'backup':str(saved),'exists':True,'hash':m.common.file_digest(saved)}]))
+            runner.journal['backup_index_hash']=m.common.file_digest(backup/'index.json')
+            saved.write_bytes(b'corrupted')
+            with self.assertRaisesRegex(RuntimeError,'backup_changed'):runner.restore()
+            self.assertEqual(source.read_bytes(),b'new-state')
+
+    def test_restore_after_target_activation_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner=self.fixture(Path(directory));runner.journal['activation_started']=True
+            with self.assertRaisesRegex(RuntimeError,'rollback_after_activation_forbidden'):runner.restore()
+
+    def test_resume_failed_rollback_startup_preserves_new_old_version_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=self.fixture(root)
+            runner.journal.update(rollback_activation_started=True,backup_index_hash='would-fail-if-read')
+            source=root/'db';source.write_bytes(b'new-data-after-old-service-start')
+            runner.restore()
+            self.assertEqual(source.read_bytes(),b'new-data-after-old-service-start')
+            self.assertEqual(runner.journal['phase'],'rolled_back')
+
+
+class ActiveRunTests(unittest.TestCase):
+    def test_interrupted_run_cannot_be_overwritten_by_another_run(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
+            root=Path(directory);(root/'.dona-maintenance').mkdir()
+            first=root/'first';first.mkdir();(first/'plan.json').write_text('{}')
+            m.atomic(first/'journal.json',m.encode({'phase':'migrating'}))
+            second=root/'second';second.mkdir();(second/'plan.json').write_text('{}')
+            m.claim_run(first)
+            self.assertEqual(m.active_run(),first)
+            with self.assertRaisesRegex(RuntimeError,'未完了'):m.claim_run(second)
+            m.atomic(first/'journal.json',m.encode({'phase':'succeeded'}))
+            self.assertIsNone(m.active_run())
+            m.claim_run(second)
+
+    def test_changed_plan_is_not_resumed_implicitly(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
+            root=Path(directory);(root/'.dona-maintenance').mkdir()
+            run=root/'run';run.mkdir();(run/'plan.json').write_text('{}')
+            m.atomic(run/'journal.json',m.encode({'phase':'stopping'}))
+            m.claim_run(run);(run/'plan.json').write_text('{"changed":true}')
+            with self.assertRaisesRegex(RuntimeError,'active_run_changed'):m.active_run()
+
+if __name__ == '__main__':unittest.main()
