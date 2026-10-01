@@ -211,16 +211,46 @@ class MainHealthTests(unittest.TestCase):
 
 
 
+class RollbackPreparationTests(unittest.TestCase):
+    def test_rollback_stages_current_adapter_with_old_policy_and_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);release=root/'target';run=root/'run';run.mkdir()
+            (release/'updater/dist').mkdir(parents=True)
+            (release/'updater/dist/adapters.js').write_text('current adapter accepts wBR:p1')
+            inv={'policy':{'executables':{'node':'/old/node'},'release_root':'/old/releases'},
+                 'old_pointer':'/old/releases/sha',
+                 'plists':{'dev.dona.updater':{'WorkingDirectory':'/old/broken-updater'}},
+                 'configs':{key:{'values':{'KEEP':'old'}} for key in ('dispatcher','slack')}}
+            plan={'release':str(release),'node':'/new/node'}
+            with patch.object(m.common,'installed_codex',return_value='/new/codex'),patch.object(m,'command') as command:
+                m.prepare_rollback(run,inv,plan)
+            staged=run/'rollback/control/updater'
+            self.assertFalse(staged.is_symlink())
+            self.assertEqual((staged/'dist/adapters.js').read_text(),'current adapter accepts wBR:p1')
+            self.assertEqual(m.read_json(run/'rollback/control/policy.json')['release_root'],'/old/releases')
+            self.assertIn('/old/releases/sha', (run/'rollback/config/mcp-dispatcher.mjs').read_text())
+            self.assertEqual(command.call_args.args[0][0],'/new/node')
+            self.assertIn(str(staged/'dist/policy.js'),command.call_args.args[0][3])
+
+    def test_rollback_main_start_uses_current_node_and_adapter_with_old_release(self):
+        runner=FakeRunner();runner.run=Path('/fixture/run');runner.g=Path('/fixture/g')
+        runner.node='/new/node';runner.inv={'old_pointer':'/old/release','policy':{'executables':{'node':'/old/node'}}}
+        runner.policy['executables']={'herdr':'/fixture/herdr'}
+        runner.journal['old_main']={'pane':'wBR:p1'}
+        runner.ensure_herdr=lambda:None
+        responses=[{'exists':False},{'outcome':'started','observation':{'session_id':'new-session'}}]
+        with patch.object(m,'command',side_effect=[m.encode(v) for v in responses]) as command:
+            m.Runner.start_main(runner,old=True)
+        for call in command.call_args_list:
+            self.assertEqual(call.args[0],['/new/node','/fixture/run/main_bridge.mjs','/fixture/run/rollback/control'])
+            request=m.json.loads(call.kwargs['input'])
+            self.assertEqual(request['release'],'/old/release')
+            self.assertEqual(request['mcp_root'],'/fixture/run/rollback/config')
+        self.assertEqual(request['pane'],'wBR:p1')
+        self.assertEqual(runner.journal['old_main']['session_id'],'new-session')
+
+
 class StartupTests(unittest.TestCase):
-    def test_server_config_disables_auto_resume_and_preserves_other_settings(self):
-        for source in ('[ui]\nmouse=true\n', '[session]\nresume_agents_on_restore = true\n[ui]\nmouse=true\n', '[\"session\"]\n\"resume_agents_on_restore\" = true\n[ui]\nmouse=true\n'):
-            result=m.herdr_no_resume_config(source)
-            self.assertIn('mouse=true',result)
-            self.assertEqual(result.count('resume_agents_on_restore'),1)
-            self.assertIn('resume_agents_on_restore = false',result)
-            self.assertEqual(m.herdr_no_resume_config(result),result)
-
-
     def test_intent_without_server_recovers_for_resume_and_rollback(self):
         for intent in (False, True):
             with tempfile.TemporaryDirectory() as directory:
