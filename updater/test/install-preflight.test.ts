@@ -850,7 +850,14 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
       fs.writeFile(oldReceipt, "old receipt"),
       fs.writeFile(backup, "backup")]);
     await Promise.all([oldPolicy, oldPlist, oldDispatcherPlist, newDispatcherPlist, oldReceipt].map(file => fs.chmod(file, 0o600)));
-    await fs.writeFile(rehearsal, "rehearsal");
+    const backupHash = createHash("sha256").update(await fs.readFile(backup)).digest("hex");
+    const rehearsalReceipt = { schema_version: 1, backup_sha256: backupHash,
+      old_database_module_sha256: "a".repeat(64), new_database_module_sha256: "b".repeat(64),
+      old_schema: 7, new_schema: 8, rollback: "restore_backup_required",
+      old_binary_restored_backup_readable: true };
+    await fs.writeFile(rehearsal, JSON.stringify(rehearsalReceipt));
+    await fs.chmod(backup, 0o600);
+    await fs.chmod(rehearsal, 0o600);
     const create = () => execute(process.execPath, [controlLedger, "create", attempt,
       "1".repeat(40), "2".repeat(40), oldPolicy, newPolicy, oldPlist, newPlist, "f".repeat(64),
       controlUpdater, newUpdater, oldDispatcherPlist, newDispatcherPlist, oldReceipt]);
@@ -873,6 +880,10 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await assert.rejects(advance("verified"), /out of order/);
     await advance("updater_stop_intent", "bootout_updater");
     await advance("updater_stopped");
+    await fs.writeFile(rehearsal, JSON.stringify({ ...rehearsalReceipt, backup_sha256: "0".repeat(64) }));
+    await assert.rejects(execute(process.execPath,
+      [controlLedger, "advance", attempt, "backup_verified", "none", backup, rehearsal]), /does not match/);
+    await fs.writeFile(rehearsal, JSON.stringify(rehearsalReceipt));
     await execute(process.execPath, [controlLedger, "advance", attempt, "backup_verified", "none", backup, rehearsal]);
     const snapshot = JSON.parse(await fs.readFile(path.join(attempt, "attempt.json"), "utf8"));
     assert.equal(snapshot.sequence, 4);
@@ -890,6 +901,9 @@ test("control attempt ledger preserves exact identities and rejects duplicate or
     await fs.writeFile(newPolicy, "tampered");
     await assert.rejects(verify(), /do not match/);
     await fs.writeFile(newPolicy, "new");
+    await fs.writeFile(rehearsal, JSON.stringify({ ...rehearsalReceipt, old_binary_restored_backup_readable: false }));
+    await assert.rejects(verify(), /does not match/);
+    await fs.writeFile(rehearsal, JSON.stringify(rehearsalReceipt));
     await fs.writeFile(newDispatcherPlist, "tampered");
     await assert.rejects(verify(), /do not match/);
     await fs.writeFile(newDispatcherPlist, "new dispatcher");

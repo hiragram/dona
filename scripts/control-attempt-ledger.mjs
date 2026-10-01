@@ -53,6 +53,21 @@ function publish(file, value, writeFile = fs.writeFileSync) {
   try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
 }
 
+function verifyRehearsal(backup, rehearsal) {
+  assertPrivateFile(backup);
+  assertPrivateFile(rehearsal);
+  const receipt = JSON.parse(fs.readFileSync(rehearsal, "utf8"));
+  if (receipt.schema_version !== 1 || receipt.backup_sha256 !== digest(backup) ||
+      !Number.isSafeInteger(receipt.old_schema) || receipt.old_schema < 0 ||
+      !Number.isSafeInteger(receipt.new_schema) || receipt.new_schema < receipt.old_schema ||
+      receipt.rollback !== (receipt.new_schema > receipt.old_schema ? "restore_backup_required" : "same_schema") ||
+      receipt.old_binary_restored_backup_readable !== true ||
+      !/^[0-9a-f]{64}$/.test(receipt.old_database_module_sha256 ?? "") ||
+      !/^[0-9a-f]{64}$/.test(receipt.new_database_module_sha256 ?? "")) {
+    throw new Error("control restore rehearsal does not match the DB backup and schema contract");
+  }
+}
+
 export function createAttempt(directory, oldSha, newSha, oldPolicy, newPolicy, oldPlist, newPlist,
   releaseDigest, oldUpdaterTree, newUpdaterTree, oldDispatcherPlist, newDispatcherPlist, oldReceipt) {
   assertPrivateDirectory(directory);
@@ -106,6 +121,7 @@ export function verifyRestoredControl(directory, policy, plist, updaterTree, dat
     }
     const rehearsal = path.join(directory, "restore-rehearsal.json");
     assertPrivateFile(rehearsal);
+    verifyRehearsal(backup, rehearsal);
     if (digest(rehearsal) !== attempt.restore_rehearsal_sha256) {
       throw new Error("control restore rehearsal differs from the saved attempt");
     }
@@ -167,6 +183,7 @@ export function advanceAttempt(directory, phase, operation = "none", backup = un
   if (phase === "backup_verified" && (backup === undefined || rehearsal === undefined)) {
     throw new Error("backup_verified requires both durable artifacts");
   }
+  if (phase === "backup_verified") verifyRehearsal(backup, rehearsal);
   const next = { ...current, phase, sequence: current.sequence + 1,
     db_backup_sha256: backup === undefined ? current.db_backup_sha256 : digest(backup),
     restore_rehearsal_sha256: rehearsal === undefined ? current.restore_rehearsal_sha256 : digest(rehearsal),
@@ -180,6 +197,7 @@ export function verifyAttemptArtifacts(directory, policy, plist, dispatcherPlist
   const file = path.join(directory, "attempt.json");
   assertPrivateFile(file);
   const attempt = JSON.parse(fs.readFileSync(file, "utf8"));
+  verifyRehearsal(backup, rehearsal);
   if (attempt.phase !== "updater_started" || digest(policy) !== attempt.new_policy_sha256 ||
       digest(plist) !== attempt.new_plist_sha256 ||
       digest(dispatcherPlist) !== attempt.new_dispatcher_plist_sha256 ||
