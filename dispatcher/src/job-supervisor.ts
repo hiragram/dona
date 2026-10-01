@@ -1,3 +1,4 @@
+import { jobSnapshot, publicObservation, type WorkerObservation } from "./job-handoff.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -188,6 +189,69 @@ export class JobSupervisor {
 
   isRunning(): boolean {
     return this.running && !this.stopping;
+  }
+
+  private async observeWorker(job: JobRow): Promise<WorkerObservation> {
+    let observation: WorkerObservation = this.runtime.observeWorker
+      ? await this.runtime.observeWorker(job, this.abortController.signal)
+      : {state:"unknown",reason:"runtime_observation_unavailable",observed_at:new Date().toISOString(),process_ids:[],process_groups:[]};
+    const prior = this.database.getWorkerObservation(job);
+    if (observation.state === "unknown" && prior && this.runtime.workerRetired &&
+        await this.runtime.workerRetired(job, prior, this.abortController.signal))
+      observation = { ...prior, state: "stopped", reason: "recorded_processes_and_pane_absent", observed_at: new Date().toISOString() };
+    this.database.recordWorkerObservation(job, observation);
+    return observation;
+  }
+
+  async inspectWorker(jobId: string, sourceEventId: string): Promise<Record<string, unknown>> {
+    this.database.assertHandoffOwner(jobId, sourceEventId);
+    const before = this.database.getJob(jobId)!;
+    let observation = await this.observeWorker(before);
+    this.database.assertHandoffOwner(jobId, sourceEventId);
+    if (jobSnapshot(this.database.getJob(jobId)!) !== jobSnapshot(before))
+      observation = { ...observation, state: "unknown", reason: "job_changed_during_observation", process_ids: [], process_groups: [] };
+    const handoff = this.database.getJobHandoff(jobId);
+    return { schema_version: 1, job_id: jobId, durable_status: this.database.getJob(jobId)!.status,
+      worker: publicObservation(observation), handoff: handoff ? { state: handoff.state, successor_job_id: handoff.successor_job_id } : null };
+  }
+
+  resumeJob(jobId: string, sourceEventId: string, instruction: string): Promise<Record<string, unknown>> {
+    return this.serialized(jobId, async () => {
+      this.database.assertHandoffOwner(jobId, sourceEventId);
+      let record = this.database.getJobHandoff(jobId);
+      if (record && record.instruction !== instruction) throw new Error("handoff_instruction_conflict");
+      if (record?.successor_job_id) return { schema_version: 1, outcome: "reused", predecessor_job_id: jobId, job_id: record.successor_job_id };
+      if (!this.runtime.observeWorker || !this.runtime.retireWorker || !this.runtime.workerRetired) throw new Error("handoff_runtime_unavailable");
+      if (!record) {
+        const before = this.database.getJob(jobId)!;
+        if (!["running", "blocked", "needs_review"].includes(before.status)) throw new Error("handoff_job_not_resumable");
+        try { await fs.lstat(before.result_path); throw new Error("handoff_result_requires_reconciliation"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        const observation = await this.observeWorker(before);
+        if (!["inactive", "stopped"].includes(observation.state)) return { schema_version: 1, outcome: "not_resumed", job_id: jobId, worker: publicObservation(observation) };
+        // A claimed write is never sent twice, even after crash or lost response.
+        // Recheck immediately before the durable claim and the only retirement write.
+        const fresh = await this.observeWorker(before);
+        if (!["inactive", "stopped"].includes(fresh.state) || (JSON.stringify(fresh.process_ids) !== JSON.stringify(observation.process_ids) || JSON.stringify(fresh.process_groups) !== JSON.stringify(observation.process_groups)))
+          return { schema_version: 1, outcome: "not_resumed", job_id: jobId, worker: publicObservation(fresh) };
+        this.database.assertHandoffAdmission(before, sourceEventId, instruction, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
+        record = this.database.claimJobHandoff(before, sourceEventId, instruction, fresh);
+        try { if (fresh.state !== "stopped") await this.runtime.retireWorker(before, this.abortController.signal); }
+        catch { /* Read-only reconciliation below establishes the actual outcome. */ }
+      }
+      const old = JSON.parse(record.expected_job_json) as JobRow;
+      const evidence = JSON.parse(record.observation_json) as WorkerObservation;
+      let stopped = await this.runtime.workerRetired(old, evidence, this.abortController.signal);
+      const deadline = Date.now() + 2_000;
+      while (!stopped && !this.stopping && Date.now() < deadline) {
+        await abortableDelay(100, this.abortController.signal);
+        stopped = await this.runtime.workerRetired(old, evidence, this.abortController.signal);
+      }
+      if (!stopped) return { schema_version: 1, outcome: "retirement_pending", job_id: jobId };
+      const successor = this.database.finishJobHandoff(jobId, sourceEventId, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
+      this.wake();
+      return { schema_version: 1, outcome: "created", predecessor_job_id: jobId, job_id: successor.job_id };
+    });
   }
 
   async observeLiveSession(jobId:string,sourceEventId?:string):Promise<LiveSessionReceiptProjection> {
@@ -821,6 +885,11 @@ export class JobSupervisor {
       return;
     }
     this.database.setJobRuntime(row.job_id, prepared.herdrWorkspaceId, prepared.herdrPaneId, prepared.herdrAgentSessionId);
+    // Capture the shell/worker tree before the first prompt, for later exit verification.
+    if (this.runtime.observeWorker && row.source !== "dona_schedule") {
+      try { await this.observeWorker(this.database.getJob(row.job_id)!); }
+      catch { this.logger.warn("Worker process observation unavailable", {job_id:row.job_id}); }
+    }
     if (this.database.getJob(row.job_id)?.status !== "preparing") return;
     const promptBaseline = await this.readPromptBaseline(preparing);
     if (this.stopping) return;

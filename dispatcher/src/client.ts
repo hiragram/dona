@@ -10,6 +10,13 @@ export class DispatcherClientError extends Error {
 export class DispatcherApiClient {
   constructor(private readonly socketPath: string, private readonly timeoutMs = 10_000) {}
 
+  inspectWorker(jobId: string, sourceEventId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/v1/jobs/${encodeURIComponent(jobId)}/worker?${new URLSearchParams({source_event_id:sourceEventId})}`);
+  }
+  resumeJob(jobId: string, input: unknown): Promise<Record<string, unknown>> {
+    return this.request("POST", `/v1/jobs/${encodeURIComponent(jobId)}/resume`, input);
+  }
+
   createJob(input: unknown): Promise<Record<string, unknown>> {
     return this.request("POST", "/v1/jobs", input);
   }

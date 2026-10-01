@@ -1,3 +1,4 @@
+import { jobSnapshot, workspaceJobId, handoffKey, type HandoffRecord, type WorkerObservation } from "./job-handoff.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs";
@@ -733,6 +734,17 @@ export class DispatcherDatabase {
       this.db.prepare(`INSERT OR IGNORE INTO job_queued_steer_receipts(job_id,source_event_id)
         SELECT job_id,steer_event_id FROM jobs WHERE steer_event_id IS NOT NULL AND steer_state='accepted'
           AND status IN ('queued','retryable_failed')`).run();
+      this.db.exec(`CREATE TABLE IF NOT EXISTS job_worker_observations(
+        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id), identity_json TEXT NOT NULL, observation_json TEXT NOT NULL)`);
+      this.db.exec(`CREATE TABLE IF NOT EXISTS job_handoffs(
+        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+        source_event_id TEXT NOT NULL,
+        instruction TEXT NOT NULL,
+        expected_job_json TEXT NOT NULL,
+        observation_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('claimed','accepted')),
+        successor_job_id TEXT UNIQUE REFERENCES jobs(job_id),
+        created_at TEXT NOT NULL)`);
       this.db.exec(`CREATE TABLE IF NOT EXISTS job_terminal_worker_stop_proofs(
         job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
         stopped_at TEXT NOT NULL)`);
@@ -936,6 +948,91 @@ export class DispatcherDatabase {
         .all(status, limit) as EventRow[];
     }
     return this.db.prepare("SELECT * FROM events ORDER BY sequence LIMIT ?").all(limit) as EventRow[];
+  }
+
+  recordWorkerObservation(job: JobRow, observation: WorkerObservation): void {
+    const current = this.getJobRequired(job.job_id);
+    if (jobSnapshot(current) !== jobSnapshot(job) || !observation.process_ids.length) return;
+    this.db.prepare(`INSERT INTO job_worker_observations(job_id,identity_json,observation_json) VALUES(?,?,?)
+      ON CONFLICT(job_id) DO UPDATE SET identity_json=excluded.identity_json,observation_json=excluded.observation_json`)
+      .run(job.job_id, JSON.stringify([job.agent_name,job.herdr_workspace_id,job.herdr_pane_id]), JSON.stringify(observation));
+  }
+
+  getWorkerObservation(job: JobRow): WorkerObservation | undefined {
+    const row = this.db.prepare("SELECT observation_json FROM job_worker_observations WHERE job_id=? AND identity_json=?")
+      .get(job.job_id, JSON.stringify([job.agent_name,job.herdr_workspace_id,job.herdr_pane_id])) as {observation_json:string} | undefined;
+    return row ? JSON.parse(row.observation_json) as WorkerObservation : undefined;
+  }
+
+  getJobHandoff(jobId: string): HandoffRecord | undefined {
+    return this.db.prepare("SELECT * FROM job_handoffs WHERE job_id=?").get(jobId) as HandoffRecord | undefined;
+  }
+
+  assertHandoffOwner(jobId: string, sourceEventId: string): void {
+    this.assertJobSourceMatchesThread(jobId, sourceEventId);
+    this.assertJobSteerAllowed(jobId);
+    if (this.getRequired(sourceEventId).source !== "slack") throw new Error("handoff_requires_slack_event");
+  }
+
+  claimJobHandoff(job: JobRow, sourceEventId: string, instruction: string, observation: WorkerObservation): HandoffRecord {
+    return this.db.transaction(() => {
+      this.assertHandoffOwner(job.job_id, sourceEventId);
+      if (this.getJobHandoff(job.job_id)) throw new Error("handoff_already_claimed");
+      const current = this.getJobRequired(job.job_id);
+      if (jobSnapshot(current) !== jobSnapshot(job) || !["running", "blocked", "needs_review"].includes(current.status) ||
+          current.result_json || current.steer_state === "dispatching" || !["inactive", "stopped"].includes(observation.state) || !observation.process_ids.length)
+        throw new Error("handoff_job_changed_or_not_inactive");
+      // Reserve before the only runtime write; cancellation also reconciles prior notification ownership.
+      this.beginJobCancellation(job.job_id, sourceEventId);
+      this.db.prepare("UPDATE jobs SET last_error_code='handoff_retirement_pending',last_error_message=NULL WHERE job_id=?").run(job.job_id);
+      this.db.prepare(`INSERT INTO job_handoffs(job_id,source_event_id,instruction,expected_job_json,observation_json,state,created_at)
+        VALUES(?,?,?,?,?,'claimed',?)`).run(job.job_id, sourceEventId, instruction,
+          jobSnapshot(this.getJobRequired(job.job_id)), JSON.stringify(observation), nowUtc());
+      return this.getJobHandoff(job.job_id)!;
+    }).immediate();
+  }
+
+  private handoffRequest(old: JobRow, sourceEventId: string, instruction: string): CreateJobRequest {
+    return { source_event_id: sourceEventId, job_key: handoffKey(old.job_id),
+      objective: old.objective + "\n\n[DONA_HANDOFF]\n旧workerは停止確認済みです。既存のcommit、未commit差分、ファイル、PRと外部操作の受理状況を先に照合し、重複実行せず残作業を続けてください。旧Resultを新しいResultへ転用せず、未解決の承認を承認済みと解釈しないでください。\n" + instruction + "\n[/DONA_HANDOFF]",
+      workspace: parseJobWorkspace(JSON.parse(old.workspace_json)) };
+  }
+
+  assertHandoffAdmission(job: JobRow, sourceEventId: string, instruction: string, workspaceRoot: string, resultDir: string): void {
+    const rollback = new Error("handoff_admission_preview");
+    try {
+      this.db.transaction(() => {
+        const candidate = this.createJob(this.handoffRequest(job,sourceEventId,instruction), workspaceRoot,resultDir);
+        if (candidate.duplicate) throw new Error("handoff_successor_key_conflict");
+        // Exercise the same owner, group, key and size checks without committing a job.
+        throw rollback;
+      }).immediate();
+    } catch (error) { if (error !== rollback) throw error; }
+  }
+
+  finishJobHandoff(jobId: string, sourceEventId: string, workspaceRoot: string, resultDir: string): JobRow {
+    return this.db.transaction(() => {
+      this.assertHandoffOwner(jobId, sourceEventId);
+      const record = this.getJobHandoff(jobId);
+      if (!record) throw new Error("handoff_not_claimed");
+      if (record.successor_job_id) return this.getJobRequired(record.successor_job_id);
+      const old = this.getJobRequired(jobId);
+      if (jobSnapshot(old) !== record.expected_job_json) throw new Error("handoff_job_changed");
+      try { fs.lstatSync(old.result_path); throw new Error("handoff_result_requires_reconciliation"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      const result = this.createJob(this.handoffRequest(old, sourceEventId, record.instruction), workspaceRoot, resultDir);
+      if (result.duplicate) throw new Error("handoff_successor_key_conflict");
+      const workspace = { ...JSON.parse(result.row.workspace_json), _dona_handoff: {
+        predecessor_job_id: old.job_id, workspace_job_id: workspaceJobId(old) } };
+      this.db.prepare("UPDATE jobs SET workspace_path=?,workspace_json=? WHERE job_id=?")
+        .run(old.workspace_path, stableStringify(workspace), result.row.job_id);
+      this.markJobCancelled(jobId, `Work handed off to ${result.row.job_id}`);
+      this.markTerminalWorkerStopProof(jobId);
+      this.db.prepare("UPDATE job_terminal_worker_cleanups SET outcome='stopped',updated_at=? WHERE job_id=?").run(nowUtc(),jobId);
+      this.db.prepare("UPDATE job_handoffs SET state='accepted',successor_job_id=? WHERE job_id=? AND state='claimed'")
+        .run(result.row.job_id, jobId);
+      return this.getJobRequired(result.row.job_id);
+    }).immediate();
   }
 
   createJob(
@@ -1441,7 +1538,8 @@ export class DispatcherDatabase {
           WHEN status='dispatching' THEN 'ambiguous_prompt_acceptance' ELSE 'ambiguous_steer_acceptance' END,
         last_error_message = 'Dispatcher restarted while job prompt, steer, or cancellation acceptance was unknown',
         steer_state = NULL, updated_at = ?
-      WHERE status IN ('dispatching', 'cancelling') OR steer_state = 'dispatching'
+      WHERE (status IN ('dispatching', 'cancelling') OR steer_state = 'dispatching')
+        AND NOT EXISTS (SELECT 1 FROM job_handoffs h WHERE h.job_id=jobs.job_id AND h.state='claimed')
     `).run(timestamp).changes;
     return { retryable, needsReview };
   }
@@ -2329,6 +2427,7 @@ export class DispatcherDatabase {
 
   beginJobCancellation(jobId: string, sourceEventId: string): JobRow {
     this.assertJobSourceMatchesThread(jobId, sourceEventId);
+    if (this.getJobHandoff(jobId)?.state === "claimed") throw new Error("handoff_retirement_pending");
     const row = this.getJobRequired(jobId);
     if (row.status === "cancelled") return row;
     if(row.status==="needs_review"&&["cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance"].includes(row.last_error_code??"")) {
