@@ -42,7 +42,20 @@ test('停止更新は旧requestと監査履歴を残して自動再開・古い�
       assert.equal((db.prepare('SELECT active_request_id FROM controller_state').get() as {active_request_id:null}).active_request_id,null);
     } finally {db.close();}
     const reopened=new UpdateDatabase(file);
-    try {assert.equal(reopened.nonTerminalCount(),0);assert.equal(reopened.reconcilableNeedsReview().length,0);}
+    try {
+      assert.equal(reopened.nonTerminalCount(),0);assert.equal(reopened.reconcilableNeedsReview().length,0);
+      const rollback=reopened.beginOperatorRollback(second.request_id,second.plan_hash,'operator',30_000);
+      assert.equal(rollback.last_error_code,'offline_update_superseded');
+      const again=new Database(file);
+      try {
+        retireUpdates(again,'next-offline-run',targetSha);
+        retireUpdates(again,'next-offline-run',targetSha);
+        const stopped=again.prepare('SELECT state,fence,lease_owner FROM update_requests WHERE request_id=?').get(second.request_id) as Record<string,unknown>;
+        assert.equal(stopped.state,'needs_review');assert.equal(stopped.fence,rollback.fence+1);assert.equal(stopped.lease_owner,null);
+        assert.equal((again.prepare("SELECT COUNT(*) AS n FROM update_audit WHERE code='offline_update_superseded'").get() as {n:number}).n,2);
+      } finally {again.close();}
+      assert.equal(reopened.nonTerminalCount(),0);
+    }
     finally {reopened.close();}
   } finally {await fs.rm(root,{recursive:true,force:true});}
 });

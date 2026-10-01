@@ -12,7 +12,7 @@ export function retireUpdates(db, runId, targetSha, at = new Date().toISOString(
     const rows = db.prepare("SELECT request_id,state,fence,last_error_code FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','cancelled')").all();
     for (const row of rows) {
       // 再開は同じjournalに束縛する。以前の失敗理由はappend-only auditへ保持。
-      if (row.last_error_code === 'offline_update_superseded') continue;
+      if (row.state === 'needs_review' && row.last_error_code === 'offline_update_superseded') continue;
       db.prepare(`UPDATE update_requests SET state='needs_review', completed_at=?, updated_at=?,
         lease_owner=NULL, lease_expires_at=NULL, fence=fence+1, ${reconcile}
         last_error_code='offline_update_superseded', last_error_message='独立CLIの停止更新により旧更新の自動再開を停止しました'

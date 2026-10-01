@@ -148,6 +148,31 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotIn('stop',runner.calls);self.assertNotIn('restore',runner.calls)
 
 
+    def test_stopping_resume_checks_source_and_mcp_before_any_stop(self):
+        for step in ('validate_source','probe'):
+            runner=FakeRunner('stopping',fail=step)
+            with self.assertRaisesRegex(RuntimeError,step):runner.execute()
+            self.assertNotIn('stop',runner.calls)
+        runner=FakeRunner('stopping');runner.execute()
+        self.assertLess(runner.calls.index('validate_source'),runner.calls.index('stop'))
+        self.assertLess(runner.calls.index('probe'),runner.calls.index('stop'))
+
+
+class MainHealthTests(unittest.TestCase):
+    def test_same_session_must_still_be_ready_at_final_health(self):
+        runner=FakeRunner();runner.run=Path('/fixture/run');runner.g=Path('/fixture/g')
+        runner.node='/fixture/node';runner.plan={'release':'/fixture/release'}
+        runner.policy['main_agent']={'name':'dona-main'}
+        runner.journal['main']={'pane':'pane','session_id':'session'}
+        valid={'exists':True,'matches_release':True,'interactive_ready':True,'name':'dona-main',
+               'kind':'codex','status':'working','pane_id':'pane','session_id':'session'}
+        for field,value in [('interactive_ready',False),('name','other'),('kind','other'),('status','unknown'),('status',None)]:
+            with self.subTest(field=field,value=value),patch.object(m,'command',return_value=m.encode(dict(valid,**{field:value}))):
+                with self.assertRaisesRegex(RuntimeError,'main_health_not_confirmed'):runner.verify_main()
+        for status in ('idle','done','working','blocked'):
+            with patch.object(m,'command',return_value=m.encode(dict(valid,status=status))):runner.verify_main()
+
+
 
 class StartupTests(unittest.TestCase):
     def test_intent_without_server_recovers_for_resume_and_rollback(self):

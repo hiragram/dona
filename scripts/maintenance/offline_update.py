@@ -533,12 +533,14 @@ class Runner:
         observed = json.loads(command([node, str(self.run/'main_bridge.mjs'), str(control)],
             input=encode({'action': 'status', 'release': release}), timeout=30))
         state = self.journal.get('old_main' if old else 'main', {})
+        policy = self.inv['policy'] if old else self.policy
         require(observed.get('exists') and observed.get('matches_release') and
+                observed.get('interactive_ready') is True and observed.get('name') == policy['main_agent']['name'] and
+                observed.get('kind') == 'codex' and observed.get('status') in ('idle','done','working','blocked') and
                 observed.get('pane_id') == state.get('pane') and state.get('session_id') is not None and
                 observed.get('session_id') == state['session_id'], 'main_health_not_confirmed')
 
     def health(self, old=False):
-        self.verify_main(old)
         policy = self.inv['policy'] if old else self.policy
         sha = Path(self.inv['old_pointer']).name if old else self.plan['target_sha']
         for socket, service in ((policy['dispatcher_socket'], 'dispatcher'), (policy['slack_socket'], 'slack_adapter'),
@@ -555,6 +557,7 @@ class Runner:
                 except Exception:
                     require(time.monotonic() < deadline, 'health_timeout_'+service)
                     time.sleep(.5)
+        self.verify_main(old)  # serviceの起動待ち中にmainが異常化していないか最後に照合。
 
     def restore(self):
         require(common.tree_seal(self.run/'rollback') == self.plan['rollback_seal'], 'rollback_files_changed')
@@ -629,6 +632,10 @@ class Runner:
                 herdr_root(self.policy['executables']['herdr'])  # 自分が停止対象でないことを先に確認。
                 self.record('stopping')
             if self.journal['phase'] == 'stopping':
+                if phase == 'stopping':
+                    # 停止intent直後のcrashでも、別更新後のサービスを先に止めない。
+                    self.validate_source()
+                    self.probe()
                 progress('Donaの3サービスと専用Herdrプロセスを停止しています。')
                 self.stop()
                 self.validate_source()
