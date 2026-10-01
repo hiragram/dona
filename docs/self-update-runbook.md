@@ -1,5 +1,7 @@
 # Self-update運用runbook
 
+Slack経由の更新が内部状態で止まる場合は、[CLIからの停止更新](operations/offline-update.md)を使用できます。`./scripts/dona-update`で準備・停止・データ保持・更新・再起動を実行します。
+
 ## 導入前確認
 
 1. macOS GUI userで、`node`、`npm`、`git`、`gh`、`herdr`がabsolute pathへ解決できることを確認します。

@@ -236,7 +236,7 @@ console.log(JSON.stringify({{config:{method}(values),values}}));'''
     return dict(result, dotenv_sha256=digest(dotenv_bytes), cwd=str(cwd))
 
 
-def inventory():
+def inventory(require_running=True):
     home = Path.home()
     plists = {}
     files = {}
@@ -249,11 +249,15 @@ def inventory():
         require(plists[label]['Label'] == label, 'plist_label_mismatch')
         files[str(p)] = digest(plist_bytes)
         observation = live.observe(label)
-        require(observation and observation['pid'], 'source_service_not_running')
-        process = live.process(observation['pid'])
-        args = plists[label]['ProgramArguments']
-        require(process and process.split()[0] == str(os.getuid()) and args[1] in process, 'service_process_owner')
-        observations[label] = {**observation, 'identity_hash': digest(process.encode())}
+        if require_running:
+            require(observation and observation['pid'], 'source_service_not_running')
+        if observation and observation['pid']:
+            process = live.process(observation['pid'])
+            args = plists[label]['ProgramArguments']
+            require(process and process.split()[0] == str(os.getuid()) and args[1] in process, 'service_process_owner')
+            observations[label] = {**observation, 'identity_hash': digest(process.encode())}
+        else:
+            observations[label] = observation
     configs = {c: effective_config(plists['dev.dona.'+label], c) for c, label in [('dispatcher', 'dispatcher'), ('slack', 'slack-adapter')]}
     policy_path = regular(plists['dev.dona.updater']['EnvironmentVariables']['DONA_UPDATE_POLICY_PATH'])
     policy_bytes = policy_path.read_bytes()

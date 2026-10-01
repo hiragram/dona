@@ -1,0 +1,6 @@
+#!/bin/sh
+# Donaの外のターミナルから実行する停止更新CLI。
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "$#" -eq 0 ]; then set -- update; fi
+exec python3 -B "$SCRIPT_DIR/maintenance/offline_update.py" "$@"
