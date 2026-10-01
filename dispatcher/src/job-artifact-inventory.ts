@@ -107,3 +107,22 @@ export async function inventoryJobArtifacts(row: JobRow, config: DispatcherConfi
 export function inventorySizeIsComplete(jobs: ReadonlyArray<{ artifacts: ReadonlyArray<ArtifactObservation> }>): boolean {
   return jobs.every((job) => job.artifacts.every((artifact) => artifact.allocated_bytes !== null));
 }
+
+export function inventoryPageMetrics(jobs: ReadonlyArray<{
+  created_at: string; artifacts: ReadonlyArray<ArtifactObservation>;
+}>): { artifact_count: number; oldest_created_at: string | null; measured_bytes: number; unmeasured_count: number } {
+  let oldest: string | null = null;
+  let measured = 0;
+  let unmeasured = 0;
+  let count = 0;
+  for (const job of jobs) {
+    const time = Date.parse(job.created_at);
+    if (Number.isFinite(time) && (oldest === null || time < Date.parse(oldest))) oldest = job.created_at;
+    for (const artifact of job.artifacts) {
+      count++;
+      if (artifact.allocated_bytes === null) unmeasured++;
+      else measured += artifact.allocated_bytes;
+    }
+  }
+  return { artifact_count: count, oldest_created_at: oldest, measured_bytes: measured, unmeasured_count: unmeasured };
+}

@@ -5,7 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 import Database from "better-sqlite3";
 
-import { inventoryJobArtifacts, inventorySizeIsComplete, readJobArtifactInventoryPage } from "../src/job-artifact-inventory.js";
+import { inventoryJobArtifacts, inventoryPageMetrics, inventorySizeIsComplete, readJobArtifactInventoryPage } from "../src/job-artifact-inventory.js";
 import type { DispatcherConfig } from "../src/config.js";
 import type { JobRow } from "../src/types.js";
 
@@ -32,6 +32,9 @@ test("job artifact inventory observes only contract paths and reports unsafe ent
     assert.equal(first.artifacts[0]?.allocated_bytes, null);
     assert.equal(first.artifacts[2]?.allocated_bytes, null);
     assert.equal(inventorySizeIsComplete([first]), false);
+    assert.deepEqual(inventoryPageMetrics([first]), {
+      artifact_count: 3, oldest_created_at: row.created_at, measured_bytes: 0, unmeasured_count: 3,
+    });
     const legacyResult = path.join(config.jobResultsDir, `${job_id}.json`);
     await fs.writeFile(legacyResult, "{}");
     const legacy = await inventoryJobArtifacts({ ...row, result_path: legacyResult }, config);
