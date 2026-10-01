@@ -678,6 +678,24 @@ export function migrateDispatcherDatabase(
   }
 }
 
+// A superseded job never sends a cancellation notice. Its siblings may report
+// progress, but their final group notice waits for the whole successor chain.
+function pendingHandoffSql(source: string): string {
+  return `EXISTS (
+    WITH RECURSIVE linked_groups(source_event_id) AS (
+      SELECT ${source}
+      UNION
+      SELECT neighbor.source_event_id FROM linked_groups g
+        JOIN jobs endpoint ON endpoint.source_event_id=g.source_event_id
+        JOIN job_handoffs h ON h.state='accepted' AND (h.job_id=endpoint.job_id OR h.successor_job_id=endpoint.job_id)
+        JOIN jobs neighbor ON neighbor.job_id=CASE WHEN h.job_id=endpoint.job_id THEN h.successor_job_id ELSE h.job_id END
+    ) SELECT 1 FROM linked_groups g JOIN jobs successor ON successor.source_event_id=g.source_event_id
+      WHERE successor.status NOT IN ('completed','failed','cancelled') OR
+        (successor.status='failed' AND NOT EXISTS (SELECT 1 FROM job_attention_resolutions r
+          WHERE r.job_id=successor.job_id AND r.source_event_id=successor.source_event_id AND r.status_at_resolution='failed'))
+  )`;
+}
+
 export class DispatcherDatabase {
   private readonly db: Database.Database;
   readonly scheduler: SchedulerRepository;
@@ -1027,6 +1045,8 @@ export class DispatcherDatabase {
       this.db.prepare("UPDATE jobs SET workspace_path=?,workspace_json=? WHERE job_id=?")
         .run(old.workspace_path, stableStringify(workspace), result.row.job_id);
       this.markJobCancelled(jobId, `Work handed off to ${result.row.job_id}`);
+      this.markTerminalAcceptedSteerStopped(jobId);
+      this.db.prepare("UPDATE jobs SET last_error_code='handed_off' WHERE job_id=?").run(jobId);
       this.markTerminalWorkerStopProof(jobId);
       this.db.prepare("UPDATE job_terminal_worker_cleanups SET outcome='stopped',updated_at=? WHERE job_id=?").run(nowUtc(),jobId);
       this.db.prepare("UPDATE job_handoffs SET state='accepted',successor_job_id=? WHERE job_id=? AND state='claimed'")
@@ -1452,7 +1472,8 @@ export class DispatcherDatabase {
       SELECT j.* FROM jobs j
       JOIN job_owner_bindings b ON b.job_id=j.job_id
       LEFT JOIN job_groups g ON g.source_event_id=j.source_event_id
-      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review') AND (
+      WHERE j.status IN ('blocked','completed','failed','cancelled','needs_review')
+        AND NOT EXISTS (SELECT 1 FROM job_handoffs h WHERE h.job_id=j.job_id AND h.state='accepted') AND (
         (json_extract(b.owner_json,'$.kind')='schedule' AND j.completion_event_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM job_completion_results c WHERE c.job_id=j.job_id AND c.job_status=j.status))
         OR (json_extract(b.owner_json,'$.kind')='slack_thread'
@@ -1461,7 +1482,10 @@ export class DispatcherDatabase {
               AND m.state IN ('notified','acceptance_unknown'))
           AND (g.notification_mode='legacy' OR (g.sealed_at IS NOT NULL AND g.all_terminal_event_id IS NULL))
           AND (j.completion_event_id IS NULL
-            OR (g.notification_mode='grouped' AND g.attention_event_id IS NOT NULL
+            OR (g.notification_mode='grouped'
+              AND NOT ${pendingHandoffSql('j.source_event_id')}
+              AND (g.attention_event_id IS NOT NULL OR EXISTS (SELECT 1 FROM jobs original JOIN job_handoffs h ON (h.job_id=original.job_id OR h.successor_job_id=original.job_id)
+                WHERE original.source_event_id=j.source_event_id AND h.state='accepted'))
               AND NOT EXISTS (SELECT 1 FROM jobs sibling WHERE sibling.source_event_id=j.source_event_id
                 AND sibling.status NOT IN ('completed','failed','cancelled'))
               AND NOT EXISTS (SELECT 1 FROM jobs unresolved WHERE unresolved.source_event_id=j.source_event_id
@@ -2509,6 +2533,7 @@ export class DispatcherDatabase {
   ): EnqueueResult {
     return this.db.transaction(() => {
       const job = this.getJobRequired(jobId);
+      if (this.getJobHandoff(jobId)?.state === "accepted") throw new Error("job_notification_superseded_by_handoff");
       this.assertJobSourceMatchesThread(jobId, job.source_event_id);
       const legacyState = this.db.prepare(`SELECT state FROM job_legacy_notification_migration
         WHERE job_id=? AND job_status=? AND last_error_code IS ?`)
@@ -2538,7 +2563,7 @@ export class DispatcherDatabase {
           group.attention_event_id === null && group.all_terminal_event_id === null &&
           jobAttentionStatuses.has(job.status) && !this.jobAttentionResolved(job);
         const needsAllTerminal = group.notification_mode === "grouped" &&
-          group.attention_event_id !== null && group.all_terminal_event_id === null &&
+          group.all_terminal_event_id === null &&
           this.groupCanClaimAllTerminal(job.source_event_id, group);
         if (!needsAllTerminal && !needsReplacementAttention) return { row: existing, duplicate: true, payloadMismatch: false };
       }
@@ -3607,6 +3632,7 @@ export class DispatcherDatabase {
 
   private groupCanClaimAllTerminal(sourceEventId: string, group: JobGroupRow): boolean {
     if (group.notification_mode !== "grouped" || !group.sealed_at || group.all_terminal_event_id) return false;
+    if (this.db.prepare(`SELECT 1 WHERE ${pendingHandoffSql('?')}`).get(sourceEventId)) return false;
     if (this.db.prepare("SELECT 1 FROM job_attention_delivery_claims WHERE source_event_id=? LIMIT 1")
       .get(sourceEventId)) return false;
     if (group.attention_event_id && !this.attentionNotificationSettled(this.getRequired(group.attention_event_id))) return false;

@@ -10,7 +10,7 @@
 4. 利用者が再開・引継ぎを依頼し、既存PR・commit・未完了範囲を確認したら、`resume_job(job_id, source_event_id, instruction)`を呼ぶ。`instruction`には引継ぐ残作業と外部操作の照合事項を書く。toolへpath、branch、workspace、result保存先を渡せない。
 5. Dispatcherが再観測し、`inactive`なworkerの終了意図を先にDBへ保存する。保存されたpaneだけを閉じ、採取したshell/子孫processの消失、pane不存在、agent不存在、完全なagent一覧を再確認する。作業中・承認待ち・確認不能なら新workerを作らない。`stopped`では追加の停止writeは不要である。
 6. 停止を確認した場合だけ、旧jobの取消、新job作成、旧→新jobのrelationshipを同じDB transactionで確定する。新jobには新しいagent名・Result保存先・進捗保存先を割り当て、元のworktreeとbranch、staged / unstaged / untrackedファイル、元objectiveを保持する。新workerは既存PRと外部操作の受理状態を確認して残作業を進める。古いResultを新jobの成功証拠として使わない。
-7. `created` / `reused`で返った`job_id`が新担当である。旧job IDを新worker名へ付け替えない。Projectは引継ぎ手順に従いwrite直前に再読し、新担当を記録してread-backする。完了通知は通常の新job経路から届く。
+7. `created` / `reused`で返った`job_id`が新担当である。旧job IDを新worker名へ付け替えない。Projectは引継ぎ手順に従いwrite直前に再読し、新担当を記録してread-backする。旧jobは`handed_off`として取消通知を抑止し、完了通知は新job経路から届く。旧groupに別のsiblingがある場合はその結果を保持し、引継ぎで接続されたgroupの全作業がterminalになるまで双方の最終通知を保留する。停止確認済みの受理済みsteerは同じtransaction内で停止待ち状態を解消する。
 
 ## 応答喪失・再起動・競合
 

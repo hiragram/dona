@@ -13,14 +13,17 @@ import { eventEnvelope, tempConfig } from "./helpers.js";
 
 const logger = {debug(){},info(){},warn(){},error(){}};
 const inactive = (): WorkerObservation => ({state:"inactive",reason:"agent_idle",observed_at:new Date().toISOString(),process_ids:[123,124],process_groups:[123]});
-async function fixture() {
+async function fixture(acceptedSteer = false) {
   const {root,config} = await tempConfig();
   const db = new DispatcherDatabase(config.databasePath);
   const event = db.enqueue(eventEnvelope("original")).row;
   const job = db.createJob({source_event_id:event.event_id,job_key:"work",objective:"実装してPRを提出",workspace:{kind:"scratch"}},config.jobsWorkspaceRoot,config.jobResultsDir).row;
   db.beginJobPreparation(job.job_id); db.setJobRuntime(job.job_id,"w1","w1:p1"); db.beginJobDispatch(job.job_id); db.markJobRunning(job.job_id);
-  db.markJobNeedsReview(job.job_id,"agent_wait_failed","network interruption");
   const follow = db.enqueue(eventEnvelope("resume")).row;
+  if (acceptedSteer) {
+    db.beginJobSteer(job.job_id,follow.event_id);db.markJobSteerAccepted(job.job_id,follow.event_id);
+    db.markJobBlocked(job.job_id,"interrupted");
+  } else db.markJobNeedsReview(job.job_id,"agent_wait_failed","network interruption");
   await fs.mkdir(job.workspace_path,{recursive:true});
   await fs.writeFile(path.join(job.workspace_path,"unfinished.txt"),"未完了の変更");
   let retired = false, closes = 0, observations = 0;
@@ -156,5 +159,70 @@ test("複数回の引継ぎも元workspaceを維持し、各Resultを分離す�
     const latest=f.db.getJob(String(second.job_id))!;
     assert.equal(workspaceJobId(latest),f.job.job_id);assert.equal(latest.workspace_path,f.job.workspace_path);
     assert.notEqual(latest.result_path,next.result_path);assert.equal(f.closes(),2);
+  } finally {await f.dispose();}
+});
+
+test("sealedな旧groupは引継ぎ取消を通知せず、新jobのterminal通知だけを生成する",async()=>{
+  const f=await fixture();try {
+    f.db.sealJobGroup(f.job.source_event_id);
+    const result=await f.supervisor().resumeJob(f.job.job_id,f.follow.event_id,"続ける");
+    assert.equal(f.db.listJobsNeedingNotification().some(row=>row.job_id===f.job.job_id),false);
+    assert.throws(()=>f.db.enqueueJobNotification(f.job.job_id),/superseded_by_handoff/);
+    const next=f.db.getJob(String(result.job_id))!;
+    f.db.beginJobPreparation(next.job_id);f.db.setJobRuntime(next.job_id,"w2","w2:p1");f.db.beginJobDispatch(next.job_id);f.db.markJobRunning(next.job_id);
+    f.db.sealJobGroup(next.source_event_id);
+    assert.deepEqual(f.db.listJobsNeedingNotification(),[]);
+    f.db.saveJobResult(next.job_id,{schema_version:1,job_id:next.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},next.result_path);
+    assert.deepEqual(f.db.listJobsNeedingNotification().map(row=>row.job_id),[next.job_id]);
+    assert.equal(JSON.parse(f.db.enqueueJobNotification(next.job_id).row.payload_json).group.transition,"all_terminal");
+    assert.equal(f.db.getJobGroup(f.job.source_event_id)!.all_terminal_event_id,null);
+  } finally {await f.dispose();}
+});
+
+test("旧siblingの最終通知も後継の稼働中は保留し、完了後に集約する",async()=>{
+  const f=await fixture();try {
+    const sibling=f.db.createJob({source_event_id:f.job.source_event_id,job_key:"sibling",objective:"別作業",workspace:{kind:"scratch"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
+    f.db.beginJobPreparation(sibling.job_id);f.db.setJobRuntime(sibling.job_id,"w3","w3:p1");f.db.beginJobDispatch(sibling.job_id);f.db.markJobRunning(sibling.job_id);
+    f.db.sealJobGroup(f.job.source_event_id);
+    const result=await f.supervisor().resumeJob(f.job.job_id,f.follow.event_id,"続ける");
+    f.db.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"completed",summary:"別作業完了",completed_at:new Date().toISOString()},sibling.result_path);
+    assert.equal(JSON.parse(f.db.enqueueJobNotification(sibling.job_id).row.payload_json).group.transition,"progress");
+    assert.deepEqual(f.db.listJobsNeedingNotification(),[]);
+    const next=f.db.getJob(String(result.job_id))!;
+    f.db.beginJobPreparation(next.job_id);f.db.setJobRuntime(next.job_id,"w2","w2:p1");f.db.beginJobDispatch(next.job_id);f.db.markJobRunning(next.job_id);
+    f.db.saveJobResult(next.job_id,{schema_version:1,job_id:next.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},next.result_path);
+    assert.deepEqual(f.db.listJobsNeedingNotification().map(row=>row.job_id),[sibling.job_id]);
+    assert.equal(JSON.parse(f.db.enqueueJobNotification(sibling.job_id).row.payload_json).group.transition,"all_terminal");
+    assert.deepEqual(f.db.listJobsNeedingNotification(),[]);
+  } finally {await f.dispose();}
+});
+
+test("受理済みsteerの停止fenceは終了確認後のtransactionで解消する",async()=>{
+  const f=await fixture(true);try {
+    assert.equal(f.db.getJob(f.job.job_id)!.steer_state,"accepted");
+    let stop=false;f.runtime.workerRetired=async()=>stop;
+    assert.equal((await f.supervisor().resumeJob(f.job.job_id,f.follow.event_id,"続ける")).outcome,"retirement_pending");
+    assert.equal(f.db.getJob(f.job.job_id)!.steer_state,"accepted");
+    stop=true;assert.equal((await f.supervisor().resumeJob(f.job.job_id,f.follow.event_id,"続ける")).outcome,"created");
+    assert.equal(f.db.getJob(f.job.job_id)!.steer_state,null);
+    assert.equal(f.db.getJob(f.job.job_id)!.last_error_code,"handed_off");
+  } finally {await f.dispose();}
+});
+
+test("後継が先に完了しても旧groupの稼働siblingを残してactiveへ戻さない",async()=>{
+  const f=await fixture();try {
+    const sibling=f.db.createJob({source_event_id:f.job.source_event_id,job_key:"sibling",objective:"別作業",workspace:{kind:"scratch"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
+    f.db.beginJobPreparation(sibling.job_id);f.db.setJobRuntime(sibling.job_id,"w3","w3:p1");f.db.beginJobDispatch(sibling.job_id);f.db.markJobRunning(sibling.job_id);
+    f.db.sealJobGroup(f.job.source_event_id);
+    const result=await f.supervisor().resumeJob(f.job.job_id,f.follow.event_id,"続ける");
+    const next=f.db.getJob(String(result.job_id))!;
+    f.db.beginJobPreparation(next.job_id);f.db.setJobRuntime(next.job_id,"w2","w2:p1");f.db.beginJobDispatch(next.job_id);f.db.markJobRunning(next.job_id);f.db.sealJobGroup(next.source_event_id);
+    f.db.saveJobResult(next.job_id,{schema_version:1,job_id:next.job_id,status:"completed",summary:"完了",completed_at:new Date().toISOString()},next.result_path);
+    assert.equal(JSON.parse(f.db.enqueueJobNotification(next.job_id).row.payload_json).group.transition,"progress");
+    assert.deepEqual(f.db.listJobsNeedingNotification(),[]);
+    f.db.saveJobResult(sibling.job_id,{schema_version:1,job_id:sibling.job_id,status:"completed",summary:"別作業完了",completed_at:new Date().toISOString()},sibling.result_path);
+    assert.equal(JSON.parse(f.db.enqueueJobNotification(sibling.job_id).row.payload_json).group.transition,"all_terminal");
+    assert.equal(JSON.parse(f.db.enqueueJobNotification(next.job_id).row.payload_json).group.transition,"all_terminal");
+    assert.deepEqual(f.db.listJobsNeedingNotification(),[]);
   } finally {await f.dispose();}
 });
