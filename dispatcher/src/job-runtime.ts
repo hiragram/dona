@@ -65,7 +65,7 @@ export function codexAgentArguments(row: JobRow, config: DispatcherConfig, disab
   const projects = trustedPaths
     .map((trustedPath) => `${JSON.stringify(trustedPath)} = { trust_level = "trusted" }`)
     .join(", ");
-  args.push("--model", "gpt-6-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false", "-c", `projects = { ${projects} }`);
+  args.push("--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false", "-c", `projects = { ${projects} }`);
   return args;
 }
 

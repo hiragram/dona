@@ -77,7 +77,7 @@ process.stdout.write(JSON.stringify({result:{agent_status:"idle"}}));
     const job = database.createJob({ source_event_id:source.event_id, objective:"調査する", workspace:{ kind:"scratch" } }, config.jobsWorkspaceRoot, config.jobResultsDir).row;
     const args = codexAgentArguments(job, config, [], false);
     assert.equal(args.includes(path.dirname(job.workspace_path)), false);
-    assert.equal(args[args.indexOf("--model") + 1], "gpt-6-sol");
+    assert.equal(args[args.indexOf("--model") + 1], "gpt-6.1-sol");
     assert.ok(args.includes('model_reasoning_effort="low"'));
     const prompt = buildJobPrompt(job, false);
     assert.equal(prompt.includes("progress_path"), false);
@@ -111,7 +111,7 @@ process.stdout.write(JSON.stringify({result:{agent_status:"idle"}}));
       path.dirname(job.result_path),
       "--add-dir",
       path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
-      "--model", "gpt-6-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
+      "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
       "-c",
       `projects = { ${JSON.stringify(repositoryPath)} = { trust_level = "trusted" }, ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -130,18 +130,18 @@ process.stdout.write(JSON.stringify({result:{agent_status:"idle"}}));
     ).row;
     const expectedOverride = `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`;
     const args = codexAgentArguments(job, config);
-    assert.deepEqual(args, ["--add-dir", path.dirname(job.result_path), "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "--model", "gpt-6-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false", "-c", expectedOverride]);
+    assert.deepEqual(args, ["--add-dir", path.dirname(job.result_path), "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)), "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false", "-c", expectedOverride]);
     assert.equal(args[11]!.match(/trust_level/g)?.length, 1);
     assert.equal(args[11]!.includes(`${JSON.stringify(config.jobsWorkspaceRoot)} =`), false);
     assert.equal(args[11]!.includes(`${JSON.stringify(config.jobResultsDir)} =`), false);
     assert.doesNotMatch(buildJobPrompt({...job,source:"dona_schedule"}), /progress_path|工程が変わるたび/);
     const scheduledOverride=`projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" }, ${JSON.stringify(path.dirname(job.result_path))} = { trust_level = "trusted" } }`;
     assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,[],true,["/usr/bin/codex"]),[
-      "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"],job.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser","--model","gpt-6-sol","-c",'model_reasoning_effort="low"',"-c","check_for_update_on_startup=false","-c",scheduledOverride,
+      "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"],job.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser","--model","gpt-6.1-sol","-c",'model_reasoning_effort="low"',"-c","check_for_update_on_startup=false","-c",scheduledOverride,
     ]);
     assert.deepEqual(codexAgentArguments({...job,source:"dona_schedule"},config,["slack","github"],true,["/usr/bin/codex"]),[
       "--strict-config","-C",path.dirname(job.result_path),...scheduledPermissionArguments(path.dirname(job.result_path),["/usr/bin/codex"],job.workspace_path),"--ask-for-approval","never","--disable","plugins","--disable","apps","--disable","remote_plugin","--disable","in_app_browser",
-      "-c","mcp_servers.slack.enabled=false","-c","mcp_servers.github.enabled=false","--model","gpt-6-sol","-c",'model_reasoning_effort="low"',"-c","check_for_update_on_startup=false","-c",scheduledOverride,
+      "-c","mcp_servers.slack.enabled=false","-c","mcp_servers.github.enabled=false","--model","gpt-6.1-sol","-c",'model_reasoning_effort="low"',"-c","check_for_update_on_startup=false","-c",scheduledOverride,
     ]);
     database.close();
   });
@@ -191,7 +191,7 @@ process.stdout.write(JSON.stringify({result:{agent_status:"idle"}}));
       path.dirname(job.result_path),
       "--add-dir",
       path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
-      "--model", "gpt-6-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
+      "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
       "-c",
       `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
@@ -248,7 +248,7 @@ process.exit(1);
       "--",
       "--add-dir", path.dirname(job.result_path),
       "--add-dir", path.join(path.dirname(job.workspace_path), ".dona-progress", path.basename(job.workspace_path)),
-      "--model", "gpt-6-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
+      "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "-c", "check_for_update_on_startup=false",
       "-c", `projects = { ${JSON.stringify(job.workspace_path)} = { trust_level = "trusted" } }`,
     ]);
     assert.equal((await fs.stat(job.workspace_path)).mode & 0o777, 0o700);
