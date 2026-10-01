@@ -59,3 +59,11 @@ test("同じ権限とbodyでも動的routeのresourceを差し替えられない
  for(const target of ["/api/jobs/%61/cancel","/api/jobs/a/cancel?x=1","/api/jobs/a/../b/cancel"])
   assert.throws(()=>ingressContextRequest("POST",target,Buffer.from("{}")),ContextError);
 });
+test("承認一覧cursorは署名済みrequestの実targetへ結合する",()=>{
+ const a=ingressContextRequest("GET","/api/approvals?cursor=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",Buffer.alloc(0));
+ const b=ingressContextRequest("GET","/api/approvals?cursor=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",Buffer.alloc(0));
+ const token=signIngressContext(identity,a,key,now,end);
+ assert.ok(verifyIngressContext(token,key,identity,a,now));
+ assert.throws(()=>verifyIngressContext(token,key,identity,b,now),ContextError);
+ assert.throws(()=>signIngressContext(identity,{...a,target_digest:undefined},key,now,end),ContextError);
+});

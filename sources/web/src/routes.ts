@@ -31,6 +31,7 @@ const definitions: readonly Definition[] = [
   {id:"job_read",method:"GET",pattern:/^\/api\/jobs\/([A-Za-z0-9_-]{1,128})$/,resourceKind:"job",gate:"session",capability:"job_read",activity:"automatic_poll"},
   {id:"job_events",method:"GET",pattern:/^\/api\/jobs\/([A-Za-z0-9_-]{1,128})\/events$/,resourceKind:"job",gate:"session",capability:"job_read",activity:"sse"},
   {id:"job_cancel",method:"POST",pattern:/^\/api\/jobs\/([A-Za-z0-9_-]{1,128})\/cancel$/,resourceKind:"job",gate:"session",capability:"job_command",activity:"user_command"},
+  {id:"approval_list",method:"GET",pattern:/^\/api\/approvals$/,gate:"session",capability:"approval",activity:"automatic_poll"},
   {id:"approval_read",method:"GET",pattern:/^\/api\/approvals\/([A-Za-z0-9_-]{1,128})$/,resourceKind:"approval",gate:"session",capability:"approval",activity:"automatic_poll"},
   {id:"approval_challenge",method:"POST",pattern:/^\/api\/approvals\/([A-Za-z0-9_-]{1,128})\/challenge$/,resourceKind:"approval",gate:"session",capability:"approval",activity:"user_command"},
   {id:"approval_decision",method:"POST",pattern:/^\/api\/approvals\/([A-Za-z0-9_-]{1,128})\/decision$/,resourceKind:"approval",gate:"approval_step_up",capability:"approval",activity:"user_command"},
@@ -39,7 +40,7 @@ export class WebRouteError extends Error {constructor(){super("web_route_invalid
 const scopeRequirements: Readonly<Record<string, readonly string[]>> = {
   job_list: ["job:read:own", "job:read:granted"], job_submit: ["job:submit"],
   job_read: ["job:read:own", "job:read:granted"], job_events: ["job:read:own", "job:read:granted"],
-  job_cancel: ["job:cancel:own"], approval_read: ["approval:read:bound"],
+  job_cancel: ["job:cancel:own"], approval_list: ["approval:read:bound"], approval_read: ["approval:read:bound"],
   approval_challenge: ["approval:decide:bound"], approval_decision: ["approval:decide:bound"],
 };
 const roleScopes: Readonly<Record<string, readonly string[]>> = {
@@ -78,7 +79,7 @@ export function matchWebRoute(method:unknown,target:unknown):WebRoute {
   for(const definition of definitions){
     const match=definition.method===method?definition.pattern.exec(pathname):null;
     if(!match)continue;
-    if(queryAt>=0 && !["login_callback","job_list"].includes(definition.id))throw new WebRouteError();
+    if(queryAt>=0 && !["login_callback","job_list","approval_list"].includes(definition.id))throw new WebRouteError();
     return {id:definition.id,method:definition.method,gate:definition.gate,capability:definition.capability,
       activity:definition.activity,resource:definition.resourceKind?{kind:definition.resourceKind,id:match[1]!}:null};
   }

@@ -22,3 +22,9 @@ test("BFF生成fixtureをDispatcherが独立に照合し改変を拒否する",(
  const job1=fixture.fixtures.find((item:{target:string})=>item.target==="/api/jobs/job_1");
  assert.throws(()=>verifyIngressContext(job1.token,key,fixture.identity,ingressContextRequest("GET","/api/jobs/job_2",Buffer.alloc(0)),fixture.now));
 });
+test("承認一覧cursorの実target差替えを検出する",()=>{
+ const a=ingressContextRequest("GET","/api/approvals?cursor=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",Buffer.alloc(0));
+ const b=ingressContextRequest("GET","/api/approvals?cursor=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",Buffer.alloc(0));
+ assert.notEqual(a.target_digest,b.target_digest);
+ assert.throws(()=>verifyIngressContext(fixture.fixtures[0].token,key,fixture.identity,a,fixture.now));
+});
