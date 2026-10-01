@@ -105,7 +105,7 @@ class ExecutionTests(unittest.TestCase):
                                      'dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater','health'])
         self.assertEqual(runner.journal['phase'],'succeeded')
     def test_each_pre_activation_failure_restores(self):
-        for step in ('backup','migrate','install','main'):
+        for step in ('backup','migrate','install'):
             with self.subTest(step=step):
                 runner=FakeRunner(fail=step)
                 with self.assertRaises(RuntimeError):runner.execute()
@@ -116,7 +116,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(runner.journal['phase'],'stopping')
         self.assertNotIn('backup',runner.calls);self.assertNotIn('restore',runner.calls)
     def test_activation_failure_never_restores_database(self):
-        for step in ('dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater','health'):
+        for step in ('main','dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater','health'):
             with self.subTest(step=step):
                 runner=FakeRunner(fail=step)
                 with self.assertRaises(RuntimeError):runner.execute()
@@ -190,6 +190,36 @@ class StartupTests(unittest.TestCase):
             self.assertEqual(env['npm_config_engine_strict'],'true')
 
 
+class RenderTests(unittest.TestCase):
+    def test_manifest_and_mcp_follow_the_next_current_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);g=root/'generation';release=g/'runtime/releases/first'
+            (release/'config').mkdir(parents=True);(release/'updater').mkdir()
+            (release/'config/release-compatibility.json').write_text('{}')
+            (release/'config/update-compatibility-transitions.json').write_text('{"transitions":[]}')
+            (release/'release-manifest.json').write_text('first')
+            token=root/'token';token.write_text('fixture-token')
+            run=root/'run';run.mkdir()
+            policy={'executables':{},'dispatcher_internal_token_file':str(token)}
+            configs={'dispatcher':{'values':{},'config':{k:'fixture' for k in ('databasePath','resultsDir','jobResultsDir','jobProgressDatabasePath','updateNotificationDatabasePath','socketPath')}},
+                     'slack':{'values':{},'config':{k:'fixture' for k in ('healthSocketPath','dispatcherSocketPath')}}}
+            inv={'policy':policy,'configs':configs,'plists':{label:{'EnvironmentVariables':{}} for label in m.LABELS}}
+            def effective(plist,component):return {'config':dict(configs[component]['config'],buildSha='first')}
+            with patch.object(m.common,'installed_codex',return_value='/fixture/codex'), \
+                 patch.object(m.common,'target_required_checks',return_value=[]), \
+                 patch.object(m.common,'effective_config',side_effect=effective),patch.object(m,'command'):
+                m.render(run,{'generation':str(g),'release':str(release),'node':'/fixture/node','target_sha':'first'},inv)
+            second=g/'runtime/releases/second';second.mkdir();(second/'release-manifest.json').write_text('second')
+            (g/'runtime/current').unlink();(g/'runtime/current').symlink_to(second)
+            for label,key,component in (('dev.dona.dispatcher','dispatcher','dispatcher'),('dev.dona.slack-adapter','slack','sources/slack')):
+                plist=m.plistlib.loads((run/'plists'/(label+'.plist')).read_bytes())
+                manifest=Path(plist['EnvironmentVariables']['DONA_RELEASE_MANIFEST_PATH'])
+                self.assertEqual(manifest.read_text(),'second')
+                wrapper=(g/'config'/('mcp-'+key+'.mjs')).read_text()
+                self.assertIn((g/'runtime/current'/component/'dist/mcp/index.js').as_uri(),wrapper)
+                self.assertNotIn(str(release),wrapper)
+
+
 class RestoreTests(unittest.TestCase):
     def fixture(self, root):
         runner=object.__new__(m.Runner)
@@ -231,6 +261,39 @@ class RestoreTests(unittest.TestCase):
             runner.restore()
             self.assertEqual(source.read_bytes(),b'new-data-after-old-service-start')
             self.assertEqual(runner.journal['phase'],'rolled_back')
+
+    def test_restore_prepared_run_rejects_before_stopping_even_without_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner=self.fixture(Path(directory));runner.journal['phase']='prepared'
+            runner.stop=lambda:self.fail('prepared restore stopped live services')
+            with self.assertRaisesRegex(RuntimeError,'restore_phase_invalid'):runner.restore()
+
+    def test_restore_without_backup_checks_source_before_stopping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner=self.fixture(Path(directory));runner.journal['phase']='stopped'
+            runner.stop=lambda:self.fail('changed source was stopped')
+            def changed():raise RuntimeError('source_configuration_changed')
+            runner.validate_source=changed
+            with self.assertRaisesRegex(RuntimeError,'source_configuration_changed'):runner.restore()
+
+    def test_main_start_failure_preserves_writes_on_rollback_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=self.fixture(root)
+            backup=root/'backup';backup.mkdir()
+            source=root/'db';source.write_bytes(b'old')
+            saved=backup/'db-0';saved.write_bytes(b'old')
+            m.atomic(backup/'index.json',m.encode([{'source':str(source),'backup':str(saved),'exists':True,'hash':m.common.file_digest(saved)}]))
+            runner.journal['backup_index_hash']=m.common.file_digest(backup/'index.json')
+            def start(**_):
+                self.assertTrue(runner.journal['rollback_activation_started'])
+                source.write_bytes(b'write-after-ambiguous-main-start')
+                raise RuntimeError('response_lost')
+            runner.start_main=start
+            with self.assertRaisesRegex(RuntimeError,'response_lost'):runner.restore()
+            runner.start_main=lambda **_:None
+            runner.restore()
+            self.assertEqual(source.read_bytes(),b'write-after-ambiguous-main-start')
+
 
 
 class ActiveRunTests(unittest.TestCase):

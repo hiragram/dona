@@ -65,11 +65,11 @@ python3 -B "$HOME/.dona-maintenance/offline-20261001-1/offline_update.py" resume
 途中の再起動でもLaunchAgentのdisableが残るため、migration中のDBでサービスが勝手に起動しません。
 
 - 停止確認前の失敗ではDBに進まず、保存したプロセスidentityを次回照合します。
-- 新Dispatcherの起動前に失敗した場合は、確定backupからDB・Result・plistを戻して旧版を起動します。復旧にも失敗した場合は`restoring`に残し、同じrunから復旧を再開します。
-- Dispatcherの起動intent以後はscheduleやjobが実行された可能性があるため、DBを巻き戻しません。次回の`resume`でtarget側を停止・再起動し、更新後のデータを保持したまま前進復旧します。
+- 新mainの起動を試みる前に失敗した場合は、確定backupからDB・Result・plistを戻して旧版を起動します。復旧にも失敗した場合は`restoring`に残し、同じrunから復旧を再開します。
+- mainの起動intent以後は必須MCPから書き込まれた可能性があり、その後はDispatcherのscheduleやjobも実行され得るため、DBを巻き戻しません。次回の`resume`でtarget側を停止・再起動し、更新後のデータを保持したまま前進復旧します。
 - `succeeded`のrunを再開した場合は正常性を再確認するだけです。
 
-起動前の更新を明示的に戻す場合は`restore`を使えます。受付開始後は拒否します。
+停止処理を開始した更新を明示的に戻す場合は`restore`を使えます。準備だけのrun、新mainの起動intent以後は拒否します。旧mainの復旧起動でも、そのintent以後はDBを再コピーせず現データを保持します。
 
 ```sh
 python3 -B "$HOME/.dona-maintenance/offline-20261001-1/offline_update.py" status \

@@ -186,7 +186,7 @@ def render(run, plan, inv):
             values = dict(inv['configs'][key]['values'])
             values.pop('DOTENV_CONFIG_PATH', None)
             values.pop('DONA_BUILD_SHA', None)
-            values.update(DONA_RELEASE_MANIFEST_PATH=str(release/'release-manifest.json'),
+            values.update(DONA_RELEASE_MANIFEST_PATH=str(Path(policy['current_pointer'])/'release-manifest.json'),
                           DONA_CODEX_PATH=policy['executables']['codex'],
                           DONA_UPDATER_SOCKET_PATH=str(g/'control/updater.sock'),
                           DONA_UPDATE_INTERNAL_TOKEN_PATH=policy['dispatcher_internal_token_file'])
@@ -197,10 +197,10 @@ def render(run, plan, inv):
             env['DOTENV_CONFIG_PATH'] = str(file)
             code, entry = g/'runtime/current'/component, 'cli.js' if key == 'dispatcher' else 'index.js'
             wrapper = f'''import fs from 'node:fs';
-import {{parse}} from {json.dumps((release/component/'node_modules/dotenv/lib/main.js').as_uri())};
+import {{parse}} from {json.dumps((Path(policy['current_pointer'])/component/'node_modules/dotenv/lib/main.js').as_uri())};
 Object.assign(process.env,parse(fs.readFileSync({json.dumps(str(file))})));
 delete process.env.DONA_BUILD_SHA;
-await import({json.dumps((release/component/'dist/mcp/index.js').as_uri())});
+await import({json.dumps((Path(policy['current_pointer'])/component/'dist/mcp/index.js').as_uri())});
 '''
             atomic(g/'config'/('mcp-'+key+'.mjs'), wrapper.encode())
         plist.update(ProgramArguments=[plan['node'], str(code/'dist'/entry)] + ([] if entry == 'index.js' else ['serve']),
@@ -542,6 +542,11 @@ class Runner:
     def restore(self):
         require(common.tree_seal(self.run/'rollback') == self.plan['rollback_seal'], 'rollback_files_changed')
         require(not self.journal.get('activation_started'), 'rollback_after_activation_forbidden')
+        require(self.journal['phase'] in ('stopping','stopped','backed_up','migrating','migrated','installed','main_ready','restoring'), 'restore_phase_invalid')
+        if not self.journal.get('backup_index_hash'):
+            # backup前の停止失敗だけは、まだ同じ旧設定・DBであることを確認して復旧する。
+            require(self.journal['phase'] in ('stopping','stopped','restoring'), 'restore_backup_required')
+            self.validate_source()
         self.record('restoring')
         self.stop()
         index = self.run/'backup/index.json'
@@ -569,8 +574,8 @@ class Runner:
             self.migrate(retire_only=True)
         self.install(old=True)
         self.journal.pop('old_main', None)
-        self.start_main(old=True)
         self.record(rollback_activation_started=True)
+        self.start_main(old=True)
         for label in ('dev.dona.dispatcher', 'dev.dona.slack-adapter', 'dev.dona.updater'):
             self.start_service(label)
         self.health(old=True)
@@ -622,6 +627,8 @@ class Runner:
                 self.record('installed')
             if self.journal['phase'] == 'installed':
                 progress('新しいmain agentとMCPを起動しています。')
+                # mainの必須MCPにも書き込み権限がある。起動応答を失っても巻き戻さない。
+                self.record(activation_started=True)
                 self.start_main()
                 self.record('main_ready')
             if self.journal['phase'] in ('main_ready', 'activating'):
