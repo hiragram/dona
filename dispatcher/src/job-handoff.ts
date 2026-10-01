@@ -17,6 +17,7 @@ export interface HandoffRecord {
   expected_job_json: string;
   observation_json: string;
   state: "claimed" | "accepted";
+  retirement_state: "not_sent" | "attempting";
   successor_job_id: string | null;
   created_at: string;
 }

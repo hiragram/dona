@@ -86,6 +86,50 @@ test("並行再開は一つの停止要求と後継jobへ集約される",async(
   } finally {await f.dispose();}
 });
 
+test("claim直後の再起動では未送信receiptを再観測して一度だけ停止する",async()=>{
+  const f=await fixture();let reopened:DispatcherDatabase|undefined;
+  try {
+    f.db.claimJobHandoff(f.db.getJob(f.job.job_id)!,f.follow.event_id,"続ける",inactive());
+    assert.equal(f.db.getJobHandoff(f.job.job_id)!.retirement_state,"not_sent");
+    f.db.close();reopened=new DispatcherDatabase(f.config.databasePath);reopened.recoverStaleJobs();
+    const supervisor=new JobSupervisor(reopened,f.runtime,f.config,logger,()=>{});
+    f.runtime.observeWorker=async()=>({...inactive(),state:"working"});
+    assert.equal((await supervisor.resumeJob(f.job.job_id,f.follow.event_id,"続ける")).outcome,"not_resumed");
+    assert.equal(f.closes(),0);assert.equal(reopened.getJobHandoff(f.job.job_id)!.retirement_state,"not_sent");
+    f.runtime.observeWorker=async()=>inactive();
+    assert.equal((await supervisor.resumeJob(f.job.job_id,f.follow.event_id,"続ける")).outcome,"created");
+    assert.equal(reopened.getJobHandoff(f.job.job_id)!.retirement_state,"attempting");
+    assert.equal((await supervisor.resumeJob(f.job.job_id,f.follow.event_id,"続ける")).outcome,"reused");
+    assert.equal(f.closes(),1);
+  } finally {reopened?.close();await f.dispose();}
+});
+
+test("送信開始receipt後のクラッシュは未送信と推測せず照合のみ行う",async()=>{
+  const f=await fixture();try {
+    f.db.claimJobHandoff(f.db.getJob(f.job.job_id)!,f.follow.event_id,"続ける",inactive());
+    assert.equal(f.db.beginHandoffRetirement(f.job.job_id,f.follow.event_id),true);
+    assert.equal(f.db.beginHandoffRetirement(f.job.job_id,f.follow.event_id),false);
+    assert.equal((await f.supervisor().resumeJob(f.job.job_id,f.follow.event_id,"続ける")).outcome,"retirement_pending");
+    assert.equal(f.closes(),0);
+    f.retire();assert.equal((await f.supervisor().resumeJob(f.job.job_id,f.follow.event_id,"続ける")).outcome,"created");
+    assert.equal(f.closes(),0);
+  } finally {await f.dispose();}
+});
+
+test("送信状態を保存していない旧claimは未送信と推測せず移行する",async()=>{
+  const f=await fixture();let reopened:DispatcherDatabase|undefined;
+  try {
+    f.db.claimJobHandoff(f.db.getJob(f.job.job_id)!,f.follow.event_id,"続ける",inactive());
+    f.db.close();
+    const {default:Database}=await import("better-sqlite3");
+    const legacy=new Database(f.config.databasePath);
+    try {legacy.exec("ALTER TABLE job_handoffs DROP COLUMN retirement_state");} finally {legacy.close();}
+    reopened=new DispatcherDatabase(f.config.databasePath);
+    assert.equal(reopened.getJobHandoff(f.job.job_id)!.retirement_state,"attempting");
+    assert.equal(reopened.beginHandoffRetirement(f.job.job_id,f.follow.event_id),false);
+  } finally {reopened?.close();await f.dispose();}
+});
+
 test("観測中のdurable driftと直前の稼働再開を拒否する",async()=>{
   const f=await fixture();try {
     let count=0;f.runtime.observeWorker=async()=>{count++;if(count===2) f.db.markJobNeedsReview(f.job.job_id,"changed","changed");return inactive();};

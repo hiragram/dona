@@ -212,7 +212,7 @@ export class JobSupervisor {
       observation = { ...observation, state: "unknown", reason: "job_changed_during_observation", process_ids: [], process_groups: [] };
     const handoff = this.database.getJobHandoff(jobId);
     return { schema_version: 1, job_id: jobId, durable_status: this.database.getJob(jobId)!.status,
-      worker: publicObservation(observation), handoff: handoff ? { state: handoff.state, successor_job_id: handoff.successor_job_id } : null };
+      worker: publicObservation(observation), handoff: handoff ? { state: handoff.state, retirement_state: handoff.retirement_state, successor_job_id: handoff.successor_job_id } : null };
   }
 
   resumeJob(jobId: string, sourceEventId: string, instruction: string): Promise<Record<string, unknown>> {
@@ -229,18 +229,28 @@ export class JobSupervisor {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
         const observation = await this.observeWorker(before);
         if (!["inactive", "stopped"].includes(observation.state)) return { schema_version: 1, outcome: "not_resumed", job_id: jobId, worker: publicObservation(observation) };
-        // A claimed write is never sent twice, even after crash or lost response.
-        // Recheck immediately before the durable claim and the only retirement write.
+        // Recheck immediately before reserving the handoff.
         const fresh = await this.observeWorker(before);
         if (!["inactive", "stopped"].includes(fresh.state) || (JSON.stringify(fresh.process_ids) !== JSON.stringify(observation.process_ids) || JSON.stringify(fresh.process_groups) !== JSON.stringify(observation.process_groups)))
           return { schema_version: 1, outcome: "not_resumed", job_id: jobId, worker: publicObservation(fresh) };
         this.database.assertHandoffAdmission(before, sourceEventId, instruction, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
         record = this.database.claimJobHandoff(before, sourceEventId, instruction, fresh);
-        try { if (fresh.state !== "stopped") await this.runtime.retireWorker(before, this.abortController.signal); }
-        catch { /* Read-only reconciliation below establishes the actual outcome. */ }
       }
       const old = JSON.parse(record.expected_job_json) as JobRow;
       const evidence = JSON.parse(record.observation_json) as WorkerObservation;
+      if (record.retirement_state === "not_sent") {
+        // A crash after claim is recoverable. Only an atomic unsent -> attempting
+        // receipt permits a write; an ambiguous attempt is never sent again.
+        const fresh = await this.observeWorker(old);
+        if (!["inactive", "stopped"].includes(fresh.state) || JSON.stringify(fresh.process_ids) !== JSON.stringify(evidence.process_ids) ||
+            JSON.stringify(fresh.process_groups) !== JSON.stringify(evidence.process_groups))
+          return { schema_version: 1, outcome: "not_resumed", job_id: jobId, worker: publicObservation(fresh) };
+        this.database.assertHandoffAdmission(old, sourceEventId, instruction, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
+        if (fresh.state !== "stopped" && this.database.beginHandoffRetirement(jobId, sourceEventId)) {
+          try { await this.runtime.retireWorker(old, this.abortController.signal); }
+          catch { /* Read-only reconciliation below establishes the actual outcome. */ }
+        }
+      }
       let stopped = await this.runtime.workerRetired(old, evidence, this.abortController.signal);
       const deadline = Date.now() + 2_000;
       while (!stopped && !this.stopping && Date.now() < deadline) {

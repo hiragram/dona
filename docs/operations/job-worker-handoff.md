@@ -14,9 +14,9 @@
 
 ## 応答喪失・再起動・競合
 
-`resume_job`は旧jobごとに一つの引継ぎclaimを持つ。同じinstructionの再照合は同じ新jobを返し、異なるinstructionはconflictになる。停止writeの前にclaimを保存するため、停止成功直後のクラッシュでも同じ停止writeを再送しない。
+`resume_job`は旧jobごとに一つの引継ぎclaimを持つ。同じinstructionの再照合は同じ新jobを返し、異なるinstructionはconflictになる。claimは`retirement_state: not_sent`で保存し、停止writeの直前に`attempting`への一度だけの遷移を永続化する。claim直後のクラッシュでは、未送信を確認して再観測・受付条件確認後に初回の停止要求を送れる。`attempting`以降のクラッシュや応答喪失は受理不明として同じ停止writeを再送しない。この遷移と外部writeの間で落ちた場合も未送信とは断定できず、read-only照合を維持する。送信状態の証拠を持たない既存claimも`attempting`として移行する。
 
-`retirement_pending`やtimeoutでは、まず`inspect_job_worker`で保存済み`handoff.state`と`successor_job_id`を読む。acceptedなら後継jobを確認する。claimedでは、利用者による再照合・再開依頼に同じinstructionで`resume_job`を使えるが、実行するのは停止結果の読み取りと、停止が証明できた場合の後継作成だけである。旧依頼eventが終了済みなら、後続の現在eventへ後継jobを所属させる。shellからのworker操作やDB直接更新で回避しない。
+`retirement_pending`やtimeoutでは、まず`inspect_job_worker`で保存済み`handoff.state`、`retirement_state`と`successor_job_id`を読む。acceptedなら後継jobを確認する。claimedでは、利用者による再照合・再開依頼に同じinstructionで`resume_job`を使える。`not_sent`の場合だけ上記の再検証後に初回送信し、`attempting`なら停止結果の読み取りと、停止が証明できた場合の後継作成だけを行う。旧依頼eventが終了済みなら、後続の現在eventへ後継jobを所属させる。shellからのworker操作やDB直接更新で回避しない。
 
 観測中のjob更新、別owner、未決着の通知、遅着Result、後継のkey競合・受付上限では後継を重複作成しない。遅着Resultがある場合は先に既存Resultを照合する。承認待ちのworkerを自動で閉じたり、承認を満たしたことにして新workerへ渡したりしない。
 

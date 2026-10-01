@@ -763,6 +763,10 @@ export class DispatcherDatabase {
         state TEXT NOT NULL CHECK(state IN ('claimed','accepted')),
         successor_job_id TEXT UNIQUE REFERENCES jobs(job_id),
         created_at TEXT NOT NULL)`);
+      if (!(this.db.prepare("PRAGMA table_info(job_handoffs)").all() as Array<{name:string}>).some(column => column.name === "retirement_state")) {
+        // Existing claims have no send receipt: never reinterpret them as unsent.
+        this.db.exec("ALTER TABLE job_handoffs ADD COLUMN retirement_state TEXT NOT NULL DEFAULT 'attempting' CHECK(retirement_state IN ('not_sent','attempting'))");
+      }
       this.db.exec(`CREATE TABLE IF NOT EXISTS job_terminal_worker_stop_proofs(
         job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
         stopped_at TEXT NOT NULL)`);
@@ -1003,10 +1007,23 @@ export class DispatcherDatabase {
       // Reserve before the only runtime write; cancellation also reconciles prior notification ownership.
       this.beginJobCancellation(job.job_id, sourceEventId);
       this.db.prepare("UPDATE jobs SET last_error_code='handoff_retirement_pending',last_error_message=NULL WHERE job_id=?").run(job.job_id);
-      this.db.prepare(`INSERT INTO job_handoffs(job_id,source_event_id,instruction,expected_job_json,observation_json,state,created_at)
-        VALUES(?,?,?,?,?,'claimed',?)`).run(job.job_id, sourceEventId, instruction,
+      this.db.prepare(`INSERT INTO job_handoffs(job_id,source_event_id,instruction,expected_job_json,observation_json,state,retirement_state,created_at)
+        VALUES(?,?,?,?,?,'claimed','not_sent',?)`).run(job.job_id, sourceEventId, instruction,
           jobSnapshot(this.getJobRequired(job.job_id)), JSON.stringify(observation), nowUtc());
       return this.getJobHandoff(job.job_id)!;
+    }).immediate();
+  }
+
+  beginHandoffRetirement(jobId: string, sourceEventId: string): boolean {
+    return this.db.transaction(() => {
+      this.assertHandoffOwner(jobId, sourceEventId);
+      const record = this.getJobHandoff(jobId);
+      const job = this.getJobRequired(jobId);
+      if (!record || jobSnapshot(job) !== record.expected_job_json) throw new Error("handoff_job_changed");
+      try { fs.lstatSync(job.result_path); throw new Error("handoff_result_requires_reconciliation"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      return this.db.prepare("UPDATE job_handoffs SET retirement_state='attempting' WHERE job_id=? AND state='claimed' AND retirement_state='not_sent'")
+        .run(jobId).changes === 1;
     }).immediate();
   }
 
