@@ -53,7 +53,7 @@ function agentResponse(cwd: string, sessionId: string | null, interactiveReady =
         agent_status: "idle",
         workspace_id: "w1",
         tab_id: "w1:t1",
-        pane_id: "w1:p1",
+        pane_id: "wBR:p1",
         focused: false,
         revision: 1,
         agent: "codex",
@@ -77,7 +77,7 @@ function paneResponse(cwd: string): string {
         agent_status: "unknown",
         workspace_id: "w1",
         tab_id: "w1:t1",
-        pane_id: "w1:p1",
+        pane_id: "wBR:p1",
         cwd,
         foreground_cwd: cwd,
       },
@@ -510,9 +510,9 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
     runner.sessionId = "session-replaced";
     assert.equal((await runtime.stopMainAgent(idle)).outcome, "rejected");
     runner.sessionId = "session-old";
-    assert.deepEqual(await runtime.stopMainAgent(idle), { outcome: "stopped", pane_id: "w1:p1", error_code: null });
+    assert.deepEqual(await runtime.stopMainAgent(idle), { outcome: "stopped", pane_id: "wBR:p1", error_code: null });
     runner.interactiveReady = true;
-    const started = await runtime.startMainAgent("w1:p1", targetRelease);
+    const started = await runtime.startMainAgent("wBR:p1", targetRelease);
     assert.equal(started.outcome, "started");
     assert.equal(started.observation.matches_release, true);
     assert.equal(started.observation.session_id, "session-new");
@@ -521,14 +521,14 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
       [policy.executables.herdr, "--session", "dona", "agent", "wait", "dona-main", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "100"],
       [policy.executables.herdr, "--session", "dona", "agent", "get", "dona-main"],
       [policy.executables.herdr, "--session", "dona", "agent", "get", "dona-main"],
-      [policy.executables.herdr, "--session", "dona", "agent", "send-keys", "w1:p1", "ctrl+c"],
-      [policy.executables.herdr, "--session", "dona", "agent", "get", "w1:p1"],
-      [policy.executables.herdr, "--session", "dona", "agent", "get", "w1:p1"],
-      [policy.executables.herdr, "--session", "dona", "pane", "run", "w1:p1", `cd -- '${canonicalTargetRelease}'`],
-      [policy.executables.herdr, "--session", "dona", "pane", "get", "w1:p1"],
+      [policy.executables.herdr, "--session", "dona", "agent", "send-keys", "wBR:p1", "ctrl+c"],
+      [policy.executables.herdr, "--session", "dona", "agent", "get", "wBR:p1"],
+      [policy.executables.herdr, "--session", "dona", "agent", "get", "wBR:p1"],
+      [policy.executables.herdr, "--session", "dona", "pane", "run", "wBR:p1", `cd -- '${canonicalTargetRelease}'`],
+      [policy.executables.herdr, "--session", "dona", "pane", "get", "wBR:p1"],
       [
         policy.executables.herdr, "--session", "dona", "agent", "start", "dona-main", "--kind", "codex",
-        "--pane", "w1:p1", "--timeout", "100", "--", "-C", canonicalTargetRelease, "-c",
+        "--pane", "wBR:p1", "--timeout", "100", "--", "-C", canonicalTargetRelease, "-c",
         `projects = { ${JSON.stringify(canonicalTargetRelease)} = { trust_level = "trusted" } }`,
         "-c", dispatcherMcpEnvironment, "-c", slackMcpEnvironment,
         "--model", "gpt-6-sol", "-c", 'model_reasoning_effort="medium"',
@@ -541,31 +541,31 @@ test("RealRuntime restarts the exact idle dona-main pane from the immutable targ
     runner.sessionId = "session-old";
     runner.interactiveReady = false;
     runner.becomeReadyOnNextGet = true;
-    const delayedReady = await runtime.startMainAgent("w1:p1", targetRelease, "session-old");
+    const delayedReady = await runtime.startMainAgent("wBR:p1", targetRelease, "session-old");
     assert.equal(delayedReady.outcome, "started");
     assert.equal(delayedReady.observation.interactive_ready, true);
     runner.running = false;
     runner.cwd = currentRelease;
     runner.omitSessionOnStart = true;
-    assert.equal((await runtime.startMainAgent("w1:p1", targetRelease)).outcome, "accepted_unknown");
+    assert.equal((await runtime.startMainAgent("wBR:p1", targetRelease)).outcome, "accepted_unknown");
     const busyCallCount = runner.calls.length;
-    const busy = await runtime.startMainAgent("w1:p1", targetRelease);
+    const busy = await runtime.startMainAgent("wBR:p1", targetRelease);
     assert.equal(busy.outcome, "rejected");
     assert.equal(busy.error_code, "agent_pane_busy");
     assert.equal(runner.calls.length, busyCallCount + 1);
-    assert.deepEqual(runner.calls.at(-1)!.args, ["--session", "dona", "agent", "get", "w1:p1"]);
+    assert.deepEqual(runner.calls.at(-1)!.args, ["--session", "dona", "agent", "get", "wBR:p1"]);
     runner.running = false;
     runner.cwd = currentRelease;
     runner.ignoreCwdChange = true;
     const unchangedCwdCallCount = runner.calls.length;
-    const unchangedCwd = await runtime.startMainAgent("w1:p1", targetRelease);
+    const unchangedCwd = await runtime.startMainAgent("wBR:p1", targetRelease);
     assert.equal(unchangedCwd.outcome, "accepted_unknown");
     assert.equal(unchangedCwd.error_code, "main_agent_pane_cwd_change_unknown");
     assert.equal(runner.calls.slice(unchangedCwdCallCount).some(({ args }) => args.includes("start")), false);
     runner.ignoreCwdChange = false;
     const callCount = runner.calls.length;
     await fs.chmod(path.join(policy.config_root, "slack.env"), 0o644);
-    assert.equal((await runtime.startMainAgent("w1:p1", targetRelease)).outcome, "rejected");
+    assert.equal((await runtime.startMainAgent("wBR:p1", targetRelease)).outcome, "rejected");
     assert.equal(runner.calls.length, callCount);
     assert.equal(Object.values(runner.calls.at(-1)!.options.env ?? {}).some((value) => /token|secret/i.test(value)), false);
   } finally {

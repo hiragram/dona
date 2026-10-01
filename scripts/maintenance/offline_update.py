@@ -219,14 +219,18 @@ await import({json.dumps((Path(policy['current_pointer'])/component/'dist/mcp/in
 
 
 
-def prepare_rollback(run, inv):
+def prepare_rollback(run, inv, plan):
     root = common.private_dir(run/'rollback')
     config = common.private_dir(root/'config')
     control = common.private_dir(root/'control')
     policy = copy.deepcopy(inv['policy'])
     policy['executables']['codex'] = common.installed_codex()
     atomic(control/'policy.json', encode(policy))
-    os.symlink(inv['plists']['dev.dona.updater']['WorkingDirectory'], control/'updater')
+    # 復旧対象は旧releaseのまま、main lifecycleの実装は検証済みの新版を使う。
+    shutil.copytree(Path(plan['release'])/'updater', control/'updater', symlinks=True)
+    command([plan['node'], '--input-type=module', '-e',
+             f'import {{loadPolicy}} from {json.dumps((control/"updater/dist/policy.js").as_uri())};loadPolicy(process.argv[1]);',
+             str(control/'policy.json')])
     release = Path(inv['old_pointer'])
     for key, component in [('dispatcher', 'dispatcher'), ('slack', 'sources/slack')]:
         values = dict(inv['configs'][key]['values'])
@@ -264,6 +268,17 @@ def build_command(argv, cwd, run, timeout=900, env=None):
         require(result == 0, 'build_failed; prepare.logを確認してください')
     finally:
         os.close(descriptor)
+
+def prepare_herdr_config(run, plan, executable):
+    source = Path(os.environ.get('HERDR_CONFIG_PATH', str(Path.home()/'.config/herdr/config.toml')))
+    content = source.read_text() if source.exists() else ''
+    result = json.loads(command([plan['node'], str(run/'main_bridge.mjs'),
+        str(Path(plan['generation'])/'control')],
+        input=encode({'action': 'herdr_config', 'source': content})))
+    atomic(run/'herdr-config.toml', result['config'].encode())
+    command([executable, 'config', 'check'],
+            env=dict(os.environ, HERDR_CONFIG_PATH=str(run/'herdr-config.toml')))
+
 
 def probe_main(run, plan):
     results = json.loads(command([plan['node'], str(run/'main_bridge.mjs'),
@@ -320,13 +335,14 @@ def prepare(run, repository):
     progress('更新用の設定と復旧用の設定を検証しています。')
     render(run, plan, inv)
     probe_main(run, plan)
-    prepare_rollback(run, inv)
+    prepare_herdr_config(run, plan, inv['policy']['executables']['herdr'])
+    prepare_rollback(run, inv, plan)
     common.make_immutable(release)
     common.make_immutable(g/'control/updater')
     plan['rollback_seal'] = common.tree_seal(run/'rollback')
     plan['seal'] = asset_seal(g)
     plan['plists_seal'] = common.tree_seal(run/'plists')
-    plan['bundle'] = {name: common.file_digest(run/name) for name in ('offline_update.py', 'reset_upgrade.py', 'main_bridge.mjs', 'offline_state.mjs')}
+    plan['bundle'] = {name: common.file_digest(run/name) for name in ('offline_update.py', 'reset_upgrade.py', 'main_bridge.mjs', 'offline_state.mjs', 'herdr-config.toml')}
     atomic(run/'plan.json', encode(plan))
     atomic(run/'journal.json', encode({'phase': 'prepared', 'plan_hash': common.file_digest(run/'plan.json'), 'processes': [], 'steps': []}))
     progress('準備完了: ' + sha)
@@ -502,7 +518,8 @@ class Runner:
             log = os.open(self.run/'herdr.log', os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             try:
                 child = subprocess.Popen([executable, '--session', 'dona', 'server'], stdin=subprocess.DEVNULL,
-                                         stdout=log, stderr=log, start_new_session=True)
+                                         stdout=log, stderr=log, start_new_session=True,
+                                         env=dict(os.environ, HERDR_CONFIG_PATH=str(self.run/'herdr-config.toml')))
                 self.record(server_pid=child.pid)
             finally:
                 os.close(log)
@@ -540,7 +557,7 @@ class Runner:
         request = {'action': 'status', 'release': release}
         def bridge(req):
             if old: req['mcp_root'] = str(self.run/'rollback/config')
-            return json.loads(command([self.inv['policy']['executables']['node'] if old else self.node, str(self.run/'main_bridge.mjs'), str(control)], input=encode(req), timeout=120))
+            return json.loads(command([self.node, str(self.run/'main_bridge.mjs'), str(control)], input=encode(req), timeout=120))
         observed = bridge(request)
         if observed.get('exists'):
             require(observed.get('matches_release') and observed.get('interactive_ready') and
@@ -565,7 +582,7 @@ class Runner:
 
     def verify_main(self, old=False):
         control = self.run/'rollback/control' if old else self.g/'control'
-        node = self.inv['policy']['executables']['node'] if old else self.node
+        node = self.node
         release = self.inv['old_pointer'] if old else self.plan['release']
         observed = json.loads(command([node, str(self.run/'main_bridge.mjs'), str(control)],
             input=encode({'action': 'status', 'release': release}), timeout=30))

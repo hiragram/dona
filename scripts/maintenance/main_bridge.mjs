@@ -51,11 +51,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     const request = JSON.parse(fs.readFileSync(0, 'utf8'));
     const root = path.resolve(process.argv[2]);
-    const {loadPolicy} = await import(pathToFileURL(path.join(root, 'updater/dist/policy.js')));
-    const {RealRuntime} = await import(pathToFileURL(path.join(root, 'updater/dist/adapters.js')));
-    const {ProcessRunner} = await import(pathToFileURL(path.join(root, 'updater/dist/process.js')));
-    const policy = loadPolicy(path.join(root, 'policy.json'));
-    console.log(JSON.stringify(request.action === 'probe' ? await probe(policy) : await operate(request, policy, RealRuntime, ProcessRunner)));
+    if (request.action === 'herdr_config') {
+      const {herdrNoResumeConfig} = await import(pathToFileURL(path.join(root, 'updater/dist/herdr-config.js')));
+      console.log(JSON.stringify({config: herdrNoResumeConfig(request.source)}));
+    } else {
+      const {loadPolicy} = await import(pathToFileURL(path.join(root, 'updater/dist/policy.js')));
+      const {RealRuntime} = await import(pathToFileURL(path.join(root, 'updater/dist/adapters.js')));
+      const {ProcessRunner} = await import(pathToFileURL(path.join(root, 'updater/dist/process.js')));
+      const policy = loadPolicy(path.join(root, 'policy.json'));
+      console.log(JSON.stringify(request.action === 'probe' ? await probe(policy) : await operate(request, policy, RealRuntime, ProcessRunner)));
+    }
   } catch {
     // adapter stderr、環境設定、認証情報を親のログへ転記しない。
     console.error('main_lifecycle_bridge_failed');
