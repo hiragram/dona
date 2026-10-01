@@ -128,6 +128,33 @@ def herdr_root(executable):
     return [root]
 
 
+def herdr_starting(executable):
+    # socket公開前のserverも照合する。PopenとPID記録の間のcrashでも二重起動しない。
+    for process in process_table().values():
+        if process['uid'] != os.getuid() or 'Z' in process['state']:
+            continue
+        result = subprocess.run(['/bin/ps', '-ww', '-p', str(process['pid']), '-o', 'command='],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:  # 観測中に終了したprocess。
+            continue
+        argv = result.stdout.strip()
+        suffix = ' --session dona server'
+        if argv.endswith(suffix) and Path(argv[:-len(suffix)]).resolve() == Path(executable).resolve():
+            return True
+    return False
+
+
+def toolchain(executables):
+    node, npm = executables['node'], executables['npm']
+    require(all(Path(p).is_absolute() and os.access(p, os.X_OK) for p in (node, npm)), 'node_npm_missing')
+    # npmのshebangと子scriptのnodeもpolicyで固定した実体を使う。
+    env = dict(os.environ, PATH=str(Path(node).parent)+os.pathsep+os.environ.get('PATH', ''),
+               npm_config_engine_strict='true')
+    selected = shutil.which('node', path=env['PATH'])
+    require(selected and Path(selected).resolve() == Path(node).resolve(), 'node_path_mismatch')
+    return node, npm, env
+
+
 def render(run, plan, inv):
     """code/configを世代分離し、既存DBとResultの絶対pathはそのまま保持する。"""
     g, release = Path(plan['generation']), Path(plan['release'])
@@ -219,12 +246,12 @@ def asset_seal(g):
 
 
 
-def build_command(argv, cwd, run, timeout=900):
+def build_command(argv, cwd, run, timeout=900, env=None):
     # privateな完全logを保持する。失敗理由を失ったまま同じコマンドを再試行しない。
     descriptor = os.open(run/'prepare.log', os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
     try:
         os.write(descriptor, (common.stamp()+' '+Path(cwd).name+' '+ ' '.join(argv[1:])+'\n').encode())
-        child = subprocess.Popen(argv, cwd=cwd, stdout=descriptor, stderr=descriptor, start_new_session=True)
+        child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=descriptor, stderr=descriptor, start_new_session=True)
         try:
             result = child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -247,9 +274,8 @@ def prepare(run, repository):
     inv = common.inventory(require_running=False)
     atomic(run/'inventory.json', encode(inv))
     executables = inv['policy']['executables']
-    git, npm = executables['git'], shutil.which('npm')
-    node = shutil.which('node')
-    require(node and npm, 'node_npm_missing')
+    git = executables['git']
+    node, npm, build_env = toolchain(executables)
     remote = command([git, '-C', str(repository), 'remote', 'get-url', 'origin'])
     require(remote in (common.REMOTE, common.REMOTE[:-4], 'git@github.com:hiragram/dona.git',
                        'https://github.com/reirei-lab/dona.git', 'git@github.com:reirei-lab/dona.git'), 'repository_scope')
@@ -280,9 +306,9 @@ def prepare(run, repository):
         progress(component + ' の依存関係・テスト・型検査・ビルドを確認しています。')
         for args in (['ci'], ['test'], ['run', 'typecheck'], ['run', 'build']):
             common.staging_space(g, inv['policy'])
-            build_command([npm, *args], release/component, run)
+            build_command([node, npm, *args], release/component, run, env=build_env)
     command([node, str(release/'scripts/write-release-manifest.mjs'), str(release), sha,
-             command([npm, '--version']), inv['policy']['policy_version']])
+             command([node, npm, '--version'], env=build_env), inv['policy']['policy_version']])
     build_command([node, str(Path(__file__).resolve().parents[2]/'test/offline-state-integration.mjs'), str(release)], release, run)
     progress('更新用の設定と復旧用の設定を検証しています。')
     render(run, plan, inv)
@@ -338,7 +364,6 @@ class Runner:
             command(['/bin/launchctl', 'disable' if disabled else 'enable', self.live.domain+'/'+label])
 
     def stop(self):
-        self.switch_disabled(True)
         roots = herdr_root(self.policy['executables']['herdr'])
         table = process_table()
         for label in LABELS:
@@ -347,6 +372,7 @@ class Runner:
                 p = table.get(observation['pid'])
                 require(p and p['uid'] == os.getuid(), 'service_process_owner')
                 roots.append(p)
+        self.switch_disabled(True)
         def unregister():
             for label in LABELS:
                 self.live.stop(label)
@@ -416,7 +442,8 @@ class Runner:
         executable = self.policy['executables']['herdr']
         if herdr_root(executable):
             return
-        if not self.journal.get('server_start_intent'):
+        if not herdr_starting(executable):
+            # intentは実行の証拠ではない。不在を再観測できた場合は新しい起動を記録する。
             self.record(server_start_intent=True)
             log = os.open(self.run/'herdr.log', os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             try:

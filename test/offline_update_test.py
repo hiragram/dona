@@ -141,6 +141,55 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotIn('stop',runner.calls)
 
 
+class StartupTests(unittest.TestCase):
+    def test_intent_without_server_recovers_for_resume_and_rollback(self):
+        for intent in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                runner=FakeRunner();runner.run=Path(directory)
+                runner.journal['server_start_intent']=intent
+                with patch.object(m,'herdr_root',side_effect=[[],[proc(800001)]]), \
+                     patch.object(m,'herdr_starting',return_value=False), patch.object(m.subprocess,'Popen') as start:
+                    start.return_value.pid=800001
+                    runner.ensure_herdr()
+                    start.assert_called_once()
+                    self.assertEqual(runner.journal['server_pid'],800001)
+
+    def test_live_startup_before_socket_or_pid_record_does_not_spawn_twice(self):
+        runner=FakeRunner();runner.journal['server_start_intent']=True
+        with patch.object(m,'herdr_root',side_effect=[[],[],[proc(800001)]]), \
+             patch.object(m,'herdr_starting',return_value=True), patch.object(m.subprocess,'Popen') as start, \
+             patch.object(m.time,'sleep'):
+            runner.ensure_herdr()
+            start.assert_not_called()
+
+    def test_pending_server_requires_exact_command_and_owner(self):
+        rows={800001:proc(800001),800002:proc(800002)}
+        result=subprocess.CompletedProcess([],0,stdout='/bin/herdr --session other server')
+        with patch.object(m,'process_table',return_value=rows), patch.object(m.subprocess,'run',return_value=result):
+            self.assertFalse(m.herdr_starting('/bin/herdr'))
+            result.stdout='/bin/herdr --session dona server'
+            self.assertTrue(m.herdr_starting('/bin/herdr'))
+
+    def test_dona_pane_rejection_never_disables_launchagents(self):
+        runner=FakeRunner()
+        with patch.object(m,'herdr_root',side_effect=RuntimeError('run_from_terminal_outside_dona')), \
+             patch.object(runner,'switch_disabled') as disable:
+            with self.assertRaisesRegex(RuntimeError,'run_from_terminal_outside_dona'):
+                m.Runner.stop(runner)
+            disable.assert_not_called()
+
+    def test_toolchain_uses_policy_even_with_other_node_first_in_shell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);trusted=root/'trusted';trusted.mkdir();other=root/'other';other.mkdir()
+            for file in (trusted/'node',trusted/'npm',other/'node'):
+                file.write_text('#!/bin/sh\n');file.chmod(0o700)
+            with patch.dict(os.environ,PATH=str(other)):
+                node,npm,env=m.toolchain({'node':str(trusted/'node'),'npm':str(trusted/'npm')})
+            self.assertEqual(node,str(trusted/'node'));self.assertEqual(npm,str(trusted/'npm'))
+            self.assertEqual(m.shutil.which('node',path=env['PATH']),node)
+            self.assertEqual(env['npm_config_engine_strict'],'true')
+
+
 class RestoreTests(unittest.TestCase):
     def fixture(self, root):
         runner=object.__new__(m.Runner)

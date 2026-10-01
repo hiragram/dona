@@ -46,3 +46,33 @@ test('停止更新は旧requestと監査履歴を残して自動再開・古い�
     finally {reopened.close();}
   } finally {await fs.rm(root,{recursive:true,force:true});}
 });
+
+
+test('v1への復旧ではschemaを変更せず旧requestをretireする', () => {
+  const db=new Database(':memory:');
+  try {
+    db.exec(`
+      CREATE TABLE update_requests(request_id TEXT PRIMARY KEY,state TEXT,fence INTEGER,
+        last_error_code TEXT,last_error_message TEXT,completed_at TEXT,updated_at TEXT,
+        lease_owner TEXT,lease_expires_at TEXT);
+      CREATE TABLE update_audit(request_id TEXT,from_state TEXT,to_state TEXT,fence INTEGER,
+        code TEXT,details_json TEXT,occurred_at TEXT);
+      CREATE TABLE controller_state(singleton INTEGER,active_request_id TEXT,updated_at TEXT);
+      CREATE TABLE update_outbox(status TEXT,last_error TEXT,updated_at TEXT);
+      INSERT INTO update_requests VALUES('old','activating',5,'old_error',NULL,NULL,NULL,'owner','later');
+      INSERT INTO controller_state VALUES(1,'old',NULL);
+      INSERT INTO update_outbox VALUES('pending',NULL,NULL);
+      PRAGMA user_version=1;
+    `);
+    const schema=db.prepare('SELECT sql FROM sqlite_master ORDER BY name').all();
+    retireUpdates(db,'rollback-v1',targetSha);
+    retireUpdates(db,'rollback-v1',targetSha);
+    assert.deepEqual(db.prepare('SELECT sql FROM sqlite_master ORDER BY name').all(),schema);
+    assert.equal(db.pragma('user_version',{simple:true}),1);
+    const row=db.prepare('SELECT * FROM update_requests').get() as Record<string,unknown>;
+    assert.equal(row.state,'needs_review');assert.equal(row.fence,6);assert.equal(row.lease_owner,null);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM update_audit').get() as {n:number}).n,1);
+    assert.equal((db.prepare('SELECT active_request_id FROM controller_state').get() as {active_request_id:null}).active_request_id,null);
+    assert.equal((db.prepare('SELECT status FROM update_outbox').get() as {status:string}).status,'needs_review');
+  } finally {db.close();}
+});
