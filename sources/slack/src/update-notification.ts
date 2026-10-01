@@ -133,7 +133,7 @@ async function existingMessage(
     );
   }
   let cursor: string | undefined;
-  let found: string | undefined;
+  let found: SlackThreadMessage | undefined;
   const seenCursors = new Set<string>();
   do {
     const thread = await client.getThread(input.channel_id, input.thread_ts, 200, cursor);
@@ -152,7 +152,7 @@ async function existingMessage(
         "duplicate update notifications already exist",
       );
     }
-    if (matching[0]) found = matching[0].ts;
+    if (matching[0]) found = matching[0];
     if (thread.hasMore && !thread.nextCursor) {
       throw new Error("Slack thread pagination ended before all identity blocks could be checked");
     }
@@ -160,7 +160,14 @@ async function existingMessage(
     if (cursor && seenCursors.has(cursor)) throw new Error("Slack thread pagination cursor repeated");
     if (cursor) seenCursors.add(cursor);
   } while (cursor);
-  return found;
+  if (found && (found.text !== input.text || found.threadTs !== input.thread_ts ||
+    found.subtype === "thread_broadcast")) {
+    throw new UpdateNotificationPermanentError(
+      "conflicting_update_notification",
+      "an update notification identity block has a different payload or destination",
+    );
+  }
+  return found?.ts;
 }
 
 export class SlackUpdateNotificationReporter implements UpdateNotificationPort {
