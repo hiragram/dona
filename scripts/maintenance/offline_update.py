@@ -265,6 +265,36 @@ def build_command(argv, cwd, run, timeout=900, env=None):
     finally:
         os.close(descriptor)
 
+def herdr_no_resume_config(source):
+    # 既存設定を保持し、Dona serverの起動だけnative conversationの自動復元を無効にする。
+    lines = source.splitlines(keepends=True)
+    output, section, found = [], False, False
+    for line in lines:
+        if re.match(r'^\s*\[', line):
+            section = bool(re.match(r"^\s*\[\s*['\"]?session['\"]?\s*\]\s*(?:#.*)?$", line.strip()))
+            output.append(line if line.endswith('\n') else line+'\n')
+            if section:
+                require(not found, 'duplicate_herdr_session_config')
+                output.append('resume_agents_on_restore = false\n')
+                found = True
+        elif section and re.match(r"^\s*['\"]?resume_agents_on_restore['\"]?\s*=", line):
+            continue
+        else:
+            output.append(line)
+    if not found:
+        output.append('\n[session]\nresume_agents_on_restore = false\n')
+    return ''.join(output)
+
+
+def prepare_herdr_config(run, executable=None):
+    source = Path(os.environ.get('HERDR_CONFIG_PATH', str(Path.home()/'.config/herdr/config.toml')))
+    content = source.read_text() if source.exists() else ''
+    atomic(run/'herdr-config.toml', herdr_no_resume_config(content).encode())
+    if executable:
+        command([executable, 'config', 'check'],
+                env=dict(os.environ, HERDR_CONFIG_PATH=str(run/'herdr-config.toml')))
+
+
 def probe_main(run, plan):
     results = json.loads(command([plan['node'], str(run/'main_bridge.mjs'),
         str(Path(plan['generation'])/'control')], input=encode({'action':'probe'}), timeout=120))
@@ -320,13 +350,14 @@ def prepare(run, repository):
     progress('更新用の設定と復旧用の設定を検証しています。')
     render(run, plan, inv)
     probe_main(run, plan)
+    prepare_herdr_config(run, inv['policy']['executables']['herdr'])
     prepare_rollback(run, inv)
     common.make_immutable(release)
     common.make_immutable(g/'control/updater')
     plan['rollback_seal'] = common.tree_seal(run/'rollback')
     plan['seal'] = asset_seal(g)
     plan['plists_seal'] = common.tree_seal(run/'plists')
-    plan['bundle'] = {name: common.file_digest(run/name) for name in ('offline_update.py', 'reset_upgrade.py', 'main_bridge.mjs', 'offline_state.mjs')}
+    plan['bundle'] = {name: common.file_digest(run/name) for name in ('offline_update.py', 'reset_upgrade.py', 'main_bridge.mjs', 'offline_state.mjs', 'herdr-config.toml')}
     atomic(run/'plan.json', encode(plan))
     atomic(run/'journal.json', encode({'phase': 'prepared', 'plan_hash': common.file_digest(run/'plan.json'), 'processes': [], 'steps': []}))
     progress('準備完了: ' + sha)
@@ -502,7 +533,8 @@ class Runner:
             log = os.open(self.run/'herdr.log', os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             try:
                 child = subprocess.Popen([executable, '--session', 'dona', 'server'], stdin=subprocess.DEVNULL,
-                                         stdout=log, stderr=log, start_new_session=True)
+                                         stdout=log, stderr=log, start_new_session=True,
+                                         env=dict(os.environ, HERDR_CONFIG_PATH=str(self.run/'herdr-config.toml')))
                 self.record(server_pid=child.pid)
             finally:
                 os.close(log)

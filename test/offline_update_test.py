@@ -212,6 +212,15 @@ class MainHealthTests(unittest.TestCase):
 
 
 class StartupTests(unittest.TestCase):
+    def test_server_config_disables_auto_resume_and_preserves_other_settings(self):
+        for source in ('[ui]\nmouse=true\n', '[session]\nresume_agents_on_restore = true\n[ui]\nmouse=true\n', '[\"session\"]\n\"resume_agents_on_restore\" = true\n[ui]\nmouse=true\n'):
+            result=m.herdr_no_resume_config(source)
+            self.assertIn('mouse=true',result)
+            self.assertEqual(result.count('resume_agents_on_restore'),1)
+            self.assertIn('resume_agents_on_restore = false',result)
+            self.assertEqual(m.herdr_no_resume_config(result),result)
+
+
     def test_intent_without_server_recovers_for_resume_and_rollback(self):
         for intent in (False, True):
             with tempfile.TemporaryDirectory() as directory:
@@ -222,6 +231,7 @@ class StartupTests(unittest.TestCase):
                     start.return_value.pid=800001
                     runner.ensure_herdr()
                     start.assert_called_once()
+                    self.assertEqual(start.call_args.kwargs['env']['HERDR_CONFIG_PATH'],str(runner.run/'herdr-config.toml'))
                     self.assertEqual(runner.journal['server_pid'],800001)
 
     def test_live_startup_before_socket_or_pid_record_does_not_spawn_twice(self):

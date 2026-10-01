@@ -797,7 +797,7 @@ export class RealRuntime implements RuntimePort {
   }
 
   async startMainAgent(paneId: string, releasePath: string, previousSessionId?: string): Promise<MainAgentStartResult> {
-    if (!/^[a-z0-9][a-z0-9:_-]{0,63}$/.test(paneId)) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,63}$/.test(paneId)) {
       return { outcome: "rejected", observation: missingMainAgent("invalid_main_agent_pane"), error_code: "invalid_main_agent_pane" };
     }
     let canonicalRelease: string;

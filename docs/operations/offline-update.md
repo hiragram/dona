@@ -37,7 +37,7 @@ schedule・jobを空DBで初期化せず、repository・worktree・未commit成�
 2. 準備物と元設定を照合し、3つのLaunchAgentをdisableする。対象プロセスを親から順に`SIGSTOP`してforkを止めてから子を列挙する。停止対象のPID・UID・開始時刻をjournalへ記録し、launchd登録を外した後、同じidentityの子孫と親を終了する。
 3. 全4DBをDonaと同じNode SQLiteでWAL込みbackupし、integrity checkを行う。Result directoryもcopyし、復旧用hashを記録する。
 4. target版の正規DB migrationを適用する。コード・設定は新しい世代に置き、旧世代を保持する。activeなUpdater ledgerの自動再開を終了する。
-5. 新しいmainを起動する。両MCPは`required=true`で接続し、target release・pane・interactive readyを確認する。
+5. run専用のHerdr設定で`resume_agents_on_restore=false`を指定し、旧main・workerのnative conversationを自動再開しない状態でserverを起動する。元のHerdr設定は変更しない。新しいmainを起動する。両MCPは`required=true`で接続し、target release・pane・interactive readyを確認する。
 6. Dispatcher、Slack Adapter、Updaterを起動する。3サービスの`/health/version`でexact SHAとreadyを確認し、Slackのworkspace接続、Dispatcher接続、mainのreleaseを照合した後だけ`succeeded`にする。
 
 親子関係を切って事前にdaemon化した任意の外部プログラムや、別の管理者による同時起動まで隔離するOS sandboxではありません。
