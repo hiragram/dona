@@ -366,6 +366,28 @@ class Runner:
             require(common.file_digest(file) == expected, 'source_configuration_changed')
         require(str(Path(self.inv['policy']['current_pointer']).resolve()) == self.inv['old_pointer'], 'source_release_changed')
 
+    def source_preflight(self):
+        try:
+            self.validate_source()
+        except Exception:
+            if not self.journal.get('source_stop_guard'):
+                self.record('aborted')
+            raise
+
+    def undo_source_freeze(self):
+        guard = self.journal.get('source_stop_guard')
+        require(guard and guard['phase'] == 'freezing', 'source_stop_already_committed')
+        # bootout/killより前の凍結だけを取り消す。PID再利用先にはsignalを送らない。
+        for expected in reversed(self.journal.get('processes', [])):
+            current = process_table().get(expected['pid'])
+            if same_process(expected, current) and 'Z' not in current['state']:
+                require(current['uid'] == os.getuid(), 'process_thaw_scope')
+                os.kill(expected['pid'], signal.SIGCONT)
+        for label, disabled in guard['disabled'].items():
+            require(label in LABELS, 'launchd_restore_scope')
+            command(['/bin/launchctl', 'disable' if disabled else 'enable', self.live.domain+'/'+label])
+        self.record(processes=[], source_stop_guard=None)
+
     def probe(self):
         probe_main(self.run, self.plan)
 
@@ -374,7 +396,7 @@ class Runner:
         for label in LABELS:
             command(['/bin/launchctl', 'disable' if disabled else 'enable', self.live.domain+'/'+label])
 
-    def stop(self):
+    def stop(self, check_source=False):
         roots = list(herdr_root(self.policy['executables']['herdr']))
         roots.extend(herdr_starting(self.policy['executables']['herdr']))
         table = process_table()
@@ -388,8 +410,23 @@ class Runner:
                 p = table.get(observation['pid'])
                 require(p and p['uid'] == os.getuid(), 'service_process_owner')
                 roots.append(p)
+        if check_source and not self.journal.get('source_stop_guard'):
+            listing = command(['/bin/launchctl', 'print-disabled', self.live.domain])
+            require('disabled services = {' in listing, 'launchd_disabled_state_unknown')
+            states = dict(re.findall(r'"([^"]+)"\s*=>\s*(enabled|disabled|true|false)', listing))
+            self.record(source_stop_guard={'phase':'freezing',
+                'disabled':{label:states.get(label) in ('disabled','true') for label in LABELS}})
         self.switch_disabled(True)
         def unregister():
+            if check_source:
+                try:
+                    self.validate_source()  # Updaterも凍結済み。ここではまだbootout/killしていない。
+                except Exception:
+                    if self.journal['source_stop_guard']['phase'] == 'freezing':
+                        self.undo_source_freeze()
+                        self.record('aborted')
+                    raise
+                self.record(source_stop_guard={**self.journal['source_stop_guard'], 'phase':'committed'})
             for label in LABELS:
                 self.live.stop(label)
         ProcessStop(lambda processes: self.record(processes=processes)).stop(roots, self.journal.get('processes', []), unregister)
@@ -562,11 +599,13 @@ class Runner:
     def restore(self):
         require(common.tree_seal(self.run/'rollback') == self.plan['rollback_seal'], 'rollback_files_changed')
         require(not self.journal.get('activation_started'), 'rollback_after_activation_forbidden')
+        if (self.journal.get('source_stop_guard') or {}).get('phase') == 'freezing':
+            self.undo_source_freeze()
         require(self.journal['phase'] in ('stopping','stopped','backed_up','migrating','migrated','installed','main_ready','restoring'), 'restore_phase_invalid')
         if not self.journal.get('backup_index_hash'):
             # backup前の停止失敗だけは、まだ同じ旧設定・DBであることを確認して復旧する。
             require(self.journal['phase'] in ('stopping','stopped','restoring'), 'restore_backup_required')
-            self.validate_source()
+            self.source_preflight()
         self.record('restoring')
         self.stop()
         index = self.run/'backup/index.json'
@@ -603,15 +642,18 @@ class Runner:
 
     def execute(self):
         phase = self.journal['phase']
-        require(phase in ('prepared','stopping','stopped','backed_up','migrating','migrated','installed','main_ready','activating','restarting_target','succeeded','restoring','rolled_back'), 'unknown_phase')
+        require(phase in ('prepared','stopping','stopped','backed_up','migrating','migrated','installed','main_ready','activating','restarting_target','succeeded','restoring','rolled_back','aborted'), 'unknown_phase')
         if phase == 'succeeded':
             self.health()
             return
         require(phase != 'rolled_back', 'already_rolled_back')
+        require(phase != 'aborted', 'source_changed; 新しいrunで更新を準備してください')
         if phase == 'restoring':
             self.restore()
             return
         try:
+            if phase == 'stopping' and (self.journal.get('source_stop_guard') or {}).get('phase') == 'freezing':
+                self.undo_source_freeze()
             self.validate()
             if phase in ('stopped', 'backed_up', 'migrating', 'migrated'):
                 self.stop()  # crash/reboot後もwriter停止を実状態で取り直す。
@@ -627,18 +669,17 @@ class Runner:
                 self.start_main()
                 self.record('main_ready')
             if phase == 'prepared':
-                self.validate_source()
+                self.source_preflight()
                 self.probe()
                 herdr_root(self.policy['executables']['herdr'])  # 自分が停止対象でないことを先に確認。
                 self.record('stopping')
             if self.journal['phase'] == 'stopping':
                 if phase == 'stopping':
                     # 停止intent直後のcrashでも、別更新後のサービスを先に止めない。
-                    self.validate_source()
+                    self.source_preflight()
                     self.probe()
                 progress('Donaの3サービスと専用Herdrプロセスを停止しています。')
-                self.stop()
-                self.validate_source()
+                self.stop(check_source=True)
                 self.record('stopped')
             if self.journal['phase'] == 'stopped':
                 progress('DBとResultをバックアップしています。')
@@ -669,7 +710,7 @@ class Runner:
             # 受付開始後は新データを保ち、同じrunで前進復旧する。
             if self.journal.get('activation_started'):
                 progress('起動確認に失敗しました。データを保持しています。同じrunのresumeで再確認できます。')
-            elif self.journal['phase'] not in ('prepared', 'stopping'):
+            elif self.journal['phase'] not in ('prepared', 'stopping', 'aborted'):
                 progress('起動前の失敗のため、バックアップから復元します。')
                 self.restore()
             raise
@@ -684,7 +725,7 @@ def active_run():
     run = Path(owner['run'])
     require(run.is_absolute() and common.file_digest(common.regular(run/'plan.json')) == owner['plan_hash'], 'active_run_changed')
     journal = read_json(common.regular(run/'journal.json'))
-    if journal['phase'] in ('succeeded', 'rolled_back'):
+    if journal['phase'] in ('succeeded', 'rolled_back', 'aborted'):
         return None
     return run
 

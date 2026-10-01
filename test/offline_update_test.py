@@ -86,7 +86,7 @@ class FakeRunner(m.Runner):
     def validate(self): self.hit('validate')
     def validate_source(self): self.hit('validate_source')
     def probe(self): self.hit('probe')
-    def stop(self): self.hit('stop')
+    def stop(self, **_): self.hit('stop')
     def backup(self): self.hit('backup'); self.record('backed_up')
     def migrate(self): self.hit('migrate')
     def install(self): self.hit('install')
@@ -102,7 +102,7 @@ class ExecutionTests(unittest.TestCase):
     def tearDown(self): self.patch.stop()
     def test_success_orders_stop_backup_migrate_main_and_services(self):
         runner=FakeRunner();runner.execute()
-        self.assertEqual(runner.calls,['validate','validate_source','probe','stop','validate_source','backup','migrate','install','main',
+        self.assertEqual(runner.calls,['validate','validate_source','probe','stop','backup','migrate','install','main',
                                      'dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater','health'])
         self.assertEqual(runner.journal['phase'],'succeeded')
     def test_each_pre_activation_failure_restores(self):
@@ -156,6 +156,43 @@ class ExecutionTests(unittest.TestCase):
         runner=FakeRunner('stopping');runner.execute()
         self.assertLess(runner.calls.index('validate_source'),runner.calls.index('stop'))
         self.assertLess(runner.calls.index('probe'),runner.calls.index('stop'))
+
+
+class SourceFreezeTests(unittest.TestCase):
+    def test_drift_while_frozen_thaws_and_restores_launchd_without_kill(self):
+        runner=FakeRunner('stopping',fail='validate_source')
+        runner.live=unittest.mock.Mock();runner.live.domain='gui/fixture';runner.live.observe.return_value=None
+        root=proc(800001);table={800001:root};signals=[];commands=[]
+        def send(pid,sig):
+            signals.append(sig)
+            table[pid]['state']='T' if sig == signal.SIGSTOP else 'S'
+        def command(argv):
+            commands.append(argv)
+            return 'disabled services = { "dev.dona.slack-adapter" => disabled }'
+        process_stop=m.ProcessStop
+        with patch.object(m,'herdr_root',side_effect=lambda _: [copy.deepcopy(root)]), \
+             patch.object(m,'herdr_starting',return_value=[]),patch.object(m,'process_table',side_effect=lambda:copy.deepcopy(table)), \
+             patch.object(m,'command',side_effect=command),patch.object(m.os,'kill',side_effect=send), \
+             patch.object(m,'ProcessStop',side_effect=lambda save:process_stop(save,lambda:copy.deepcopy(table),send)):
+            with self.assertRaisesRegex(RuntimeError,'validate_source'):m.Runner.stop(runner,check_source=True)
+        self.assertEqual(signals,[signal.SIGSTOP,signal.SIGCONT])
+        runner.live.stop.assert_not_called()
+        self.assertEqual(runner.journal['phase'],'aborted')
+        self.assertEqual(commands[-3:],[[ '/bin/launchctl','disable' if label=='dev.dona.slack-adapter' else 'enable','gui/fixture/'+label] for label in m.LABELS])
+        self.assertFalse(runner.journal['processes']);self.assertIsNone(runner.journal['source_stop_guard'])
+
+    def test_crash_during_freeze_is_undone_before_source_preflight(self):
+        runner=FakeRunner('stopping',fail='validate_source')
+        runner.live=unittest.mock.Mock();runner.live.domain='gui/fixture'
+        root=proc(800001,state='T');reused=proc(800002,start='different')
+        runner.journal.update(processes=[root,proc(800002)],source_stop_guard={'phase':'freezing','disabled':{label:False for label in m.LABELS}})
+        with patch.object(m,'process_table',return_value={800001:root,800002:reused}), \
+             patch.object(m.os,'kill') as send,patch.object(m,'command'):
+            with self.assertRaisesRegex(RuntimeError,'validate_source'):runner.execute()
+        send.assert_called_once_with(800001,signal.SIGCONT)
+        self.assertNotIn('stop',runner.calls)
+        self.assertEqual(runner.journal['phase'],'aborted')
+
 
 
 class MainHealthTests(unittest.TestCase):
@@ -363,7 +400,7 @@ class ActiveRunTests(unittest.TestCase):
             m.claim_run(first)
             self.assertEqual(m.active_run(),first)
             with self.assertRaisesRegex(RuntimeError,'未完了'):m.claim_run(second)
-            m.atomic(first/'journal.json',m.encode({'phase':'succeeded'}))
+            m.atomic(first/'journal.json',m.encode({'phase':'aborted'}))
             self.assertIsNone(m.active_run())
             m.claim_run(second)
 
