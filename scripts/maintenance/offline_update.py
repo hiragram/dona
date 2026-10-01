@@ -130,6 +130,7 @@ def herdr_root(executable):
 
 def herdr_starting(executable):
     # socket公開前のserverも照合する。PopenとPID記録の間のcrashでも二重起動しない。
+    roots = []
     for process in process_table().values():
         if process['uid'] != os.getuid() or 'Z' in process['state']:
             continue
@@ -140,8 +141,8 @@ def herdr_starting(executable):
         argv = result.stdout.strip()
         suffix = ' --session dona server'
         if argv.endswith(suffix) and Path(argv[:-len(suffix)]).resolve() == Path(executable).resolve():
-            return True
-    return False
+            roots.append(process)
+    return roots
 
 
 def toolchain(executables):
@@ -169,7 +170,7 @@ def render(run, plan, inv):
     policy['required_checks'] = common.target_required_checks(release)
     # Updater ledgerは停止後のsnapshotを新controlへ引き継ぐ。
     policy['dispatcher_internal_token_file'] = str(g/'control/dispatcher.token')
-    atomic(g/'control/dispatcher.token', Path(inv['policy']['dispatcher_internal_token_file']).read_bytes())
+    atomic(g/'control/dispatcher.token', (os.urandom(32).hex()+'\n').encode())
     shutil.copytree(release/'updater', g/'control/updater', symlinks=True)
     atomic(g/'control/policy.json', encode(policy))
     os.symlink(release, g/'runtime/current')
@@ -264,6 +265,12 @@ def build_command(argv, cwd, run, timeout=900, env=None):
     finally:
         os.close(descriptor)
 
+def probe_main(run, plan):
+    results = json.loads(command([plan['node'], str(run/'main_bridge.mjs'),
+        str(Path(plan['generation'])/'control')], input=encode({'action':'probe'}), timeout=120))
+    require({row['server'] for row in results if row.get('initialized')} == {'dispatcher','slack'}, 'mcp_probe_failed')
+
+
 def prepare(run, repository):
     require(not run.exists(), 'run_already_exists')
     common.private_dir(run.parent)
@@ -312,6 +319,7 @@ def prepare(run, repository):
     build_command([node, str(Path(__file__).resolve().parents[2]/'test/offline-state-integration.mjs'), str(release)], release, run)
     progress('更新用の設定と復旧用の設定を検証しています。')
     render(run, plan, inv)
+    probe_main(run, plan)
     prepare_rollback(run, inv)
     common.make_immutable(release)
     common.make_immutable(g/'control/updater')
@@ -358,14 +366,22 @@ class Runner:
             require(common.file_digest(file) == expected, 'source_configuration_changed')
         require(str(Path(self.inv['policy']['current_pointer']).resolve()) == self.inv['old_pointer'], 'source_release_changed')
 
+    def probe(self):
+        probe_main(self.run, self.plan)
+
     def switch_disabled(self, disabled):
         # login/rebootが途中に入ってもLaunchAgentを勝手に起動させない。
         for label in LABELS:
             command(['/bin/launchctl', 'disable' if disabled else 'enable', self.live.domain+'/'+label])
 
     def stop(self):
-        roots = herdr_root(self.policy['executables']['herdr'])
+        roots = list(herdr_root(self.policy['executables']['herdr']))
+        roots.extend(herdr_starting(self.policy['executables']['herdr']))
         table = process_table()
+        ancestor = os.getpid()
+        while ancestor in table:
+            require(all(ancestor != p['pid'] for p in roots), 'run_from_terminal_outside_dona')
+            ancestor = table[ancestor]['parent']
         for label in LABELS:
             observation = self.live.observe(label)
             if observation and observation['pid']:
@@ -377,7 +393,8 @@ class Runner:
             for label in LABELS:
                 self.live.stop(label)
         ProcessStop(lambda processes: self.record(processes=processes)).stop(roots, self.journal.get('processes', []), unregister)
-        require(not herdr_root(self.policy['executables']['herdr']), 'herdr_still_running')
+        require(not herdr_root(self.policy['executables']['herdr']) and
+                not herdr_starting(self.policy['executables']['herdr']), 'herdr_still_running')
         self.record(processes=[], server_start_intent=False, server_pid=None)
 
     def backup(self):
@@ -608,6 +625,7 @@ class Runner:
                 self.record('main_ready')
             if phase == 'prepared':
                 self.validate_source()
+                self.probe()
                 herdr_root(self.policy['executables']['herdr'])  # 自分が停止対象でないことを先に確認。
                 self.record('stopping')
             if self.journal['phase'] == 'stopping':

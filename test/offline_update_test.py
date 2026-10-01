@@ -85,6 +85,7 @@ class FakeRunner(m.Runner):
         self.journal.update(fields)
     def validate(self): self.hit('validate')
     def validate_source(self): self.hit('validate_source')
+    def probe(self): self.hit('probe')
     def stop(self): self.hit('stop')
     def backup(self): self.hit('backup'); self.record('backed_up')
     def migrate(self): self.hit('migrate')
@@ -101,7 +102,7 @@ class ExecutionTests(unittest.TestCase):
     def tearDown(self): self.patch.stop()
     def test_success_orders_stop_backup_migrate_main_and_services(self):
         runner=FakeRunner();runner.execute()
-        self.assertEqual(runner.calls,['validate','validate_source','stop','validate_source','backup','migrate','install','main',
+        self.assertEqual(runner.calls,['validate','validate_source','probe','stop','validate_source','backup','migrate','install','main',
                                      'dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater','health'])
         self.assertEqual(runner.journal['phase'],'succeeded')
     def test_each_pre_activation_failure_restores(self):
@@ -139,6 +140,13 @@ class ExecutionTests(unittest.TestCase):
         runner=FakeRunner(fail='validate')
         with self.assertRaises(RuntimeError):runner.execute()
         self.assertNotIn('stop',runner.calls)
+
+    def test_pre_stop_mcp_probe_failure_keeps_live_services(self):
+        runner=FakeRunner(fail='probe')
+        with self.assertRaisesRegex(RuntimeError,'probe'):runner.execute()
+        self.assertEqual(runner.journal['phase'],'prepared')
+        self.assertNotIn('stop',runner.calls);self.assertNotIn('restore',runner.calls)
+
 
 
 class StartupTests(unittest.TestCase):
@@ -178,6 +186,27 @@ class StartupTests(unittest.TestCase):
                 m.Runner.stop(runner)
             disable.assert_not_called()
 
+
+    def test_resume_collects_hung_server_before_restarting(self):
+        runner=FakeRunner();runner.live=unittest.mock.Mock()
+        runner.live.observe.return_value=None
+        root=proc(800001)
+        with patch.object(m,'herdr_root',return_value=[]), \
+             patch.object(m,'herdr_starting',side_effect=[[root],[]]), \
+             patch.object(m,'process_table',return_value={root['pid']:root}), \
+             patch.object(m,'ProcessStop') as stop,patch.object(runner,'switch_disabled'):
+            m.Runner.stop(runner)
+            stop.return_value.stop.assert_called_once()
+            self.assertEqual(stop.return_value.stop.call_args.args[0],[root])
+            self.assertFalse(runner.journal['server_start_intent'])
+        with tempfile.TemporaryDirectory() as directory:
+            runner.run=Path(directory)
+            with patch.object(m,'herdr_root',side_effect=[[],[root]]), \
+                 patch.object(m,'herdr_starting',return_value=[]),patch.object(m.subprocess,'Popen') as start:
+                start.return_value.pid=800002
+                runner.ensure_herdr()
+                start.assert_called_once()
+
     def test_toolchain_uses_policy_even_with_other_node_first_in_shell(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);trusted=root/'trusted';trusted.mkdir();other=root/'other';other.mkdir()
@@ -209,6 +238,9 @@ class RenderTests(unittest.TestCase):
                  patch.object(m.common,'target_required_checks',return_value=[]), \
                  patch.object(m.common,'effective_config',side_effect=effective),patch.object(m,'command'):
                 m.render(run,{'generation':str(g),'release':str(release),'node':'/fixture/node','target_sha':'first'},inv)
+            self.assertNotEqual((g/'control/dispatcher.token').read_bytes(),token.read_bytes())
+            self.assertEqual(token.read_text(),'fixture-token')
+            self.assertEqual((g/'control/dispatcher.token').stat().st_mode & 0o777,0o600)
             second=g/'runtime/releases/second';second.mkdir();(second/'release-manifest.json').write_text('second')
             (g/'runtime/current').unlink();(g/'runtime/current').symlink_to(second)
             for label,key,component in (('dev.dona.dispatcher','dispatcher','dispatcher'),('dev.dona.slack-adapter','slack','sources/slack')):

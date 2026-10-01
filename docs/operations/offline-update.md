@@ -13,7 +13,7 @@ Slack上の更新依頼、event/job ID、handoff receipt、旧jobの`needs_revie
 
 ## 保持するデータと停止範囲
 
-Dispatcher DB、通知DB、進捗DB、Resultのpathと履歴を保持します。Updater DBは履歴ごと新しいcontrol領域へ複製し、旧DBも残します。
+Dispatcher DB、通知DB、進捗DB、Resultのpathと履歴を保持します。Updater DBは履歴ごと新しいcontrol領域へ複製し、旧DBも残します。内部tokenは新世代用に生成し、旧tokenは復旧用の旧設定にだけ残します。
 schedule・jobを空DBで初期化せず、repository・worktree・未commit成果も残します。
 既存のlaunchd plistとdotenvから実際のpathを読むため、標準installと世代別installの両方に対応します。
 停止済みサービスからでも準備できます。Slack tokenなどを標準出力へ出しません。
@@ -33,7 +33,7 @@ schedule・jobを空DBで初期化せず、repository・worktree・未commit成�
 
 ## 更新の順序
 
-1. 設定を読み、mainのSHAと必須CIを確認する。独立領域で各componentの`npm ci`、test、typecheck、buildを完了する。この間はサービスを稼働させたままにする。
+1. 設定を読み、mainのSHAと必須CIを確認する。独立領域で各componentの`npm ci`、test、typecheck、buildを完了する。生成した設定で両MCPのinitialize・tools/listも確認し、停止直前にも再確認する。この間はサービスを稼働させたままにする。
 2. 準備物と元設定を照合し、3つのLaunchAgentをdisableする。対象プロセスを親から順に`SIGSTOP`してforkを止めてから子を列挙する。停止対象のPID・UID・開始時刻をjournalへ記録し、launchd登録を外した後、同じidentityの子孫と親を終了する。
 3. 全4DBをDonaと同じNode SQLiteでWAL込みbackupし、integrity checkを行う。Result directoryもcopyし、復旧用hashを記録する。
 4. target版の正規DB migrationを適用する。コード・設定は新しい世代に置き、旧世代を保持する。activeなUpdater ledgerの自動再開を終了する。
