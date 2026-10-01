@@ -207,6 +207,41 @@ describe("SlackUpdateNotificationReporter", () => {
     assert.equal(client.statusCount, 0);
   });
 
+  test("同一通知 ID でも本文または投稿先が異なれば既送信と認めない", async () => {
+    for (const change of [
+      { text: "別の報告" },
+      { threadTs: "1756722031.123456" },
+      { subtype: "thread_broadcast" },
+    ]) {
+      const { client, reporter } = await reporterFixture();
+      client.messages.push({
+        ts: "1788390700.987654", botId: "B_TEST", text: request.text,
+        threadTs: request.thread_ts, fileIds: [], reactions: [],
+        blockIds: [`dona_update_notification:${request.notification_id}`],
+        ...change,
+      });
+      await assert.rejects(reporter.deliver(request), /different payload or destination/);
+      assert.equal(client.postCount, 0);
+      assert.equal(client.statusCount, 0);
+    }
+  });
+
+  test("応答喪失後の後続ページに異なる本文の ID があれば再投稿しない", async () => {
+    const { client, reporter } = await reporterFixture();
+    client.threadPages = [
+      { messages: Array.from({ length: 200 }, (_, index) => ({
+        ts: `1788390600.${String(index).padStart(6, "0")}`, botId: "B_TEST", text: "other",
+        threadTs: request.thread_ts, fileIds: [], blockIds: [], reactions: [],
+      })), hasMore: true },
+      { messages: [{ ts: "1788390700.987654", botId: "B_TEST", text: "別の報告",
+        threadTs: request.thread_ts, fileIds: [], reactions: [],
+        blockIds: [`dona_update_notification:${request.notification_id}`] }], hasMore: false },
+    ];
+    await assert.rejects(reporter.deliver(request), /different payload or destination/);
+    assert.equal(client.postCount, 0);
+    assert.equal(client.statusCount, 0);
+  });
+
   test("detects duplicate notification identity blocks across all thread pages", async () => {
     const { client, reporter } = await reporterFixture();
     const blockIds = [`dona_update_notification:${request.notification_id}`];
