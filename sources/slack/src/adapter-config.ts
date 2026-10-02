@@ -15,19 +15,19 @@ export interface SlackAdapterConfig {
   socketModeEnabled: true;
   logLevel: SlackLogLevel;
   buildSha: string;
-  appSchemaWrite: 2 | 3;
-  appSchemaReadMax: 2 | 3;
+  appSchemaWrite: 2 | 3 | 4;
+  appSchemaReadMax: 2 | 3 | 4;
 }
 
-function appSchemaCompatibility(env: NodeJS.ProcessEnv): { readMax: 2 | 3; write: 2 | 3 } {
+function appSchemaCompatibility(env: NodeJS.ProcessEnv): { readMax: 2 | 3 | 4; write: 2 | 3 | 4 } {
   const manifestPath = env.DONA_RELEASE_MANIFEST_PATH;
-  if (!manifestPath) return { readMax: 3, write: 3 };
+  if (!manifestPath) return { readMax: 4, write: 4 };
   const parsed = JSON.parse(fs.readFileSync(expandHome(manifestPath), "utf8")) as {
     compatibility?: { app_schema_read_max?: unknown; app_schema_write?: unknown };
   };
   const readMax = parsed.compatibility?.app_schema_read_max;
   const write = parsed.compatibility?.app_schema_write;
-  if ((readMax !== 2 && readMax !== 3) || (write !== 2 && write !== 3) || write > readMax) {
+  if ((readMax !== 2 && readMax !== 3 && readMax !== 4) || (write !== 2 && write !== 3 && write !== 4) || write > readMax) {
     throw new Error("DONA release manifest schema compatibility is invalid");
   }
   return { readMax, write };

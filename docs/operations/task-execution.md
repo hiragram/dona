@@ -10,15 +10,17 @@
 
 `project`を指定する場合はowner、numberと、必要なら`completion_status`を渡す。既定の完了時表示は`In Progress`。Issue全体の提出までを依頼した場合だけ`Merge Ready`を指定する。事前にProjectへTEXT field `Dona Task ID`を作り、Issueを追加しておく。field作成やIssue移送をTask作成の副作用にはしない。
 
-既存の`delegate_job`/UDS作成routeも通常の依頼にはTaskを作る。内部の`jobs` tableはAttemptの実行・Result・通知transportとして使う。これは旧DBのjobをTaskへ採用するmigrationではない。Taskに紐付いたjobの旧制御routeは拒否される。
+既存の`delegate_job`/UDS作成routeも通常の依頼にはTaskを作る。旧委任の表示用Issueは表示metadataとして扱い、Taskの明示`issue_number` claimとは分離する。内部の`jobs` tableはAttemptの実行・Result・通知transportとして使う。これは旧DBのjobをTaskへ採用するmigrationではない。Taskに紐付いたjobの旧制御routeは拒否される。
 
 ## 後続操作
 
 1. `list_tasks`で現在のthreadと依頼者のTaskを確認し、`get_task`で最新revisionと待機理由を読む。100件の上限に達した一覧を全件取得と扱わない。
-2. `steer_task`へ追加指示を渡す。指示はTaskへ永続化され、後継Attemptにも引き継ぐ。送信結果が曖昧なら再送せず、TaskとAttemptのsteer receiptを照合する。
+2. `steer_task`へ追加指示を渡す。指示はTaskへ永続化され、後継Attemptにも引き継ぐ。`human_input`待ちへの回答も同じAttemptへ届け、受理済みの回答より古いcheckpointを再度の待機理由にしない。送信結果が曖昧なら再送せず、TaskとAttemptのsteer receiptを照合する。
 3. `pause_task`は自動再開を止め、起動済みworkerの停止を確認する。`resume_task`は同じTask・目的・残予算で続ける。承認待ちをpause/resumeで迂回しない。
 4. `cancel_task`は自動再開を禁止する。起動済みworkerでは停止確認が終わるまで取消完了にしない。
 5. `retry_exhausted`では、追加実行の明示依頼を得てから`retry_task`へ新しい総`max_attempts`を渡す。使用済みAttempt数は維持する。
+
+Taskの読み取り・制御は元のworkspace/channel/threadと依頼者へ束縛する。
 
 同じeventによる同じcontrolの再照合は既存状態を返し、異内容はconflictにする。古いrevisionを自動上書きしない。
 

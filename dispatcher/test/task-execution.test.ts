@@ -12,8 +12,8 @@ import { DispatcherApi } from "../src/api.js";
 import { DispatcherApiClient } from "../src/client.js";
 import { eventEnvelope,tempConfig } from "./helpers.js";
 const logger={debug(){},info(){},warn(){},error(){}};
-async function fixture(){
-  const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath);
+async function fixture(limits?:{jobsPerEventMax:number;jobObjectiveTotalMaxBytes:number}){
+  const {root,config}=await tempConfig(),db=new DispatcherDatabase(config.databasePath,limits);
   const event=db.enqueue(eventEnvelope("task")).row;
   const request=taskRequestSchema.parse({source_event_id:event.event_id,task_key:"implementation",objective:"実装して検証済みPRを提出",workspace:{kind:"scratch"},policy:{max_attempts:3,retry_delay_ms:1000}});
   const task=db.tasks.create(request,config.jobsWorkspaceRoot,config.jobResultsDir).task;
@@ -249,5 +249,107 @@ test("停止直前にworkerがworkingへ戻れば停止writeを送らない",asy
     f.start();f.interrupt();let reads=0;
     f.runtime.observeWorker=async()=>({state:++reads===1?"inactive":"working",reason:"changed",observed_at:new Date().toISOString(),process_ids:[123],process_groups:[123]});
     await f.supervisor().reconcileTasks();assert.equal(f.sends(),0);assert.equal(f.db.tasks.get(f.task.task_id)!.attempt_number,1);
+  }finally{await f.dispose();}
+});
+
+for(const status of ["blocked","checkpoint"] as const)test(`人間入力待ち(${status})に回答を一度だけ送り同じAttemptを続行`,async()=>{
+  const f=await fixture(),api=new DispatcherApi(f.db,{isRunning:()=>true,wake(){}},f.supervisor(),f.config,logger);
+  try{
+    f.start();const job=f.db.getJob(f.task.current_attempt_id)!;
+    if(status==="blocked")f.db.markJobBlocked(job.job_id,"回答待ち");
+    else {
+      f.interrupt();await fs.mkdir(path.dirname(job.result_path),{recursive:true});
+      await fs.writeFile(path.join(path.dirname(job.result_path),"checkpoint.json"),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:job.job_id,sequence:1,summary:"質問",remaining:[],artifacts:[],unresolved_operations:[],waiting:"human_input"}));
+    }
+    await f.supervisor().reconcileTasks();const waiting=f.db.tasks.get(f.task.task_id)!;assert.equal(waiting.wait_reason,"human_input");
+    let writes=0;f.runtime.prompt=async()=>{writes++;return {ok:true,stdout:"",stderr:"",exitCode:0,timedOut:false,aborted:false};};
+    await api.start();const client=new DispatcherApiClient(f.config.socketPath),event=f.db.enqueue(eventEnvelope("answer")).row;
+    const control={source_event_id:event.event_id,revision:waiting.revision,instruction:"この条件で続行してください"};
+    await client.controlTask(waiting.task_id,"steer",control);await client.controlTask(waiting.task_id,"steer",control);
+    assert.equal(writes,1);assert.equal(f.db.tasks.get(waiting.task_id)!.state,"active");assert.equal(f.db.getJob(job.job_id)!.status,"running");
+    if(status==="checkpoint"){f.interrupt();await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(waiting.task_id)!.attempt_number,2);}
+  }finally{await api.stop();await f.dispose();}
+});
+
+test("解除時刻なしの利用上限はblockedから定期観測し回復する",async()=>{
+  const f=await fixture();try{
+    f.start();const job=f.db.getJob(f.task.current_attempt_id)!;f.db.markJobBlocked(job.job_id,"capacity");
+    await fs.mkdir(path.dirname(job.result_path),{recursive:true});
+    await fs.writeFile(path.join(path.dirname(job.result_path),"checkpoint.json"),JSON.stringify({schema_version:1,task_id:f.task.task_id,attempt_id:job.job_id,sequence:1,summary:"上限",remaining:[],artifacts:[],unresolved_operations:[],waiting:"usage_limit"}));
+    f.setObserved({state:"waiting"});const before=Date.now();await f.supervisor().reconcileTasks();
+    const waiting=f.db.tasks.get(f.task.task_id)!;assert.equal(waiting.wait_reason,"capacity_wait");assert.ok(Date.parse(waiting.next_check_at!)>=before+waiting.retry_delay_ms);
+    assert.equal(f.sends(),0);f.due();f.setObserved({state:"working"});await f.supervisor().reconcileTasks();assert.equal(f.db.getJob(job.job_id)!.status,"running");assert.equal(f.db.tasks.get(waiting.task_id)!.state,"active");
+    f.interrupt();f.setObserved({state:"inactive"});await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(waiting.task_id)!.attempt_number,2);
+  }finally{await f.dispose();}
+});
+
+test("needs_review中のwaiting workerをpauseすると停止確認まで進む",async()=>{
+  const f=await fixture();try{
+    f.start();f.interrupt();f.setObserved({state:"waiting"});const task=f.db.tasks.get(f.task.task_id)!,event=f.db.enqueue(eventEnvelope("pause-waiting")).row;
+    f.db.tasks.control(task.task_id,event.event_id,task.revision,"pause");await f.supervisor().reconcileTasks();
+    assert.equal(f.sends(),1);assert.equal(f.db.tasks.get(task.task_id)!.stop_state,"stopped");assert.equal(f.db.tasks.get(task.task_id)!.wait_reason,"paused");
+  }finally{await f.dispose();}
+});
+
+test("中断AttemptはTask受付件数・objective予算を消費しない",async()=>{
+  const f=await fixture({jobsPerEventMax:2,jobObjectiveTotalMaxBytes:200});try{
+    f.start();f.interrupt();await f.supervisor().reconcileTasks();
+    const second=f.db.tasks.create({...f.request,task_key:"second"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).task;
+    assert.ok(second);assert.throws(()=>f.db.tasks.create({...f.request,task_key:"third"},f.config.jobsWorkspaceRoot,f.config.jobResultsDir),/limit exceeded/);
+  }finally{await f.dispose();}
+});
+
+for(const reason of ["result_path_exists","invalid_result","invalid_result_agent_stopped"])test(`${reason}のTaskは後から有効Resultに置換されても隔離を維持`,async()=>{
+  const f=await fixture();try{
+    if(reason!=="result_path_exists")f.start();else f.db.beginJobPreparation(f.task.current_attempt_id);
+    f.db.markJobNeedsReview(f.task.current_attempt_id,reason,"quarantine");const job=f.db.getJob(f.task.current_attempt_id)!;
+    await fs.mkdir(path.dirname(job.result_path),{recursive:true});await fs.writeFile(job.result_path,JSON.stringify({schema_version:1,job_id:job.job_id,status:"completed",summary:"不正な置換",completed_at:new Date().toISOString()}));
+    await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(f.task.task_id)!.wait_reason,"result_conflict");assert.equal(f.db.getJob(job.job_id)!.result_json,null);
+  }finally{await f.dispose();}
+});
+
+test("所有者の異なるIssue claim競合は存在を開示しない",async()=>{
+  const f=await fixture();try{
+    const input=taskRequestSchema.parse({...f.request,task_key:"issue",workspace:{kind:"github",repository:"org/repo"},issue_number:1}),issue={node_id:"I_1",repository:"org/repo",number:1};
+    f.db.tasks.create(input,f.config.jobsWorkspaceRoot,f.config.jobResultsDir,issue);
+    const e=eventEnvelope("foreign-claim");e.subject.actor_id="U_OTHER";const event=f.db.enqueue(e).row;
+    assert.throws(()=>f.db.tasks.create({...input,source_event_id:event.event_id},f.config.jobsWorkspaceRoot,f.config.jobResultsDir,issue),/^Error: task_owner_mismatch$/);
+    const otherThread=eventEnvelope("foreign-thread");otherThread.subject.thread_ts="1700000000.000002";otherThread.reply_target!.thread_ts="1700000000.000002";
+    const threadEvent=f.db.enqueue(otherThread).row;
+    assert.throws(()=>f.db.tasks.create({...input,source_event_id:threadEvent.event_id},f.config.jobsWorkspaceRoot,f.config.jobResultsDir,issue),/^Error: task_owner_mismatch$/);
+  }finally{await f.dispose();}
+});
+
+test("旧委任の表示用Issueはclaimせず表示ラベルとして保持する",async()=>{
+  const f=await fixture(),api=new DispatcherApi(f.db,{isRunning:()=>true,wake(){}},f.supervisor(),f.config,logger);
+  try{
+    await api.start();const client=new DispatcherApiClient(f.config.socketPath);
+    const response=await client.createJob({source_event_id:f.event.event_id,job_key:"display",objective:"作業",workspace:{kind:"github",repository:"org/repo"},display:{short_name:"表示名",issue:{repository:"another/repo",number:999}}});
+    const task=f.db.tasks.forAttempt((response.job as {job_id:string}).job_id)!;assert.equal(task.resource_id,null);
+    assert.equal(JSON.parse(f.db.getJob(task.current_attempt_id)!.workspace_json).__dona_job_display,undefined);
+    const matching=await client.createJob({source_event_id:f.event.event_id,job_key:"display-match",objective:"作業",workspace:{kind:"github",repository:"org/repo"},display:{short_name:"表示名",issue:{repository:"org/repo",number:999}}});
+    const matched=f.db.tasks.forAttempt((matching.job as {job_id:string}).job_id)!;assert.equal(matched.resource_id,null);
+    assert.equal(JSON.parse(f.db.getJob(matched.current_attempt_id)!.workspace_json).__dona_job_display.label,"#999 表示名");
+  }finally{await api.stop();await f.dispose();}
+});
+
+test("未送信停止intent後にworkerがworkingへ戻れば同じAttemptへ再接続",async()=>{
+  const f=await fixture();try{
+    f.start();f.interrupt();const task=f.db.tasks.get(f.task.task_id)!;
+    f.db.tasks.claimStop(task,{state:"inactive",reason:"idle",observed_at:new Date().toISOString(),process_ids:[123],process_groups:[123]});
+    f.setObserved({state:"working"});await f.supervisor().reconcileTasks();
+    const current=f.db.tasks.get(task.task_id)!;assert.equal(current.stop_state,"none");assert.equal(current.state,"active");assert.equal(f.db.getJob(current.current_attempt_id)!.status,"running");assert.equal(f.sends(),0);
+  }finally{await f.dispose();}
+});
+
+test("steer受理直後の再起動はexact eventのreceiptだけで復旧する",async()=>{
+  const f=await fixture();try{
+    f.start();const job=f.db.getJob(f.task.current_attempt_id)!;
+    const first=f.db.enqueue(eventEnvelope("accepted-answer")).row,task=f.db.tasks.get(f.task.task_id)!;
+    f.db.tasks.prepareSteer(task.task_id,first.event_id,task.revision,"一つ目");f.db.beginJobSteer(job.job_id,first.event_id);f.db.markJobSteerAccepted(job.job_id,first.event_id);
+    await f.supervisor().reconcileTasks();assert.equal(f.db.tasks.get(task.task_id)!.state,"active");
+    const second=f.db.enqueue(eventEnvelope("unsent-answer")).row,current=f.db.tasks.get(task.task_id)!;
+    f.db.tasks.prepareSteer(task.task_id,second.event_id,current.revision,"二つ目");
+    await f.supervisor().reconcileTasks();assert.notEqual(f.db.tasks.get(task.task_id)!.state,"active");
   }finally{await f.dispose();}
 });

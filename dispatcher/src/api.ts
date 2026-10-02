@@ -684,8 +684,8 @@ export class DispatcherApi {
           if(typeof input.instruction!=="string"||!input.instruction.trim())throw new Error("task_control_invalid");
           if(this.database.tasks.prepareSteer(id,input.source_event_id,input.revision as number,input.instruction)) {
             await this.jobs.steer(task.current_attempt_id,input.source_event_id,input.instruction);
-            this.database.tasks.finishSteer(id,input.source_event_id);
           }
+          this.database.tasks.finishSteer(id,input.source_event_id);
         } else this.database.tasks.control(id,input.source_event_id,input.revision as number,action as "pause"|"resume"|"cancel");
         this.jobs.wake();sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,input.source_event_id))});return;
       }
@@ -711,7 +711,7 @@ export class DispatcherApi {
       let result;
       try {
         const request=taskRequestSchema.parse({source_event_id:input.source_event_id,task_key:input.job_key??"legacy-default",objective:input.objective,workspace:input.workspace,
-          ...(input.display?.issue?{issue_number:input.display.issue.number}:{})});
+          ...(input.display?{display:input.display}:{})});
         const existing=this.database.tasks.lookupRequest(request);
         const issue=existing?undefined:await verifyTaskIssue(request,githubQuery(this.config.ghPath));
         const created=existing?{outcome:"reused" as const,task:existing}:this.database.tasks.create(request,this.config.jobsWorkspaceRoot,this.config.jobResultsDir,issue);

@@ -7,7 +7,7 @@ import fs from "node:fs";
 import { z } from "zod";
 import type { DispatcherDatabase } from "./database.js";
 import type { JobRow } from "./types.js";
-import { parseCreateJobRequest, stableStringify } from "./validation.js";
+import { jobDisplaySchema, parseCreateJobRequest, stableStringify } from "./validation.js";
 import { workspaceJobId, type WorkerObservation } from "./job-handoff.js";
 
 /** Inspect before the normal constructor can migrate or mutate an old generation. */
@@ -31,6 +31,7 @@ export const taskRequestSchema = z.object({
     z.object({kind:z.literal("scratch")}).strict(),
     z.object({kind:z.literal("github"),repository:z.string().regex(/^[\w.-]+\/[\w.-]+$/),base_ref:z.string().min(1).max(255).optional()}).strict(),
   ]),
+  display: jobDisplaySchema.optional(),
   issue_number: z.number().int().positive().optional(),
   project: z.object({owner:z.string().regex(/^[\w-]+$/),number:z.number().int().positive(),completion_status:z.enum(["In Progress","Merge Ready"]).default("In Progress")}).strict().optional(),
   policy: z.object({max_attempts:z.number().int().min(1).max(10).default(3),retry_delay_ms:z.number().int().min(1000).max(86_400_000).default(60_000)}).strict().default({max_attempts:3,retry_delay_ms:60_000}),
@@ -43,7 +44,7 @@ export interface TaskRow {
   resource_id:string|null;current_attempt_id:string;revision:number;progress:string;state:TaskState;desired_state:"running"|"paused"|"cancelled";
   wait_reason:string|null;observation_failures:number;next_check_at:string|null;attempt_number:number;max_attempts:number;retry_delay_ms:number;
   stop_state:"none"|"not_sent"|"attempting"|"stopped";stop_evidence_json:string|null;
-  objective:string;project_json:string|null;project_state:string;created_at:string;updated_at:string;
+  objective:string;steer_pending_event_id:string|null;project_json:string|null;project_state:string;created_at:string;updated_at:string;
 }
 export interface VerifiedTaskIssue {node_id:string;repository:string;number:number;project?:Record<string,unknown>;}
 const automaticReasons = new Set(["result_missing","agent_wait_failed","transport_failure","agent_not_found","agent_not_running","prompt_acceptance_unknown","prompt_interrupted","prompt_acceptance_unproven","prompt_reconcile_timeout","prompt_reconcile_transient_failures","prompt_reconcile_transport_failure","ambiguous_prompt_acceptance"]);
@@ -53,6 +54,9 @@ export function taskRecoveryReason(job:JobRow):string {
   if(job.steer_state==="dispatching"||job.last_error_code?.includes("steer"))return "human_input";
   if(job.last_error_code?.includes("invalid_result"))return "result_conflict";
   return automaticReasons.has(job.last_error_code??"") ? "observation_unknown" : "human_input";
+}
+export function taskMayAcceptLateResult(job:JobRow):boolean {
+  return !!job.dispatch_started_at && (automaticReasons.has(job.last_error_code??"") || job.last_error_code==="task_stop_pending");
 }
 const hash = (value:unknown) => createHash("sha256").update(stableStringify(value)).digest("hex");
 
@@ -65,19 +69,19 @@ export class TaskRepository {
       request_sha256 TEXT NOT NULL,resource_id TEXT UNIQUE,current_attempt_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
       revision INTEGER NOT NULL DEFAULT 1,progress TEXT NOT NULL DEFAULT 'todo',state TEXT NOT NULL DEFAULT 'active',desired_state TEXT NOT NULL DEFAULT 'running',wait_reason TEXT,observation_failures INTEGER NOT NULL DEFAULT 0,next_check_at TEXT,
       attempt_number INTEGER NOT NULL DEFAULT 1,max_attempts INTEGER NOT NULL,retry_delay_ms INTEGER NOT NULL,
-      stop_state TEXT NOT NULL DEFAULT 'none',stop_evidence_json TEXT,objective TEXT NOT NULL,project_json TEXT,
+      stop_state TEXT NOT NULL DEFAULT 'none',stop_evidence_json TEXT,objective TEXT NOT NULL,steer_pending_event_id TEXT,project_json TEXT,
       project_state TEXT NOT NULL DEFAULT 'pending',project_next_check_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
       UNIQUE(source_event_id,task_key));
       CREATE TABLE IF NOT EXISTS task_attempts(
         attempt_id TEXT PRIMARY KEY REFERENCES jobs(job_id),task_id TEXT NOT NULL REFERENCES tasks(task_id),
-        number INTEGER NOT NULL,outcome TEXT,stop_receipt_json TEXT,checkpoint_json TEXT,
+        number INTEGER NOT NULL,outcome TEXT,stop_receipt_json TEXT,checkpoint_json TEXT,checkpoint_ack_sequence INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,ended_at TEXT,UNIQUE(task_id,number));
       CREATE TABLE IF NOT EXISTS task_project_intents(
         task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),revision INTEGER NOT NULL,field_id TEXT NOT NULL,
         kind TEXT NOT NULL,value TEXT NOT NULL,state TEXT NOT NULL,attempted_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_controls(
         task_id TEXT NOT NULL REFERENCES tasks(task_id),source_event_id TEXT NOT NULL REFERENCES events(event_id),
-        request_sha256 TEXT NOT NULL,PRIMARY KEY(task_id,source_event_id));
+        request_sha256 TEXT NOT NULL,checkpoint_sequence INTEGER,PRIMARY KEY(task_id,source_event_id));
       CREATE INDEX IF NOT EXISTS tasks_recovery ON tasks(state,next_check_at);
       CREATE TRIGGER IF NOT EXISTS task_attempt_completion AFTER UPDATE OF status ON jobs
       WHEN NEW.status IN ('completed','failed','cancelled') AND EXISTS(SELECT 1 FROM tasks WHERE current_attempt_id=NEW.job_id)
@@ -134,11 +138,13 @@ export class TaskRepository {
   forAttempt(id:string):TaskRow|undefined {return this.sql.prepare("SELECT t.* FROM tasks t JOIN task_attempts a USING(task_id) WHERE a.attempt_id=?").get(id) as TaskRow|undefined;}
   assertOwner(id:string,eventId:string):TaskRow {
     const task=this.get(id);if(!task)throw new Error("task_owner_mismatch");
-    this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);
+    try{this.dispatcher.assertJobSourceMatchesThread(task.current_attempt_id,eventId);}catch{throw new Error("task_owner_mismatch");}
     const event=this.dispatcher.get(eventId);
     if(!event||!["slack","dona_job"].includes(event.source))throw new Error("task_owner_mismatch");
     if(event.source==="dona_job"&&JSON.parse(event.subject_json).source_event_id!==task.source_event_id)throw new Error("task_owner_mismatch");
     const original=this.dispatcher.get(task.source_event_id)!;
+    const target=original.reply_target_json?JSON.parse(original.reply_target_json):{},current=event.reply_target_json?JSON.parse(event.reply_target_json):{};
+    if(["workspace_id","channel_id","thread_ts"].some(key=>typeof target[key]!=="string"||target[key]!==current[key]))throw new Error("task_owner_mismatch");
     const actor=JSON.parse(original.subject_json).actor_id;
     if(typeof actor!=="string"||JSON.parse(event.subject_json).actor_id!==actor)throw new Error("task_owner_mismatch");
     return task;
@@ -161,8 +167,11 @@ export class TaskRepository {
       if(parsed.issue_number!==undefined&&(!issue||issue.number!==parsed.issue_number||parsed.workspace.kind!=="github"||issue.repository.toLowerCase()!==parsed.workspace.repository.toLowerCase()))throw new Error("task_issue_identity_unverified");
       if(parsed.project&&!issue?.project)throw new Error("task_project_identity_unverified");
       const resource=issue?`github:${issue.node_id}`:null;
-      if(resource&&this.sql.prepare("SELECT 1 FROM tasks WHERE resource_id=?").get(resource))throw new Error("task_resource_already_claimed");
-      const request=parseCreateJobRequest({source_event_id:parsed.source_event_id,...(parsed.task_key==="legacy-default"?{}:{job_key:parsed.task_key}),objective:parsed.objective,workspace:parsed.workspace});
+      if(resource) {
+        const claimed=this.sql.prepare("SELECT task_id FROM tasks WHERE resource_id=?").get(resource) as {task_id:string}|undefined;
+        if(claimed){this.assertOwner(claimed.task_id,parsed.source_event_id);throw new Error("task_resource_already_claimed");}
+      }
+      const request=parseCreateJobRequest({source_event_id:parsed.source_event_id,...(parsed.task_key==="legacy-default"?{}:{job_key:parsed.task_key}),objective:parsed.objective,workspace:parsed.workspace,...(parsed.display?{display:parsed.display}:{})});
       const created=this.dispatcher.createJob(request,workspaceRoot,resultDir);
       if(created.duplicate)throw new Error("task_attempt_identity_conflict");
       const job=created.row,id=`task_${ulid().toLowerCase()}`,now=new Date().toISOString();
@@ -216,7 +225,7 @@ export class TaskRepository {
           this.sql.prepare("UPDATE tasks SET state=?,wait_reason=?,next_check_at=NULL WHERE task_id=?").run(action==="pause"?"paused":"active",action==="pause"?"paused":null,id);
         }
       }
-      this.sql.prepare("INSERT INTO task_controls VALUES(?,?,?)").run(id,eventId,digest);
+      this.sql.prepare("INSERT INTO task_controls(task_id,source_event_id,request_sha256) VALUES(?,?,?)").run(id,eventId,digest);
       return this.get(id)!;
     }).immediate();
   }
@@ -226,17 +235,29 @@ export class TaskRepository {
       if(this.dispatcher.get(eventId)?.source!=="slack")throw new Error("task_control_requires_slack");
       const prior=this.sql.prepare("SELECT request_sha256 FROM task_controls WHERE task_id=? AND source_event_id=?").get(id,eventId) as {request_sha256:string}|undefined;
       if(prior){if(prior.request_sha256!==digest)throw new Error("task_control_conflict");return false;}
-      if(task.revision!==revision||task.state!=="active"||task.desired_state!=="running")throw new Error("task_control_conflict");
+      const answer=task.state==="waiting"&&task.wait_reason==="human_input";
+      if(task.revision!==revision||(!answer&&task.state!=="active")||task.desired_state!=="running"||task.stop_state!=="none")throw new Error("task_control_conflict");
       const objective=task.objective+"\n\n利用者の追加指示（既存の承認境界を維持）:\n"+instruction;
       if([...objective].length>100_000)throw new Error("task_objective_limit");
-      this.sql.prepare("UPDATE tasks SET objective=?,revision=revision+1,state='waiting',wait_reason='steer_acceptance_unknown' WHERE task_id=?").run(objective,id);
-      this.sql.prepare("INSERT INTO task_controls VALUES(?,?,?)").run(id,eventId,digest);return true;
+      this.sql.prepare("UPDATE tasks SET objective=?,revision=revision+1,state='waiting',wait_reason='steer_acceptance_unknown',steer_pending_event_id=? WHERE task_id=?").run(objective,eventId,id);
+      const checkpoint=this.sql.prepare("SELECT json_extract(checkpoint_json,'$.sequence') AS sequence FROM task_attempts WHERE attempt_id=?").get(task.current_attempt_id) as {sequence:number|null};
+      this.sql.prepare("INSERT INTO task_controls(task_id,source_event_id,request_sha256,checkpoint_sequence) VALUES(?,?,?,?)").run(id,eventId,digest,checkpoint.sequence);return true;
     }).immediate();
+  }
+  pendingSteer(jobId:string,eventId:string):boolean {
+    const task=this.forAttempt(jobId);
+    return !!task&&task.current_attempt_id===jobId&&task.steer_pending_event_id===eventId&&task.wait_reason==="steer_acceptance_unknown"&&task.stop_state==="none"&&
+      !!this.sql.prepare("SELECT 1 FROM task_controls WHERE task_id=? AND source_event_id=?").get(task.task_id,eventId);
+  }
+  checkpointAnswered(job:JobRow,checkpoint:TaskCheckpoint):boolean {
+    const row=this.sql.prepare("SELECT checkpoint_ack_sequence FROM task_attempts WHERE attempt_id=?").get(job.job_id) as {checkpoint_ack_sequence:number};
+    return checkpoint.sequence<=row.checkpoint_ack_sequence;
   }
   finishSteer(id:string,eventId:string):void {
     const task=this.get(id)!;const job=this.dispatcher.getJob(task.current_attempt_id)!;
-    if(job.steer_event_id!==eventId||job.steer_state!=="accepted")return;
-    this.sql.prepare("UPDATE tasks SET state='active',wait_reason=NULL WHERE task_id=? AND desired_state='running' AND wait_reason='steer_acceptance_unknown'").run(id);
+    if(task.steer_pending_event_id!==eventId||job.steer_event_id!==eventId||job.steer_state!=="accepted")return;
+    this.sql.prepare("UPDATE task_attempts SET checkpoint_ack_sequence=MAX(checkpoint_ack_sequence,COALESCE((SELECT checkpoint_sequence FROM task_controls WHERE task_id=? AND source_event_id=?),0)) WHERE attempt_id=?").run(id,eventId,job.job_id);
+    this.sql.prepare("UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,steer_pending_event_id=NULL WHERE task_id=? AND desired_state='running' AND wait_reason='steer_acceptance_unknown'").run(id);
   }
   retry(id:string,eventId:string,revision:number,maxAttempts:number):TaskRow {
     return this.sql.transaction(()=>{
@@ -250,7 +271,7 @@ export class TaskRepository {
       if(!Number.isSafeInteger(maxAttempts)||maxAttempts<=task.attempt_number||maxAttempts>10)throw new Error("task_retry_budget_invalid");
       this.sql.prepare("UPDATE tasks SET max_attempts=?,state='waiting',wait_reason='resume_requested',next_check_at=?,revision=revision+1 WHERE task_id=?")
         .run(maxAttempts,new Date().toISOString(),id);
-      this.sql.prepare("INSERT INTO task_controls VALUES(?,?,?)").run(id,eventId,digest);return this.get(id)!;
+      this.sql.prepare("INSERT INTO task_controls(task_id,source_event_id,request_sha256) VALUES(?,?,?)").run(id,eventId,digest);return this.get(id)!;
     }).immediate();
   }
   wait(task:TaskRow,reason:string,delayMs=30_000):void {
@@ -265,7 +286,7 @@ export class TaskRepository {
   candidates(at=new Date()):TaskRow[] {
     return this.sql.prepare(`SELECT t.* FROM tasks t JOIN jobs j ON j.job_id=t.current_attempt_id
       WHERE t.state IN ('active','waiting','paused') AND NOT (t.state='paused' AND t.wait_reason='paused') AND (t.next_check_at IS NULL OR t.next_check_at<=?)
-      AND (j.status IN ('needs_review','blocked') OR t.desired_state<>'running' OR t.wait_reason IN ('cancel_requested','pause_requested','resume_requested','worker_stop_pending'))
+      AND (j.status IN ('needs_review','blocked') OR t.desired_state<>'running' OR t.wait_reason IN ('cancel_requested','pause_requested','resume_requested','worker_stop_pending','steer_acceptance_unknown'))
       ORDER BY COALESCE(t.next_check_at,t.created_at),t.task_id LIMIT 8`).all(at.toISOString()) as TaskRow[];
   }
   mayNotify(job:JobRow):boolean {
@@ -278,9 +299,9 @@ export class TaskRepository {
   canRun(job:JobRow):boolean {const task=this.forAttempt(job.job_id);return !task||(task.current_attempt_id===job.job_id&&task.state==="active"&&task.desired_state==="running");}
   reconnect(task:TaskRow):void {
     this.sql.transaction(()=>{
-      const fresh=this.get(task.task_id)!;if(fresh.revision!==task.revision||fresh.current_attempt_id!==task.current_attempt_id||fresh.desired_state!=="running"||fresh.stop_state!=="none")return;
-      this.sql.prepare("UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL WHERE job_id=? AND status='needs_review'").run(task.current_attempt_id);
-      this.sql.prepare("UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL WHERE task_id=?").run(task.task_id);
+      const fresh=this.get(task.task_id)!;if(fresh.revision!==task.revision||fresh.current_attempt_id!==task.current_attempt_id||fresh.desired_state!=="running"||! ["none","not_sent"].includes(fresh.stop_state))return;
+      this.sql.prepare("UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL WHERE job_id=? AND status IN ('needs_review','blocked')").run(task.current_attempt_id);
+      this.sql.prepare("UPDATE tasks SET state='active',wait_reason=NULL,next_check_at=NULL,stop_state='none',stop_evidence_json=NULL,observation_failures=0 WHERE task_id=?").run(task.task_id);
     }).immediate();
   }
   claimStop(task:TaskRow,evidence:WorkerObservation):TaskRow {

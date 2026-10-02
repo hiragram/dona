@@ -81,8 +81,8 @@ export class SlackHealthServer {
     private readonly updateInternalTokenPath?: string,
     private readonly reminders?: Pick<SlackReminderConnector, "deliver">,
     private readonly jobProgress?: SlackJobProgressReporter,
-    private readonly appSchemaWrite: 2 | 3 = 3,
-    private readonly appSchemaReadMax: 2 | 3 = 3,
+    private readonly appSchemaWrite: 2 | 3 | 4 = 4,
+    private readonly appSchemaReadMax: 2 | 3 | 4 = 4,
   ) {}
 
   async start(): Promise<void> {
@@ -273,7 +273,7 @@ export class SlackHealthServer {
         build_sha: this.buildSha,
         protocol: 1,
         app_schema: this.appSchemaWrite,
-        app_schema_read_min: 2,
+        app_schema_read_min: this.appSchemaWrite===4?4:2,
         app_schema_read_max: this.appSchemaReadMax,
         app_schema_write: this.appSchemaWrite,
         config: 1,

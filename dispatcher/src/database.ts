@@ -1,4 +1,4 @@
-import { TaskRepository } from "./task-execution.js";
+import { TaskRepository, taskMayAcceptLateResult } from "./task-execution.js";
 import { jobSnapshot, workspaceJobId, handoffKey, type HandoffRecord, type WorkerObservation } from "./job-handoff.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
@@ -1151,7 +1151,7 @@ export class DispatcherDatabase {
         if(group?.sealed_at) throw new JobCreationError("job_group_closed","Job group is sealed");
         if(group?.notification_mode==="grouped"&&parsedRequest.job_key===undefined) throw new JobCreationError("job_group_closed","Grouped jobs require an explicit job key");
         if(group?.notification_mode==="legacy"&&jobKey!==legacyJobKey) throw new JobCreationError("job_group_closed","Legacy job group does not accept additional keys");
-        const admitted=this.db.prepare("SELECT objective,workspace_json FROM jobs WHERE source_event_id=?").all(sourceEvent.event_id) as Array<{objective:string;workspace_json:string}>;
+        const admitted=this.db.prepare("SELECT COALESCE(t.objective,j.objective) AS objective,j.workspace_json FROM jobs j LEFT JOIN task_attempts a ON a.attempt_id=j.job_id LEFT JOIN tasks t ON t.task_id=a.task_id WHERE j.source_event_id=? AND (a.number IS NULL OR a.number=1)").all(sourceEvent.event_id) as Array<{objective:string;workspace_json:string}>;
         if(admitted.length>=this.jobAdmissionLimits.jobsPerEventMax) throw new JobCreationError("job_group_limit_exceeded","Job group jobs-per-event limit exceeded",{resource:"jobs_per_event",current:admitted.length,attempted:admitted.length+1,maximum:this.jobAdmissionLimits.jobsPerEventMax});
         const currentBytes=admitted.reduce((sum,row)=>sum+(jobCreationObjectiveBytesFromWorkspace(JSON.parse(row.workspace_json))??Buffer.byteLength(row.objective,"utf8")),0);
         if(currentBytes+objectiveUtf8Bytes>this.jobAdmissionLimits.jobObjectiveTotalMaxBytes) throw new JobCreationError("job_group_limit_exceeded","Job group objective UTF-8 byte limit exceeded",{resource:"objective_utf8_bytes_per_event",current:currentBytes,attempted:currentBytes+objectiveUtf8Bytes,maximum:this.jobAdmissionLimits.jobObjectiveTotalMaxBytes});
@@ -2375,8 +2375,9 @@ export class DispatcherDatabase {
       const acceptedDeadline=job.prompt_accepted_at??job.dispatch_started_at;
       if(binding?.owner.kind==="schedule"&&acceptedDeadline&&at.getTime()>Date.parse(acceptedDeadline)+3_600_000)
         throw new Error("scheduled_work_result_deadline_exceeded");
-      const recoverAmbiguous=job.status==="needs_review"&&(operatorLate||this.tasks.forAttempt(jobId)?.current_attempt_id===jobId||["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
-        (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId)));
+      const managedAttempt=this.tasks.forAttempt(jobId)?.current_attempt_id===jobId;
+      const recoverAmbiguous=job.status==="needs_review"&&(operatorLate||(managedAttempt?taskMayAcceptLateResult(job):["ambiguous_prompt_acceptance","prompt_acceptance_unknown","prompt_interrupted","cancel_acceptance_unknown","cancel_exit_unknown","ambiguous_cancel_acceptance","agent_wait_observation_unknown","invalid_result_agent_stopped"].includes(job.last_error_code??"")||
+        (job.last_error_code==="legacy_agent_sandbox_unknown"&&this.isLegacySharedGrantAgentStopped(jobId))));
       if(binding?.owner.kind==="schedule"&&job.dispatch_started_at&&completedAt.getTime()<Date.parse(job.dispatch_started_at))
         throw new Error("completed_at_precedes_prompt_dispatch");
       this.db.transaction(()=>{
@@ -2449,7 +2450,7 @@ export class DispatcherDatabase {
     if (this.db.prepare("SELECT 1 FROM job_queued_steer_receipts WHERE job_id=? AND source_event_id=?")
       .get(jobId,sourceEventId)) return { row, duplicate: true };
     if (row.steer_event_id === sourceEventId && row.steer_state === "accepted") return { row, duplicate: true };
-    if (row.status !== "running") throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
+    if (row.status !== "running" && !(this.tasks.pendingSteer(jobId,sourceEventId)&&["blocked","needs_review"].includes(row.status))) throw new Error(`Job ${jobId} in status ${row.status} cannot be steered`);
     this.db.prepare(`
       UPDATE jobs SET steer_event_id = ?, steer_state = 'dispatching', updated_at = ? WHERE job_id = ?
     `).run(sourceEventId, nowUtc(), jobId);
@@ -2464,6 +2465,7 @@ export class DispatcherDatabase {
       WHERE job_id = ? AND steer_event_id = ? AND steer_state = 'dispatching'
     `).run(nowUtc(), jobId, sourceEventId).changes;
     if (changed !== 1) throw new Error(`Job ${jobId} steer state changed unexpectedly`);
+    if(this.tasks.pendingSteer(jobId,sourceEventId))this.db.prepare("UPDATE jobs SET status='running',last_error_code=NULL,last_error_message=NULL WHERE job_id=? AND status IN ('blocked','needs_review')").run(jobId);
   }
 
   clearJobSteer(jobId: string, sourceEventId: string): void {

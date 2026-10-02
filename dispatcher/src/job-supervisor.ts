@@ -222,6 +222,9 @@ export class JobSupervisor {
     let task=this.database.tasks.get(snapshot.task_id)!;
     if(task.revision!==snapshot.revision||task.current_attempt_id!==snapshot.current_attempt_id)return;
     const job=this.database.getJob(task.current_attempt_id)!;
+    if(task.wait_reason==="steer_acceptance_unknown"&&job.steer_state==="accepted"&&job.steer_event_id&&task.steer_pending_event_id===job.steer_event_id) {
+      this.database.tasks.finishSteer(task.task_id,job.steer_event_id);return;
+    }
     // A result is evidence belonging to this attempt, never to its successor.
     try {
       const result=await readJobResultEnvelope(job.result_path,job.job_id);
@@ -229,24 +232,27 @@ export class JobSupervisor {
     } catch(error) {
       if(!(error instanceof JobResultNotFoundError)) {this.database.tasks.wait(task,"result_conflict");return;}
     }
+    if(task.wait_reason==="steer_acceptance_unknown") {this.database.tasks.wait(task,"steer_acceptance_unknown",60_000);return;}
     const checkpoint=await readCheckpoint(job,task.task_id);
+    let capacityWait=false;
     if(checkpoint) {
       this.database.tasks.checkpoint(job,checkpoint);
-      if(task.desired_state==="running"&&["human_input","external_effect_unknown"].includes(checkpoint.waiting)) {this.database.tasks.wait(task,checkpoint.waiting);return;}
-      if(task.desired_state==="running"&&checkpoint.waiting==="usage_limit"&&checkpoint.retry_after&&Date.parse(checkpoint.retry_after)>Date.now()) {
+      if(task.desired_state==="running"&&["human_input","external_effect_unknown"].includes(checkpoint.waiting)&&!this.database.tasks.checkpointAnswered(job,checkpoint)) {this.database.tasks.wait(task,checkpoint.waiting);return;}
+      capacityWait=checkpoint.waiting==="usage_limit"&&!this.database.tasks.checkpointAnswered(job,checkpoint);
+      if(task.desired_state==="running"&&capacityWait&&checkpoint.retry_after&&Date.parse(checkpoint.retry_after)>Date.now()) {
         this.database.tasks.wait(task,"capacity_wait",Math.min(Date.parse(checkpoint.retry_after)-Date.now(),86_400_000));return;
       }
     }
     if(task.stop_state==="stopped") {this.database.tasks.replaceStopped(task.task_id,this.config.jobResultsDir);this.wake();return;}
     if(task.desired_state==="running"&&task.stop_state==="none") {
       const reason=taskRecoveryReason(job);
-      if(reason!=="observation_unknown"&&task.wait_reason!=="resume_requested") {this.database.tasks.wait(task,reason);return;}
+      if(reason!=="observation_unknown"&&task.wait_reason!=="resume_requested"&&!capacityWait) {this.database.tasks.wait(task,reason);return;}
     }
     if(!this.runtime.observeWorker||!this.runtime.retireWorker||!this.runtime.workerRetired){this.database.tasks.wait(task,"observation_unknown");return;}
     if(task.stop_state==="none"||task.stop_state==="not_sent") {
       const observed=await this.observeWorker(job);
       if(observed.state==="working"&&task.desired_state==="running") {this.database.tasks.reconnect(task);return;}
-      if(observed.state==="waiting"&&task.desired_state!=="cancelled") {this.database.tasks.wait(task,"human_input");return;}
+      if(observed.state==="waiting"&&task.desired_state==="running") {this.database.tasks.wait(task,capacityWait?"capacity_wait":"human_input",capacityWait?task.retry_delay_ms:30_000);return;}
       if(observed.state==="unknown") {this.database.tasks.wait(task,"observation_unknown");return;}
       if(this.database.getJob(job.job_id)?.updated_at!==job.updated_at)return;
       if(task.stop_state==="none"&&task.desired_state==="running") {
