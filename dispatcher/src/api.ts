@@ -1,3 +1,5 @@
+import { taskRequestSchema, taskIdSchema } from "./task-execution.js";
+import { githubQuery, verifyTaskIssue } from "./task-github.js";
 import fs from "node:fs/promises";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
@@ -443,6 +445,9 @@ export class DispatcherApi {
         }
         return;
       }
+      if (url.pathname === "/v1/tasks" || url.pathname.startsWith("/v1/tasks/")) {
+        await this.handleTasks(request,response,url);return;
+      }
       if (url.pathname === "/v1/jobs" || url.pathname.startsWith("/v1/jobs/")) {
         await this.handleJobs(request, response, url);
         return;
@@ -652,6 +657,46 @@ export class DispatcherApi {
     return timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
   }
 
+  private async handleTasks(request:IncomingMessage,response:ServerResponse,url:URL):Promise<void> {
+    if(this.shuttingDown&&request.method!=="GET")throw new ApiRequestError(503,"shutting_down","Dispatcher is shutting down");
+    try {
+      if(request.method==="POST"&&url.pathname==="/v1/tasks") {
+        const input=taskRequestSchema.parse(await this.readJson(request));
+        const existing=this.database.tasks.lookupRequest(input);
+        const issue=existing?undefined:await verifyTaskIssue(input,githubQuery(this.config.ghPath));
+        const result=existing?{outcome:"reused" as const,task:existing}:this.database.tasks.create(input,this.config.jobsWorkspaceRoot,this.config.jobResultsDir,issue);
+        this.jobs.wake();sendJson(response,result.outcome==="created"?202:200,{schema_version:1,outcome:result.outcome,task:this.database.tasks.projection(result.task)});return;
+      }
+      const source=url.searchParams.get("source_event_id")??"";
+      if(request.method==="GET"&&url.pathname==="/v1/tasks") {
+        sendJson(response,200,{schema_version:1,tasks:this.database.tasks.list(source).map(task=>this.database.tasks.projection(task)),limit:100});return;
+      }
+      const match=/^\/v1\/tasks\/([^/]+)(?:\/(pause|resume|cancel|steer|retry))?$/.exec(url.pathname);
+      if(!match)throw new Error("task_route_not_found");
+      const id=taskIdSchema.parse(match[1]),action=match[2];
+      if(request.method==="GET"&&!action){sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,source),true)});return;}
+      if(request.method==="POST"&&action) {
+        const input=await this.readJson(request) as Record<string,unknown>;
+        if(typeof input.source_event_id!=="string"||!Number.isSafeInteger(input.revision))throw new Error("task_control_invalid");
+        if(action==="retry")this.database.tasks.retry(id,input.source_event_id,input.revision as number,input.max_attempts as number);
+        else if(action==="steer") {
+          const task=this.database.tasks.assertOwner(id,input.source_event_id);
+          if(typeof input.instruction!=="string"||!input.instruction.trim())throw new Error("task_control_invalid");
+          if(this.database.tasks.prepareSteer(id,input.source_event_id,input.revision as number,input.instruction)) {
+            await this.jobs.steer(task.current_attempt_id,input.source_event_id,input.instruction);
+            this.database.tasks.finishSteer(id,input.source_event_id);
+          }
+        } else this.database.tasks.control(id,input.source_event_id,input.revision as number,action as "pause"|"resume"|"cancel");
+        this.jobs.wake();sendJson(response,200,{schema_version:1,task:this.database.tasks.projection(this.database.tasks.assertOwner(id,input.source_event_id))});return;
+      }
+      throw new Error("task_route_not_found");
+    } catch(error) {
+      const message=error instanceof Error?error.message:"task_request_failed";
+      const code=/^task_[a-z_]+$/.test(message)?message:"task_request_failed";
+      throw new ApiRequestError(code==="task_owner_mismatch"?403:409,code,code);
+    }
+  }
+
   private async handleJobs(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     if (this.shuttingDown && request.method !== "GET") {
       throw new ApiRequestError(503, "shutting_down", "Dispatcher is shutting down");
@@ -665,8 +710,14 @@ export class DispatcherApi {
       }
       let result;
       try {
-        result = this.database.createJob(input, this.config.jobsWorkspaceRoot, this.config.jobResultsDir);
+        const request=taskRequestSchema.parse({source_event_id:input.source_event_id,task_key:input.job_key??"legacy-default",objective:input.objective,workspace:input.workspace,
+          ...(input.display?.issue?{issue_number:input.display.issue.number}:{})});
+        const existing=this.database.tasks.lookupRequest(request);
+        const issue=existing?undefined:await verifyTaskIssue(request,githubQuery(this.config.ghPath));
+        const created=existing?{outcome:"reused" as const,task:existing}:this.database.tasks.create(request,this.config.jobsWorkspaceRoot,this.config.jobResultsDir,issue);
+        result={row:this.database.getJob(created.task.current_attempt_id)!,outcome:created.outcome,duplicate:created.outcome==="reused"};
       } catch (error) {
+        if(error instanceof Error&&error.message==="task_idempotency_conflict")throw new ApiRequestError(409,"job_idempotency_conflict","Task key already exists with a different canonical payload");
         if (error instanceof ScheduledJobCreationError) {
           this.database.recordScheduledDelegationRejection(input.source_event_id,error.code);
           throw new ApiRequestError(409,error.code,error.message);
@@ -691,6 +742,7 @@ export class DispatcherApi {
         outcome: result.outcome,
         duplicate: result.duplicate,
         job: result.row,
+        task: this.database.tasks.projection(this.database.tasks.forAttempt(result.row.job_id)!),
       });
       return;
     }
@@ -721,6 +773,12 @@ export class DispatcherApi {
     if (!match) throw new ApiRequestError(404, "not_found", "Route not found");
     const jobId = match[1]!;
     const action = match[2];
+    const managedTask=this.database.tasks.forAttempt(jobId);
+    if(managedTask&&request.method==="POST")throw new ApiRequestError(409,"task_control_required","Use the Task ID and revision for control");
+    if(managedTask&&request.method==="GET"&&url.searchParams.has("source_event_id")) {
+      try{this.database.tasks.assertOwner(managedTask.task_id,url.searchParams.get("source_event_id")!);}
+      catch{throw new ApiRequestError(403,"task_owner_mismatch","Task does not belong to this event owner");}
+    }
     const liveReceiptId=match[3];
     if ((request.method === "GET" && action === "worker") || (request.method === "POST" && action === "resume")) {
       const input = action === "resume" ? parseSteerJobRequest(await this.readJson(request)) :

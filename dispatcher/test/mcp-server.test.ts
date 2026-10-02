@@ -88,6 +88,7 @@ describe("Dona Dispatcher MCP server", () => {
       const listed = await client.listTools();
       assert.equal(listed.tools.find(tool=>tool.name==="authorize_job_notification")?.annotations?.idempotentHint,false);
       assert.deepEqual(listed.tools.map(({ name }) => name), [
+        "delegate_task", "get_task", "list_tasks", "pause_task", "resume_task", "cancel_task", "steer_task", "retry_task",
         "delegate_job",
         "delegate_scheduled_work",
         "list_event_jobs",

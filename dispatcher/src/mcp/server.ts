@@ -1,3 +1,4 @@
+import { taskRequestSchema, taskIdSchema } from "../task-execution.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
@@ -12,6 +13,10 @@ import {
 } from "../validation.js";
 
 export interface DispatcherJobClient {
+  createTask?(input:unknown):Promise<Record<string,unknown>>;
+  getTask?(id:string,eventId:string):Promise<Record<string,unknown>>;
+  listTasks?(eventId:string):Promise<Record<string,unknown>>;
+  controlTask?(id:string,action:string,input:unknown):Promise<Record<string,unknown>>;
   inspectWorker?(jobId: string, sourceEventId: string): Promise<Record<string, unknown>>;
   resumeJob?(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   createJob(input: unknown): Promise<Record<string, unknown>>;
@@ -125,6 +130,7 @@ function projectJobResponse(response: Record<string, unknown>, includeResult = f
   };
   return {
     schema_version: 1,
+    ...(response.task ? {task:response.task}:{}),
     ...(response.outcome !== undefined ? { outcome: response.outcome } : {}),
     ...(response.duplicate !== undefined ? { duplicate: response.duplicate } : {}),
     ...(response.job !== undefined ? { job: project(response.job) } : {}),
@@ -176,6 +182,20 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
         "DispatcherはHerdr/Codexへの投入と永続化を担当します。生のHerdrコマンドを別経路で実行しないでください。",
     },
   );
+
+  server.registerTool("delegate_task",{
+    description:"通常の長時間作業をTaskとして委任します。Task IDはworkerが交代しても変わりません。同じ目的・権限での中断から自動再開します。Issueはissue_numberで明示し、Projectを同期する場合はprojectを指定します。scheduleには使いません。曖昧な応答ではlist_tasksで照合し、重複委任しません。",
+    inputSchema:taskRequestSchema,annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:true},
+  },async(input)=>{try{if(!client.createTask)throw new Error("task_api_unavailable");const result=await client.createTask(input);const task=result.task as Record<string,unknown>;
+      return success({...result,...(["created","reused"].includes(String(result.outcome))?{action:{tool:"delegate_task",source_event_id:input.source_event_id,task_key:input.task_key,task_id:task.task_id,attempt_id:task.current_attempt_id,outcome:result.outcome}}:{})});}catch(error){return failure(error,logger,"delegate_task");}});
+  server.registerTool("get_task",{description:"現在のeventのownerを照合し、Task・Attempt履歴・再開待ち理由・結果を取得します。",inputSchema:{task_id:taskIdSchema,source_event_id:eventId},annotations:{readOnlyHint:true}},
+    async({task_id,source_event_id})=>{try{if(!client.getTask)throw new Error("task_api_unavailable");return success(await client.getTask(task_id,source_event_id));}catch(error){return failure(error,logger,"get_task");}});
+  server.registerTool("list_tasks",{description:"現在のSlack threadと依頼者のTaskを最大100件取得します。上限に達した場合、全件確認済みと扱いません。",inputSchema:{source_event_id:eventId},annotations:{readOnlyHint:true}},
+    async({source_event_id})=>{try{if(!client.listTasks)throw new Error("task_api_unavailable");return success(await client.listTasks(source_event_id));}catch(error){return failure(error,logger,"list_tasks");}});
+  for(const action of ["pause","resume","cancel","steer","retry"] as const)server.registerTool(`${action}_task`,{
+    description:`Taskの${action}。直前に取得したrevisionを渡します。pauseは安全な停止を待ち、resumeは同じ権限・残予算で続行します。cancelは自動再開を禁止します。retryは停止確認済みの再試行上限待ちでだけ、明示された総Attempt数上限を増やします。曖昧な応答はget_taskで照合します。`,
+    inputSchema:{task_id:taskIdSchema,source_event_id:eventId,revision:z.number().int().positive(),...(action==="steer"?{instruction:jobObjective}:{}),...(action==="retry"?{max_attempts:z.number().int().min(2).max(10)}:{})},
+    annotations:{readOnlyHint:false,destructiveHint:action==="cancel",idempotentHint:true}},async(input)=>{try{if(!client.controlTask)throw new Error("task_api_unavailable");const {task_id,...body}=input;return success(await client.controlTask(task_id,action,body));}catch(error){return failure(error,logger,`${action}_task`);}});
 
   server.registerTool("delegate_job", {
     title: "Delegate background job",

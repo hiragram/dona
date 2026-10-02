@@ -573,7 +573,7 @@ describe("DispatcherApi", () => {
         app_schema_read_max: version.body.app_schema_read_max,
         app_schema_write: version.body.app_schema_write,
       },
-      { app_schema: 3, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3 },
+      { app_schema: 3, app_schema_read_min: 2, app_schema_read_max: 4, app_schema_write: 3 },
     );
     assert.equal(JSON.stringify(version.body).includes(config.databasePath), false);
     database.manualComplete(eventId);

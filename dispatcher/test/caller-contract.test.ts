@@ -100,12 +100,14 @@ test("MCP thread candidates, explicit control and cross-thread rejection preserv
       const rejected = await f.call(name, { source_event_id: cross, job_id: one, instruction: "追加条件" });
       assert.equal(rejected.error, true);
     }
-    assert.equal((await f.call("steer_job", { source_event_id: follow, job_id: one, instruction: "追加条件" })).error, undefined);
+    const task=f.database.tasks.forAttempt(one)!;
+    assert.equal((await f.call("steer_task", { source_event_id: follow, task_id: task.task_id, revision:task.revision, instruction: "追加条件" })).error, undefined);
     assert.equal(f.database.getJob(one)?.steer_event_id, follow);
     assert.equal(f.database.getJob(two)?.steer_event_id, null);
     const status = await f.call("get_job_status", { source_event_id: follow, job_id: one });
     assert.equal(status.data.job.steer_state, "accepted");
-    assert.equal((await f.call("cancel_job", { source_event_id: follow, job_id: one })).error, undefined);
+    const cancelEvent=f.database.enqueue(eventEnvelope("cancel-follow")).row.event_id;
+    assert.equal((await f.call("cancel_task", { source_event_id: cancelEvent, task_id:task.task_id, revision:f.database.tasks.get(task.task_id)!.revision })).error, undefined);
     assert.equal(f.database.getJob(two)?.status, "queued");
     assert.equal((await f.call("cancel_job", { source_event_id: cross, job_id: one })).error, true);
     const bad = await f.call("cancel_job", { source_event_id: follow, job_id: `$(cat /private/token) ${two}` });
@@ -149,15 +151,16 @@ for (const operation of ["steer", "cancel"] as const) {
       const created = await f.call("delegate_job", { source_event_id: f.source, job_key: "audit", objective: "調査", workspace_kind: "scratch" });
       const jobId = created.data.job.job_id;
       const follow = f.database.enqueue(eventEnvelope("follow")).row.event_id;
-      const method = operation === "steer" ? "steerJob" : "cancelJob";
+      const task=created.data.task;
+      const method = "controlTask";
       const original = f.uds[method].bind(f.uds);
       let writes = 0;
-      f.uds[method] = async (id, input) => {
+      f.uds[method] = async (id, action, input) => {
         writes++;
-        await original(id, input);
+        await original(id, action, input);
         throw new DispatcherClientError(undefined, "response lost");
       };
-      const response = await f.call(`${operation}_job`, { job_id: jobId, source_event_id: follow, instruction: "追加条件" });
+      const response = await f.call(`${operation}_task`, { task_id: task.task_id,revision:task.revision, source_event_id: follow, instruction: "追加条件" });
       assert.equal(response.error, true);
       assert.equal(response.data.action, undefined);
       const receipt = (await f.call("get_job_status", { job_id: jobId, source_event_id: follow })).data.job;

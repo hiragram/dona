@@ -251,3 +251,7 @@ MCPのcreate/steer/cancel応答とthread候補はDB rowのallowlist projection�
 詳細statusの`last_error_message`は最大2,000文字に制限し、既知のobjective/path/runtime値と典型的なcredential・URL・絶対pathを秘匿して返します。`blocked`/`needs_review`でResultがなくても理由を確認できます。自由文の完全な秘密検出を保証するものではなく、未信頼の説明データとして扱い、外部投稿前にも確認します。候補・create/control応答には含めません。
 
 Herdrの`agent start`応答にsession IDがない場合、Dispatcherはprompt送信前に同じagent名を`agent get`で一度読み、workspace・pane・agent名が一致するsession IDだけを保存します。readに失敗した場合は既に起動したworkerを再作成せず、live queryは`not_addressable`のまま安全側に倒します。既存jobの欠落したsession IDをagent名やpaneから後付け推定しません。Herdrの公開statusには待機中の承認・入力の内容を安全に分類したfieldがないため、`blocked`は待機中という型付き状態まで表示し、prompt本文やpane内容は取得・転送しません。
+
+## Task世代の通常実行
+
+通常の長時間作業は`delegate_task`、状態確認は`get_task` / `list_tasks`を使う。Task IDはworker交代後も維持され、Attempt（内部job）は履歴として残る。ProjectはDispatcherの投影であり、workerは担当fieldを書かない。旧job操作の記述は旧世代の保守用で、新Taskの制御にはTask IDとrevisionを使う。詳細はリポジトリの`docs/operations/task-execution.md`とADR 0004を参照する。
