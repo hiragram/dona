@@ -9,7 +9,7 @@ export function workspaceFromJob(row: JobRow): JobWorkspace {
 }
 
 export function jobProgressPath(row: JobRow): string {
-  return path.join(path.dirname(row.workspace_path), ".dona-progress", path.basename(row.workspace_path), "progress.json");
+  return path.join(path.dirname(row.workspace_path), ".dona-progress", row.job_id, "progress.json");
 }
 
 /** Safe prompt fragment. The rollout must deliver the raw grant outside argv/prompt. */
@@ -31,6 +31,7 @@ export function buildJobPrompt(row: JobRow, progressEnabled = true): string {
     ...(progressEnabled ? { progress_path: progressPath } : {}),
     workspace: workspaceFromJob(row),
     objective: row.objective,
+    ...(JSON.parse(row.workspace_json)._dona_handoff ? {handoff: JSON.parse(row.workspace_json)._dona_handoff} : {}),
   });
   return `[DONA_JOB_BEGIN]
 job_json:

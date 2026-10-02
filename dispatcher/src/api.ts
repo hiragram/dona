@@ -97,6 +97,8 @@ export interface ApiWorkerState {
 }
 
 export interface ApiJobController {
+  inspectWorker?(jobId: string, sourceEventId: string): Promise<Record<string, unknown>>;
+  resumeJob?(jobId: string, sourceEventId: string, instruction: string): Promise<Record<string, unknown>>;
   isRunning(): boolean;
   wake(): void;
   steer(jobId: string, sourceEventId: string, instruction: string): Promise<JobControlResult>;
@@ -715,11 +717,25 @@ export class DispatcherApi {
       });
       return;
     }
-    const match = /^\/v1\/jobs\/([^/]+)(?:\/(steer|cancel)|\/live-session-receipts\/([^/]+))?$/.exec(url.pathname);
+    const match = /^\/v1\/jobs\/([^/]+)(?:\/(steer|cancel|worker|resume)|\/live-session-receipts\/([^/]+))?$/.exec(url.pathname);
     if (!match) throw new ApiRequestError(404, "not_found", "Route not found");
     const jobId = match[1]!;
     const action = match[2];
     const liveReceiptId=match[3];
+    if ((request.method === "GET" && action === "worker") || (request.method === "POST" && action === "resume")) {
+      const input = action === "resume" ? parseSteerJobRequest(await this.readJson(request)) :
+        { source_event_id: url.searchParams.get("source_event_id") ?? "", instruction: "" };
+      if (!/^evt_[0-9A-HJKMNP-TV-Z]{26}$/i.test(input.source_event_id)) throw new ApiRequestError(400, "invalid_request", "valid source_event_id is required");
+      try { this.database.assertHandoffOwner(jobId, input.source_event_id); }
+      catch { throw new ApiRequestError(403, "job_owner_mismatch", "Job does not belong to this Slack event"); }
+      try {
+        const result = action === "worker" ? await this.jobs.inspectWorker?.(jobId, input.source_event_id) :
+          await this.jobs.resumeJob?.(jobId, input.source_event_id, input.instruction);
+        if (!result) throw new Error("handoff_unavailable");
+        sendJson(response, 200, result);
+      } catch (error) { throw new ApiRequestError(409, "job_handoff_failed", error instanceof Error ? error.message : String(error)); }
+      return;
+    }
     if(request.method==="GET"&&liveReceiptId){
       const job=this.database.getJob(jobId);
       if(!job)throw new ApiRequestError(404,"job_not_found",`Job ${jobId} was not found`);

@@ -938,3 +938,30 @@ process.exit(2);
     fixture.database.close();
   });
 });
+
+test("引継ぎworkerは元branchの追加commit・index・未trackedファイルを保持して新しいResultだけを使う",async()=>{
+  const f=await githubFixture();
+  try {
+    const event=f.database.enqueue(eventEnvelope("handoff-github")).row;
+    const old=f.database.createJob({source_event_id:event.event_id,objective:"実装",workspace:{kind:"github",repository:"owner/repo"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
+    const runtime=new HerdrJobAgentRuntime(f.config);
+    await runtime.prepare(old);
+    await git(old.workspace_path,"config","user.email","test@example.com");
+    await git(old.workspace_path,"config","user.name","Test");
+    await fs.writeFile(path.join(old.workspace_path,"committed.txt"),"commit");
+    await git(old.workspace_path,"add","committed.txt");await git(old.workspace_path,"commit","-m","checkpoint");
+    await fs.writeFile(path.join(old.workspace_path,"committed.txt"),"staged");await git(old.workspace_path,"add","committed.txt");
+    await fs.writeFile(path.join(old.workspace_path,"committed.txt"),"unstaged");
+    await fs.writeFile(path.join(old.workspace_path,"untracked.txt"),"untracked");
+    const before=await git(old.workspace_path,"status","--porcelain");const head=await git(old.workspace_path,"rev-parse","HEAD");
+    const follow=f.database.enqueue(eventEnvelope("handoff-github-follow")).row;
+    const raw=f.database.createJob({source_event_id:follow.event_id,objective:"続ける",workspace:{kind:"github",repository:"owner/repo"}},f.config.jobsWorkspaceRoot,f.config.jobResultsDir).row;
+    const next={...raw,workspace_path:old.workspace_path,workspace_json:JSON.stringify({...JSON.parse(raw.workspace_json),_dona_handoff:{predecessor_job_id:old.job_id,workspace_job_id:old.job_id}})};
+    await runtime.prepare(next);
+    assert.equal(await git(old.workspace_path,"status","--porcelain"),before);assert.equal(await git(old.workspace_path,"rev-parse","HEAD"),head);
+    const calls=(await fs.readFile(f.logPath,"utf8")).trim().split("\n").map(line=>JSON.parse(line) as string[]);
+    assert.equal(calls.filter(args=>args[2]==="worktree"&&args[3]==="create").length,1);
+    const start=calls.filter(args=>args[2]==="agent"&&args[3]==="start").at(-1)!;
+    assert.equal(start[4],next.job_id);assert.ok(start.includes(path.dirname(next.result_path)));assert.ok(!start.includes(path.dirname(old.result_path)));
+  } finally {f.database.close();}
+});

@@ -35,7 +35,7 @@ test("worker summary is never sent and phase is rendered as a fixed label", () =
 test("scratch progress path stays fixed when the worker creates git metadata", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "dona-progress-git-"));
   try {
-    const row = { workspace_path: root, workspace_json: JSON.stringify({ kind:"scratch" }) } as never;
+    const row = { job_id: path.basename(root), workspace_path: root, workspace_json: JSON.stringify({ kind:"scratch" }) } as never;
     const expected=path.join(path.dirname(root),".dona-progress",path.basename(root),"progress.json");
     assert.equal(jobProgressPath(row), expected);
     await fs.mkdir(path.join(root, ".git"));

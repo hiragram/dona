@@ -12,6 +12,8 @@ import {
 } from "../validation.js";
 
 export interface DispatcherJobClient {
+  inspectWorker?(jobId: string, sourceEventId: string): Promise<Record<string, unknown>>;
+  resumeJob?(jobId: string, input: unknown): Promise<Record<string, unknown>>;
   createJob(input: unknown): Promise<Record<string, unknown>>;
   delegateScheduledWork?(eventId: string): Promise<Record<string, unknown>>;
   getJob(jobId: string, sourceEventId?: string, options?:{includeLiveSession?:boolean;liveSessionReceiptId?:string}): Promise<Record<string, unknown>>;
@@ -298,6 +300,26 @@ export function createDispatcherMcpServer(client: DispatcherJobClient, logger: L
   }, async ({ source_event_id }) => {
     try { if(!client.listOwnerJobs) throw new Error("Owner query is unavailable"); return success(await client.listOwnerJobs(source_event_id)); }
     catch(error){ return failure(error,logger,"list_owner_jobs"); }
+  });
+
+  server.registerTool("inspect_job_worker", {
+    title: "ジョブのワーカー稼働状況を確認",
+    description: "現在のSlack eventと同一workspace/channelのexact jobを、永続statusと独立に照会します。working、waiting、inactive、stopped、unknownを区別します。inactiveは停止完了ではなく再委譲候補、stoppedは保存済みprocessとpaneの消失を確認済みです。unknownや通信失敗を停止証拠にしてはいけません。",
+    inputSchema: { job_id: jobId, source_event_id: eventId },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({job_id, source_event_id}) => {
+    try { if (!client.inspectWorker) throw new Error("Worker inspection unavailable"); return success(await client.inspectWorker(job_id, source_event_id)); }
+    catch (error) { return failure(error, logger, "inspect_job_worker"); }
+  });
+
+  server.registerTool("resume_job", {
+    title: "停止したジョブを新しいワーカーへ引継ぐ",
+    description: "利用者の明示的な再開・引継ぎ依頼に使います。対象を確定後、現在のSlack event、旧job ID、残作業と既存成果を照合するinstructionを渡します。Dispatcherが再観測し、inactiveな旧paneの終了とprocess消失を確認してから同じworktreeを新jobへ引継ぎます。承認待ちは承認済みと解釈しません。retirement_pendingやtimeoutはblind retryせずinspect_job_workerで照合します。created/reusedのjob_idだけを新担当に使い、旧jobを直接上書きしません。",
+    inputSchema: { job_id: jobId, source_event_id: eventId, instruction: z.string().min(1).max(10_000) },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({job_id, source_event_id, instruction}) => {
+    try { if (!client.resumeJob) throw new Error("Job resumption unavailable"); return success(await client.resumeJob(job_id, {source_event_id, instruction})); }
+    catch (error) { return failure(error, logger, "resume_job"); }
   });
 
   server.registerTool("get_job_status", {

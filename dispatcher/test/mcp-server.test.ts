@@ -15,6 +15,8 @@ describe("Dona Dispatcher MCP server", () => {
     const calls: Array<{ method: string; args: unknown[] }> = [];
     let planError: Error | undefined;
     const api: DispatcherJobClient = {
+      async inspectWorker(jobId,sourceEventId) { calls.push({method:"inspectWorker",args:[jobId,sourceEventId]}); return {worker:{state:"inactive"}}; },
+      async resumeJob(jobId,input) { calls.push({method:"resumeJob",args:[jobId,input]}); return {outcome:"created",job_id:"job_01m1es03xy5cf8d9pm5cwx4srv"}; },
       async createJob(input) {
         calls.push({ method: "createJob", args: [input] });
         return { schema_version: 1, job: { job_id: "job_01m1es03xy5cf8d9pm5cwx4srv" } };
@@ -79,6 +81,10 @@ describe("Dona Dispatcher MCP server", () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
+      await client.callTool({name:"inspect_job_worker",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01K00000000000000000000000"}});
+      assert.equal(calls.pop()?.method,"inspectWorker");
+      await client.callTool({name:"resume_job",arguments:{job_id:"job_01m1es03xy5cf8d9pm5cwx4srv",source_event_id:"evt_01K00000000000000000000000",instruction:"残作業を引継ぐ"}});
+      assert.deepEqual(calls.pop(),{method:"resumeJob",args:["job_01m1es03xy5cf8d9pm5cwx4srv",{source_event_id:"evt_01K00000000000000000000000",instruction:"残作業を引継ぐ"}]});
       const listed = await client.listTools();
       assert.equal(listed.tools.find(tool=>tool.name==="authorize_job_notification")?.annotations?.idempotentHint,false);
       assert.deepEqual(listed.tools.map(({ name }) => name), [
@@ -87,6 +93,8 @@ describe("Dona Dispatcher MCP server", () => {
         "list_event_jobs",
         "list_thread_jobs",
         "list_owner_jobs",
+        "inspect_job_worker",
+        "resume_job",
         "get_job_status",
         "authorize_job_notification",
         "record_schedule_job_access",

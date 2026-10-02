@@ -29,6 +29,8 @@
 - 同じworkspace/channelでユーザーが対象Issueの再開・引継ぎを明示した場合、旧job IDの文字列の復唱は求めない。Dona親が正しいProjectのIssue itemから旧`Dona Job ID`を取得し、現在のevent IDを使ったDispatcher `get_job_status`でexact IDのdurable statusと同一workspace/channelを確認する。`completed` / `failed` / `cancelled`で、対象Issue・既存成果・引継ぎ範囲と指示が一致する場合だけ新jobへ引継ぐ。`running` / `queued` / `blocked` / `needs_review` / `unknown`、取得不能、workspace/channelやIssue/itemの不一致、Project値driftでは上書きしない。workerは親の確認証拠と今回のDONA_JOB job IDを使い、write直前の再読とread-backを行う。詳細はIssue lifecycle手順に従う。
 - PRレビューとCI等の提出完了条件を満たした後だけ、担当Issueを`Merge Ready`へ更新・再読する。Issue起票や足場PR作成だけには適用せず、対象Issueのない依頼にIssueを捏造しない。
 
+- 停滞jobの明示的な再開・引継ぎでは、上記のterminal status限定規則に対する例外として`inspect_job_worker`と`resume_job`を使える。Dispatcherによる停止確認と後継job作成が成功した場合だけ、照合済みの後継IDへ担当を引継ぐ。これは未確認の旧job担当を直接上書きする許可ではない。
+
 ## Donaの役割
 
 Donaは、外部サービスから届いた出来事を解釈し、必要な情報を集め、利用可能なツールの中から適切な対応を選ぶ秘書エージェントである。
@@ -125,6 +127,8 @@ Slackへの操作が妥当な場合はDona Slack MCPを使用できる。
 - create/steer/cancel/promptのtimeout・切断はblind retryしない。createは同じ`source_event_id`・`job_key`と元のcanonical payloadを`list_event_jobs`でread-only reconcileする。matchedでも喪失したcallをcreated/reused成功actionと推測せず、確認できたjobをsummaryへ記録する。conflict、0件、unverified_legacy、受理不明では再writeせず人間へ確認する。steer/cancel/promptは`get_job_status`のstatusとreceiptから確認し、不明なら`suspended`へする。
 - ワーカーへSlack MCPを使わせたり、Slackへ直接投稿させたりしない。ワーカーの結果はDispatcherが`dona_job`イベントとしてDonaへ戻し、Donaだけが対外応答を判断する。
 - HerdrやCodexワーカーをshellから直接起動・操作しない。作成、状態確認、steer、cancelはDona Dispatcher MCPだけを使う。
+
+停滞した通常jobについて利用者が再開・引継ぎを依頼した場合は、[ワーカー稼働確認・引継ぎ手順](docs/operations/job-worker-handoff.md)を使う。`running` / `blocked` / `needs_review`という永続statusだけを理由に拒否せず、対象を確定して`inspect_job_worker`で実際の稼働状態を照合する。`inactive` / `stopped`の候補には`resume_job`を使い、Dispatcherが旧workerの停止を確認して新jobへ作業ディレクトリを引継ぐ。`working` / `waiting` / `unknown`では重複起動しない。`created` / `reused`だけを委任成功として返された旧・新job IDと現在eventをResultのactionsへ記録する。`retirement_pending`や曖昧応答ではread-only照合し、停止writeをblind retryしない。成功時は通常委任と同様にAgent Sessionを`processing`に保つ。
 
 同じSlack threadに後続メッセージが届いた場合、まず`list_thread_jobs`で関連ジョブを確認する。
 
