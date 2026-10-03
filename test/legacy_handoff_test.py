@@ -172,6 +172,9 @@ class HandoffTest(unittest.TestCase):
         plan={'mode':'preserve','generation':str(self.root/'g2'),'previous_offline_run':seed_owner}
         save(owner,seal(successor,plan,{'databases':expected}))
         self.assertEqual(h.expected_databases(seed,owner),expected[:3]+[str(self.root/'g2/control/updater.sqlite3')])
+        plan['mode']='fresh_generation';save(owner,seal(successor,plan,{'databases':expected}))
+        with self.assertRaisesRegex(RuntimeError,'new_fresh_cutover_requires_inventory'):h.expected_databases(seed,owner)
+        plan['mode']='preserve'
         save(owner,seal(successor,plan,{'databases':expected,'old_results':['/old/results','/old/job-results']}))
         with self.assertRaisesRegex(RuntimeError,'offline_lineage_storage_mismatch'):h.expected_databases(seed,owner)
         for index in range(4):
@@ -224,6 +227,17 @@ class HandoffTest(unittest.TestCase):
         nested=alias/'nested';nested.mkdir()
         with self.assertRaisesRegex(RuntimeError,'result_directory_overlap'):h.verify_result_directories([nested,current[1]],old)
         with self.assertRaisesRegex(RuntimeError,'result_directory_overlap'):h.verify_result_directories(current,[alias/'..'/'new-results'])
+
+    def test_generation_root_and_storage_parent_alias_cannot_escape(self):
+        generation=self.root/'generation';generation.mkdir()
+        outside=self.root/'outside';outside.mkdir()
+        (generation/'db').write_bytes(b'new');(outside/'db').write_bytes(b'copied old')
+        h.verify_storage_roots([generation/'db'],[generation])
+        saved=self.root/'original-generation';generation.rename(saved);generation.symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError,'generation_root_not_regular'):h.verify_storage_roots([generation/'db'],[generation])
+        generation.unlink();saved.rename(generation)
+        (generation/'control').symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError,'storage_outside_generation'):h.verify_storage_roots([generation/'control/db'],[generation])
 
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)

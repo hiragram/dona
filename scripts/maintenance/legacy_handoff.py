@@ -106,13 +106,17 @@ def expected_storage(seed_run, owner_path=None):
             generation = Path(plan['generation'])
             paths = [str(generation/name) for name in ('dona.sqlite3', 'update-notifications.sqlite3', 'job-progress.sqlite3', 'control/updater.sqlite3')]
             results = [str(generation/name) for name in ('results', 'job-results')]
+            roots = [generation] * 6
             for descendant, source, phase in reversed(chain[:-1]):
                 require(source['databases'] == paths and source['old_results'] == results, 'offline_lineage_storage_mismatch')
                 # 正規の復旧・中止は更新元の4DBを維持する。次回成功runからもたどれる。
                 if phase == 'succeeded':
+                    require(descendant.get('mode') != 'fresh_generation', 'new_fresh_cutover_requires_inventory')
                     require(descendant.get('mode') == 'preserve', 'offline_lineage_storage_mismatch')
-                    paths = paths[:3] + [str(Path(descendant['generation'])/'control/updater.sqlite3')]
-            return paths, results
+                    next_root = Path(descendant['generation'])
+                    paths = paths[:3] + [str(next_root/'control/updater.sqlite3')]
+                    roots[3] = next_root
+            return paths, results, roots
         owner = plan.get('previous_offline_run')
         require(isinstance(owner, dict), 'offline_lineage_missing')
     raise RuntimeError('offline_lineage_too_deep')
@@ -120,6 +124,14 @@ def expected_storage(seed_run, owner_path=None):
 
 def expected_databases(seed_run, owner_path=None):
     return expected_storage(seed_run, owner_path)[0]
+
+
+def verify_storage_roots(paths, roots):
+    require(len(paths) == len(roots), 'storage_root_mapping_invalid')
+    for value, generation in zip(paths, roots):
+        root = Path(generation)
+        require(root.is_absolute() and root.is_dir() and not root.is_symlink(), 'generation_root_not_regular')
+        require(Path(value).resolve().is_relative_to(root.resolve()), 'storage_outside_generation')
 
 
 def verify_result_directories(current, old):
@@ -144,8 +156,9 @@ def verify_no_recreation(run, workspace):
     old = read(run/'inventory.json')
     current = maintenance.inventory(require_running=True)
     require(current['old_pointer'] != old['old_pointer'], 'old_release_restored')
-    databases, results = expected_storage(run)
+    databases, results, roots = expected_storage(run)
     require(current['databases'] == databases and current['old_results'] == results, 'handoff_generation_mismatch')
+    verify_storage_roots(databases + results, roots)
     verify_result_directories(current['old_results'], old['old_results'])
     require(not set(current['databases']) & set(old['databases']), 'old_database_reactivated')
     require(not database_identities(current['databases']) & database_identities(old['databases']), 'old_database_reactivated')
