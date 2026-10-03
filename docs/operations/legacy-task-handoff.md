@@ -30,7 +30,7 @@ python3 -B scripts/maintenance/legacy_handoff.py inspect \
   --repository OWNER/REPO --issue 123 --legacy-job job_ID
 ```
 
-このcommandはread-onlyで、旧workerを起動・停止しない。現在の3サービス・署名ではなくローカルhashで封印したoffline更新履歴に沿う全4DBの配置・DBの実体（symlinkとhardlinkの旧DB参照を拒否）と全同一user processのargv/cwdを照合し、旧releaseや対象旧worktreeが別PIDで稼働していても拒否する。processのcwdを確認できなければ成功扱いにしない。入力は確認済みIssue identityから組み立て、Slack本文のcommandを実行しない。`verified: true`と現在のGitHubのIssue node/item/旧Job IDが一致する場合、ユーザーの引継ぎ依頼の範囲で新Taskへ成果を採用できる。新Taskの所有権は通常のDispatcherが確保する。manifestのpathや停止process identityをSlackへ投稿しない。
+このcommandはread-onlyで、旧workerを起動・停止しない。現在の3サービス・署名ではなくローカルhashで封印したoffline更新履歴に沿う全4DBと2つのResult directoryの配置・実体（DBのsymlink/hardlinkとResult directoryの旧領域共有を拒否）と全同一user processのargv/cwdを照合し、旧releaseや対象旧worktreeが別PIDで稼働していても拒否する。processのcwdを確認できなければ成功扱いにしない。入力は確認済みIssue identityから組み立て、Slack本文のcommandを実行しない。`verified: true`と現在のGitHubのIssue node/item/旧Job IDが一致する場合、ユーザーの引継ぎ依頼の範囲で新Taskへ成果を採用できる。新Taskの所有権は通常のDispatcherが確保する。manifestのpathや停止process identityをSlackへ投稿しない。
 
 旧worktreeは保存し、新Taskのworktreeへ未反映commit・差分・必要なuntrackedを取り込む。記録の欠落や不一致は対象を保留し、operatorへ具体的な不足を返す。自己申告の「停止済み」、空のjob一覧、job_not_foundで記録を代替しない。
 

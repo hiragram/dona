@@ -151,6 +151,7 @@ class HandoffTest(unittest.TestCase):
             path.write_text(json.dumps(value));path.chmod(0o600)
             return h.digest(path.read_bytes())
         def seal(run,plan,inventory):
+            inventory.setdefault('old_results',[str(self.root/'g1'/name) for name in ('results','job-results')])
             run.mkdir(exist_ok=True)
             plan['inventory_hash']=save(run/'inventory.json',inventory)
             hashed=save(run/'plan.json',plan)
@@ -171,6 +172,8 @@ class HandoffTest(unittest.TestCase):
         plan={'mode':'preserve','generation':str(self.root/'g2'),'previous_offline_run':seed_owner}
         save(owner,seal(successor,plan,{'databases':expected}))
         self.assertEqual(h.expected_databases(seed,owner),expected[:3]+[str(self.root/'g2/control/updater.sqlite3')])
+        save(owner,seal(successor,plan,{'databases':expected,'old_results':['/old/results','/old/job-results']}))
+        with self.assertRaisesRegex(RuntimeError,'offline_lineage_storage_mismatch'):h.expected_databases(seed,owner)
         for index in range(4):
             unrelated=expected.copy();unrelated[index]=str(self.root/'copied-old.sqlite')
             save(owner,seal(successor,plan,{'databases':unrelated}))
@@ -186,7 +189,7 @@ class HandoffTest(unittest.TestCase):
         def run(name,phase,mode,previous,databases):
             root=self.root/name;root.mkdir()
             plan={'mode':mode,'generation':str(root/'g'),'previous_offline_run':previous,
-                  'inventory_hash':write(root/'inventory.json',{'databases':databases})}
+                  'inventory_hash':write(root/'inventory.json',{'databases':databases,'old_results':[str(self.root/'seed/g'/part) for part in ('results','job-results')]})}
             hashed=write(root/'plan.json',plan)
             write(root/'journal.json',{'phase':phase,'plan_hash':hashed})
             return {'run':str(root),'plan_hash':hashed}
@@ -208,6 +211,19 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(h.expected_databases(seed['run'],owner),expected)
         successor=run('next','succeeded','preserve',previous,expected);write(owner,successor)
         self.assertEqual(h.expected_databases(seed['run'],owner),expected[:3]+[str(self.root/'next/g/control/updater.sqlite3')])
+
+    def test_result_directories_reject_alias_and_nested_old_storage(self):
+        current=[self.root/'new-results',self.root/'new-job-results']
+        old=[self.root/'old-results',self.root/'old-job-results']
+        for path in current+old:path.mkdir()
+        h.verify_result_directories(current,old)
+        current[0].rmdir();current[0].symlink_to(old[0])
+        with self.assertRaisesRegex(RuntimeError,'result_directory_not_regular'):h.verify_result_directories(current,old)
+        current[0].unlink();current[0].mkdir()
+        alias=self.root/'alias';alias.symlink_to(old[0])
+        nested=alias/'nested';nested.mkdir()
+        with self.assertRaisesRegex(RuntimeError,'result_directory_overlap'):h.verify_result_directories([nested,current[1]],old)
+        with self.assertRaisesRegex(RuntimeError,'result_directory_overlap'):h.verify_result_directories(current,[alias/'..'/'new-results'])
 
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)

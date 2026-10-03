@@ -25,6 +25,7 @@ schema 3以前からschema 4へ移る場合、履歴保持の通常モードは�
 - 3サービスの自動起動を抑止し、Dona専用Herdr sessionとその時点の子孫を凍結・終了する。PID/start identityと停止確認をrunへ保存する。管理外daemonや外部サービスの停止は別の確認対象である。
 - 旧4DBとResultをbackupし、原位置にも保持する。旧DBをmigration・削除・retireしない。
 - 新世代の4DB・Result・socketを独立したpathにする。schedule、Task、旧job、未処理eventは自動移行・再送しない。worktreeと未commit成果を残し、残作業は別途棚卸しして登録する。
+- このresetは旧workerの完了を前提にせず、停止直前に受理されたqueued eventも旧DB snapshotへ保全する。operatorは停止時点のsnapshotから受付済み未完了依頼も棚卸しし、必要な作業を新しい依頼として登録する。受付履歴をそのまま継続する更新には、DBを保持する通常モードを使う。
 - 新mainの起動前の失敗では旧設定へ戻せる。旧DBをsnapshotで上書きしない。新main起動intent以後は新世代を保持して同じrunで前進復旧する。
 
 ```sh

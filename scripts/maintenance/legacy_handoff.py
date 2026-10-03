@@ -86,7 +86,7 @@ def database_identities(paths):
     return identities
 
 
-def expected_databases(seed_run, owner_path=None):
+def expected_storage(seed_run, owner_path=None):
     owner = read(owner_path or Path.home()/'.dona-maintenance/offline-active.json')
     chain, seen = [], set()
     for _ in range(64):
@@ -105,23 +105,48 @@ def expected_databases(seed_run, owner_path=None):
             require(plan.get('mode') == 'fresh_generation' and journal['phase'] == 'succeeded', 'offline_lineage_seed_invalid')
             generation = Path(plan['generation'])
             paths = [str(generation/name) for name in ('dona.sqlite3', 'update-notifications.sqlite3', 'job-progress.sqlite3', 'control/updater.sqlite3')]
+            results = [str(generation/name) for name in ('results', 'job-results')]
             for descendant, source, phase in reversed(chain[:-1]):
-                require(source['databases'] == paths, 'offline_lineage_storage_mismatch')
+                require(source['databases'] == paths and source['old_results'] == results, 'offline_lineage_storage_mismatch')
                 # 正規の復旧・中止は更新元の4DBを維持する。次回成功runからもたどれる。
                 if phase == 'succeeded':
                     require(descendant.get('mode') == 'preserve', 'offline_lineage_storage_mismatch')
                     paths = paths[:3] + [str(Path(descendant['generation'])/'control/updater.sqlite3')]
-            return paths
+            return paths, results
         owner = plan.get('previous_offline_run')
         require(isinstance(owner, dict), 'offline_lineage_missing')
     raise RuntimeError('offline_lineage_too_deep')
+
+
+def expected_databases(seed_run, owner_path=None):
+    return expected_storage(seed_run, owner_path)[0]
+
+
+def verify_result_directories(current, old):
+    identities = set()
+    for value in current:
+        directory = Path(value)
+        require(directory.is_dir() and not directory.is_symlink(), 'result_directory_not_regular')
+        info = directory.stat(); identities.add((info.st_dev, info.st_ino))
+    require(len(identities) == len(current), 'result_directory_overlap')
+    current_roots, old_roots = ([Path(value).resolve() for value in paths] for paths in (current, old))
+    for index, root in enumerate(current_roots):
+        for other in old_roots + current_roots[:index]:
+            require(root != other and root not in other.parents and other not in root.parents, 'result_directory_overlap')
+    for value in old:
+        directory = Path(value)
+        if directory.exists():
+            info = directory.stat()
+            require(stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) not in identities, 'result_directory_overlap')
 
 
 def verify_no_recreation(run, workspace):
     old = read(run/'inventory.json')
     current = maintenance.inventory(require_running=True)
     require(current['old_pointer'] != old['old_pointer'], 'old_release_restored')
-    require(current['databases'] == expected_databases(run), 'handoff_generation_mismatch')
+    databases, results = expected_storage(run)
+    require(current['databases'] == databases and current['old_results'] == results, 'handoff_generation_mismatch')
+    verify_result_directories(current['old_results'], old['old_results'])
     require(not set(current['databases']) & set(old['databases']), 'old_database_reactivated')
     require(not database_identities(current['databases']) & database_identities(old['databases']), 'old_database_reactivated')
     raw = subprocess.check_output(['/bin/ps', '-axo', 'pid=,ppid=,uid=,args='], text=True)
