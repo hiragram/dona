@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import stat
 import sys
@@ -51,12 +52,33 @@ def fingerprint(root):
         name = os.fsdecode(raw)
         p = root / name
         require(not p.is_symlink() and p.is_file() and p.resolve().is_relative_to(root.resolve()), 'untracked_file_unsafe')
-        untracked.append({'path': name, 'sha256': digest(p.read_bytes()), 'executable': bool(p.stat().st_mode & 0o111)})
+        untracked.append({'path': name, 'sha256': maintenance.file_digest(p), 'executable': bool(p.stat().st_mode & 0o111)})
     return {'head': head, 'diff_sha256': digest(diff), 'untracked': untracked}
 
 
 def retired_roots(inventory, workspace):
     return [Path(inventory['old_pointer']).resolve(), Path(inventory['policy']['control_root']).resolve(), Path(workspace).resolve()]
+
+
+def observed_argument_paths(command, cwd):
+    # psの表示は完全なargv境界を保持しない。解釈できたpathだけを補助照合する。
+    try:
+        arguments = shlex.split(command)
+    except ValueError:
+        arguments = command.split()
+    for argument in arguments:
+        value = argument.split('=', 1)[1] if argument.startswith('-') and '=' in argument else argument
+        if not value.startswith(('/', './', '../')):
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            if cwd is None:
+                continue
+            path = cwd/path
+        try:
+            yield path.resolve()
+        except (OSError, ValueError, RuntimeError):
+            continue  # cwd・既知identityの必須検査とは別の補助情報。
 
 
 def assert_no_retired_process(rows, cwds, retired_roots, exempt):
@@ -67,11 +89,12 @@ def assert_no_retired_process(rows, cwds, retired_roots, exempt):
         if uid != os.getuid():
             continue
         cwd = cwds.get(pid)
+        references = list(observed_argument_paths(command, cwd)) if pid not in exempt else []
         for root in retired_roots:
             # shell/workerと子processのcwd、または旧releaseを指定したargvを照合する。
             if cwd and (cwd == root or root in cwd.parents):
                 raise RuntimeError('retired_generation_process_running')
-            if pid not in exempt and str(root) in command:
+            if pid not in exempt and (str(root) in command or any(path == root or root in path.parents for path in references)):
                 raise RuntimeError('retired_generation_process_running')
 
 
@@ -222,7 +245,7 @@ def verify_cutover(run, expected=None):
                 isinstance(item.get('hash'), str), 'old_database_backup_incomplete')
         backup = Path(item['backup'])
         require(backup.is_file() and not backup.is_symlink(), 'old_database_backup_incomplete')
-        require(digest(backup.read_bytes()) == item['hash'], 'old_database_backup_changed')
+        require(maintenance.file_digest(backup) == item['hash'], 'old_database_backup_changed')
     directories = [item for item in entries if item.get('directory')]
     source_results = read(run/'inventory.json')['old_results']
     require(len(directories) == len(source_results) == 2 and len(set(source_results)) == 2 and
@@ -250,7 +273,7 @@ def inspect(root, repository, issue, legacy_job):
     verify_cutover(value['cutover_run'], value['cutover_seals'])
     verify_no_recreation(Path(value['cutover_run']), value['workspace'])
     require(fingerprint(value['workspace']) == value['workspace_fingerprint'], 'legacy_workspace_changed')
-    return {**value, 'verified': True, 'scope': '旧Dona管理下の停止記録と旧成果の一致。外部操作の完了証明・再実行許可ではない。'}
+    return {**value, 'verified': True, 'scope': '正規切替の停止記録、現設定・観測可能なprocess path、保存成果の一致。DB内容の来歴・稼働codeの完全性・任意processの全出自・外部操作の完了は証明しない。'}
 
 
 

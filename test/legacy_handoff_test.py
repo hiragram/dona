@@ -86,6 +86,11 @@ class HandoffTest(unittest.TestCase):
         with patch.object(subprocess,'check_output',return_value=''):
             seals=h.verify_cutover(run)
             self.assertEqual(h.verify_cutover(run,seals),seals)
+            original_read=Path.read_bytes
+            def bounded_read(path):
+                if path.parent == run/'backup' and path.name.isdigit():self.fail('DB backup must stream its hash')
+                return original_read(path)
+            with patch.object(Path,'read_bytes',new=bounded_read):h.verify_cutover(run,seals)
         with patch.object(subprocess,'check_output',return_value='123 456 Sat Oct 3 12:00:00 2026 S\n'):
             with self.assertRaisesRegex(RuntimeError,'old_process_still_alive'):h.verify_cutover(run,seals)
         changed_result=run/'backup/results-0/changed.json';changed_result.write_text('{}')
@@ -278,6 +283,14 @@ class HandoffTest(unittest.TestCase):
         hashed=save(run/'plan.json',final_plan);save(run/'journal.json',{'phase':'succeeded','plan_hash':hashed})
         save(owner,{'run':str(run),'plan_hash':hashed})
         with self.assertRaisesRegex(RuntimeError,'offline_lineage_invalid'):h.expected_databases(seed,owner)
+
+    def test_process_argument_alias_is_resolved_against_retired_root(self):
+        retired=self.root/'retired';retired.mkdir();(retired/'worker.py').write_text('')
+        alias=self.root/'alias';alias.symlink_to(retired)
+        for command in ('python3 '+str(alias/'worker.py'), 'python3 ./alias/worker.py', 'runner --script='+str(alias/'worker.py')):
+            with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
+                h.assert_no_retired_process([(9876,os.getuid(),command)],{9876:self.root},[retired],set())
+        h.assert_no_retired_process([(9876,os.getuid(),'python3 '+str(alias/'worker.py'))],{9876:self.root},[retired],{9876})
 
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)
