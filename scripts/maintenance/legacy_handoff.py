@@ -78,6 +78,25 @@ def retired_roots(inventory, workspace):
     return [Path(inventory['old_pointer']).resolve(), Path(inventory['policy']['control_root']).resolve(), Path(workspace).resolve()]
 
 
+def lineage_retired_roots(lineage, current, workspace):
+    active = {Path(current['old_pointer']).resolve(), Path(current['policy']['control_root']).resolve()}
+    candidates = {Path(workspace).resolve()}
+    release_parents = set()
+    for plan, source in lineage:
+        release = Path(plan['release']).resolve()
+        candidates.update((release, Path(plan['generation']).resolve()/'control'))
+        candidates.update(retired_roots(source, workspace))
+        release_parents.update((release.parent, Path(source['old_pointer']).resolve().parent))
+    # 通常self-updateはoffline ownerを変更しない。同じrelease storeに残る旧版も対象。
+    release_parents.add(Path(current['old_pointer']).resolve().parent)
+    for directory in release_parents:
+        require(directory.is_dir() and not directory.is_symlink(), 'runtime_release_store_invalid')
+        for child in directory.iterdir():
+            if child.is_dir():
+                candidates.add(child.resolve())
+    return sorted(candidates - active)
+
+
 def observed_argument_paths(command, cwd):
     # psの表示は完全なargv境界を保持しない。解釈できたpathだけを補助照合する。
     try:
@@ -127,7 +146,7 @@ def database_identities(paths):
     return identities
 
 
-def expected_storage(seed_run, owner_path=None):
+def expected_storage(seed_run, owner_path=None, lineage=None):
     owner = read(owner_path or Path.home()/'.dona-maintenance/offline-active.json')
     chain, seen = [], set()
     while True:
@@ -142,6 +161,8 @@ def expected_storage(seed_run, owner_path=None):
                 (not journal.get('source_recreation_detected') or
                  (journal['phase'] == 'rolled_back' and offline.recreation_reconciled(journal))), 'offline_lineage_not_terminal')
         chain.append((plan, inventory, journal['phase']))
+        if lineage is not None:
+            lineage.append((plan, inventory))
         if run == Path(seed_run).resolve():
             require(plan.get('mode') == 'fresh_generation' and journal['phase'] == 'succeeded', 'offline_lineage_seed_invalid')
             generation = Path(plan['generation'])
@@ -196,7 +217,8 @@ def verify_no_recreation(run, workspace):
     old = read(run/'inventory.json')
     current = maintenance.inventory(require_running=True)
     require(current['old_pointer'] != old['old_pointer'], 'old_release_restored')
-    databases, results, roots = expected_storage(run)
+    lineage = []
+    databases, results, roots = expected_storage(run, lineage=lineage)
     require(current['databases'] == databases and current['old_results'] == results, 'handoff_generation_mismatch')
     verify_storage_roots(databases + results, roots)
     verify_result_directories(current['old_results'], old['old_results'])
@@ -226,7 +248,7 @@ def verify_no_recreation(run, workspace):
             continue
         state = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True, timeout=5)
         require(state.returncode != 0 or 'Z' in state.stdout, 'process_cwd_observation_incomplete')
-    assert_no_retired_process(rows, cwds, retired_roots(old, workspace), exempt)
+    assert_no_retired_process(rows, cwds, lineage_retired_roots(lineage, current, workspace), exempt)
 
 
 def verify_cutover(run, expected=None):

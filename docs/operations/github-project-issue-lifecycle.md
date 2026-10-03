@@ -20,7 +20,7 @@
 2. [旧成果の引継ぎ記録](legacy-task-handoff.md)をread-onlyの`inspect`で照合する。外部operatorが確認・記録した切替停止証拠と旧worktreeの一致を使う。記録がなければ必要なのは外部operatorによる引継ぎ準備であり、旧DBを現行Dispatcherに戻すことではない。
 3. 記録のrepository・Issue number/node ID・Project item ID・旧job IDを現在のGitHub値と照合する。不一致、旧成果の変更、停止記録の変更では、その対象だけを保留して他の確認可能なIssueを進める。外部サービスで継続する処理や送信結果が曖昧な操作は別途照合する。
 4. 新Taskのobjectiveへ確認済みIssue identity、recordの照合コマンド、旧成果のHEAD、成果の取り込み方針、残作業と承認範囲を含める。旧worktreeは読み取り専用の資料とし、新Taskが新しいworktreeで作業する。旧Resultを新Taskの完了Resultにコピーしない。
-5. workerはrecordを再照合し、既存PR・commitを現行mainと比較する。既にmainへ入った変更は再適用しない。未反映commit、`git diff --binary HEAD`、記録されたuntrackedだけを新worktreeへ必要な範囲で取り込み、競合を解決する。旧`.git`、node_modules、設定・認証情報、旧AGENTSを丸ごと上書きコピーしない。旧worktreeへのcheckout、reset、clean、commit、削除は禁止する。
+5. workerはrecordを再照合し、既存PR・commitを現行mainと比較する。既にmainへ入った変更は再適用しない。未反映commit、記録されたtracked fileの生内容・mode・削除状態、untrackedだけを新worktreeへ必要な範囲で取り込み、競合を解決する。旧worktreeでは`git diff`を実行しない（external diff、textconv、clean/process filterを起動し得る）。indexと通常fileを直接読み、symlinkはtarget文字列だけを扱い、外部targetを読まない。確認済み変更を新worktree側で組み立て、そこで差分をreviewする。旧`.git`、node_modules、設定・認証情報、旧AGENTSを丸ごと上書きコピーしない。旧worktreeへのcheckout、reset、clean、commit、削除は禁止する。
 6. 通常の`delegate_task`のIssue claimを使用する。Projectの旧Job IDは履歴として残せる。新Task IDが他Taskと競合する場合は上書きしない。
 
 operator記録は成果の由来と停止時点の証拠であり、外部操作の成功・全Issueの完了・承認の代用品ではない。

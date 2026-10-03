@@ -140,6 +140,29 @@ class HandoffTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
             h.assert_no_retired_process([],{9999:Path('/old/control/updater')},roots,set())
 
+    def test_retired_runtime_roots_include_preserve_and_online_updates(self):
+        generations = [self.root/('g'+str(i)) for i in range(3)]
+        releases = []
+        for generation in generations:
+            release = generation/'runtime/releases/initial'
+            release.mkdir(parents=True)
+            (generation/'control').mkdir()
+            releases.append(release)
+        online = generations[2]/'runtime/releases/online'
+        online.mkdir()
+        source = lambda i: {'old_pointer':str(releases[i]), 'policy':{'control_root':str(generations[i]/'control')}}
+        lineage = [({'release':str(releases[2]),'generation':str(generations[2])},source(1)),
+                   ({'release':str(releases[1]),'generation':str(generations[1])},source(0))]
+        current = {**source(2),'old_pointer':str(online)}
+        roots = h.lineage_retired_roots(lineage,current,self.workspace)
+        self.assertNotIn(online,roots)
+        self.assertNotIn(generations[2]/'control',roots)
+        for retired in [*releases,generations[0]/'control',generations[1]/'control']:
+            self.assertIn(retired,roots)
+            with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
+                h.assert_no_retired_process([(9876,os.getuid(),'node '+str(retired/'server.js'))],{9876:self.root},roots,set())
+        h.assert_no_retired_process([(9876,os.getuid(),'node '+str(online/'server.js'))],{9876:online},roots,set())
+
     def test_database_symlink_and_hardlink_alias_are_detected(self):
         old=self.root/'old.sqlite';old.write_bytes(b'db')
         new=self.root/'new.sqlite';new.symlink_to(old)
