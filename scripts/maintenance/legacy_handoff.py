@@ -52,7 +52,14 @@ def fingerprint(root):
     return {'head': head, 'diff_sha256': digest(diff), 'untracked': untracked}
 
 
+def retired_roots(inventory, workspace):
+    return [Path(inventory['old_pointer']).resolve(), Path(inventory['policy']['control_root']).resolve(), Path(workspace).resolve()]
+
+
 def assert_no_retired_process(rows, cwds, retired_roots, exempt):
+    # psとlsofの間に生まれたPIDもcwd一覧だけで検出する。lsofは同一userへ限定済み。
+    for cwd in cwds.values():
+        require(not any(cwd == root or root in cwd.parents for root in retired_roots), 'retired_generation_process_running')
     for pid, uid, command in rows:
         if uid != os.getuid():
             continue
@@ -96,7 +103,7 @@ def verify_no_recreation(run, workspace):
             continue
         state = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True, timeout=5)
         require(state.returncode != 0 or 'Z' in state.stdout, 'process_cwd_observation_incomplete')
-    assert_no_retired_process(rows, cwds, [Path(old['old_pointer']).resolve(), Path(workspace).resolve()], exempt)
+    assert_no_retired_process(rows, cwds, retired_roots(old, workspace), exempt)
 
 
 def verify_cutover(run, expected=None):

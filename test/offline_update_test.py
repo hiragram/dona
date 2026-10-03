@@ -455,6 +455,18 @@ class ActiveRunTests(unittest.TestCase):
 if __name__ == '__main__':unittest.main()
 
 class FreshGenerationTests(unittest.TestCase):
+    def test_stopping_resume_keeps_previous_stop_receipt(self):
+        runner=FakeRunner('stopping');runner.live=unittest.mock.Mock()
+        runner.live.observe.return_value=None
+        runner.plan={'bundle':{'herdr-config.toml':'config-hash'}}
+        old=proc(800001)
+        runner.journal.update(source_stop_guard={'phase':'committed'},source_stop_receipt={'processes':[old]},processes=[])
+        with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={}), patch.object(m,'ProcessStop'), patch.object(runner,'switch_disabled'):
+            m.Runner.stop(runner,check_source=True)
+        self.assertEqual(runner.journal['source_stop_receipt']['processes'],[old])
+        self.assertEqual(runner.journal['processes'],[])
+
     def test_fresh_migration_requires_stop_receipt_and_only_targets_new_paths(self):
         runner=object.__new__(m.Runner)
         runner.plan={'mode':'fresh_generation','release':'/target/release','target_sha':'a'*40}

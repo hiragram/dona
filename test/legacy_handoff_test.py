@@ -103,6 +103,14 @@ class HandoffTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
             h.assert_no_retired_process([(9876,os.getuid(),'python')],{9876:old},[old],{9876})
 
+    def test_old_control_root_and_new_cwd_pid_are_checked(self):
+        roots=h.retired_roots({'old_pointer':'/old/release','policy':{'control_root':'/old/control'}},'/old/worktree')
+        self.assertIn(Path('/old/control'),roots)
+        with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
+            h.assert_no_retired_process([(9876,os.getuid(),'node /old/control/updater/dist/cli.js')],{9876:Path('/tmp')},roots,set())
+        with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
+            h.assert_no_retired_process([],{9999:Path('/old/control/updater')},roots,set())
+
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)
         with self.assertRaisesRegex(RuntimeError,'not_private_or_owned'):h.read(p)

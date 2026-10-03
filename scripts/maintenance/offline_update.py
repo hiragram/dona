@@ -482,7 +482,10 @@ class Runner:
         ProcessStop(lambda processes: self.record(processes=processes)).stop(roots, self.journal.get('processes', []), unregister)
         require(not herdr_root(self.policy['executables']['herdr']) and
                 not herdr_starting(self.policy['executables']['herdr']), 'herdr_still_running')
-        receipt = {'verified_at': common.stamp(), 'processes': self.journal.get('processes', []),
+        # receipt保存後・phase遷移前のcrashでも、確認済みidentityを空で上書きしない。
+        previous = self.journal.get('source_stop_receipt', {}).get('processes', []) if check_source else []
+        identities = {(p['pid'], p['uid'], p['start']): p for p in previous + self.journal.get('processes', [])}
+        receipt = {'verified_at': common.stamp(), 'processes': list(identities.values()),
                    'launch_agents': list(LABELS), 'herdr_session': 'dona',
                    'herdr_config_sha256': self.plan['bundle']['herdr-config.toml'] if check_source else None}
         for label in LABELS:
