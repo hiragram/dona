@@ -42,7 +42,7 @@ def git(root, *args):
 
 def fingerprint(root):
     root = Path(root)
-    require(root.is_absolute() and root.is_dir() and not root.is_symlink(), 'workspace_invalid')
+    require(root.is_absolute() and root.is_dir() and all(not part.is_symlink() for part in (root, *root.parents)), 'workspace_invalid')
     require(Path(git(root, 'rev-parse', '--show-toplevel').decode().strip()).resolve() == root.resolve(), 'workspace_root_mismatch')
     head = git(root, 'rev-parse', 'HEAD').decode().strip()
     diff = git(root, 'diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD', '--')
@@ -89,7 +89,7 @@ def database_identities(paths):
 def expected_storage(seed_run, owner_path=None):
     owner = read(owner_path or Path.home()/'.dona-maintenance/offline-active.json')
     chain, seen = [], set()
-    for _ in range(64):
+    while True:
         require(Path(owner['run']).is_absolute(), 'offline_lineage_invalid')
         run = Path(owner['run']).resolve()
         require(run.is_absolute() and str(run) not in seen, 'offline_lineage_invalid')
@@ -119,7 +119,6 @@ def expected_storage(seed_run, owner_path=None):
             return paths, results, roots
         owner = plan.get('previous_offline_run')
         require(isinstance(owner, dict), 'offline_lineage_missing')
-    raise RuntimeError('offline_lineage_too_deep')
 
 
 def expected_databases(seed_run, owner_path=None):
@@ -130,7 +129,7 @@ def verify_storage_roots(paths, roots):
     require(len(paths) == len(roots), 'storage_root_mapping_invalid')
     for value, generation in zip(paths, roots):
         root = Path(generation)
-        require(root.is_absolute() and root.is_dir() and not root.is_symlink(), 'generation_root_not_regular')
+        require(root.is_absolute() and root.is_dir() and all(not part.is_symlink() for part in (root, *root.parents)), 'generation_root_not_regular')
         require(Path(value).resolve().is_relative_to(root.resolve()), 'storage_outside_generation')
 
 
@@ -224,6 +223,18 @@ def verify_cutover(run, expected=None):
         backup = Path(item['backup'])
         require(backup.is_file() and not backup.is_symlink(), 'old_database_backup_incomplete')
         require(digest(backup.read_bytes()) == item['hash'], 'old_database_backup_changed')
+    directories = [item for item in entries if item.get('directory')]
+    source_results = read(run/'inventory.json')['old_results']
+    require(len(directories) == len(source_results) == 2 and len(set(source_results)) == 2 and
+            [item.get('source') for item in directories] == source_results, 'old_result_backup_incomplete')
+    for item in directories:
+        backup = Path(item['backup'])
+        if item.get('exists') is True:
+            require(backup.is_dir() and not backup.is_symlink(), 'old_result_backup_incomplete')
+            require(maintenance.tree_seal(backup) == item.get('hash'), 'old_result_backup_changed')
+        else:
+            require(item.get('exists') is False and item.get('hash') is None and
+                    not backup.exists() and not backup.is_symlink(), 'old_result_backup_incomplete')
     return seals
 
 

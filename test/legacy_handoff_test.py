@@ -16,7 +16,7 @@ class HandoffTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.workspace = self.root/'job_test'
         self.workspace.mkdir()
         def git(*args):
@@ -69,11 +69,14 @@ class HandoffTest(unittest.TestCase):
         def save(name, value):
             p=run/name;p.write_text(json.dumps(value));p.chmod(0o600)
             return h.digest(p.read_bytes())
-        inventory=save('inventory.json', {'databases':['/old/db-'+str(i) for i in range(4)]})
+        inventory=save('inventory.json', {'databases':['/old/db-'+str(i) for i in range(4)],'old_results':['/old/results','/old/job-results']})
         entries=[]
         for index in range(4):
             file=run/'backup'/str(index);file.write_bytes(b'old database')
             entries.append({'source':'/old/db-'+str(index),'exists':True,'backup':str(file),'hash':h.digest(file.read_bytes())})
+        for index,name in enumerate(('results','job-results')):
+            directory=run/'backup'/('results-'+str(index));directory.mkdir()
+            entries.append({'directory':True,'source':'/old/'+name,'exists':True,'backup':str(directory),'hash':h.maintenance.tree_seal(directory)})
         backup=save('backup/index.json', entries)
         plan=save('plan.json', {'mode':'fresh_generation','inventory_hash':inventory,'bundle':{'herdr-config.toml':'sealed-config'}})
         receipt={'verified_at':'2026-10-03T12:00:00Z','processes':[{'pid':123,'uid':456,'start':'Sat Oct 3 12:00:00 2026'}],
@@ -85,6 +88,10 @@ class HandoffTest(unittest.TestCase):
             self.assertEqual(h.verify_cutover(run,seals),seals)
         with patch.object(subprocess,'check_output',return_value='123 456 Sat Oct 3 12:00:00 2026 S\n'):
             with self.assertRaisesRegex(RuntimeError,'old_process_still_alive'):h.verify_cutover(run,seals)
+        changed_result=run/'backup/results-0/changed.json';changed_result.write_text('{}')
+        with patch.object(subprocess,'check_output',return_value=''):
+            with self.assertRaisesRegex(RuntimeError,'old_result_backup_changed'):h.verify_cutover(run,seals)
+        changed_result.unlink()
         for changed in ({'exists':False,'hash':None}, {'source':'/different/db'}):
             original=entries[0].copy();entries[0].update(changed)
             journal['backup_index_hash']=save('backup/index.json',entries);save('journal.json',journal)
@@ -238,6 +245,39 @@ class HandoffTest(unittest.TestCase):
         generation.unlink();saved.rename(generation)
         (generation/'control').symlink_to(outside)
         with self.assertRaisesRegex(RuntimeError,'storage_outside_generation'):h.verify_storage_roots([generation/'control/db'],[generation])
+
+    def test_generation_ancestor_alias_is_rejected(self):
+        actual=self.root/'actual';actual.mkdir();generation=actual/'generation';generation.mkdir()
+        (generation/'db').write_bytes(b'db')
+        alias=self.root/'alias';alias.symlink_to(actual)
+        with self.assertRaisesRegex(RuntimeError,'generation_root_not_regular'):
+            h.verify_storage_roots([alias/'generation/db'],[alias/'generation'])
+
+    def test_more_than_64_preserve_updates_keep_lineage(self):
+        def save(path,value):
+            path.write_text(json.dumps(value));path.chmod(0o600)
+            return h.digest(path.read_bytes())
+        seed=self.root/'seed';generation=self.root/'generation'
+        databases=[str(generation/name) for name in ('dona.sqlite3','update-notifications.sqlite3','job-progress.sqlite3','control/updater.sqlite3')]
+        results=[str(generation/name) for name in ('results','job-results')]
+        previous=None
+        for index in range(70):
+            run=seed if index==0 else self.root/('run-'+str(index));run.mkdir()
+            target=generation if index==0 else self.root/('generation-'+str(index))
+            inventory=save(run/'inventory.json',{'databases':databases,'old_results':results})
+            plan={'mode':'fresh_generation' if index==0 else 'preserve','generation':str(target),
+                  'inventory_hash':inventory,'previous_offline_run':previous}
+            hashed=save(run/'plan.json',plan)
+            save(run/'journal.json',{'phase':'succeeded','plan_hash':hashed})
+            previous={'run':str(run),'plan_hash':hashed}
+            databases=databases[:3]+[str(target/'control/updater.sqlite3')]
+        owner=self.root/'owner.json';save(owner,previous)
+        self.assertEqual(h.expected_databases(seed,owner),databases)
+        # 循環は件数制限に頼らず拒否する。plan hashの照合より先に再訪を検出する。
+        final_plan=h.read(run/'plan.json');final_plan['previous_offline_run']=previous
+        hashed=save(run/'plan.json',final_plan);save(run/'journal.json',{'phase':'succeeded','plan_hash':hashed})
+        save(owner,{'run':str(run),'plan_hash':hashed})
+        with self.assertRaisesRegex(RuntimeError,'offline_lineage_invalid'):h.expected_databases(seed,owner)
 
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)
