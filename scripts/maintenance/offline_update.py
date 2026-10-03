@@ -342,7 +342,9 @@ def prepare(run, repository, fresh_generation=False):
         for protected in (run.resolve(), g.resolve(), Path(inv['old_pointer']), Path(inv['policy']['config_root'])):
             require(root != protected and root not in protected.parents, 'result_directory_overlaps_update')
     release = common.private_dir(g/'runtime/releases'/sha)
+    previous_owner = Path.home()/'.dona-maintenance/offline-active.json'
     plan = {'schema_version': 1, 'target_sha': sha, 'generation': str(g), 'release': str(release),
+            'previous_offline_run': read_json(common.regular(previous_owner)) if previous_owner.exists() else None,
             'node': node, 'mode': 'fresh_generation' if fresh_generation else 'preserve', 'created_at': common.stamp(), 'inventory_hash': common.file_digest(run/'inventory.json')}
     common.staging_space(g, inv['policy'])
     archive = run/'source.tar'

@@ -76,15 +76,20 @@ class HandoffTest(unittest.TestCase):
             entries.append({'exists':True,'backup':str(file),'hash':h.digest(file.read_bytes())})
         backup=save('backup/index.json', entries)
         plan=save('plan.json', {'mode':'fresh_generation','inventory_hash':inventory,'bundle':{'herdr-config.toml':'sealed-config'}})
-        receipt={'processes':[{'pid':123,'uid':456,'start':'Sat Oct 3 12:00:00 2026'}],
+        receipt={'verified_at':'2026-10-03T12:00:00Z','processes':[{'pid':123,'uid':456,'start':'Sat Oct 3 12:00:00 2026'}],
                  'herdr_session':'dona','herdr_config_sha256':'sealed-config','launch_agents':['dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater']}
-        journal={'phase':'succeeded','plan_hash':plan,'backup_index_hash':backup,'source_stop_receipt':receipt}
+        journal={'phase':'succeeded','plan_hash':plan,'backup_index_hash':backup,'source_stop_receipt':receipt,'source_stop_guard':{'phase':'committed'}}
         save('journal.json',journal)
         with patch.object(subprocess,'check_output',return_value=''):
             seals=h.verify_cutover(run)
             self.assertEqual(h.verify_cutover(run,seals),seals)
         with patch.object(subprocess,'check_output',return_value='123 456 Sat Oct 3 12:00:00 2026 S\n'):
             with self.assertRaisesRegex(RuntimeError,'old_process_still_alive'):h.verify_cutover(run,seals)
+        receipt['processes']=[];save('journal.json',journal)
+        with patch.object(subprocess,'check_output',return_value=''):
+            h.verify_cutover(run)
+            journal['source_stop_guard']['phase']='freezing';save('journal.json',journal)
+            with self.assertRaisesRegex(RuntimeError,'cutover_stop_evidence_missing'):h.verify_cutover(run)
         journal['phase']='prepared';save('journal.json',journal)
         with self.assertRaisesRegex(RuntimeError,'cutover_evidence_changed'):h.verify_cutover(run,seals)
         with self.assertRaisesRegex(RuntimeError,'fresh_cutover_not_succeeded'):h.verify_cutover(run)
@@ -120,6 +125,47 @@ class HandoffTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'database_identity_overlap'):h.database_identities([old,new])
         new.unlink();new.write_bytes(b'new db')
         self.assertFalse(h.database_identities([old]) & h.database_identities([new]))
+
+    def test_record_publication_is_atomic_and_does_not_overwrite(self):
+        target=self.root/'record.json'
+        with patch.object(os, 'fsync', side_effect=OSError('disk error')):
+            with self.assertRaises(OSError):h.publish_record(target, {'a':1})
+        self.assertFalse(target.exists())
+        h.publish_record(target, {'a':1})
+        inode=target.stat().st_ino
+        h.publish_record(target, {'a':1})
+        self.assertEqual(target.stat().st_ino,inode)
+        with self.assertRaisesRegex(RuntimeError,'handoff_record_conflict'):h.publish_record(target, {'a':2})
+        self.assertEqual(h.read(target),{'a':1})
+        self.assertEqual(list(self.root.glob('.record-*')),[])
+
+    def test_database_lineage_supports_preserve_and_rejects_unrelated_storage(self):
+        def save(path,value):
+            path.write_text(json.dumps(value));path.chmod(0o600)
+            return h.digest(path.read_bytes())
+        def seal(run,plan,inventory):
+            run.mkdir(exist_ok=True)
+            plan['inventory_hash']=save(run/'inventory.json',inventory)
+            hashed=save(run/'plan.json',plan)
+            save(run/'journal.json',{'phase':'succeeded','plan_hash':hashed})
+            return {'run':str(run),'plan_hash':hashed}
+        seed=self.root/'seed'; generation=self.root/'g1'
+        owner=self.root/'owner.json'
+        seed_owner=seal(seed,{'mode':'fresh_generation','generation':str(generation)},{})
+        save(owner,seed_owner)
+        expected=[str(generation/name) for name in ('dona.sqlite3','update-notifications.sqlite3','job-progress.sqlite3','control/updater.sqlite3')]
+        self.assertEqual(h.expected_databases(seed,owner),expected)
+        successor=self.root/'successor'
+        plan={'mode':'preserve','generation':str(self.root/'g2'),'previous_offline_run':seed_owner}
+        save(owner,seal(successor,plan,{'databases':expected}))
+        self.assertEqual(h.expected_databases(seed,owner),expected[:3]+[str(self.root/'g2/control/updater.sqlite3')])
+        for index in range(4):
+            unrelated=expected.copy();unrelated[index]=str(self.root/'copied-old.sqlite')
+            save(owner,seal(successor,plan,{'databases':unrelated}))
+            with self.assertRaisesRegex(RuntimeError,'offline_lineage_storage_mismatch'):h.expected_databases(seed,owner)
+        save(owner,seal(successor,plan,{'databases':expected}))
+        save(successor/'journal.json',{'phase':'prepared','plan_hash':h.digest((successor/'plan.json').read_bytes())})
+        with self.assertRaisesRegex(RuntimeError,'offline_lineage_not_succeeded'):h.expected_databases(seed,owner)
 
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)

@@ -9,6 +9,7 @@ import re
 import subprocess
 import stat
 import sys
+import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import reset_upgrade as maintenance
@@ -84,12 +85,36 @@ def database_identities(paths):
     return identities
 
 
+def expected_databases(seed_run, owner_path=None):
+    owner = read(owner_path or Path.home()/'.dona-maintenance/offline-active.json')
+    chain, seen = [], set()
+    for _ in range(64):
+        run = Path(owner['run'])
+        require(run.is_absolute() and str(run) not in seen, 'offline_lineage_invalid')
+        seen.add(str(run))
+        plan, journal, inventory = (read(run/name) for name in ('plan.json', 'journal.json', 'inventory.json'))
+        require(owner['plan_hash'] == journal['plan_hash'] == digest((run/'plan.json').read_bytes()) and
+                plan['inventory_hash'] == digest((run/'inventory.json').read_bytes()), 'offline_lineage_seal_mismatch')
+        require(journal['phase'] == 'succeeded' and not journal.get('source_recreation_detected'), 'offline_lineage_not_succeeded')
+        chain.append((plan, inventory))
+        if run == Path(seed_run):
+            require(plan.get('mode') == 'fresh_generation', 'offline_lineage_seed_invalid')
+            generation = Path(plan['generation'])
+            paths = [str(generation/name) for name in ('dona.sqlite3', 'update-notifications.sqlite3', 'job-progress.sqlite3', 'control/updater.sqlite3')]
+            for descendant, source in reversed(chain[:-1]):
+                require(descendant.get('mode') == 'preserve' and source['databases'] == paths, 'offline_lineage_storage_mismatch')
+                paths = paths[:3] + [str(Path(descendant['generation'])/'control/updater.sqlite3')]
+            return paths
+        owner = plan.get('previous_offline_run')
+        require(isinstance(owner, dict), 'offline_lineage_missing')
+    raise RuntimeError('offline_lineage_too_deep')
+
+
 def verify_no_recreation(run, workspace):
-    plan = read(run/'plan.json')
     old = read(run/'inventory.json')
     current = maintenance.inventory(require_running=True)
     require(current['old_pointer'] != old['old_pointer'], 'old_release_restored')
-    require(current['databases'][0] == str(Path(plan['generation'])/'dona.sqlite3'), 'handoff_generation_mismatch')
+    require(current['databases'] == expected_databases(run), 'handoff_generation_mismatch')
     require(not set(current['databases']) & set(old['databases']), 'old_database_reactivated')
     require(not database_identities(current['databases']) & database_identities(old['databases']), 'old_database_reactivated')
     raw = subprocess.check_output(['/bin/ps', '-axo', 'pid=,ppid=,uid=,args='], text=True)
@@ -128,7 +153,9 @@ def verify_cutover(run, expected=None):
     require(plan.get('mode') == 'fresh_generation' and journal.get('phase') == 'succeeded' and not journal.get('source_recreation_detected'), 'fresh_cutover_not_succeeded')
     require(journal['plan_hash'] == seals['plan.json'] and plan['inventory_hash'] == seals['inventory.json'] and journal['backup_index_hash'] == seals['backup/index.json'], 'cutover_seal_mismatch')
     receipt = journal.get('source_stop_receipt', {})
-    require(receipt.get('processes') and receipt.get('herdr_session') == 'dona' and
+    require(isinstance(receipt.get('processes'), list) and receipt.get('verified_at') and
+            (journal.get('source_stop_guard') or {}).get('phase') == 'committed' and
+            receipt.get('herdr_session') == 'dona' and
             receipt.get('herdr_config_sha256') == plan.get('bundle', {}).get('herdr-config.toml') and
             isinstance(receipt.get('herdr_config_sha256'), str) and
             set(receipt.get('launch_agents', [])) == {'dev.dona.dispatcher', 'dev.dona.slack-adapter', 'dev.dona.updater'}, 'cutover_stop_evidence_missing')
@@ -164,6 +191,29 @@ def inspect(root, repository, issue, legacy_job):
     return {**value, 'verified': True, 'scope': '旧Dona管理下の停止記録と旧成果の一致。外部操作の完了証明・再実行許可ではない。'}
 
 
+
+def publish_record(target, value):
+    payload = json.dumps(value, ensure_ascii=False, indent=2).encode()
+    descriptor, temporary = tempfile.mkstemp(prefix='.record-', suffix='.tmp', dir=target.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            # 完成済みinodeを原子的に公開する。競合時も既存recordを上書きしない。
+            os.link(temporary, target)
+        except FileExistsError:
+            require(read(target) == value, 'handoff_record_conflict')
+        directory = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        os.unlink(temporary)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['record', 'inspect'])
@@ -187,14 +237,7 @@ def main():
                  'cutover_seals': verify_cutover(args.run)}
         verify_no_recreation(args.run, args.workspace)
         ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # operatorのみ作成する。既存recordは上書きせず、異内容なら照合へ戻す。
-        if target.exists():
-            require(read(target) == value, 'handoff_record_conflict')
-        else:
-            with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as file:
-                json.dump(value, file, ensure_ascii=False, indent=2)
-                file.flush()
-                os.fsync(file.fileno())
+        publish_record(target, value)
     print(json.dumps(inspect(ROOT, args.repository, args.issue, args.legacy_job), ensure_ascii=False))
 
 
