@@ -9,6 +9,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import reset_upgrade as maintenance
+
 ROOT = Path.home() / '.dona-maintenance/legacy-handoffs'
 
 
@@ -45,8 +48,55 @@ def fingerprint(root):
         name = os.fsdecode(raw)
         p = root / name
         require(not p.is_symlink() and p.is_file() and p.resolve().is_relative_to(root.resolve()), 'untracked_file_unsafe')
-        untracked.append({'path': name, 'sha256': digest(p.read_bytes())})
+        untracked.append({'path': name, 'sha256': digest(p.read_bytes()), 'executable': bool(p.stat().st_mode & 0o111)})
     return {'head': head, 'diff_sha256': digest(diff), 'untracked': untracked}
+
+
+def assert_no_retired_process(rows, cwds, retired_roots, exempt):
+    for pid, uid, command in rows:
+        if uid != os.getuid():
+            continue
+        cwd = cwds.get(pid)
+        for root in retired_roots:
+            # shell/workerと子processのcwd、または旧releaseを指定したargvを照合する。
+            if cwd and (cwd == root or root in cwd.parents):
+                raise RuntimeError('retired_generation_process_running')
+            if pid not in exempt and str(root) in command:
+                raise RuntimeError('retired_generation_process_running')
+
+
+def verify_no_recreation(run, workspace):
+    plan = read(run/'plan.json')
+    old = read(run/'inventory.json')
+    current = maintenance.inventory(require_running=True)
+    require(current['old_pointer'] != old['old_pointer'], 'old_release_restored')
+    require(current['databases'][0] == str(Path(plan['generation'])/'dona.sqlite3'), 'handoff_generation_mismatch')
+    require(not set(current['databases']) & set(old['databases']), 'old_database_reactivated')
+    raw = subprocess.check_output(['/bin/ps', '-axo', 'pid=,ppid=,uid=,args='], text=True)
+    rows, parents = [], {}
+    for line in raw.splitlines():
+        fields = line.strip().split(None, 3)
+        require(len(fields) == 4, 'process_command_table_invalid')
+        pid, parent, uid = map(int, fields[:3])
+        rows.append((pid, uid, fields[3]));parents[pid] = parent
+    exempt = set()
+    pid = os.getpid()
+    while pid and pid not in exempt:
+        exempt.add(pid);pid = parents.get(pid, 0)
+    # operator自身とancestorのargvは引数に旧pathを含み得るため除外する。cwdは除外しない。
+    output = subprocess.run(['/usr/sbin/lsof', '-n', '-a', '-u', str(os.getuid()), '-d', 'cwd', '-F', 'pn'],
+                            capture_output=True, text=True, timeout=30)
+    require(output.returncode == 0, 'process_cwd_observation_failed')
+    cwds, pid = {}, None
+    for line in output.stdout.splitlines():
+        if line.startswith('p'):pid = int(line[1:])
+        elif line.startswith('n') and pid is not None:cwds[pid] = Path(line[1:]).resolve()
+    for pid, uid, _ in rows:
+        if uid != os.getuid() or pid in exempt or pid in cwds:
+            continue
+        state = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True, timeout=5)
+        require(state.returncode != 0 or 'Z' in state.stdout, 'process_cwd_observation_incomplete')
+    assert_no_retired_process(rows, cwds, [Path(old['old_pointer']).resolve(), Path(workspace).resolve()], exempt)
 
 
 def verify_cutover(run, expected=None):
@@ -89,6 +139,7 @@ def inspect(root, repository, issue, legacy_job):
     require(value.get('schema_version') == 1 and value['repository'] == repository and value['issue_number'] == issue
             and value['legacy_job_id'] == legacy_job, 'handoff_identity_mismatch')
     verify_cutover(value['cutover_run'], value['cutover_seals'])
+    verify_no_recreation(Path(value['cutover_run']), value['workspace'])
     require(fingerprint(value['workspace']) == value['workspace_fingerprint'], 'legacy_workspace_changed')
     return {**value, 'verified': True, 'scope': '旧Dona管理下の停止記録と旧成果の一致。外部操作の完了証明・再実行許可ではない。'}
 
@@ -114,6 +165,7 @@ def main():
                  'legacy_job_id': args.legacy_job, 'workspace': str(args.workspace.resolve()),
                  'workspace_fingerprint': fingerprint(args.workspace), 'cutover_run': str(args.run.resolve()),
                  'cutover_seals': verify_cutover(args.run)}
+        verify_no_recreation(args.run, args.workspace)
         ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
         # operatorのみ作成する。既存recordは上書きせず、異内容なら照合へ戻す。
         if target.exists():

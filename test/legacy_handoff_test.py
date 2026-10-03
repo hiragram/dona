@@ -56,7 +56,7 @@ class HandoffTest(unittest.TestCase):
                  'workspace': str(self.workspace), 'workspace_fingerprint': h.fingerprint(self.workspace)}
         p = self.root/h.key('owner/repo', 12)
         p.write_text(json.dumps(value));p.chmod(0o600)
-        with patch.object(h, 'verify_cutover'):
+        with patch.object(h, 'verify_cutover'), patch.object(h, 'verify_no_recreation'):
             self.assertTrue(h.inspect(self.root, 'owner/repo', 12, 'job_test')['verified'])
             with self.assertRaisesRegex(RuntimeError, 'identity_mismatch'):
                 h.inspect(self.root, 'owner/repo', 12, 'job_other')
@@ -88,6 +88,20 @@ class HandoffTest(unittest.TestCase):
         journal['phase']='prepared';save('journal.json',journal)
         with self.assertRaisesRegex(RuntimeError,'cutover_evidence_changed'):h.verify_cutover(run,seals)
         with self.assertRaisesRegex(RuntimeError,'fresh_cutover_not_succeeded'):h.verify_cutover(run)
+
+    def test_untracked_executable_bit_drift(self):
+        file=self.workspace/'new.sh';file.write_text('echo example\n');file.chmod(0o644)
+        before=h.fingerprint(self.workspace);file.chmod(0o755)
+        self.assertNotEqual(before,h.fingerprint(self.workspace))
+
+    def test_new_pid_using_retired_workspace_or_release_is_rejected(self):
+        old=Path('/retired/worktree')
+        for argv,cwd in [('codex',old),('node /retired/worktree/server.js',Path('/tmp'))]:
+            with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
+                h.assert_no_retired_process([(9876,os.getuid(),argv)],{9876:cwd},[old],set())
+        h.assert_no_retired_process([(9876,os.getuid(),'codex')],{9876:Path('/new/worktree')},[old],set())
+        with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
+            h.assert_no_retired_process([(9876,os.getuid(),'python')],{9876:old},[old],{9876})
 
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)
