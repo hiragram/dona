@@ -37,23 +37,41 @@ def read(path):
 
 
 def git(root, *args):
-    return subprocess.check_output(['git', '-C', str(root), *args], timeout=30,
+    return subprocess.check_output(['git', '--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-C', str(root), *args], timeout=30,
                                    env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
 
 
 def fingerprint(root):
     root = Path(root)
-    require(root.is_absolute() and root.is_dir() and all(not part.is_symlink() for part in (root, *root.parents)), 'workspace_invalid')
+    require(root.is_absolute() and root.is_dir() and not root.is_symlink(), 'workspace_invalid')
     require(Path(git(root, 'rev-parse', '--show-toplevel').decode().strip()).resolve() == root.resolve(), 'workspace_root_mismatch')
     head = git(root, 'rev-parse', 'HEAD').decode().strip()
-    diff = git(root, 'diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD', '--')
+    # Git diffはclean/process filterを実行し得るため使わない。indexと生のfileを別々に固定する。
+    index = git(root, 'ls-files', '--stage', '-z')
+    tracked = set()
+    for entry in filter(None, index.split(b'\0')):
+        metadata, name = entry.split(b'\t', 1)
+        require(not metadata.startswith(b'160000 '), 'submodule_fingerprint_requires_inventory')
+        tracked.add(name)
+    working = hashlib.sha256()
+    for raw in sorted(tracked):
+        file = root/os.fsdecode(raw)
+        require(file.parent.resolve().is_relative_to(root.resolve()), 'tracked_file_unsafe')
+        if file.is_symlink():
+            value = {'kind':'symlink', 'target':os.readlink(file)}
+        elif not file.exists():
+            value = {'kind':'missing'}
+        else:
+            require(file.is_file(), 'tracked_file_unsafe')
+            value = {'kind':'file', 'sha256':maintenance.file_digest(file), 'executable':bool(file.stat().st_mode & 0o111)}
+        working.update(raw + b'\0' + json.dumps(value, sort_keys=True).encode() + b'\0')
     untracked = []
     for raw in sorted(filter(None, git(root, 'ls-files', '--others', '--exclude-standard', '-z').split(b'\0'))):
         name = os.fsdecode(raw)
         p = root / name
         require(not p.is_symlink() and p.is_file() and p.resolve().is_relative_to(root.resolve()), 'untracked_file_unsafe')
         untracked.append({'path': name, 'sha256': maintenance.file_digest(p), 'executable': bool(p.stat().st_mode & 0o111)})
-    return {'head': head, 'diff_sha256': digest(diff), 'untracked': untracked}
+    return {'format_version': 2, 'head': head, 'index_sha256': digest(index), 'working_tree_sha256': working.hexdigest(), 'untracked': untracked}
 
 
 def retired_roots(inventory, workspace):
@@ -254,6 +272,7 @@ def verify_cutover(run, expected=None):
         backup = Path(item['backup'])
         if item.get('exists') is True:
             require(backup.is_dir() and not backup.is_symlink(), 'old_result_backup_incomplete')
+            require(all(not child.is_symlink() for child in backup.rglob('*')), 'old_result_backup_symlink')
             require(maintenance.tree_seal(backup) == item.get('hash'), 'old_result_backup_changed')
         else:
             require(item.get('exists') is False and item.get('hash') is None and
@@ -270,6 +289,7 @@ def inspect(root, repository, issue, legacy_job):
     value = read(root/key(repository, issue))
     require(value.get('schema_version') == 1 and value['repository'] == repository and value['issue_number'] == issue
             and value['legacy_job_id'] == legacy_job, 'handoff_identity_mismatch')
+    require(value['workspace_fingerprint'].get('format_version') == 2, 'handoff_fingerprint_requires_refresh')
     verify_cutover(value['cutover_run'], value['cutover_seals'])
     verify_no_recreation(Path(value['cutover_run']), value['workspace'])
     require(fingerprint(value['workspace']) == value['workspace_fingerprint'], 'legacy_workspace_changed')

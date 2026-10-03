@@ -97,6 +97,11 @@ class HandoffTest(unittest.TestCase):
         with patch.object(subprocess,'check_output',return_value=''):
             with self.assertRaisesRegex(RuntimeError,'old_result_backup_changed'):h.verify_cutover(run,seals)
         changed_result.unlink()
+        target=self.root/'outside-result';target.write_text('outside')
+        changed_result.symlink_to(target)
+        with patch.object(subprocess,'check_output',return_value=''):
+            with self.assertRaisesRegex(RuntimeError,'old_result_backup_symlink'):h.verify_cutover(run,seals)
+        changed_result.unlink()
         for changed in ({'exists':False,'hash':None}, {'source':'/different/db'}):
             original=entries[0].copy();entries[0].update(changed)
             journal['backup_index_hash']=save('backup/index.json',entries);save('journal.json',journal)
@@ -291,6 +296,20 @@ class HandoffTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
                 h.assert_no_retired_process([(9876,os.getuid(),command)],{9876:self.root},[retired],set())
         h.assert_no_retired_process([(9876,os.getuid(),'python3 '+str(alias/'worker.py'))],{9876:self.root},[retired],{9876})
+
+    def test_fingerprint_does_not_execute_repository_filters_or_fsmonitor(self):
+        import shlex
+        marker=self.root/'filter-executed'
+        (self.workspace/'.gitattributes').write_text('tracked filter=legacy\n')
+        self.git('add','.gitattributes')
+        self.git('config','filter.legacy.clean','touch '+shlex.quote(str(marker))+'; cat')
+        self.git('config','filter.legacy.process','touch '+shlex.quote(str(marker))+'; exit 1')
+        self.git('config','filter.legacy.required','true')
+        self.git('config','core.fsmonitor','touch '+shlex.quote(str(marker))+'; exit 1')
+        (self.workspace/'tracked').write_text('dirty\n')
+        value=h.fingerprint(self.workspace)
+        self.assertIn('index_sha256',value)
+        self.assertFalse(marker.exists())
 
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)

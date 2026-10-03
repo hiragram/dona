@@ -21,7 +21,7 @@ python3 -B scripts/maintenance/legacy_handoff.py record \
 
 `reset_upgrade.py`の独立世代runは停止receiptの契約が異なるため、この経路へ転用しない。
 
-記録は`~/.dona-maintenance/legacy-handoffs/`にmode 600で置く。切替plan/journal/inventory/backup indexのhash、旧worktreeのHEAD・binary diff hash・untracked file hashes・実行bitを保持する。既存記録の異内容上書き、旧DBの変更、workerの操作は行わない。記録作成時にGitHub照合と稼働世代の確認をoperatorが行う責任は、このCLIだけでは代替しない。
+記録は`~/.dona-maintenance/legacy-handoffs/`にmode 600で置く。切替plan/journal/inventory/backup indexのhash、旧worktreeのHEAD・index entry hash・tracked fileの生内容/mode hash・untracked file hashes・実行bitを保持する。既存記録の異内容上書き、旧DBの変更、workerの操作は行わない。記録作成時にGitHub照合と稼働世代の確認をoperatorが行う責任は、このCLIだけでは代替しない。
 
 ## Dona親とworkerの照合
 
@@ -51,3 +51,7 @@ DB backupに加え、Result snapshotもdirectoryの存在状態と保存したtr
 正規pathへのDB file copy・手動restore、release/controlへの直接上書き、独立daemonの再起動等があった場合は、operatorがその変更と外部作用を再照合する。`inspect`の成功だけでその変更を承認済み・旧状態を再導入していないと扱わない。同じuserが変更できるDB markerも、snapshot全体の巻き戻しを認証する独立した信頼源にはならない。
 
 準備時のasset sealはactivation前の準備物検証に使う。通常self-updateでは同一generation内のrelease追加とcurrent pointer変更が正当な操作なので、その後のhandoffへ古いasset sealをそのまま適用しない。稼働コードの確認は正規updaterのversion/healthと更新記録を用い、手動差し替えは別途照合する。processのargv表示に完全な引数境界がない場合や、fileを閉じて別cwdへ移動した独立processの出自も、このpath検査だけでは証明しない。
+
+worktree照合はGit diffを呼ばず、fsmonitor/hookを無効にしたGitのindex列挙と通常fileの直接hashを使う。clean/process filterやtextconvは実行しない。tracked symlinkはlink文字列だけを記録し、外部targetの内容は採用証拠に含めない。submoduleがある場合は専用の棚卸しを要求する。Result snapshot内のsymlinkは拒否する。旧形式のdiff hash記録はoperatorが旧記録を保全し、現在のIssue・worktreeを照合して再作成する。
+
+成果の取り込みでも旧worktreeのGit設定を新worktreeへ持ち込まない。旧worktree上のdiff/addでfilterを起動せず、必要な通常fileを取り込み、新worktree側で差分とテストを確認する。
