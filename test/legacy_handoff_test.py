@@ -1,0 +1,99 @@
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location('handoff', Path(__file__).parents[1]/'scripts/maintenance/legacy_handoff.py')
+h = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(h)
+
+
+class HandoffTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.workspace = self.root/'job_test'
+        self.workspace.mkdir()
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(self.workspace), *args], stderr=subprocess.DEVNULL)
+        self.git = git
+        git('init')
+        git('config', 'user.name', 'Test')
+        git('config', 'user.email', 'test@example.invalid')
+        (self.workspace/'tracked').write_text('base\n')
+        git('add', '.')
+        git('commit', '-m', 'base')
+
+    def test_fingerprint_tracks_staged_unstaged_untracked_without_mutation(self):
+        base = h.fingerprint(self.workspace)
+        (self.workspace/'tracked').write_text('staged\n')
+        self.git('add', '.')
+        staged = h.fingerprint(self.workspace)
+        self.assertNotEqual(base, staged)
+        (self.workspace/'tracked').write_text('unstaged\n')
+        unstaged = h.fingerprint(self.workspace)
+        self.assertNotEqual(staged, unstaged)
+        (self.workspace/'new').write_text('untracked\n')
+        before = self.git('status', '--porcelain')
+        current = h.fingerprint(self.workspace)
+        self.assertEqual(current['untracked'][0]['path'], 'new')
+        self.assertEqual(self.git('status', '--porcelain'), before)
+        self.assertEqual(current['head'], base['head'])
+
+    def test_untracked_symlink_refused(self):
+        (self.workspace/'outside').symlink_to(self.root)
+        with self.assertRaisesRegex(RuntimeError, 'untracked_file_unsafe'):
+            h.fingerprint(self.workspace)
+
+    def test_identity_and_workspace_drift(self):
+        value = {'schema_version': 1, 'repository': 'owner/repo', 'issue_number': 12,
+                 'legacy_job_id': 'job_test', 'cutover_run': '/unused', 'cutover_seals': {},
+                 'workspace': str(self.workspace), 'workspace_fingerprint': h.fingerprint(self.workspace)}
+        p = self.root/h.key('owner/repo', 12)
+        p.write_text(json.dumps(value));p.chmod(0o600)
+        with patch.object(h, 'verify_cutover'):
+            self.assertTrue(h.inspect(self.root, 'owner/repo', 12, 'job_test')['verified'])
+            with self.assertRaisesRegex(RuntimeError, 'identity_mismatch'):
+                h.inspect(self.root, 'owner/repo', 12, 'job_other')
+            (self.workspace/'tracked').write_text('changed\n')
+            with self.assertRaisesRegex(RuntimeError, 'workspace_changed'):
+                h.inspect(self.root, 'owner/repo', 12, 'job_test')
+
+    def test_cutover_rejects_live_process_tamper_and_nonfresh(self):
+        run = self.root/'run';run.mkdir();(run/'backup').mkdir()
+        def save(name, value):
+            p=run/name;p.write_text(json.dumps(value));p.chmod(0o600)
+            return h.digest(p.read_bytes())
+        inventory=save('inventory.json', {})
+        entries=[]
+        for index in range(4):
+            file=run/'backup'/str(index);file.write_bytes(b'old database')
+            entries.append({'exists':True,'backup':str(file),'hash':h.digest(file.read_bytes())})
+        backup=save('backup/index.json', entries)
+        plan=save('plan.json', {'mode':'fresh_generation','inventory_hash':inventory,'bundle':{'herdr-config.toml':'sealed-config'}})
+        receipt={'processes':[{'pid':123,'uid':456,'start':'Sat Oct 3 12:00:00 2026'}],
+                 'herdr_session':'dona','herdr_config_sha256':'sealed-config','launch_agents':['dev.dona.dispatcher','dev.dona.slack-adapter','dev.dona.updater']}
+        journal={'phase':'succeeded','plan_hash':plan,'backup_index_hash':backup,'source_stop_receipt':receipt}
+        save('journal.json',journal)
+        with patch.object(subprocess,'check_output',return_value=''):
+            seals=h.verify_cutover(run)
+            self.assertEqual(h.verify_cutover(run,seals),seals)
+        with patch.object(subprocess,'check_output',return_value='123 456 Sat Oct 3 12:00:00 2026 S\n'):
+            with self.assertRaisesRegex(RuntimeError,'old_process_still_alive'):h.verify_cutover(run,seals)
+        journal['phase']='prepared';save('journal.json',journal)
+        with self.assertRaisesRegex(RuntimeError,'cutover_evidence_changed'):h.verify_cutover(run,seals)
+        with self.assertRaisesRegex(RuntimeError,'fresh_cutover_not_succeeded'):h.verify_cutover(run)
+
+    def test_untrusted_file_and_path_rejected(self):
+        p=self.root/'record';p.write_text('{}');p.chmod(0o666)
+        with self.assertRaisesRegex(RuntimeError,'not_private_or_owned'):h.read(p)
+        with self.assertRaisesRegex(RuntimeError,'issue_identity_invalid'):h.key('../../other',1)
+
+
+if __name__ == '__main__':
+    unittest.main()

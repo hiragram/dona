@@ -24,7 +24,7 @@
 
 ## Task世代の実行契約
 
-Task世代では、この節を以下の旧job担当・手動引継ぎ手順より優先する。旧手順は旧世代の保守照合用であり、新Taskの作成や再開には使わない。
+Task世代では、この節と現行Issue lifecycle手順を、後段に残る旧job transport・手動引継ぎの説明より優先する。旧手順は旧世代の保守照合用であり、新Taskの作成や再開には使わない。
 
 - 通常の長時間作業は`delegate_task`へ委任する。初回write前に安定した`task_key`を決め、対象Issueは`issue_number`へ構造化指定する。scope、権限、依頼を超える自動再開を許可しない。
 - Task IDは仕事のidentity、Attempt ID（内部のjob ID）は一回の実行identity。`get_task` / `list_tasks`で照合し、Taskごとの現在Attempt・待機理由・残予算を見る。自動回復中に別Taskや旧`resume_job`で重複実行しない。
@@ -38,12 +38,10 @@ Task世代では、この節を以下の旧job担当・手動引継ぎ手順よ�
 
 ## GitHub ProjectsのIssue着手と提出完了
 
-- Dona Projectの対象Issueを実装・対応する場合は、[Issue lifecycle手順](docs/operations/github-project-issue-lifecycle.md)を読み、Dona親はdelegate前に担当を確認し、workerは着手前に再確認する。
-- workerは信頼できるDONA_JOB契約のjob IDを`Dona Job ID`へ記録し、`Todo`から`In Progress`へ更新・再読する。別job IDの状態はDispatcher MCPで確認し、勝手に上書き・重複開始しない。
-- 同じworkspace/channelでユーザーが対象Issueの再開・引継ぎを明示した場合、旧job IDの文字列の復唱は求めない。Dona親が正しいProjectのIssue itemから旧`Dona Job ID`を取得し、現在のevent IDを使ったDispatcher `get_job_status`でexact IDのdurable statusと同一workspace/channelを確認する。`completed` / `failed` / `cancelled`で、対象Issue・既存成果・引継ぎ範囲と指示が一致する場合だけ新jobへ引継ぐ。`running` / `queued` / `blocked` / `needs_review` / `unknown`、取得不能、workspace/channelやIssue/itemの不一致、Project値driftでは上書きしない。workerは親の確認証拠と今回のDONA_JOB job IDを使い、write直前の再読とread-backを行う。詳細はIssue lifecycle手順に従う。
-- PRレビューとCI等の提出完了条件を満たした後だけ、担当Issueを`Merge Ready`へ更新・再読する。Issue起票や足場PR作成だけには適用せず、対象Issueのない依頼にIssueを捏造しない。
-
-- 停滞jobの明示的な再開・引継ぎでは、上記のterminal status限定規則に対する例外として`inspect_job_worker`と`resume_job`を使える。Dispatcherによる停止確認と後継job作成が成功した場合だけ、照合済みの後継IDへ担当を引継ぐ。これは未確認の旧job担当を直接上書きする許可ではない。
+- Task世代の着手・旧成果の採用・提出完了は[Issue lifecycle手順](docs/operations/github-project-issue-lifecycle.md)を使う。Projectの旧Job IDやIn Progressを新Taskの実行ロックにしない。
+- 空DB切替後の旧jobは現行Dispatcherに存在しない。旧jobをget_job_status / inspect_job_worker / resume_jobで照会できる状態へ戻すことを要求しない。外部operatorの[引継ぎ記録](docs/operations/legacy-task-handoff.md)を照合し、新Task・新worktreeへ既存成果を採用する。
+- 記録のinspectはローカルファイルとGitのread-only照合であり、Herdrやworkerのshell操作ではない。記録の作成はDona外のoperatorだけが行う。
+- workerはProject fieldを書かず、DispatcherのIssue claimと同期を使う。明示された複数Issueの順次対応では、照合できたものから継続し、1件の保留で全件を止めない。
 
 ## Donaの役割
 

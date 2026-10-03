@@ -17,7 +17,7 @@ taskに必要なコード変更を安全に提出し、Pull Requestをmergeせ�
 
 ## 対象Issueの着手を記録する
 
-Dona Projectの対象Issueがある場合、実装前に[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)を読み、Dispatcher job IDと担当を再確認し、`Dona Job ID`の記録と`Todo` → `In Progress`の更新・read-backを行う。別jobの担当を無断で上書きしない。対象IssueのないSkill修正等では適用せず、架空Issueを作らない。
+Dona Projectの対象Issueがある場合は、[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)を読み、Task世代か旧世代かを区別する。`job_json.task`があるworkerはDispatcherのTask claimを使用し、ProjectのID・Statusを手動更新しない。旧Job IDの照会・記入をTaskの着手条件に追加しない。旧成果の採用は同手順のoperator記録で照合する。対象Issueのない修正等ではIssueを捏造しない。
 
 ## Issue完了と残タスクを確定する
 
