@@ -446,6 +446,21 @@ class Runner:
         for label in LABELS:
             command(['/bin/launchctl', 'disable' if disabled else 'enable', self.live.domain+'/'+label])
 
+    def assert_source_stopped(self, roots=None):
+        if (not self.journal.get('source_stop_receipt') or self.journal.get('activation_started')
+                or self.journal.get('rollback_activation_started')):
+            return
+        require(not self.journal.get('source_recreation_detected'), 'source_recreation_requires_reconciliation')
+        if roots is None:
+            roots = list(herdr_root(self.policy['executables']['herdr']))
+            roots.extend(herdr_starting(self.policy['executables']['herdr']))
+        registered = [label for label in LABELS if self.live.observe(label) is not None]
+        if roots or registered:
+            # 初回停止後の再生成は、その間の外部作用が不明。killして証拠を消さない。
+            self.record(source_recreation_detected=True, source_recreation_processes=roots,
+                        source_recreation_services=registered)
+            raise RuntimeError('source_recreation_requires_reconciliation')
+
     def stop(self, check_source=False):
         roots = list(herdr_root(self.policy['executables']['herdr']))
         roots.extend(herdr_starting(self.policy['executables']['herdr']))
@@ -460,10 +475,7 @@ class Runner:
                 p = table.get(observation['pid'])
                 require(p and p['uid'] == os.getuid(), 'service_process_owner')
                 roots.append(p)
-        if self.journal.get('source_stop_receipt') and not self.journal.get('activation_started') and roots:
-            # 初回停止後の再生成は、その間の外部作用が不明。killして証拠を消さない。
-            self.record(source_recreation_detected=True, source_recreation_processes=roots)
-            raise RuntimeError('source_recreation_requires_reconciliation')
+        self.assert_source_stopped(roots)
         if check_source and not self.journal.get('source_stop_guard'):
             listing = command(['/bin/launchctl', 'print-disabled', self.live.domain])
             require('disabled services = {' in listing, 'launchd_disabled_state_unknown')
@@ -670,6 +682,7 @@ class Runner:
         self.verify_main(old)  # serviceの起動待ち中にmainが異常化していないか最後に照合。
 
     def restore(self):
+        require(not self.journal.get('source_recreation_detected'), 'source_recreation_requires_reconciliation')
         require(common.tree_seal(self.run/'rollback') == self.plan['rollback_seal'], 'rollback_files_changed')
         require(not self.journal.get('activation_started'), 'rollback_after_activation_forbidden')
         if (self.journal.get('source_stop_guard') or {}).get('phase') == 'freezing':
@@ -759,6 +772,7 @@ class Runner:
                 progress('DBとResultをバックアップしています。')
                 self.backup()
             if self.journal['phase'] in ('backed_up', 'migrating'):
+                self.assert_source_stopped()  # backup中の再生成もmigration前に照合。
                 self.record('migrating')
                 self.migrate()
                 self.record('migrated')
@@ -766,6 +780,7 @@ class Runner:
                 self.install()
                 self.record('installed')
             if self.journal['phase'] == 'installed':
+                self.assert_source_stopped()  # main起動intentを記録する直前にも再照合。
                 progress('新しいmain agentとMCPを起動しています。')
                 # mainの必須MCPにも書き込み権限がある。起動応答を失っても巻き戻さない。
                 self.record(activation_started=True)

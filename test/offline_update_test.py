@@ -484,6 +484,39 @@ class FreshGenerationTests(unittest.TestCase):
         self.assertNotIn('restore',runner.calls)
         self.assertNotIn('main',runner.calls)
 
+    def test_known_rollback_activation_can_resume_but_unreconciled_source_cannot_restore(self):
+        runner=FakeRunner('restoring');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+        runner.journal.update(source_stop_receipt={'processes':[proc(800001)]},rollback_activation_started=True)
+        root=proc(800002)
+        with patch.object(m,'herdr_root',side_effect=[[root],[]]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={root['pid']:root}), patch.object(m,'ProcessStop') as stop, \
+             patch.object(runner,'switch_disabled'):
+            m.Runner.stop(runner)
+            stop.return_value.stop.assert_called_once()
+        self.assertNotIn('source_recreation_detected',runner.journal)
+        runner.journal['source_recreation_detected']=True
+        with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):m.Runner.restore(runner)
+
+    def test_normal_execution_checks_recreation_after_backup_and_before_activation(self):
+        for phase in ('stopped','migrated'):
+            runner=FakeRunner(phase);runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+            root=proc(800002)
+            with patch.object(m,'herdr_root',return_value=[root]), patch.object(m,'herdr_starting',return_value=[]):
+                with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+            self.assertTrue(runner.journal['source_recreation_detected'])
+            self.assertNotIn('main',runner.calls)
+            self.assertNotIn('migrate',runner.calls)
+            self.assertNotIn('restore',runner.calls)
+
+    def test_registered_service_without_pid_is_also_recreation(self):
+        runner=FakeRunner('backed_up');runner.live=unittest.mock.Mock()
+        runner.live.observe.return_value={'registered':True,'pid':None}
+        runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+        with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]):
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.assert_source_stopped()
+        self.assertEqual(runner.journal['source_recreation_services'],list(m.LABELS))
+
     def test_stopping_resume_keeps_previous_stop_receipt(self):
         runner=FakeRunner('stopping');runner.live=unittest.mock.Mock()
         runner.live.observe.return_value=None
