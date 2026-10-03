@@ -31,7 +31,38 @@ export function retireUpdates(db, runId, targetSha, at = new Date().toISOString(
   })();
 }
 
+export function assertFreshDatabase(db) {
+  const seeds=new Set(['scheduler_schema','schedule_list_sequence','live_session_schema','job_routing_schema','task_execution_schema','controller_state']);
+  for(const {name} of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()) {
+    const escaped=name.replaceAll('"','""');
+    if(seeds.has(name)) {
+      if(db.prepare(`SELECT count(*) n FROM "${escaped}"`).get().n>1)throw Error('fresh_database_not_empty');
+      if(name==='controller_state'&&db.prepare('SELECT 1 FROM controller_state WHERE active_request_id IS NOT NULL').get())throw Error('fresh_database_not_empty');
+    } else if(db.prepare(`SELECT 1 FROM "${escaped}" LIMIT 1`).get())throw Error('fresh_database_not_empty');
+  }
+}
+
 export async function migrate(request) {
+  if (request.fresh_generation) {
+    const {default:Database} = await import(pathToFileURL(path.join(request.release,'updater/node_modules/better-sqlite3/lib/index.js')));
+    // 準備中の再開でも、既存の仕事を削除・移行して空DB扱いしない。
+    for (const file of request.databases) {
+      if (!fs.existsSync(file)) continue;
+      const db = new Database(file,{readonly:true,fileMustExist:true});
+      try {
+        assertFreshDatabase(db);
+      } finally {db.close();}
+    }
+    const load = (component, module) => import(pathToFileURL(path.join(request.release,component,'dist',module+'.js')));
+    const {DispatcherDatabase}=await load('dispatcher','database');
+    const {UpdateNotificationDatabase}=await load('dispatcher','update-notification');
+    const {JobProgressStore}=await load('dispatcher','job-progress');
+    const {UpdateDatabase}=await load('updater','database');
+    const dispatcher=new DispatcherDatabase(request.databases[0]);
+    try {dispatcher.tasks.assertFreshExecutionModel();} finally {dispatcher.close();}
+    for(const [index,Constructor] of [[1,UpdateNotificationDatabase],[2,JobProgressStore],[3,UpdateDatabase]])new Constructor(request.databases[index]).close();
+    return;
+  }
   if (!request.retire_only) {
     const load = (component, module) => import(pathToFileURL(path.join(request.release, component, 'dist', module+'.js')));
     const classes = [await load('dispatcher','database'), await load('dispatcher','update-notification'),

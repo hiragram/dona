@@ -11,6 +11,31 @@ Donaのサービス・専用Herdr session内のプロセスを停止して更新
 Slack上の更新依頼、event/job ID、handoff receipt、旧jobの`needs_review`解消は不要です。
 通常の`plan_self_update` / `apply_self_update`とは独立した、ローカル管理者用の停止更新です。
 
+## Task世代へ空DBで切り替える
+
+schema 3以前からschema 4へ移る場合、履歴保持の通常モードは停止前に拒否する。Donaの外にあるcheckoutから、次を使う。
+
+```sh
+./scripts/dona-update prepare --fresh-generation --run "$HOME/.dona-maintenance/task-generation-YYYYMMDD-unique"
+```
+
+この指定は旧履歴を新世代へ引き継がない切替である。停止・DB初期化を含む実行を依頼された場合は、表示されたsealed runnerの`resume`へ進む。event/job ID、旧DonaのMCP機能、親handoff、残存workerリスクを受容するreceiptは使用しない。
+
+- 対象mainをexact SHAへ固定してbuild・CI・両MCPを検証する。旧世代は準備中に稼働できる。
+- 3サービスの自動起動を抑止し、Dona専用Herdr sessionとその時点の子孫を凍結・終了する。PID/start identityと停止確認をrunへ保存する。管理外daemonや外部サービスの停止は別の確認対象である。
+- 旧4DBとResultをbackupし、原位置にも保持する。旧DBをmigration・削除・retireしない。
+- 新世代の4DB・Result・socketを独立したpathにする。schedule、Task、旧job、未処理eventは自動移行・再送しない。worktreeと未commit成果を残し、残作業は別途棚卸しして登録する。
+- 新mainの起動前の失敗では旧設定へ戻せる。旧DBをsnapshotで上書きしない。新main起動intent以後は新世代を保持して同じrunで前進復旧する。
+
+```sh
+python3 -B "$HOME/.dona-maintenance/task-generation-YYYYMMDD-unique/offline_update.py" resume \
+  --run "$HOME/.dona-maintenance/task-generation-YYYYMMDD-unique"
+```
+
+`--fresh-generation`はprepare/update時だけ指定し、resumeは保存済みmodeを使用する。実行中の別runへmodeを上書きしない。従来の`reset_upgrade.py`で作成したplanはこのCLIのplanではないため、流用・書換えせず、新しいrunを準備する。
+
+以下の履歴保持・migrationの説明は、`--fresh-generation`を指定しない通常モードを対象とする。
+
 ## 保持するデータと停止範囲
 
 Dispatcher DB、通知DB、進捗DB、Resultのpathと履歴を保持します。Updater DBは履歴ごと新しいcontrol領域へ複製し、旧DBも残します。内部tokenは新世代用に生成し、旧tokenは復旧用の旧設定にだけ残します。
