@@ -162,6 +162,11 @@ class HandoffTest(unittest.TestCase):
         save(owner,seed_owner)
         expected=[str(generation/name) for name in ('dona.sqlite3','update-notifications.sqlite3','job-progress.sqlite3','control/updater.sqlite3')]
         self.assertEqual(h.expected_databases(seed,owner),expected)
+        alias=self.root/'seed-alias';alias.symlink_to(seed)
+        save(owner,{**seed_owner,'run':str(alias)})
+        self.assertEqual(h.expected_databases(seed,owner),expected)
+        self.assertEqual(h.expected_databases(alias,owner),expected)
+        save(owner,seed_owner)
         successor=self.root/'successor'
         plan={'mode':'preserve','generation':str(self.root/'g2'),'previous_offline_run':seed_owner}
         save(owner,seal(successor,plan,{'databases':expected}))
@@ -192,6 +197,15 @@ class HandoffTest(unittest.TestCase):
         for phase in ('rolled_back','aborted'):
             previous=run(phase,phase,'preserve',previous,expected);write(owner,previous)
             self.assertEqual(h.expected_databases(seed['run'],owner),expected)
+        rollback=Path(previous['run'])
+        journal=h.read(rollback/'journal.json');journal.update(phase='rolled_back',source_recreation_detected=True)
+        write(rollback/'journal.json',journal)
+        with self.assertRaisesRegex(RuntimeError,'offline_lineage_not_terminal'):h.expected_databases(seed['run'],owner)
+        journal['source_recreation_reconciliation']={'plan_hash':journal['plan_hash'],
+            'observation_hash':h.offline.recreation_observation_hash(journal),'effects_reconciled':True,
+            'cause_removed':True,'summary':'照合済み','operator_uid':os.getuid()}
+        write(rollback/'journal.json',journal)
+        self.assertEqual(h.expected_databases(seed['run'],owner),expected)
         successor=run('next','succeeded','preserve',previous,expected);write(owner,successor)
         self.assertEqual(h.expected_databases(seed['run'],owner),expected[:3]+[str(self.root/'next/g/control/updater.sqlite3')])
 

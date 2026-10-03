@@ -13,6 +13,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import reset_upgrade as maintenance
+import offline_update as offline
 
 ROOT = Path.home() / '.dona-maintenance/legacy-handoffs'
 
@@ -89,15 +90,18 @@ def expected_databases(seed_run, owner_path=None):
     owner = read(owner_path or Path.home()/'.dona-maintenance/offline-active.json')
     chain, seen = [], set()
     for _ in range(64):
-        run = Path(owner['run'])
+        require(Path(owner['run']).is_absolute(), 'offline_lineage_invalid')
+        run = Path(owner['run']).resolve()
         require(run.is_absolute() and str(run) not in seen, 'offline_lineage_invalid')
         seen.add(str(run))
         plan, journal, inventory = (read(run/name) for name in ('plan.json', 'journal.json', 'inventory.json'))
         require(owner['plan_hash'] == journal['plan_hash'] == digest((run/'plan.json').read_bytes()) and
                 plan['inventory_hash'] == digest((run/'inventory.json').read_bytes()), 'offline_lineage_seal_mismatch')
-        require(journal['phase'] in ('succeeded', 'rolled_back', 'aborted') and not journal.get('source_recreation_detected'), 'offline_lineage_not_terminal')
+        require(journal['phase'] in ('succeeded', 'rolled_back', 'aborted') and
+                (not journal.get('source_recreation_detected') or
+                 (journal['phase'] == 'rolled_back' and offline.recreation_reconciled(journal))), 'offline_lineage_not_terminal')
         chain.append((plan, inventory, journal['phase']))
-        if run == Path(seed_run):
+        if run == Path(seed_run).resolve():
             require(plan.get('mode') == 'fresh_generation' and journal['phase'] == 'succeeded', 'offline_lineage_seed_invalid')
             generation = Path(plan['generation'])
             paths = [str(generation/name) for name in ('dona.sqlite3', 'update-notifications.sqlite3', 'job-progress.sqlite3', 'control/updater.sqlite3')]

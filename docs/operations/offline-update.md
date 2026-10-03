@@ -106,6 +106,33 @@ python3 -B "$HOME/.dona-maintenance/offline-20261001-1/offline_update.py" status
 新しいSHAでmain・3サービス・Slack接続を確認した`succeeded`だけが更新成功です。
 ログインやネットワーク障害などでhealthが失敗した場合も、起動したというだけで成功と報告しません。
 
+## 旧process再生成の照合後に復旧する
+
+`source_recreation_requires_reconciliation`で保留した場合は、外部operatorが再生成原因を除去し、記録されたprocessとその子孫の停止、3サービスの未登録・disable、途中の外部操作を照合する。Dona親・workerにこの照合記録の作成を委任しない。未確認事項を「確認済み」にせず、外部操作の重複や完了を個別に確認する。
+
+`status --run ...`が返す`plan_hash`と`recreation_observation_hash`を使い、次のJSONをprivateな通常fileへ保存する。`summary`に原因と照合結果を記す。tokenや秘密情報は含めない。
+
+```json
+{
+  "schema_version": 1,
+  "plan_hash": "statusで確認したplan hash",
+  "observation_hash": "statusで確認した再生成観測hash",
+  "effects_reconciled": true,
+  "cause_removed": true,
+  "summary": "再生成の原因、除去方法、外部操作の照合結果"
+}
+```
+
+```sh
+python3 -B /absolute/run/offline_update.py reconcile-source \
+  --run /absolute/run --reconciliation /absolute/reconciliation.json
+python3 -B /absolute/run/offline_update.py restore --run /absolute/run
+```
+
+`reconcile-source`は実runtimeの停止を再確認し、operator UID・照合時刻・evidence hashをjournalへ保存して`restoring`へ進める。サービスの起動や更新先への続行は行わない。以後`restore`または同じrunの`resume`で旧版へ復旧する。応答が曖昧ならjournalの`source_recreation_reconciliation`とphaseをread-onlyで照合し、記録writeを繰り返さない。
+
+再生成のflagは監査のため保持する。再発時は照合recordを無効化する。正規の復旧が`rolled_back`となった後だけ、新しいrunを準備できる。引継ぎ検証も、照合済みで復旧完了したrunを更新履歴として認める。新main起動intent以後にはこの復旧経路を使えない。
+
 ## 検証
 
 ```sh

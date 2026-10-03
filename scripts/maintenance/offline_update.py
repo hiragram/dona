@@ -26,6 +26,28 @@ read_json = common.read_json
 command = common.command
 
 
+def recreation_observation_hash(journal):
+    return common.digest(encode({key: journal.get(key, []) for key in
+        ('source_recreation_processes', 'source_recreation_services')}))
+
+
+def recreation_reconciled(journal):
+    receipt = journal.get('source_recreation_reconciliation') or {}
+    return (receipt.get('plan_hash') == journal.get('plan_hash') and
+            receipt.get('observation_hash') == recreation_observation_hash(journal) and
+            receipt.get('effects_reconciled') is True and receipt.get('cause_removed') is True and
+            isinstance(receipt.get('summary'), str) and bool(receipt['summary'].strip()) and
+            receipt.get('operator_uid') == os.getuid())
+
+
+def canonical_owner(owner):
+    if owner is None:
+        return None
+    run = Path(owner['run'])
+    require(run.is_absolute(), 'absolute_owner_run_required')
+    return {**owner, 'run': str(run.resolve())}
+
+
 def progress(message):
     print(message, flush=True)
 
@@ -344,7 +366,7 @@ def prepare(run, repository, fresh_generation=False):
     release = common.private_dir(g/'runtime/releases'/sha)
     previous_owner = Path.home()/'.dona-maintenance/offline-active.json'
     plan = {'schema_version': 1, 'target_sha': sha, 'generation': str(g), 'release': str(release),
-            'previous_offline_run': read_json(common.regular(previous_owner)) if previous_owner.exists() else None,
+            'previous_offline_run': canonical_owner(read_json(common.regular(previous_owner))) if previous_owner.exists() else None,
             'node': node, 'mode': 'fresh_generation' if fresh_generation else 'preserve', 'created_at': common.stamp(), 'inventory_hash': common.file_digest(run/'inventory.json')}
     common.staging_space(g, inv['policy'])
     archive = run/'source.tar'
@@ -448,19 +470,69 @@ class Runner:
         for label in LABELS:
             command(['/bin/launchctl', 'disable' if disabled else 'enable', self.live.domain+'/'+label])
 
+    def record_recreation(self, roots, observations, table):
+        captured = {p['pid']: p for p in roots}
+        for value in observations.values():
+            if value and value.get('pid') in table:
+                row = table[value['pid']]
+                require(row['uid'] == os.getuid(), 'service_process_owner')
+                captured[row['pid']] = row
+        while True:
+            descendants = {pid: row for pid, row in table.items() if row['parent'] in captured and row['uid'] == os.getuid()}
+            previous = len(captured); captured.update(descendants)
+            if len(captured) == previous: break
+        history = list(self.journal.get('source_recreation_history', []))
+        if self.journal.get('source_recreation_detected'):
+            history.append({key:self.journal.get(key) for key in ('source_recreation_processes', 'source_recreation_services', 'source_recreation_reconciliation')})
+        self.record(source_recreation_detected=True, source_recreation_processes=list(captured.values()),
+                    source_recreation_services=[label for label,value in observations.items() if value is not None],
+                    source_recreation_reconciliation=None, source_recreation_history=history)
+
+    def verify_reconciliation_stopped(self):
+        roots = list(herdr_root(self.policy['executables']['herdr'])) + list(herdr_starting(self.policy['executables']['herdr']))
+        observations = {label:self.live.observe(label) for label in LABELS}
+        table = process_table()
+        recorded = self.journal.get('source_recreation_processes', []) + self.journal.get('source_stop_receipt', {}).get('processes', [])
+        alive = [table[row['pid']] for row in recorded if same_process(row, table.get(row['pid'])) and 'Z' not in table[row['pid']]['state']]
+        if roots or any(value is not None for value in observations.values()) or alive:
+            self.record_recreation(roots + alive, observations, table)
+            raise RuntimeError('reconciliation_process_still_alive' if alive else 'reconciliation_source_not_stopped')
+        listing = command(['/bin/launchctl', 'print-disabled', self.live.domain])
+        states = dict(re.findall(r'"([^"]+)"\s*=>\s*(enabled|disabled|true|false)', listing))
+        if not all(states.get(label) in ('disabled', 'true') for label in LABELS):
+            self.record(source_recreation_reconciliation=None)
+            raise RuntimeError('reconciliation_services_not_disabled')
+
+    def reconcile_source(self, evidence_file):
+        require(self.journal.get('source_recreation_detected') and not self.journal.get('activation_started') and
+                not self.journal.get('rollback_activation_started'), 'reconciliation_phase_invalid')
+        require(self.journal['phase'] in ('stopping', 'stopped', 'backed_up', 'migrating', 'migrated', 'installed', 'restoring'), 'reconciliation_phase_invalid')
+        evidence_bytes = common.regular(evidence_file).read_bytes()
+        evidence = json.loads(evidence_bytes)
+        require(evidence.get('schema_version') == 1 and evidence.get('plan_hash') == self.journal['plan_hash'] and
+                evidence.get('observation_hash') == recreation_observation_hash(self.journal) and
+                evidence.get('effects_reconciled') is True and evidence.get('cause_removed') is True and
+                isinstance(evidence.get('summary'), str) and 0 < len(evidence['summary'].strip()) <= 4000,
+                'reconciliation_evidence_invalid')
+        self.verify_reconciliation_stopped()
+        receipt = {key: evidence[key] for key in ('plan_hash', 'observation_hash', 'effects_reconciled', 'cause_removed', 'summary')}
+        receipt.update(operator_uid=os.getuid(), verified_at=common.stamp(), evidence_hash=common.digest(evidence_bytes))
+        # 再生成の事実は消さず、旧版への復旧だけを許可する。更新先への続行には使わない。
+        self.record('restoring', source_recreation_reconciliation=receipt)
+
     def assert_source_stopped(self, roots=None):
         if (not self.journal.get('source_stop_receipt') or self.journal.get('activation_started')
                 or self.journal.get('rollback_activation_started')):
             return
-        require(not self.journal.get('source_recreation_detected'), 'source_recreation_requires_reconciliation')
+        require(not self.journal.get('source_recreation_detected') or
+                (self.journal['phase'] == 'restoring' and recreation_reconciled(self.journal)), 'source_recreation_requires_reconciliation')
         if roots is None:
             roots = list(herdr_root(self.policy['executables']['herdr']))
             roots.extend(herdr_starting(self.policy['executables']['herdr']))
-        registered = [label for label in LABELS if self.live.observe(label) is not None]
-        if roots or registered:
+        observations = {label:self.live.observe(label) for label in LABELS}
+        if roots or any(value is not None for value in observations.values()):
             # 初回停止後の再生成は、その間の外部作用が不明。killして証拠を消さない。
-            self.record(source_recreation_detected=True, source_recreation_processes=roots,
-                        source_recreation_services=registered)
+            self.record_recreation(roots, observations, process_table())
             raise RuntimeError('source_recreation_requires_reconciliation')
 
     def stop(self, check_source=False):
@@ -684,7 +756,10 @@ class Runner:
         self.verify_main(old)  # serviceの起動待ち中にmainが異常化していないか最後に照合。
 
     def restore(self):
-        require(not self.journal.get('source_recreation_detected'), 'source_recreation_requires_reconciliation')
+        require(not self.journal.get('source_recreation_detected') or
+                (self.journal['phase'] == 'restoring' and recreation_reconciled(self.journal)), 'source_recreation_requires_reconciliation')
+        if self.journal.get('source_recreation_detected') and not self.journal.get('rollback_activation_started'):
+            self.verify_reconciliation_stopped()
         require(common.tree_seal(self.run/'rollback') == self.plan['rollback_seal'], 'rollback_files_changed')
         require(not self.journal.get('activation_started'), 'rollback_after_activation_forbidden')
         if (self.journal.get('source_stop_guard') or {}).get('phase') == 'freezing':
@@ -730,7 +805,8 @@ class Runner:
 
     def execute(self):
         phase = self.journal['phase']
-        require(not self.journal.get('source_recreation_detected'), 'source_recreation_requires_reconciliation')
+        require(not self.journal.get('source_recreation_detected') or
+                (self.journal['phase'] == 'restoring' and recreation_reconciled(self.journal)), 'source_recreation_requires_reconciliation')
         require(phase in ('prepared','stopping','stopped','backed_up','migrating','migrated','installed','main_ready','activating','restarting_target','succeeded','restoring','rolled_back','aborted'), 'unknown_phase')
         if phase == 'succeeded':
             self.health()
@@ -815,8 +891,8 @@ def active_run():
     if not file.exists():
         return None
     owner = read_json(common.regular(file))
-    run = Path(owner['run'])
-    require(run.is_absolute() and common.file_digest(common.regular(run/'plan.json')) == owner['plan_hash'], 'active_run_changed')
+    run = Path(owner['run']).resolve()
+    require(Path(owner['run']).is_absolute() and common.file_digest(common.regular(run/'plan.json')) == owner['plan_hash'], 'active_run_changed')
     journal = read_json(common.regular(run/'journal.json'))
     if journal['phase'] in ('succeeded', 'rolled_back', 'aborted'):
         return None
@@ -824,24 +900,27 @@ def active_run():
 
 
 def claim_run(run):
+    run = run.resolve()
     active = active_run()
     require(active is None or active == run, '別の停止更新が未完了です。./scripts/dona-update resumeで既存runを再開してください')
     owner_file = Path.home()/'.dona-maintenance/offline-active.json'
-    current = read_json(common.regular(owner_file)) if owner_file.exists() else None
+    current = canonical_owner(read_json(common.regular(owner_file))) if owner_file.exists() else None
     target = {'run': str(run), 'plan_hash': common.file_digest(run/'plan.json')}
     if current == target:
         return  # 同じrunのcrash再開ではprepare時のownerへ戻さない。
     plan = read_json(common.regular(run/'plan.json'))
-    require(plan.get('previous_offline_run') == current, 'offline_owner_changed; 最新状態で新しいrunを準備してください')
+    require(canonical_owner(plan.get('previous_offline_run')) == current, 'offline_owner_changed; 最新状態で新しいrunを準備してください')
     atomic(owner_file, encode(target))
 
 def main():
     parser = argparse.ArgumentParser(description='Dona停止更新CLI。Donaの外のターミナルで実行してください。')
-    parser.add_argument('action', choices=('update', 'prepare', 'resume', 'status', 'restore'))
+    parser.add_argument('action', choices=('update', 'prepare', 'resume', 'status', 'restore', 'reconcile-source'))
     parser.add_argument('--run', type=Path)
+    parser.add_argument('--reconciliation', type=Path, help='外部operatorが作成した再生成原因・副作用の照合記録')
     parser.add_argument('--fresh-generation', action='store_true', help='旧履歴を保全し、独立した空DBへ切り替える')
     parser.add_argument('--repository', type=Path, default=Path(__file__).resolve().parents[2])
     args = parser.parse_args()
+    require(bool(args.reconciliation) == (args.action == 'reconcile-source'), 'reconciliation_argument_required_only_for_reconcile_source')
     require(sys.platform == 'darwin' and os.getuid() != 0, 'macos_gui_user_required')
     require(not args.fresh_generation or args.action in ('prepare', 'update'), 'fresh_mode_only_on_prepare')
     previous = active_run() if args.run is None else None
@@ -851,10 +930,12 @@ def main():
         os.execv(sys.executable, [sys.executable, str(previous/'offline_update.py'), 'resume', '--run', str(previous)])
     run = args.run or previous or Path.home()/'.dona-maintenance'/('offline-'+time.strftime('%Y%m%d-%H%M%S'))
     require(run.is_absolute(), 'absolute_run_required')
+    run = run.resolve()
     if args.action == 'status':
         journal = read_json(run/'journal.json')
         print(json.dumps({'phase': journal['phase'], 'target_sha': read_json(run/'plan.json')['target_sha'],
-                          'error': journal.get('error')}, ensure_ascii=False))
+                          'error': journal.get('error'), 'plan_hash': journal.get('plan_hash'),
+                          'recreation_observation_hash': recreation_observation_hash(journal) if journal.get('source_recreation_detected') else None}, ensure_ascii=False))
         return
     if args.action in ('prepare', 'update'):
         # prepare中も既存maintenanceとの競合を防ぐ。外部online updaterは停止直前に照合。
@@ -870,11 +951,14 @@ def main():
         os.execv(sys.executable, [sys.executable, str(run/'offline_update.py'), 'resume', '--run', str(run)])
     require(args.run is not None or previous is not None, 'run_required')
     if Path(__file__).resolve() != (run/'offline_update.py').resolve():
-        os.execv(sys.executable, [sys.executable, str(run/'offline_update.py'), args.action, '--run', str(run)])
+        os.execv(sys.executable, [sys.executable, str(run/'offline_update.py'), args.action, '--run', str(run)] +
+                 (['--reconciliation', str(args.reconciliation.resolve())] if args.reconciliation else []))
     with common.locked(run):
         runner = Runner(run)
         claim_run(run)
-        if args.action == 'restore':
+        if args.action == 'reconcile-source':
+            runner.reconcile_source(args.reconciliation.resolve())
+        elif args.action == 'restore':
             runner.restore()
         else:
             runner.execute()
