@@ -111,6 +111,16 @@ class HandoffTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'retired_generation_process_running'):
             h.assert_no_retired_process([],{9999:Path('/old/control/updater')},roots,set())
 
+    def test_database_symlink_and_hardlink_alias_are_detected(self):
+        old=self.root/'old.sqlite';old.write_bytes(b'db')
+        new=self.root/'new.sqlite';new.symlink_to(old)
+        with self.assertRaisesRegex(RuntimeError,'database_not_regular'):h.database_identities([new])
+        new.unlink();os.link(old,new)
+        self.assertTrue(h.database_identities([old]) & h.database_identities([new]))
+        with self.assertRaisesRegex(RuntimeError,'database_identity_overlap'):h.database_identities([old,new])
+        new.unlink();new.write_bytes(b'new db')
+        self.assertFalse(h.database_identities([old]) & h.database_identities([new]))
+
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)
         with self.assertRaisesRegex(RuntimeError,'not_private_or_owned'):h.read(p)

@@ -460,6 +460,10 @@ class Runner:
                 p = table.get(observation['pid'])
                 require(p and p['uid'] == os.getuid(), 'service_process_owner')
                 roots.append(p)
+        if self.journal.get('source_stop_receipt') and not self.journal.get('activation_started') and roots:
+            # 初回停止後の再生成は、その間の外部作用が不明。killして証拠を消さない。
+            self.record(source_recreation_detected=True, source_recreation_processes=roots)
+            raise RuntimeError('source_recreation_requires_reconciliation')
         if check_source and not self.journal.get('source_stop_guard'):
             listing = command(['/bin/launchctl', 'print-disabled', self.live.domain])
             require('disabled services = {' in listing, 'launchd_disabled_state_unknown')
@@ -711,6 +715,7 @@ class Runner:
 
     def execute(self):
         phase = self.journal['phase']
+        require(not self.journal.get('source_recreation_detected'), 'source_recreation_requires_reconciliation')
         require(phase in ('prepared','stopping','stopped','backed_up','migrating','migrated','installed','main_ready','activating','restarting_target','succeeded','restoring','rolled_back','aborted'), 'unknown_phase')
         if phase == 'succeeded':
             self.health()
@@ -777,7 +782,9 @@ class Runner:
         except Exception as error:
             self.record(error=type(error).__name__ + ': ' + str(error))
             # 受付開始後は新データを保ち、同じrunで前進復旧する。
-            if self.journal.get('activation_started'):
+            if self.journal.get('source_recreation_detected'):
+                progress('旧世代processの再生成を検出しました。副作用の照合が必要なため切替・自動復旧を保留します。')
+            elif self.journal.get('activation_started'):
                 progress('起動確認に失敗しました。データを保持しています。同じrunのresumeで再確認できます。')
             elif self.journal['phase'] not in ('prepared', 'stopping', 'aborted'):
                 progress('起動前の失敗のため、バックアップから復元します。')

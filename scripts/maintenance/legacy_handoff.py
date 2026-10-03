@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -72,6 +73,17 @@ def assert_no_retired_process(rows, cwds, retired_roots, exempt):
                 raise RuntimeError('retired_generation_process_running')
 
 
+def database_identities(paths):
+    identities = set()
+    for value in paths:
+        file = Path(value)
+        info = file.stat()
+        require(not file.is_symlink() and stat.S_ISREG(info.st_mode), 'database_not_regular')
+        identities.add((info.st_dev, info.st_ino))
+    require(len(identities) == len(paths), 'database_identity_overlap')
+    return identities
+
+
 def verify_no_recreation(run, workspace):
     plan = read(run/'plan.json')
     old = read(run/'inventory.json')
@@ -79,6 +91,7 @@ def verify_no_recreation(run, workspace):
     require(current['old_pointer'] != old['old_pointer'], 'old_release_restored')
     require(current['databases'][0] == str(Path(plan['generation'])/'dona.sqlite3'), 'handoff_generation_mismatch')
     require(not set(current['databases']) & set(old['databases']), 'old_database_reactivated')
+    require(not database_identities(current['databases']) & database_identities(old['databases']), 'old_database_reactivated')
     raw = subprocess.check_output(['/bin/ps', '-axo', 'pid=,ppid=,uid=,args='], text=True)
     rows, parents = [], {}
     for line in raw.splitlines():
@@ -112,7 +125,7 @@ def verify_cutover(run, expected=None):
     seals = {name: digest((run/name).read_bytes()) for name in ['plan.json', 'journal.json', 'inventory.json', 'backup/index.json']}
     if expected is not None:
         require(seals == expected, 'cutover_evidence_changed')
-    require(plan.get('mode') == 'fresh_generation' and journal.get('phase') == 'succeeded', 'fresh_cutover_not_succeeded')
+    require(plan.get('mode') == 'fresh_generation' and journal.get('phase') == 'succeeded' and not journal.get('source_recreation_detected'), 'fresh_cutover_not_succeeded')
     require(journal['plan_hash'] == seals['plan.json'] and plan['inventory_hash'] == seals['inventory.json'] and journal['backup_index_hash'] == seals['backup/index.json'], 'cutover_seal_mismatch')
     receipt = journal.get('source_stop_receipt', {})
     require(receipt.get('processes') and receipt.get('herdr_session') == 'dona' and

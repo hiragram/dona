@@ -455,6 +455,35 @@ class ActiveRunTests(unittest.TestCase):
 if __name__ == '__main__':unittest.main()
 
 class FreshGenerationTests(unittest.TestCase):
+    def test_recreated_source_is_held_before_kill_and_cannot_auto_resume(self):
+        for phase in ('stopping','stopped','backed_up','migrating','migrated'):
+            runner=FakeRunner(phase);runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+            new=proc(800002)
+            with patch.object(m,'herdr_root',return_value=[new]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={new['pid']:new}), patch.object(m,'ProcessStop') as stop, \
+                 patch.object(runner,'switch_disabled') as disable:
+                with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):
+                    m.Runner.stop(runner)
+                stop.assert_not_called();disable.assert_not_called()
+            self.assertTrue(runner.journal['source_recreation_detected'])
+            self.assertEqual(runner.journal['source_recreation_processes'],[new])
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+            self.assertNotIn('restore',runner.calls)
+            self.assertNotIn('main',runner.calls)
+
+    def test_execute_does_not_restore_after_source_recreation(self):
+        runner=FakeRunner('backed_up');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+        runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+        runner.stop=m.Runner.stop.__get__(runner,m.Runner)
+        new=proc(800002)
+        with patch.object(m,'herdr_root',return_value=[new]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={new['pid']:new}):
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+        self.assertTrue(runner.journal['source_recreation_detected'])
+        self.assertNotIn('restore',runner.calls)
+        self.assertNotIn('main',runner.calls)
+
     def test_stopping_resume_keeps_previous_stop_receipt(self):
         runner=FakeRunner('stopping');runner.live=unittest.mock.Mock()
         runner.live.observe.return_value=None

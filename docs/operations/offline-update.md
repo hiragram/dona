@@ -90,7 +90,7 @@ python3 -B "$HOME/.dona-maintenance/offline-20261001-1/offline_update.py" resume
 途中の再起動でもLaunchAgentのdisableが残るため、migration中のDBでサービスが勝手に起動しません。
 
 - 通常Updaterが停止直前にsourceを切り替えた場合は、凍結中に不一致を検出し、kill前にprocessを再開してLaunchAgentのenable/disableを元へ戻します。runは`aborted`となり、`./scripts/dona-update`で新しいsourceから準備し直せます。凍結途中のcrashでも、次のresumeでまず凍結を取り消します。
-- 停止確認前の失敗ではDBに進まず、保存したプロセスidentityを次回照合します。
+- 停止確認前の失敗ではDBに進まず、保存したプロセスidentityを次回照合します。停止receipt保存後に旧サービス・Herdrが再生成された場合は `source_recreation_requires_reconciliation` として保留します。その間の外部操作が不明なので、再停止・自動rollback・resumeによる続行は行わず、外部operatorが再生成の原因と副作用を照合します。
 - 新mainの起動を試みる前に失敗した場合は、確定backupからDB・Result・plistを戻して旧版を起動します。復旧にも失敗した場合は`restoring`に残し、同じrunから復旧を再開します。
 - mainの起動intent以後は必須MCPから書き込まれた可能性があり、その後はDispatcherのscheduleやjobも実行され得るため、DBを巻き戻しません。次回の`resume`でtarget側を停止・再起動し、更新後のデータを保持したまま前進復旧します。
 - `succeeded`のrunを再開した場合は正常性を再確認するだけです。
