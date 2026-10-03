@@ -213,7 +213,7 @@ describe("DispatcherApi", () => {
     otherEnvelope.reply_target!.thread_ts="1756722031.000001";
     otherEnvelope.subject.thread_ts="1756722031.000001";
     const other=await request(config.socketPath,"POST","/v1/events",otherEnvelope);
-    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${other.body.event_id}`)).status,200);
+    assert.equal((await request(config.socketPath,"GET",`/v1/jobs/${job.job_id}?source_event_id=${other.body.event_id}`)).status,403);
     const otherChannelEnvelope=eventEnvelope("Ev-job-api-other-channel");
     otherChannelEnvelope.subject.channel_id="C_OTHER";otherChannelEnvelope.reply_target!.channel_id="C_OTHER";
     const otherChannel=await request(config.socketPath,"POST","/v1/events",otherChannelEnvelope);
@@ -573,7 +573,7 @@ describe("DispatcherApi", () => {
         app_schema_read_max: version.body.app_schema_read_max,
         app_schema_write: version.body.app_schema_write,
       },
-      { app_schema: 3, app_schema_read_min: 2, app_schema_read_max: 3, app_schema_write: 3 },
+      { app_schema: 3, app_schema_read_min: 2, app_schema_read_max: 4, app_schema_write: 3 },
     );
     assert.equal(JSON.stringify(version.body).includes(config.databasePath), false);
     database.manualComplete(eventId);

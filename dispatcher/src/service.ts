@@ -1,3 +1,4 @@
+import { assertTaskGenerationFile } from "./task-execution.js";
 import type { DispatcherConfig } from "./config.js";
 import { DispatcherApi } from "./api.js";
 import { DispatcherDatabase } from "./database.js";
@@ -21,10 +22,12 @@ import { JobProgressCoordinator, JobProgressStore } from "./job-progress.js";
 export async function runService(config: DispatcherConfig): Promise<void> {
   const apiLogger = createLogger("dispatcher_api");
   const workerLogger = createLogger("dispatcher_worker");
+  assertTaskGenerationFile(config.databasePath);
   const database = new DispatcherDatabase(config.databasePath, {
     jobsPerEventMax: config.jobsPerEventMax,
     jobObjectiveTotalMaxBytes: config.jobObjectiveTotalMaxBytes,
   });
+  database.tasks.assertFreshExecutionModel();
   const updateNotificationDatabase = new UpdateNotificationDatabase(config.updateNotificationDatabasePath);
   let jobProgressStore: JobProgressStore | undefined;
   try {

@@ -22,6 +22,20 @@
 - 認可境界、永続状態、非同期処理、外部連携を設計・実装する際は、project Skillの`$review-informed-design`を使い、該当する過去のreview知見を現在の要件とコードに照らして確認する。
 - 過去の指摘を現在の欠陥や一律の実装要件とみなさない。PR提出後のCodex Cloud reviewには引き続き`$code-submission-review-cycle`を使う。
 
+## Task世代の実行契約
+
+Task世代では、この節を以下の旧job担当・手動引継ぎ手順より優先する。旧手順は旧世代の保守照合用であり、新Taskの作成や再開には使わない。
+
+- 通常の長時間作業は`delegate_task`へ委任する。初回write前に安定した`task_key`を決め、対象Issueは`issue_number`へ構造化指定する。scope、権限、依頼を超える自動再開を許可しない。
+- Task IDは仕事のidentity、Attempt ID（内部のjob ID）は一回の実行identity。`get_task` / `list_tasks`で照合し、Taskごとの現在Attempt・待機理由・残予算を見る。自動回復中に別Taskや旧`resume_job`で重複実行しない。
+- `pause_task` / `resume_task` / `cancel_task` / `steer_task`には直前のTask revisionと現在のSlack event IDを渡す。`retry_task`は停止確認済みの再試行上限待ちで、利用者が追加実行を明示した場合だけ総Attempt上限を増やす。旧Attempt数は消さない。
+- `job_json.task`があるworkerはProjectの`Dona Job ID`、`Dona Task ID`、`Status`を書かない。DispatcherがIssue node IDで排他し、明示されたProjectへ`Dona Task ID`と進捗を同期する。Project同期失敗は実行所有権の喪失ではない。
+- Project同期には既存のTEXT field `Dona Task ID`とStatus options `Todo` / `In Progress` / `Merge Ready`が必要。Issue全体の提出完了を依頼された場合だけ`project.completion_status: "Merge Ready"`を指定し、workerのobjectiveへcurrent-head review/CIを含む受け入れ条件を明記する。既定は`In Progress`で、調査完了を提出完了にしない。
+- 成功responseが返した`delegate_task`の`action`だけをEvent Resultへ記録する。応答不明は`list_tasks`で同じevent・task_keyを照合し、成功actionを推測しない。group terminalまで`processing`を維持し、Attemptの通常中断では最終失敗を投稿しない。
+- `dona_job`通知の`payload.task`がある場合はTask単位の結果として扱う。Taskの待機理由、current Attempt、必要な成果だけを通知する。旧Attemptの中断をTaskの取消として報告しない。group/通知先/認可の既存規則は維持する。
+- schedule workは従来の`delegate_scheduled_work`と永続認可・read-only契約を使用する。通常Taskの自動再開許可を流用しない。
+- 実行モデルと切替条件は[ADR 0004](docs/adr/0004-task-attempt-execution.md)と[Task運用](docs/operations/task-execution.md)を参照する。
+
 ## GitHub ProjectsのIssue着手と提出完了
 
 - Dona Projectの対象Issueを実装・対応する場合は、[Issue lifecycle手順](docs/operations/github-project-issue-lifecycle.md)を読み、Dona親はdelegate前に担当を確認し、workerは着手前に再確認する。

@@ -148,7 +148,7 @@ const jobWorkspaceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("scratch") }).strip(),
   z.object({ kind: z.literal("github"), repository, base_ref: gitRef.optional() }).strip(),
 ]);
-const jobDisplaySchema = z.object({
+export const jobDisplaySchema = z.object({
   short_name: z.string().min(1).max(512),
   issue: z.object({ repository, number: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict().optional(),
 }).strict();

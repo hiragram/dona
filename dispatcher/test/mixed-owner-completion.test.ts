@@ -154,6 +154,9 @@ for (const schema of ["fresh","v2"] as const) for (const outcome of ["completed"
         async get() { return { ok: false, stdout: "", stderr: "", exitCode: 1, timedOut: false, aborted: false, errorCode: "agent_not_found" }; },
         async cancel() { return ok("done"); },
         async cleanup() { return ok("done"); },
+        async observeWorker() {return {state:"inactive",reason:"fixture_idle",observed_at:new Date().toISOString(),process_ids:[123],process_groups:[123]};},
+        async retireWorker() {},
+        async workerRetired() {return false;},
       };
       supervisor = new JobSupervisor(h.database, runtime, config, integrationLogger, () => {});
       api = new DispatcherApi(h.database, { isRunning: () => true, wake() {} }, supervisor, config, integrationLogger);
@@ -167,7 +170,11 @@ for (const schema of ["fresh","v2"] as const) for (const outcome of ["completed"
       assert.equal(jobs[2]!.objective,scheduledObjective);
       for (const id of [ordinary.event_id, eventId]) h.database.saveCompleted(id, { schema_version: 1, event_id: id, status: "completed", completed_at: new Date().toISOString() }, path.join(root, `${id}.json`));
       await supervisor.start();
-      await waitFor(() => jobs.every(job => h.database.getJob(job.job_id)?.completion_event_id != null));
+      if(outcome==="missing") {
+        await waitFor(()=>jobs.every(job=>h.database.getJob(job.job_id)?.status==="needs_review")&&h.database.getJob(jobs[2]!.job_id)?.completion_event_id!=null);
+        assert.equal(h.database.getJob(jobs[0]!.job_id)!.completion_event_id,null);
+        assert.equal(h.database.getJob(jobs[1]!.job_id)!.completion_event_id,null);
+      } else await waitFor(() => jobs.every(job => h.database.getJob(job.job_id)?.completion_event_id != null));
       if (outcome === "completed") await waitFor(() => h.database.getJobGroup(ordinary.event_id)?.all_terminal_event_id != null);
       else assert.equal(h.database.getJobGroup(ordinary.event_id)?.all_terminal_event_id,null);
       await supervisor.stop(); supervisor = undefined;

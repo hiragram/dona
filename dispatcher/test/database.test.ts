@@ -173,7 +173,7 @@ describe("DispatcherDatabase", () => {
     migration.close();
 
     const database = new DispatcherDatabase(config.databasePath);
-    assert.deepEqual(database.schemaCompatibility(), { actual: 3, read_min: 2, read_max: 3, write: 3 });
+    assert.deepEqual(database.schemaCompatibility(), { actual: 3, read_min: 2, read_max: 4, write: 3 });
     const after = database.listJobs()
       .map((row) => withoutJobKey(row as unknown as SqliteRow))
       .sort((left, right) => String(left.job_id).localeCompare(String(right.job_id)));
@@ -640,7 +640,7 @@ describe("DispatcherDatabase", () => {
     delete process.env.DONA_RELEASE_MANIFEST_PATH;
     try {
       const database = new DispatcherDatabase(config.databasePath);
-      assert.deepEqual(database.schemaCompatibility(), { actual: 2, read_min: 2, read_max: 3, write: 2 });
+      assert.deepEqual(database.schemaCompatibility(), { actual: 2, read_min: 2, read_max: 4, write: 2 });
       database.close();
     } finally {
       if (previousManifest === undefined) delete process.env.DONA_RELEASE_MANIFEST_PATH;

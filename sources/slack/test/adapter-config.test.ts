@@ -18,7 +18,7 @@ describe("loadAdapterConfig", () => {
       config.healthSocketPath,
       path.join(os.homedir(), "Library", "Application Support", "Dona", "run", "slack-adapter.sock"),
     );
-    assert.equal(config.appSchemaWrite, 3);
+    assert.equal(config.appSchemaWrite, 4);
   });
 
   test("loads bridge schema write compatibility from the release manifest", async () => {
@@ -45,4 +45,14 @@ describe("loadAdapterConfig", () => {
     );
   });
 
+});
+
+test("Task世代のmanifestをSlack adapterが受理する",async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),"dona-task-manifest-"));
+  try{
+    const manifest=path.join(root,"manifest.json");
+    await fs.writeFile(manifest,JSON.stringify({sha:"a".repeat(40),compatibility:{app_schema_read_min:4,app_schema_read_max:4,app_schema_write:4}}));
+    const config=loadAdapterConfig({SLACK_WORKSPACES:"company",DONA_RELEASE_MANIFEST_PATH:manifest});
+    assert.equal(config.appSchemaWrite,4);assert.equal(config.appSchemaReadMax,4);
+  }finally{await fs.rm(root,{recursive:true,force:true});}
 });

@@ -342,8 +342,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
         // An absent agent alone is not evidence: require an empty shell process tree below.
         state = "inactive";
       }
-      if (state === "working" || state === "waiting" || state === "unknown")
-        return { ...unknown(`agent_${state}`), state };
+      if (state === "unknown") return unknown("agent_unknown");
       const processes = await this.herdr(["pane", "process-info", "--pane", row.herdr_pane_id], 2_000, signal, true);
       const processInfo = (parseJson(processes.stdout) as { result?: { type?: string; process_info?: { pane_id?: string; shell_pid?: number } } })?.result;
       const shellPid = processInfo?.process_info?.shell_pid;
@@ -354,7 +353,7 @@ export class HerdrJobAgentRuntime implements JobAgentRuntime {
       const processesSeen = processGroups(sample.stdout, shellPid!);
       const ids = processesSeen.process_ids;
       if (!agent.ok && ids.length !== 1) return unknown("unregistered_worker_processes");
-      return { state: "inactive", reason: agent.ok ? "agent_idle" : "empty_shell", observed_at: new Date().toISOString(), ...processesSeen };
+      return { state, reason: agent.ok ? `agent_${state}` : "empty_shell", observed_at: new Date().toISOString(), ...processesSeen };
     } catch { return unknown("runtime_query_failed"); }
   }
 
