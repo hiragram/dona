@@ -69,11 +69,11 @@ class HandoffTest(unittest.TestCase):
         def save(name, value):
             p=run/name;p.write_text(json.dumps(value));p.chmod(0o600)
             return h.digest(p.read_bytes())
-        inventory=save('inventory.json', {})
+        inventory=save('inventory.json', {'databases':['/old/db-'+str(i) for i in range(4)]})
         entries=[]
         for index in range(4):
             file=run/'backup'/str(index);file.write_bytes(b'old database')
-            entries.append({'exists':True,'backup':str(file),'hash':h.digest(file.read_bytes())})
+            entries.append({'source':'/old/db-'+str(index),'exists':True,'backup':str(file),'hash':h.digest(file.read_bytes())})
         backup=save('backup/index.json', entries)
         plan=save('plan.json', {'mode':'fresh_generation','inventory_hash':inventory,'bundle':{'herdr-config.toml':'sealed-config'}})
         receipt={'verified_at':'2026-10-03T12:00:00Z','processes':[{'pid':123,'uid':456,'start':'Sat Oct 3 12:00:00 2026'}],
@@ -85,6 +85,13 @@ class HandoffTest(unittest.TestCase):
             self.assertEqual(h.verify_cutover(run,seals),seals)
         with patch.object(subprocess,'check_output',return_value='123 456 Sat Oct 3 12:00:00 2026 S\n'):
             with self.assertRaisesRegex(RuntimeError,'old_process_still_alive'):h.verify_cutover(run,seals)
+        for changed in ({'exists':False,'hash':None}, {'source':'/different/db'}):
+            original=entries[0].copy();entries[0].update(changed)
+            journal['backup_index_hash']=save('backup/index.json',entries);save('journal.json',journal)
+            with patch.object(subprocess,'check_output',return_value=''):
+                with self.assertRaisesRegex(RuntimeError,'old_database_backup_incomplete'):h.verify_cutover(run)
+            entries[0]=original
+        journal['backup_index_hash']=save('backup/index.json',entries)
         receipt['processes']=[];save('journal.json',journal)
         with patch.object(subprocess,'check_output',return_value=''):
             h.verify_cutover(run)
@@ -165,7 +172,28 @@ class HandoffTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'offline_lineage_storage_mismatch'):h.expected_databases(seed,owner)
         save(owner,seal(successor,plan,{'databases':expected}))
         save(successor/'journal.json',{'phase':'prepared','plan_hash':h.digest((successor/'plan.json').read_bytes())})
-        with self.assertRaisesRegex(RuntimeError,'offline_lineage_not_succeeded'):h.expected_databases(seed,owner)
+        with self.assertRaisesRegex(RuntimeError,'offline_lineage_not_terminal'):h.expected_databases(seed,owner)
+
+    def test_rollback_and_abort_lineage_remains_usable_after_next_update(self):
+        def write(path,value):
+            path.write_text(json.dumps(value));path.chmod(0o600)
+            return h.digest(path.read_bytes())
+        def run(name,phase,mode,previous,databases):
+            root=self.root/name;root.mkdir()
+            plan={'mode':mode,'generation':str(root/'g'),'previous_offline_run':previous,
+                  'inventory_hash':write(root/'inventory.json',{'databases':databases})}
+            hashed=write(root/'plan.json',plan)
+            write(root/'journal.json',{'phase':phase,'plan_hash':hashed})
+            return {'run':str(root),'plan_hash':hashed}
+        seed=run('seed','succeeded','fresh_generation',None,[])
+        owner=self.root/'owner.json';write(owner,seed)
+        expected=h.expected_databases(seed['run'],owner)
+        previous=seed
+        for phase in ('rolled_back','aborted'):
+            previous=run(phase,phase,'preserve',previous,expected);write(owner,previous)
+            self.assertEqual(h.expected_databases(seed['run'],owner),expected)
+        successor=run('next','succeeded','preserve',previous,expected);write(owner,successor)
+        self.assertEqual(h.expected_databases(seed['run'],owner),expected[:3]+[str(self.root/'next/g/control/updater.sqlite3')])
 
     def test_untrusted_file_and_path_rejected(self):
         p=self.root/'record';p.write_text('{}');p.chmod(0o666)

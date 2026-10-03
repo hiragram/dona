@@ -95,15 +95,18 @@ def expected_databases(seed_run, owner_path=None):
         plan, journal, inventory = (read(run/name) for name in ('plan.json', 'journal.json', 'inventory.json'))
         require(owner['plan_hash'] == journal['plan_hash'] == digest((run/'plan.json').read_bytes()) and
                 plan['inventory_hash'] == digest((run/'inventory.json').read_bytes()), 'offline_lineage_seal_mismatch')
-        require(journal['phase'] == 'succeeded' and not journal.get('source_recreation_detected'), 'offline_lineage_not_succeeded')
-        chain.append((plan, inventory))
+        require(journal['phase'] in ('succeeded', 'rolled_back', 'aborted') and not journal.get('source_recreation_detected'), 'offline_lineage_not_terminal')
+        chain.append((plan, inventory, journal['phase']))
         if run == Path(seed_run):
-            require(plan.get('mode') == 'fresh_generation', 'offline_lineage_seed_invalid')
+            require(plan.get('mode') == 'fresh_generation' and journal['phase'] == 'succeeded', 'offline_lineage_seed_invalid')
             generation = Path(plan['generation'])
             paths = [str(generation/name) for name in ('dona.sqlite3', 'update-notifications.sqlite3', 'job-progress.sqlite3', 'control/updater.sqlite3')]
-            for descendant, source in reversed(chain[:-1]):
-                require(descendant.get('mode') == 'preserve' and source['databases'] == paths, 'offline_lineage_storage_mismatch')
-                paths = paths[:3] + [str(Path(descendant['generation'])/'control/updater.sqlite3')]
+            for descendant, source, phase in reversed(chain[:-1]):
+                require(source['databases'] == paths, 'offline_lineage_storage_mismatch')
+                # 正規の復旧・中止は更新元の4DBを維持する。次回成功runからもたどれる。
+                if phase == 'succeeded':
+                    require(descendant.get('mode') == 'preserve', 'offline_lineage_storage_mismatch')
+                    paths = paths[:3] + [str(Path(descendant['generation'])/'control/updater.sqlite3')]
             return paths
         owner = plan.get('previous_offline_run')
         require(isinstance(owner, dict), 'offline_lineage_missing')
@@ -169,10 +172,16 @@ def verify_cutover(run, expected=None):
         current = processes.get(old['pid'])
         require(not current or current[:2] != (old['uid'], old['start']) or 'Z' in current[2], 'old_process_still_alive')
     entries = read(run/'backup/index.json')
-    require(len([item for item in entries if not item.get('directory')]) == 4, 'old_database_backup_incomplete')
-    for item in entries:
-        if item['exists'] and not item.get('directory'):
-            require(digest(Path(item['backup']).read_bytes()) == item['hash'], 'old_database_backup_changed')
+    databases = [item for item in entries if not item.get('directory')]
+    source_databases = read(run/'inventory.json')['databases']
+    require(len(databases) == len(source_databases) == 4 and len(set(source_databases)) == 4 and
+            [item.get('source') for item in databases] == source_databases, 'old_database_backup_incomplete')
+    for item in databases:
+        require(item.get('exists') is True and isinstance(item.get('backup'), str) and
+                isinstance(item.get('hash'), str), 'old_database_backup_incomplete')
+        backup = Path(item['backup'])
+        require(backup.is_file() and not backup.is_symlink(), 'old_database_backup_incomplete')
+        require(digest(backup.read_bytes()) == item['hash'], 'old_database_backup_changed')
     return seals
 
 
