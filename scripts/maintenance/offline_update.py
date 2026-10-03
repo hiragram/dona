@@ -826,8 +826,14 @@ def active_run():
 def claim_run(run):
     active = active_run()
     require(active is None or active == run, '別の停止更新が未完了です。./scripts/dona-update resumeで既存runを再開してください')
-    atomic(Path.home()/'.dona-maintenance/offline-active.json',
-           encode({'run': str(run), 'plan_hash': common.file_digest(run/'plan.json')}))
+    owner_file = Path.home()/'.dona-maintenance/offline-active.json'
+    current = read_json(common.regular(owner_file)) if owner_file.exists() else None
+    target = {'run': str(run), 'plan_hash': common.file_digest(run/'plan.json')}
+    if current == target:
+        return  # 同じrunのcrash再開ではprepare時のownerへ戻さない。
+    plan = read_json(common.regular(run/'plan.json'))
+    require(plan.get('previous_offline_run') == current, 'offline_owner_changed; 最新状態で新しいrunを準備してください')
+    atomic(owner_file, encode(target))
 
 def main():
     parser = argparse.ArgumentParser(description='Dona停止更新CLI。Donaの外のターミナルで実行してください。')

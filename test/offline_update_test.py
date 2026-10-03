@@ -442,7 +442,32 @@ class ActiveRunTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'未完了'):m.claim_run(second)
             m.atomic(first/'journal.json',m.encode({'phase':'aborted'}))
             self.assertIsNone(m.active_run())
+            m.atomic(second/'plan.json',m.encode({'previous_offline_run':m.read_json(root/'.dona-maintenance/offline-active.json')}))
             m.claim_run(second)
+
+    def test_stale_prepared_run_cannot_replace_successful_owner(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
+            root=Path(directory);(root/'.dona-maintenance').mkdir()
+            owner=root/'.dona-maintenance/offline-active.json'
+            def prepare(name, previous):
+                run=root/name;run.mkdir()
+                m.atomic(run/'plan.json',m.encode({'previous_offline_run':previous}))
+                m.atomic(run/'journal.json',m.encode({'phase':'prepared'}))
+                return run
+            seed=prepare('seed',None);m.claim_run(seed)
+            m.atomic(seed/'journal.json',m.encode({'phase':'succeeded'}))
+            previous=m.read_json(owner)
+            stale=prepare('stale',previous);newer=prepare('newer',previous)
+            m.claim_run(newer)
+            current=owner.read_bytes()
+            m.claim_run(newer)  # 同じrunの再開は冪等。
+            self.assertEqual(owner.read_bytes(),current)
+            m.atomic(newer/'journal.json',m.encode({'phase':'succeeded'}))
+            with self.assertRaisesRegex(RuntimeError,'offline_owner_changed'):m.claim_run(stale)
+            self.assertEqual(owner.read_bytes(),current)
+            self.assertEqual(m.read_json(stale/'journal.json')['phase'],'prepared')
+            successor=prepare('successor',m.read_json(owner));m.claim_run(successor)
+            self.assertEqual(m.active_run(),successor)
 
     def test_changed_plan_is_not_resumed_implicitly(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
