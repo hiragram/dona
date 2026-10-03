@@ -89,3 +89,14 @@ test('v1への復旧ではschemaを変更せず旧requestをretireする', () =>
     assert.equal((db.prepare('SELECT status FROM update_outbox').get() as {status:string}).status,'needs_review');
   } finally {db.close();}
 });
+
+test('新世代初期化はseedだけを許し、仕事・旧履歴・active requestを拒否する', async()=>{
+  const {assertFreshDatabase}=await import(pathToFileURL(path.resolve('../scripts/maintenance/offline_state.mjs')).href);
+  const db=new Database(':memory:');
+  try {
+    db.exec('CREATE TABLE task_execution_schema(version INTEGER); INSERT INTO task_execution_schema VALUES(1); CREATE TABLE controller_state(active_request_id TEXT); INSERT INTO controller_state VALUES(NULL); CREATE TABLE events(id TEXT)');
+    assertFreshDatabase(db);
+    db.exec("INSERT INTO events VALUES('old-event')");assert.throws(()=>assertFreshDatabase(db),/fresh_database_not_empty/);
+    db.exec("DELETE FROM events; UPDATE controller_state SET active_request_id='active'");assert.throws(()=>assertFreshDatabase(db),/fresh_database_not_empty/);
+  } finally {db.close();}
+});

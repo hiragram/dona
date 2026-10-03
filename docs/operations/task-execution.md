@@ -38,7 +38,7 @@ Project同期は実行と独立する。write intentを先に保存し、成功r
 
 このPRを旧世代へ通常self-updateする運用は行わない。release contractはschema 4とrollback不可を宣言する。旧世代のDBをサービス起動時に暗黙採用しない。Task世代のDBは`user_version=4`なので旧readerは拒否する。
 
-本番切替は別作業として、次を具体的なinventoryと照合して実施する。
+本番切替はDonaの外から[停止更新CLI](offline-update.md)の`prepare --fresh-generation`とsealed runnerの`resume`で行う。旧Donaに不足するMCP機能の追加や再起動は不要。既存の`reset_upgrade.py`の残存worker受容receiptをTask世代の停止確認の代わりに使わない。次を具体的なinventoryと照合して実施する。
 
 1. 旧受付、scheduler、worker再生成主体、writerを停止し、同じ世代の停止・再生成抑止証拠を確認する。
 2. 旧DBをWAL対応の手順で保全し、worktree・未commit差分・Result・通知状態・外部操作を棚卸しする。削除しない。

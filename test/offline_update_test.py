@@ -453,3 +453,63 @@ class ActiveRunTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'active_run_changed'):m.active_run()
 
 if __name__ == '__main__':unittest.main()
+
+class FreshGenerationTests(unittest.TestCase):
+    def test_fresh_migration_requires_stop_receipt_and_only_targets_new_paths(self):
+        runner=object.__new__(m.Runner)
+        runner.plan={'mode':'fresh_generation','release':'/target/release','target_sha':'a'*40}
+        runner.g=Path('/new-generation');runner.run=Path('/prepared');runner.node='/node'
+        runner.journal={}
+        with patch.object(m,'command') as call:
+            with self.assertRaisesRegex(RuntimeError,'stop_receipt_required'):runner.migrate()
+            call.assert_not_called()
+            runner.journal['source_stop_receipt']={'verified_at':'now'}
+            runner.migrate()
+            request=m.json.loads(call.call_args.kwargs['input'])
+            self.assertTrue(request['fresh_generation'])
+            self.assertTrue(all(p.startswith('/new-generation/') for p in request['databases']))
+            call.reset_mock();runner.migrate(retire_only=True);call.assert_not_called()
+
+    def test_fresh_restore_never_replaces_old_data_or_retires_old_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=RestoreTests().fixture(root)
+            runner.plan['mode']='fresh_generation'
+            source=root/'old-db';source.write_bytes(b'old-history')
+            runner.inv['databases']=[str(source)]*4
+            runner.journal['backup_index_hash']='not-read-because-source-was-not-modified'
+            runner.migrate=lambda **_:self.fail('old ledger changed')
+            runner.restore()
+            self.assertEqual(source.read_bytes(),b'old-history')
+            self.assertEqual(runner.journal['phase'],'rolled_back')
+
+    def test_mode_guard_rejects_preserving_old_schema_before_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release=Path(directory);(release/'config').mkdir()
+            m.atomic(release/'config/schema-rollout.json',m.encode({'phase':'fresh_generation','database_schema':4,'online_migration':False}))
+            with patch.object(m.common,'NodeDatabase') as db:
+                db.return_value.read.return_value=[(3,)]
+                with self.assertRaisesRegex(RuntimeError,'fresh_generation_required'):m.validate_mode(release,{'databases':['old']},'node',False)
+                m.validate_mode(release,{},'node',True)
+                db.return_value.read.return_value=[(4,)]
+                m.validate_mode(release,{'databases':['new']},'node',False)
+
+    def test_fresh_render_uses_isolated_state_and_preserves_source_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);g=root/'new';release=g/'runtime/releases/target'
+            (release/'updater').mkdir(parents=True);(release/'config').mkdir()
+            m.atomic(release/'config/release-compatibility.json',m.encode({'schema_version':1,'app_schema_write':4}))
+            m.atomic(release/'config/update-compatibility-transitions.json',m.encode({'transitions':[]}))
+            run=root/'run';run.mkdir();(run/'main_bridge.mjs').write_text('fixture')
+            inv={'policy':{'executables':{'node':'/old-node','codex':'/old-codex'}},
+                 'configs':{key:{'values':{'DONA_DATABASE_PATH':'/old/db'}} for key in ('dispatcher','slack')},
+                 'databases':['/old/db'], 'old_results':['/old/results'],
+                 'plists':{label:{'EnvironmentVariables':{}} for label in m.LABELS}}
+            before=copy.deepcopy(inv)
+            with patch.object(m.common,'installed_codex',return_value='/new-codex'),patch.object(m.common,'target_required_checks',return_value=[]),patch.object(m.common,'validate_staging') as validate:
+                m.render(run,{'mode':'fresh_generation','generation':str(g),'release':str(release),'node':'/new-node','target_sha':'target'},inv)
+                validate.assert_called_once()
+            self.assertEqual(inv,before)
+            plist=m.plistlib.loads((run/'plists/dev.dona.dispatcher.plist').read_bytes())
+            self.assertEqual(plist['EnvironmentVariables']['DONA_DATABASE_PATH'],str(g/'dona.sqlite3'))
+            self.assertEqual(plist['EnvironmentVariables']['DONA_JOB_RESULTS_DIR'],str(g/'job-results'))
+            self.assertEqual(m.read_json(g/'control/policy.json')['dispatcher_socket'],str(g/'run/d.sock'))

@@ -156,9 +156,38 @@ def toolchain(executables):
     return node, npm, env
 
 
+def fresh(plan):
+    return plan.get('mode') == 'fresh_generation'
+
+
+def fresh_databases(g):
+    return [str(g/name) for name in ('dona.sqlite3', 'update-notifications.sqlite3', 'job-progress.sqlite3', 'control/updater.sqlite3')]
+
+
+def validate_mode(release, inv, node, fresh_generation):
+    contract = read_json(release/'config/schema-rollout.json')
+    if fresh_generation:
+        require(contract.get('phase') == 'fresh_generation' and contract.get('database_schema') == 4, 'fresh_generation_contract_required')
+    elif contract.get('online_migration') is False:
+        db = common.NodeDatabase(node, release/'updater/node_modules/better-sqlite3/lib/index.js')
+        require(db.read(inv['databases'][0], 'PRAGMA user_version') == [(contract['database_schema'],)],
+                'fresh_generation_required; --fresh-generationで新しい空DBへの切替を指定してください')
+
+
 def render(run, plan, inv):
     """code/configを世代分離し、既存DBとResultの絶対pathはそのまま保持する。"""
     g, release = Path(plan['generation']), Path(plan['release'])
+    if fresh(plan):
+        for name in ('config', 'control', 'logs', 'run', 'results', 'job-results'):
+            common.private_dir(g/name)
+        inputs = copy.deepcopy(inv)
+        inputs['policy']['executables']['node'] = plan['node']
+        common.render(run, dict(plan, codex_executable=common.installed_codex()), inputs)
+        common.validate_staging(run, plan, plan['node'])
+        protected = [Path(p).resolve() for p in inv['databases'] + inv['old_results']]
+        for target in [Path(p) for p in fresh_databases(g)] + [g/'results', g/'job-results', g/'run']:
+            require(not any(target.resolve() == old or old in target.resolve().parents or target.resolve() in old.parents for old in protected), 'fresh_paths_overlap_source')
+        return
     for name in ('config', 'control', 'logs', 'run'):
         common.private_dir(g/name)
     policy = copy.deepcopy(inv['policy'])
@@ -286,7 +315,7 @@ def probe_main(run, plan):
     require({row['server'] for row in results if row.get('initialized')} == {'dispatcher','slack'}, 'mcp_probe_failed')
 
 
-def prepare(run, repository):
+def prepare(run, repository, fresh_generation=False):
     require(not run.exists(), 'run_already_exists')
     common.private_dir(run.parent)
     run.mkdir(mode=0o700)
@@ -314,7 +343,7 @@ def prepare(run, repository):
             require(root != protected and root not in protected.parents, 'result_directory_overlaps_update')
     release = common.private_dir(g/'runtime/releases'/sha)
     plan = {'schema_version': 1, 'target_sha': sha, 'generation': str(g), 'release': str(release),
-            'node': node, 'created_at': common.stamp(), 'inventory_hash': common.file_digest(run/'inventory.json')}
+            'node': node, 'mode': 'fresh_generation' if fresh_generation else 'preserve', 'created_at': common.stamp(), 'inventory_hash': common.file_digest(run/'inventory.json')}
     common.staging_space(g, inv['policy'])
     archive = run/'source.tar'
     command([git, '-C', str(repository), 'archive', '--format=tar', '-o', str(archive), sha])
@@ -331,7 +360,8 @@ def prepare(run, repository):
             build_command([node, npm, *args], release/component, run, env=build_env)
     command([node, str(release/'scripts/write-release-manifest.mjs'), str(release), sha,
              command([node, npm, '--version'], env=build_env), inv['policy']['policy_version']])
-    build_command([node, str(Path(__file__).resolve().parents[2]/'test/offline-state-integration.mjs'), str(release)], release, run)
+    validate_mode(release, inv, node, fresh_generation)
+    build_command([node, str(Path(__file__).resolve().parents[2]/'test/offline-state-integration.mjs'), str(release)] + (['--fresh-generation'] if fresh_generation else []), release, run)
     progress('更新用の設定と復旧用の設定を検証しています。')
     render(run, plan, inv)
     probe_main(run, plan)
@@ -381,6 +411,10 @@ class Runner:
         for file, expected in self.inv['files'].items():
             require(common.file_digest(file) == expected, 'source_configuration_changed')
         require(str(Path(self.inv['policy']['current_pointer']).resolve()) == self.inv['old_pointer'], 'source_release_changed')
+        if fresh(self.plan):
+            database = common.NodeDatabase(self.node, Path(self.plan['release'])/'updater/node_modules/better-sqlite3/lib/index.js')
+            rows = database.read(self.inv['databases'][3], "SELECT count(*) FROM update_requests WHERE state NOT IN ('succeeded','failed','rolled_back','needs_review','cancelled','awaiting_approval')")
+            require(rows == [(0,)], 'source_update_in_progress')
 
     def source_preflight(self):
         try:
@@ -448,7 +482,13 @@ class Runner:
         ProcessStop(lambda processes: self.record(processes=processes)).stop(roots, self.journal.get('processes', []), unregister)
         require(not herdr_root(self.policy['executables']['herdr']) and
                 not herdr_starting(self.policy['executables']['herdr']), 'herdr_still_running')
-        self.record(processes=[], server_start_intent=False, server_pid=None)
+        receipt = {'verified_at': common.stamp(), 'processes': self.journal.get('processes', []),
+                   'launch_agents': list(LABELS), 'herdr_session': 'dona',
+                   'herdr_config_sha256': self.plan['bundle']['herdr-config.toml'] if check_source else None}
+        for label in LABELS:
+            require(self.live.observe(label) is None, 'service_still_registered')
+        self.record(processes=[], server_start_intent=False, server_pid=None,
+                    **({'source_stop_receipt': receipt} if check_source else {}))
 
     def backup(self):
         backup = common.private_dir(self.run/'backup')
@@ -485,6 +525,15 @@ class Runner:
         self.record('backed_up', backup_index_hash=common.file_digest(backup/'index.json'))
 
     def migrate(self, retire_only=False):
+        if fresh(self.plan):
+            if retire_only:
+                return  # 旧世代のledgerは変更しない。
+            require(self.journal.get('source_stop_receipt'), 'fresh_generation_stop_receipt_required')
+            request = {'release': self.plan['release'], 'databases': fresh_databases(self.g),
+                       'fresh_generation': True, 'run_id': self.run.name, 'target_sha': self.plan['target_sha']}
+            env = dict(os.environ, DONA_RELEASE_MANIFEST_PATH=str(Path(self.plan['release'])/'release-manifest.json'))
+            command([self.node, str(self.run/'offline_state.mjs')], env=env, input=encode(request), timeout=120)
+            return
         databases = list(self.inv['databases'])
         if not retire_only:
             # 常に確定backupから複製するため、migration途中からの再開でも旧ledgerを壊さない。
@@ -626,7 +675,7 @@ class Runner:
         self.record('restoring')
         self.stop()
         index = self.run/'backup/index.json'
-        if self.journal.get('backup_index_hash') and not self.journal.get('rollback_activation_started'):
+        if not fresh(self.plan) and self.journal.get('backup_index_hash') and not self.journal.get('rollback_activation_started'):
             require(common.file_digest(index) == self.journal['backup_index_hash'], 'backup_index_changed')
             entries = read_json(index)
             for item in entries:
@@ -646,7 +695,7 @@ class Runner:
                         Path(str(source)+suffix).unlink(missing_ok=True)
                     if item['exists']:
                         atomic(source, backup.read_bytes())
-        if Path(self.inv['databases'][3]).exists():
+        if not fresh(self.plan) and Path(self.inv['databases'][3]).exists():
             self.migrate(retire_only=True)
         self.install(old=True)
         self.journal.pop('old_main', None)
@@ -757,11 +806,14 @@ def main():
     parser = argparse.ArgumentParser(description='Dona停止更新CLI。Donaの外のターミナルで実行してください。')
     parser.add_argument('action', choices=('update', 'prepare', 'resume', 'status', 'restore'))
     parser.add_argument('--run', type=Path)
+    parser.add_argument('--fresh-generation', action='store_true', help='旧履歴を保全し、独立した空DBへ切り替える')
     parser.add_argument('--repository', type=Path, default=Path(__file__).resolve().parents[2])
     args = parser.parse_args()
     require(sys.platform == 'darwin' and os.getuid() != 0, 'macos_gui_user_required')
+    require(not args.fresh_generation or args.action in ('prepare', 'update'), 'fresh_mode_only_on_prepare')
     previous = active_run() if args.run is None else None
     if args.action == 'update' and previous:
+        require(not args.fresh_generation or fresh(read_json(previous/'plan.json')), 'active_run_mode_mismatch')
         progress('未完了の停止更新を同じrunから再開します。')
         os.execv(sys.executable, [sys.executable, str(previous/'offline_update.py'), 'resume', '--run', str(previous)])
     run = args.run or previous or Path.home()/'.dona-maintenance'/('offline-'+time.strftime('%Y%m%d-%H%M%S'))
@@ -777,7 +829,8 @@ def main():
         require(not run.exists(), 'run_already_exists')
         with open(common.private_dir(Path.home()/'.dona-maintenance')/'service.lock', 'a') as lock:
             common.fcntl.flock(lock, common.fcntl.LOCK_EX | common.fcntl.LOCK_NB)
-            prepare(run, args.repository.resolve())
+            require(active_run() is None, 'another_offline_run_active')
+            prepare(run, args.repository.resolve(), args.fresh_generation)
         progress('再開コマンド: python3 ' + str(run/'offline_update.py') + ' resume --run ' + str(run))
         if args.action == 'prepare':
             return
