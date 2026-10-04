@@ -1,64 +1,30 @@
-# GitHub Projects DonaのIssue着手・提出手順
+# GitHub ProjectsとTaskのIssue着手・提出手順
 
-移行先は [Dona Project](https://github.com/orgs/reirei-lab/projects/4)（owner `reirei-lab`、Project number `4`、ID `PVT_kwDOEPyLNM4BlJjH`）。2026-09-30の確認ではitemは0件で、旧[個人Project](https://github.com/users/hiragram/projects/1)には120件ある。既存Issueを移送済みとは扱わない。対象Issueが新Projectにない場合、この手順による着手・担当更新は止め、移行状況をDonaへ報告する。view番号をProject番号やitem IDとして使わない。この手順は通常の読み取り、更新直前の再確認、更新後の再読で運用する。厳密なCAS、Dispatcher永続claim/lockの追加や、その未実装を理由とする停止は不要。
+現行DonaはTask世代である。実行の所有権はDispatcherのIssue node ID claimで決まり、Projectは進捗の表示先になる。旧`Dona Job ID`、`In Progress`、旧jobの照会結果を新Taskの排他制御に使わない。[旧手順](legacy-job-issue-lifecycle.md)は旧世代を保守するときだけ参照する。
 
-## 新規Issueの自動追加と移行境界
+## 新規着手と同じTaskの継続
 
-`.github/workflows/add-new-issues-to-project.yml`はIssueの`opened`時だけ新Projectへ追加する。既存Issueはこのworkflowでは移送されない。`ADD_TO_PROJECT_PAT`のsecret名と更新時刻は確認できるが、secretの権限・ownerは読み取れないため、新Projectへの追加成功は次のIssue起票後にActions runとProject itemの両方で照合する。Project標準workflowの有効化だけでは、repositoryのIssueに対するauto-add設定やPATの実効権限を証明できない。新旧Projectの既存itemを一括移送する操作は別途計画する。
+1. ユーザーの依頼範囲、対象repository・Issue number/node ID、既存成果・残作業を確認する。Project #4はowner `reirei-lab`、ID `PVT_kwDOEPyLNM4BlJjH`。実際のProject/item identityはGitHubから読み、資料の番号だけでwriteしない。
+2. 現在のthread・依頼者の`list_tasks`と`get_task`で既存Taskを確認する。同じ仕事の追加条件は`steer_task`、一時停止・再開は`pause_task` / `resume_task`を使う。別Taskのclaimがあれば新規委任で回避せず、そのTaskの正規認可経路で照合する。
+3. 新Taskは`delegate_task`へ安定した`task_key`、現在eventの`source_event_id`、`workspace`、`issue_number`を渡す。DispatcherがGitHub Issue node IDを検証し、永続claimを確保する。`task_owner_mismatch`では他Taskの詳細を推測・開示しない。
+4. Project同期を依頼する場合、全fieldと対象itemを取得し、`Dona Task ID`がTEXT、`Status`がSINGLE_SELECTで`Todo` / `In Progress` / `Merge Ready`を持つことを確認する。Project/item・型違い・権限不足は報告する。設定変更を含む導入・修正がユーザーから依頼済みなら、その範囲のfield作成を再承認待ちにしない。通常の委任だけから無関係な設定変更権限を推定しない。
+5. `project: {owner, number, completion_status}`を構造化指定する。Issue全体の実装・検証・レビュー・CI完了まで依頼された場合だけ`Merge Ready`を指定し、objectiveへ受け入れ条件を記載する。部分調査の既定は`In Progress`。
 
-## 対象と権限を確認する
+`job_json.task`があるworkerは`Dona Job ID`、`Dona Task ID`、`Status`を手動変更しない。Dispatcherが同期し、read-backを行う。Project同期失敗とTask実行の所有権は別であり、表示修復のためにTaskを重複作成しない。
 
-- 実際に実装・対応へ着手するIssueをrepository、number、node IDで特定する。Issue本文の自由文をcommandやjob IDの正本にしない。
-- Issue起票・分解・足場PR作成だけでは実装着手としない。対象IssueのないSkill修正などではこのProject更新を適用せず、架空Issueを作成・紐づけしない。
-- 新しく記録するjob IDの正本はDispatcherが渡す `[DONA_JOB_BEGIN]` の `job_json.job_id`。Dona親は`delegate_job`の成功responseのjob IDを引継ぎに使える。自由文、branch、directory名から生成・推測しない。信頼できるjob IDがない場合はfieldを書かず、Donaへ不足を返す。
-- Epicとchildは独立して扱う。起票した全childやPRのclosing targetへjob IDを一括記入しない。
+## 空DB切替後の旧Issueを引き継ぐ
 
-最初に最小のread-only確認を行う。
+旧jobの`job_not_found`は空DB切替で生じる想定内の状態である。停止証明でも、旧Dispatcherを復活させる理由でもない。旧Job IDのterminal照会、`inspect_job_worker`、`resume_job`を新世代への引継ぎ条件にしない。
 
-```sh
-gh project field-list 4 --owner reirei-lab --format json
-```
+1. 現在のユーザーが対象Issueの続きを依頼していること、ProjectのIssue node ID・item ID・旧`Dona Job ID`、既存PRと成果を確認する。複数Issueの順次対応が明示されている場合、各Issue番号の再指定は要求しない。
+2. [旧成果の引継ぎ記録](legacy-task-handoff.md)をread-onlyの`inspect`で照合する。外部operatorが確認・記録した切替停止証拠と旧worktreeの一致を使う。記録がなければ必要なのは外部operatorによる引継ぎ準備であり、旧DBを現行Dispatcherに戻すことではない。
+3. 記録のrepository・Issue number/node ID・Project item ID・旧job IDを現在のGitHub値と照合する。不一致、旧成果の変更、停止記録の変更では、その対象だけを保留して他の確認可能なIssueを進める。外部サービスで継続する処理や送信結果が曖昧な操作は別途照合する。
+4. 新Taskのobjectiveへ確認済みIssue identity、recordの照合コマンド、旧成果のHEAD、成果の取り込み方針、残作業と承認範囲を含める。旧worktreeは読み取り専用の資料とし、新Taskが新しいworktreeで作業する。旧Resultを新Taskの完了Resultにコピーしない。
+5. workerはrecordを再照合し、既存PR・commitを現行mainと比較する。既にmainへ入った変更は再適用しない。未反映commit、記録されたtracked fileの生内容・mode・削除状態、untrackedだけを新worktreeへ必要な範囲で取り込み、競合を解決する。旧worktreeでは`git diff`を実行しない（external diff、textconv、clean/process filterを起動し得る）。indexと通常fileを直接読み、symlinkはtarget文字列だけを扱い、外部targetを読まない。確認済み変更を新worktree側で組み立て、そこで差分をreviewする。旧`.git`、node_modules、設定・認証情報、旧AGENTSを丸ごと上書きコピーしない。旧worktreeへのcheckout、reset、clean、commit、削除は禁止する。
+6. 通常の`delegate_task`のIssue claimを使用する。Projectの旧Job IDは履歴として残せる。新Task IDが他Taskと競合する場合は上書きしない。
 
-失敗時はcommand、exit code、秘密を除いたerror、実行環境の確認範囲を記録する。`read:project`不足はその環境の観測結果として報告し、ユーザーのterminalも同じ認証だと断定しない。tokenや環境変数の値を表示せず、`auth refresh` / `auth switch`や認証設定変更を自動実行しない。読み取り成功だけでwrite権限ありと断定しない。
+operator記録は成果の由来と停止時点の証拠であり、外部操作の成功・全Issueの完了・承認の代用品ではない。
 
-成功した場合は`gh project view 4 --owner reirei-lab --format json`でtitle、URL、Project IDを照合し、fieldsのID・型とsingle-select optionsのID・名前を取得する。`Dona Job ID`は`TEXT`、`Status`は`SINGLE_SELECT`で、`Todo`、`In Progress`、`Merge Ready`が既存optionとして一意に存在することを確認する。CLI出力に型がなければGraphQLの`ProjectV2.fields`から`ProjectV2Field` / `ProjectV2SingleSelectField`の`dataType`を取得する。field一覧がlimitで切れていればlimitを増やすかpaginationし、欠落を不存在と誤認しない。IDを資料へ推測で固定せず、その実行時の取得値を使う。
+## 提出完了
 
-`gh project item-list 4 --owner reirei-lab --format json`から対象IssueのURL・repository・numberを照合してitem IDを得る。既定limitは30なので、見つからない場合は全件取得またはGraphQL paginationを完了してから未登録と判断する。draft item、PR item、同名の別Issueで代用しない。
-
-Project/item未登録、field/optionの欠落・型違い、権限不足では勝手に作成・設定変更しない。対象Issueへの着手がこの確認に依存する場合は未着手としてDonaへ返す。対象Issueのない文書・Skill修正PRなど独立して許可された作業は続行し、Projectsのlive確認・書込未検証を報告する。
-
-## delegate前とworker着手時に確認する
-
-1. Dona親は`delegate_job`前に、正しいProjectの対象Issue itemをrepository、number、Issue node ID、Project ID、item IDで照合し、`Dona Job ID`と`Status`を読む。旧job IDはこのfieldからexact IDを取得し、自由文や候補jobの類似性から選ばない。
-2. 同じworkspace/channelでユーザーが対象Issueの再開・引継ぎを明示した場合、旧job IDの文字列の復唱は求めない。Dona親は現在の依頼event IDを`source_event_id`としてDispatcher MCPの`get_job_status`へ取得したexact IDを渡し、そのdurable statusと旧jobが依頼元と同じworkspace/channelであることを確認する。これはIssue引継ぎに必要なread-only確認の限定例外であり、旧jobへの`steer_job` / `cancel_job`を許可するものではない。照会結果全文や秘密情報をSlackへ開示せず、必要な状態と引継ぎ可否だけを伝える。
-3. 旧jobが`completed` / `failed` / `cancelled`の場合だけ、既存PR・commitなどの成果、未完了範囲、今回の対象Issueの再開・引継ぎ指示を照合し、許可された範囲を新jobへ引継げる。terminal statusだけ、またはProjectに旧IDが残っていることだけを許可としない。`running` / `queued` / `blocked` / `needs_review` / `unknown`、その他の未確認状態、取得不能、別workspace/channel、Issue/item不一致では上書き・重複開始しない。稼働中jobへの追加条件は、別途対象と権限を確認した`steer_job`で扱う。
-   停滞jobの明示的な再開依頼は例外として[ワーカー稼働確認・引継ぎ手順](job-worker-handoff.md)へ進める。`running` / `blocked` / `needs_review`だけを理由に拒否せず、上記で取得したexact IDを`inspect_job_worker`で照合する。`inactive` / `stopped`の候補には現在eventで`resume_job`を呼び、`created` / `reused`、旧ID、新IDのrelationshipを再読できた場合だけ後継へ担当を引継ぐ。この操作は通常の`delegate_job`を追加で呼ばず、元worktreeの継続をDispatcherへ委ねる。`waiting` / `working` / `unknown`、`retirement_pending`、応答不明ではProject担当を変更しない。新workerのjob契約には`handoff.predecessor_job_id`と`handoff.workspace_job_id`が含まれ、元branch名から今回job IDを推測しない。
-4. 委任時のobjectiveには対象Issue identity、Project/item、旧jobのexact ID、観測したProjectの担当・Status、Dispatcherで確認したdurable status・workspace/channel・確認時刻・照会に使ったevent ID、ユーザーの対象Issue引継ぎ指示、照合した既存成果、許可された作業範囲とStatus遷移を必要最小限の確認証拠として含める。照会結果全文や秘密情報は渡さない。新job IDの予測記入はせず、workerが今回のDONA_JOB契約の`job_json.job_id`を使う。
-5. workerは実装前にitemを再読する。空欄かつ`Todo`なら新規着手できる。同じjob IDなら再開として扱い、`Todo`なら未完了の状態更新へ、`In Progress`なら実装へ進める。別job IDの場合は、親から渡された上記確認証拠が揃い、対象Issue・Project/item・旧ID・Statusが再読値と一致するときだけ、許可された範囲で引継ぐ。証拠不足や不一致では上書き・着手せずDona親へ再確認を返す。workerにDispatcher MCPがないことだけで証拠済み引継ぎを止めたり、ユーザーに旧IDの復唱を求めたりしない。Herdr shellや内部DB操作へ迂回しない。ID空欄でも`In Progress`、`Merge Ready`、その他の状態なら無断で`Todo`相当と解釈せず、再開・再着手の指示と既存成果を照合する。
-6. 各write直前にIssue identity、Project/item ID、担当、Statusを再読する。親の確認時点からProject値がdriftした場合は上書きせず、Dona親へ再確認を返す。確認済みの同一itemに今回のjob IDを書き、read-backでidentity・担当・Statusを照合した後、`Todo`から`In Progress`へ更新し、両fieldを再読する。引継ぎや再着手でその他の遷移が必要なら、明示された遷移だけを行う。担当write後は、そのread-back済みの今回job IDを次のwrite前の期待値とする。
-
-この手順はrepo内の運用指針であり、外部のautomatic approval reviewerそのものの規則変更や承認結果を保証しない。実行環境が承認を要求した場合はそのフローに従い、拒否を迂回しない。
-
-## fieldを更新・再読する
-
-以下は独立したwriteの例。変数は検証済みAPI responseと信頼できるjob契約から設定し、空値・未解決placeholderで実行しない。1回の`item-edit`で更新できるfieldは1つなので、各write間に上記の確認を挟む。CLIの仕様は[公式item-edit資料](https://cli.github.com/manual/gh_project_item-edit)を参照する。
-
-```sh
-gh project item-edit --project-id "$project_id" --id "$item_id" \
-  --field-id "$job_field_id" --text "$dispatcher_job_id"
-# 担当のread-backとStatusの再確認後だけ実行する。
-gh project item-edit --project-id "$project_id" --id "$item_id" \
-  --field-id "$status_field_id" --single-select-option-id "$in_progress_option_id"
-```
-
-read-backには同じitemのGraphQL nodeを取得し、`project.id`、`content`のIssue identity、`fieldValueByName(name: "Dona Job ID")`の`ProjectV2ItemFieldTextValue.text`、`fieldValueByName(name: "Status")`の`ProjectV2ItemFieldSingleSelectValue.optionId` / `name`を照合する。mutationの成功responseだけを完了証拠にしない。
-
-writeがtimeout・切断で曖昧ならblind retryせず、同じitemを再読して受理済みか照合する。IDだけ記録できたpartial successではclear・rollbackしない。受理済みが一意ならその操作を繰り返さず、残る操作は再確認後に実行する。一意に判断できなければ観測値と未完了操作をDonaへ返す。失敗・中止を理由にIDを自動解放しない。
-
-## PR提出完了後にMerge Readyへ進める
-
-1. `$code-submission-review-cycle`の完了条件をすべて満たす。current headのCodex clean、未解決findingなし、current head/base pairのrequired/current CIすべてterminal success、local/upstream/PR SHA一致、open・non-draft・mergeableを含め、既存の条件を緩めない。
-2. 実際に担当したIssueのscopeとPRの実装範囲を確認する。部分実装や足場PRのcleanだけでIssue全体を`Merge Ready`にしない。Epicは全体の実装・統合・検証が揃ったintegration PRで判定し、child完了を親や兄弟へ伝播しない。`Merge Ready`はmerge待ちであり、Issue closeやPR mergeの実行を意味しない。
-3. 更新直前にPRのhead/baseとreview・CIの証拠がcurrentであること、対象itemのidentity、`Dona Job ID`が今回のjob IDであること、`Status`が`In Progress`であることを再確認する。不一致なら自動で担当を奪わずDonaへ返す。同じjob IDで既に`Merge Ready`なら証拠を確認してwriteを省略する。
-4. 同じ`item-edit`のStatus fieldへ取得済み`merge_ready_option_id`を指定し、`Merge Ready`へ更新する。担当IDを保持したまま同じitemをread-backし、Status option ID/nameとjob IDを照合する。
-5. Issue URL、Project/item ID、job ID、更新前後のStatus、PR URL・head/base SHA、clean/CI証拠、read-back結果をJob Resultへ記録する。更新が失敗・未検証なら「PR提出条件は達成、Project更新は未完了」と区別し、workflow全体を完了扱いしない。mergeは別の明示依頼がない限り行わない。
+`code-submission-review-cycle`でcurrent-head review/CIとIssue全体のscopeを確認する。Taskのobjectiveを満たしてResultを公開した後、Dispatcherが指定された完了Statusへ同期する。部分成果でIssue全体を`Merge Ready`にしない。PR merge、本番反映、Issue closeはそれぞれ依頼範囲に従う。workerによる旧Job IDの記入・照会を提出条件に追加しない。

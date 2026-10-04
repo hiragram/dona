@@ -17,7 +17,7 @@ taskに必要なコード変更を安全に提出し、Pull Requestをmergeせ�
 
 ## 対象Issueの着手を記録する
 
-Dona Projectの対象Issueがある場合、実装前に[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)を読み、Dispatcher job IDと担当を再確認し、`Dona Job ID`の記録と`Todo` → `In Progress`の更新・read-backを行う。別jobの担当を無断で上書きしない。対象IssueのないSkill修正等では適用せず、架空Issueを作らない。
+Dona Projectの対象Issueがある場合は、[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)を読み、Task世代か旧世代かを区別する。`job_json.task`があるworkerはDispatcherのTask claimを使用し、ProjectのID・Statusを手動更新しない。旧Job IDの照会・記入をTaskの着手条件に追加しない。旧成果の採用は同手順のoperator記録で照合する。対象Issueのない修正等ではIssueを捏造しない。
 
 ## Issue完了と残タスクを確定する
 
@@ -87,6 +87,12 @@ Pull Requestの作成・title／本文更新では、repository標準の`.github
 - selected baseからcurrent headまでのSkillが作成したtask/review commit messageにautomatic closing referenceがなく、既存commit内の各referenceはsource PRがcurrent task branchへmerge済みであること、commit provenance、current Issue identity、merge-target contractを再取得して`verified inherited closing reference`と確認済みである。未検証のreferenceは残っていない。
 - repository workflowとbranch ruleから期待するCI suite/check contextが少なくとも1回観測され、各accepted check/workflow runがcurrent head/base pairを検証したことをPull Request association、tested merge commit、または同等のGitHub API evidenceで確認でき、required/current CIがすべてterminal successである。checkが空の状態、base driftより前のrun、head/base pairを証明できないrunを成功としない。CIが構成されていない、またはcurrent pairのrunを安全に起動できない場合は未検証境界として停止する。current changeに起因するfailureは修正し、新しいheadにfresh review roundを行う。
 
-上記の提出条件をすべて満たした後、対象Issueがあり、このPRでIssue全体を完了する場合だけ[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)のscope・担当再確認を経て`Merge Ready`へ更新・read-backする。対象Issueに残タスクがある部分対応では、元Issueを`In Progress`のまま維持し、元Issueをclosing targetに含めないことと、許可された残タスクIssueの作成・read-backまたは未作成の境界を確認できれば、PR提出cycle自体は完了できる。Project更新が必要なのに失敗・未検証なら、PR提出条件の達成とProject更新未完了を分け、workflow全体を完了扱いしない。
+上記の提出条件をすべて満たした後、対象Issueがある場合は[Issue lifecycle手順](../../../docs/operations/github-project-issue-lifecycle.md)に沿って次のように分岐する。
+
+- `job_json.task`を持つTask workerでは、ProjectのStatus/IDの更新・read-backをworkerの提出完了条件に含めない。親は委任時にIssue全体の完了を依頼する場合だけ`project.completion_status: "Merge Ready"`を指定する。workerはscope・担当をread-onlyで再確認し、review/CIを含む成果をResultで返す。その後のProject同期はDispatcherが行う。委任時の完了Statusと依頼scopeの不一致は親へ報告し、workerが手動writeで補正しない。
+- Taskで部分成果だけが提出できた場合、PR提出cycleの完了とTask objectiveの完了を区別する。Issue全体を求めたobjectiveに残作業があれば、`completed`のTask Resultを返して`Merge Ready`同期を起こさない。残作業と必要な判断を親へ返す。
+- 旧Job方式に限り、このPRでIssue全体を完了する場合だけscope・担当を再確認し、`Merge Ready`へ更新・read-backする（旧Jobでの手動操作）。Project更新が必要なのに失敗・未検証なら、PR提出条件の達成とProject更新未完了を分け、旧Jobのworkflow全体を完了扱いしない。
+
+対象Issueに残タスクがある部分対応では、元Issueを`In Progress`のまま維持し（TaskではDispatcher管理）、元Issueをclosing targetに含めないことと、許可された残タスクIssueの作成・read-backまたは未作成の境界を確認できれば、PR提出cycle自体は完了できる。Task workerはProject同期の完了を待ってResult公開を止めない。同期の失敗・未確認はDispatcherの状態として別に扱う。
 
 Pull Request URL、final SHA、各roundのtarget SHA・trigger URL・clean/finding、feedbackの修正commit、inline reply URL、mergeability、CI結果、変更しなかったscope、未検証境界を報告する。明示的な別依頼がない限りPull Requestをmergeしない。

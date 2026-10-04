@@ -370,6 +370,27 @@ class RestoreTests(unittest.TestCase):
         runner.migrate=lambda **_:None
         return runner
 
+    def test_reconciled_recreation_restores_and_retains_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=self.fixture(root)
+            runner.policy={'executables':{'herdr':'herdr'}}
+            runner.live=unittest.mock.Mock();runner.live.observe.return_value=None;runner.live.domain='gui/test'
+            runner.validate_source=lambda:None
+            runner.journal.update(phase='stopped',plan_hash='plan',source_recreation_detected=True,
+                                  source_recreation_processes=[],source_recreation_services=[])
+            evidence={'schema_version':1,'plan_hash':'plan','observation_hash':m.recreation_observation_hash(runner.journal),
+                      'effects_reconciled':True,'cause_removed':True,'summary':'照合済み'}
+            file=root/'evidence.json';m.atomic(file,m.encode(evidence))
+            disabled='\n'.join('"'+label+'" => disabled' for label in m.LABELS)
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={}), patch.object(m,'command',return_value=disabled):
+                runner.reconcile_source(file)
+                runner.restore()
+            saved=m.read_json(root/'journal.json')
+            self.assertEqual(saved['phase'],'rolled_back')
+            self.assertTrue(saved['source_recreation_detected'])
+            self.assertTrue(m.recreation_reconciled(saved))
+
     def test_corrupt_backup_is_rejected_before_any_database_is_replaced(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);runner=self.fixture(root)
@@ -438,11 +459,47 @@ class ActiveRunTests(unittest.TestCase):
             m.atomic(first/'journal.json',m.encode({'phase':'migrating'}))
             second=root/'second';second.mkdir();(second/'plan.json').write_text('{}')
             m.claim_run(first)
-            self.assertEqual(m.active_run(),first)
+            self.assertEqual(m.active_run(),first.resolve())
             with self.assertRaisesRegex(RuntimeError,'未完了'):m.claim_run(second)
             m.atomic(first/'journal.json',m.encode({'phase':'aborted'}))
             self.assertIsNone(m.active_run())
+            m.atomic(second/'plan.json',m.encode({'previous_offline_run':m.read_json(root/'.dona-maintenance/offline-active.json')}))
             m.claim_run(second)
+
+    def test_stale_prepared_run_cannot_replace_successful_owner(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
+            root=Path(directory);(root/'.dona-maintenance').mkdir()
+            owner=root/'.dona-maintenance/offline-active.json'
+            def prepare(name, previous):
+                run=root/name;run.mkdir()
+                m.atomic(run/'plan.json',m.encode({'previous_offline_run':previous}))
+                m.atomic(run/'journal.json',m.encode({'phase':'prepared'}))
+                return run
+            seed=prepare('seed',None);m.claim_run(seed)
+            m.atomic(seed/'journal.json',m.encode({'phase':'succeeded'}))
+            previous=m.read_json(owner)
+            stale=prepare('stale',previous);newer=prepare('newer',previous)
+            m.claim_run(newer)
+            current=owner.read_bytes()
+            m.claim_run(newer)  # 同じrunの再開は冪等。
+            self.assertEqual(owner.read_bytes(),current)
+            m.atomic(newer/'journal.json',m.encode({'phase':'succeeded'}))
+            with self.assertRaisesRegex(RuntimeError,'offline_owner_changed'):m.claim_run(stale)
+            self.assertEqual(owner.read_bytes(),current)
+            self.assertEqual(m.read_json(stale/'journal.json')['phase'],'prepared')
+            successor=prepare('successor',m.read_json(owner));m.claim_run(successor)
+            self.assertEqual(m.active_run(),successor.resolve())
+
+    def test_run_aliases_share_one_canonical_owner(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
+            root=Path(directory);(root/'.dona-maintenance').mkdir()
+            run=root/'run';run.mkdir();alias=root/'alias';alias.symlink_to(run)
+            m.atomic(run/'plan.json',m.encode({'previous_offline_run':None}))
+            m.atomic(run/'journal.json',m.encode({'phase':'stopped'}))
+            m.claim_run(alias)
+            self.assertEqual(m.read_json(root/'.dona-maintenance/offline-active.json')['run'],str(run.resolve()))
+            m.claim_run(run)
+            self.assertEqual(m.active_run(),run.resolve())
 
     def test_changed_plan_is_not_resumed_implicitly(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(Path,'home',return_value=Path(directory)):
@@ -453,3 +510,180 @@ class ActiveRunTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'active_run_changed'):m.active_run()
 
 if __name__ == '__main__':unittest.main()
+
+class FreshGenerationTests(unittest.TestCase):
+    def test_recreated_source_is_held_before_kill_and_cannot_auto_resume(self):
+        for phase in ('stopping','stopped','backed_up','migrating','migrated'):
+            runner=FakeRunner(phase);runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+            new=proc(800002)
+            with patch.object(m,'herdr_root',return_value=[new]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={new['pid']:new}), patch.object(m,'ProcessStop') as stop, \
+                 patch.object(runner,'switch_disabled') as disable:
+                with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):
+                    m.Runner.stop(runner)
+                stop.assert_not_called();disable.assert_not_called()
+            self.assertTrue(runner.journal['source_recreation_detected'])
+            self.assertEqual(runner.journal['source_recreation_processes'],[new])
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+            self.assertNotIn('restore',runner.calls)
+            self.assertNotIn('main',runner.calls)
+
+    def test_execute_does_not_restore_after_source_recreation(self):
+        runner=FakeRunner('backed_up');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+        runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+        runner.stop=m.Runner.stop.__get__(runner,m.Runner)
+        new=proc(800002)
+        with patch.object(m,'herdr_root',return_value=[new]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={new['pid']:new}):
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+        self.assertTrue(runner.journal['source_recreation_detected'])
+        self.assertNotIn('restore',runner.calls)
+        self.assertNotIn('main',runner.calls)
+
+    def test_known_rollback_activation_can_resume_but_unreconciled_source_cannot_restore(self):
+        runner=FakeRunner('restoring');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+        runner.journal.update(source_stop_receipt={'processes':[proc(800001)]},rollback_activation_started=True)
+        root=proc(800002)
+        with patch.object(m,'herdr_root',side_effect=[[root],[]]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={root['pid']:root}), patch.object(m,'ProcessStop') as stop, \
+             patch.object(runner,'switch_disabled'):
+            m.Runner.stop(runner)
+            stop.return_value.stop.assert_called_once()
+        self.assertNotIn('source_recreation_detected',runner.journal)
+        runner.journal['source_recreation_detected']=True
+        with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):m.Runner.restore(runner)
+
+    def test_normal_execution_checks_recreation_after_backup_and_before_activation(self):
+        for phase in ('stopped','migrated'):
+            runner=FakeRunner(phase);runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+            root=proc(800002)
+            with patch.object(m,'herdr_root',return_value=[root]), patch.object(m,'herdr_starting',return_value=[]):
+                with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.execute()
+            self.assertTrue(runner.journal['source_recreation_detected'])
+            self.assertNotIn('main',runner.calls)
+            self.assertNotIn('migrate',runner.calls)
+            self.assertNotIn('restore',runner.calls)
+
+    def test_reconciliation_requires_matching_evidence_and_stopped_runtime_then_only_restores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner=FakeRunner('backed_up');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+            runner.live.domain='gui/test'
+            runner.journal.update(plan_hash='sealed-plan',source_recreation_detected=True,
+                                  source_recreation_processes=[proc(800001)],source_recreation_services=[])
+            evidence={'schema_version':1,'plan_hash':'sealed-plan','observation_hash':m.recreation_observation_hash(runner.journal),
+                      'effects_reconciled':True,'cause_removed':True,'summary':'再生成原因と外部処理を照合済み。'}
+            file=Path(directory)/'evidence.json';m.atomic(file,m.encode(evidence))
+            disabled='\n'.join('"'+label+'" => disabled' for label in m.LABELS)
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={800001:proc(800001)}), patch.object(m,'command',return_value=disabled):
+                with self.assertRaisesRegex(RuntimeError,'reconciliation_process_still_alive'):runner.reconcile_source(file)
+                self.assertEqual(runner.journal['phase'],'backed_up')
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={}), patch.object(m,'command',return_value=''):
+                with self.assertRaisesRegex(RuntimeError,'services_not_disabled'):runner.reconcile_source(file)
+            with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+                 patch.object(m,'process_table',return_value={}), patch.object(m,'command',return_value=disabled):
+                evidence['observation_hash']='stale';m.atomic(file,m.encode(evidence))
+                with self.assertRaisesRegex(RuntimeError,'evidence_invalid'):runner.reconcile_source(file)
+                evidence['observation_hash']=m.recreation_observation_hash(runner.journal);m.atomic(file,m.encode(evidence))
+                runner.reconcile_source(file)
+            self.assertTrue(runner.journal['source_recreation_detected'])
+            self.assertTrue(m.recreation_reconciled(runner.journal))
+            self.assertEqual(runner.journal['phase'],'restoring')
+            runner.execute()
+            self.assertEqual(runner.calls,['restore'])
+            self.assertEqual(runner.journal['phase'],'rolled_back')
+
+    def test_recurrence_invalidates_reconciliation_and_captures_descendants(self):
+        runner=FakeRunner('restoring');runner.live=unittest.mock.Mock();runner.live.observe.return_value=None
+        runner.journal.update(plan_hash='plan',source_stop_receipt={'processes':[]},source_recreation_detected=True)
+        runner.journal['source_recreation_reconciliation']={'plan_hash':'plan','observation_hash':m.recreation_observation_hash(runner.journal),
+            'effects_reconciled':True,'cause_removed':True,'summary':'照合済み','operator_uid':os.getuid()}
+        root=proc(800001);child=proc(800002,800001)
+        with patch.object(m,'herdr_root',return_value=[root]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={800001:root,800002:child}):
+            with self.assertRaisesRegex(RuntimeError,'requires_reconciliation'):runner.assert_source_stopped()
+        self.assertFalse(m.recreation_reconciled(runner.journal))
+        self.assertEqual(runner.journal['source_recreation_processes'],[root,child])
+        with self.assertRaisesRegex(RuntimeError,'requires_reconciliation'):runner.execute()
+
+    def test_registered_service_without_pid_is_also_recreation(self):
+        runner=FakeRunner('backed_up');runner.live=unittest.mock.Mock()
+        runner.live.observe.return_value={'registered':True,'pid':None}
+        runner.journal['source_stop_receipt']={'processes':[proc(800001)]}
+        with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]):
+            with self.assertRaisesRegex(RuntimeError,'source_recreation_requires_reconciliation'):runner.assert_source_stopped()
+        self.assertEqual(runner.journal['source_recreation_services'],list(m.LABELS))
+
+    def test_stopping_resume_keeps_previous_stop_receipt(self):
+        runner=FakeRunner('stopping');runner.live=unittest.mock.Mock()
+        runner.live.observe.return_value=None
+        runner.plan={'bundle':{'herdr-config.toml':'config-hash'}}
+        old=proc(800001)
+        runner.journal.update(source_stop_guard={'phase':'committed'},source_stop_receipt={'processes':[old]},processes=[])
+        with patch.object(m,'herdr_root',return_value=[]), patch.object(m,'herdr_starting',return_value=[]), \
+             patch.object(m,'process_table',return_value={}), patch.object(m,'ProcessStop'), patch.object(runner,'switch_disabled'):
+            m.Runner.stop(runner,check_source=True)
+        self.assertEqual(runner.journal['source_stop_receipt']['processes'],[old])
+        self.assertEqual(runner.journal['processes'],[])
+
+    def test_fresh_migration_requires_stop_receipt_and_only_targets_new_paths(self):
+        runner=object.__new__(m.Runner)
+        runner.plan={'mode':'fresh_generation','release':'/target/release','target_sha':'a'*40}
+        runner.g=Path('/new-generation');runner.run=Path('/prepared');runner.node='/node'
+        runner.journal={}
+        with patch.object(m,'command') as call:
+            with self.assertRaisesRegex(RuntimeError,'stop_receipt_required'):runner.migrate()
+            call.assert_not_called()
+            runner.journal['source_stop_receipt']={'verified_at':'now'}
+            runner.migrate()
+            request=m.json.loads(call.call_args.kwargs['input'])
+            self.assertTrue(request['fresh_generation'])
+            self.assertTrue(all(p.startswith('/new-generation/') for p in request['databases']))
+            call.reset_mock();runner.migrate(retire_only=True);call.assert_not_called()
+
+    def test_fresh_restore_never_replaces_old_data_or_retires_old_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runner=RestoreTests().fixture(root)
+            runner.plan['mode']='fresh_generation'
+            source=root/'old-db';source.write_bytes(b'old-history')
+            runner.inv['databases']=[str(source)]*4
+            runner.journal['backup_index_hash']='not-read-because-source-was-not-modified'
+            runner.migrate=lambda **_:self.fail('old ledger changed')
+            runner.restore()
+            self.assertEqual(source.read_bytes(),b'old-history')
+            self.assertEqual(runner.journal['phase'],'rolled_back')
+
+    def test_mode_guard_rejects_preserving_old_schema_before_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release=Path(directory);(release/'config').mkdir()
+            m.atomic(release/'config/schema-rollout.json',m.encode({'phase':'fresh_generation','database_schema':4,'online_migration':False}))
+            with patch.object(m.common,'NodeDatabase') as db:
+                db.return_value.read.return_value=[(3,)]
+                with self.assertRaisesRegex(RuntimeError,'fresh_generation_required'):m.validate_mode(release,{'databases':['old']},'node',False)
+                m.validate_mode(release,{},'node',True)
+                db.return_value.read.return_value=[(4,)]
+                m.validate_mode(release,{'databases':['new']},'node',False)
+
+    def test_fresh_render_uses_isolated_state_and_preserves_source_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);g=root/'new';release=g/'runtime/releases/target'
+            (release/'updater').mkdir(parents=True);(release/'config').mkdir()
+            m.atomic(release/'config/release-compatibility.json',m.encode({'schema_version':1,'app_schema_write':4}))
+            m.atomic(release/'config/update-compatibility-transitions.json',m.encode({'transitions':[]}))
+            run=root/'run';run.mkdir();(run/'main_bridge.mjs').write_text('fixture')
+            inv={'policy':{'executables':{'node':'/old-node','codex':'/old-codex'}},
+                 'configs':{key:{'values':{'DONA_DATABASE_PATH':'/old/db'}} for key in ('dispatcher','slack')},
+                 'databases':['/old/db'], 'old_results':['/old/results'],
+                 'plists':{label:{'EnvironmentVariables':{}} for label in m.LABELS}}
+            before=copy.deepcopy(inv)
+            with patch.object(m.common,'installed_codex',return_value='/new-codex'),patch.object(m.common,'target_required_checks',return_value=[]),patch.object(m.common,'validate_staging') as validate:
+                m.render(run,{'mode':'fresh_generation','generation':str(g),'release':str(release),'node':'/new-node','target_sha':'target'},inv)
+                validate.assert_called_once()
+            self.assertEqual(inv,before)
+            plist=m.plistlib.loads((run/'plists/dev.dona.dispatcher.plist').read_bytes())
+            self.assertEqual(plist['EnvironmentVariables']['DONA_DATABASE_PATH'],str(g/'dona.sqlite3'))
+            self.assertEqual(plist['EnvironmentVariables']['DONA_JOB_RESULTS_DIR'],str(g/'job-results'))
+            self.assertEqual(m.read_json(g/'control/policy.json')['dispatcher_socket'],str(g/'run/d.sock'))

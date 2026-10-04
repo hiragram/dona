@@ -11,6 +11,12 @@ description: Donaの既存DB履歴を引き継がず、独立した新世代へ�
 
 既存DBの履歴を継がず、DonaのDispatcher・Slack adapter・Updaterを独立した新世代へ切り替えるときに使う。通常のself-updateは`plan_self_update`とexact plan承認・`apply_self_update`の経路を使う。既存DB内の個別job、通知、Resultの回復やreconciliationをこの切替の条件・成果に混ぜない。旧履歴の問題は旧世代に残る。
 
+## Donaの外からのTask世代切替
+
+ローカルoperatorがDonaの外から切り替える場合は、[停止更新runbook](../../../docs/operations/offline-update.md)と`scripts/maintenance/offline_update.py`の`--fresh-generation`を使う。この経路では旧Donaのevent/job/handoffを要求せず、3サービスの再生成抑止とDona専用Herdrプロセス停止を独立runnerが行う。停止・切替の権限は現在のユーザー依頼から確認する。既存のreset runnerのplanやreceiptをこの経路へ転用しない。
+
+以下はDona内部から委任する従来のreset runner経路の説明であり、外部CLIにhandoff条件を追加する規則ではない。
+
 ## 準備と実行の判断
 
 - `prepare`はcanonical mainのexact SHA、required CI・署名、元のplist・設定・pointer・writer、容量余裕、新世代のbuild・DB・設定を調べ、planと成果をsealする。準備だけでは本番を止めない。prepare後の元設定やsealのdriftは再準備の判断に戻す。

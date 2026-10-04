@@ -53,7 +53,7 @@ exact trigger集合、reaction、review/comment集合、head/base SHA、default 
 - **stalled:** 30分state変化がない。duplicate triggerを書かず、人間によるretrigger判断を待つ。
 - **security review usage limit:** security reviewだけがusage limitで未実行と一意に確認できる場合は、そのartifactを通常roundの結果から除外する。通常reviewのclean signal、current identity、CI、未解決findingの完了条件は省略しない。
 
-clean signalだけでProjectを更新しない。`SKILL.md`の完了条件（current head/base CI等を含む）が揃った後に、[Issue lifecycle手順](../../../../docs/operations/github-project-issue-lifecycle.md)で担当Issueだけを`Merge Ready`へ更新・再読する。足場PRのcleanでEpicを進めない。
+clean signalだけでProjectを更新しない。`SKILL.md`の完了条件（current head/base CI等を含む）が揃った後は、[Issue lifecycle手順](../../../../docs/operations/github-project-issue-lifecycle.md)の世代別手順を使う。Task workerは委任時の`project.completion_status`に基づくDispatcher同期へ委ね、手動更新・同期read-backを完了条件にせずResultを返す。旧Job方式だけ担当Issueの`Merge Ready`更新・再読を行う。足場PRのcleanでEpicを進めず、Task objective未達の部分成果を`completed`にしない。
 
 ## feedbackを処理する
 
