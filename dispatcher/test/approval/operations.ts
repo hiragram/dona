@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { ApprovalHistoryTransaction } from "../../src/approval/history-transaction.js";
+import { ApprovalRecordMutation } from "../../src/approval/record-mutation.js";
 import { test } from "node:test";
 import { decisionFixture } from "./fixtures/decision.js";
 import { scope } from "./fixtures/broker.js";
@@ -152,4 +154,38 @@ test("execution attemptのneeds_reviewをhealthとmetricsへ反映する", t => 
   assert.equal(f.read().row.state, "consumed");
   assert.equal(operations.health().counts?.needs_review, 1);
   assert.ok(operations.metrics().includes("dona_approval_needs_review 1\n"));
+});
+
+test("attempt固有の古いclock履歴改変はhealthをsafe-offへ落とす", t => {
+  const f = executionFixture(t), operations = new ApprovalOperations(f.db, f.providers, scope);
+  const transactionId = f.attempt().row.clock_transaction_id;
+  const triggers = f.db.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='approval_clock_reservations'").all() as { name: string; sql: string }[];
+  for (const trigger of triggers) f.db.exec(`DROP TRIGGER "${trigger.name}"`);
+  const wire = f.db.prepare("SELECT mark_json FROM approval_clock_reservations WHERE transaction_id=?").pluck().get(transactionId) as string;
+  const mark = JSON.parse(wire); mark.continuous_ms++;
+  f.db.prepare("UPDATE approval_clock_reservations SET mark_json=? WHERE transaction_id=?").run(JSON.stringify(mark), transactionId);
+  for (const trigger of triggers) f.db.exec(trigger.sql);
+  assert.equal(operations.health().counts, null);
+});
+
+test("terminal requestのpresentation updateもunknownとneeds_reviewへ集計する", t => {
+  const f = decisionFixture(t), operations = new ApprovalOperations(f.db, f.providers, scope);
+  f.decision.decide("reject", f.command("reject"));
+  const row = f.db.prepare("SELECT update_id FROM approval_presentation_updates LIMIT 1").get() as { update_id: string };
+  const tx = new ApprovalHistoryTransaction(f.db, f.providers, scope), mutations = new ApprovalRecordMutation(f.db, scope);
+  for (const nextState of ["dispatching", "acceptance_unknown", "needs_review"] as const) {
+    tx.runPrepared("fixture_presentation_" + nextState, (mark, state) => {
+      const previous = f.records.readInState(state, "presentation", row.update_id)!;
+      const next = { ...previous, row: { ...previous.row, state: nextState, fence: previous.row.fence + 1 } };
+      return { event: { scope: { instance_id: scope.instance_id, tenant_id: scope.workspace_id }, actor: { kind: "system" as const, id: "fixture" },
+        action: "approval_delivery" as const, operation: "slack.post_thread_reply.v1" as const, resource_id: f.requestId,
+        outcome: "pending" as const, reason: "none" as const, session_ref: null, receipt_id: null, attempt_id: null,
+        policy_revision: 1, binding_revision: 3, authz_revision: 7 }, ...mutations.prepare(mark, state, [{ previous, next }]) };
+    });
+    const health = operations.health();
+    assert.notEqual(health.counts, null);
+    assert.equal(health.counts?.unknown_delivery, Number(nextState === "acceptance_unknown"));
+    assert.equal(health.counts?.needs_review, Number(nextState === "needs_review"));
+  }
+  assert.equal(f.read().row.state, "rejected");
 });

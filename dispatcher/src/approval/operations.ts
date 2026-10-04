@@ -7,7 +7,7 @@ import { AuditRepository } from "../audit/repository.js";
 import { ApprovalRecordRepository } from "./record-repository.js";
 import { ApprovalClockHistory } from "./clock-history.js";
 import type { SupervisorBindingGuard } from "./supervisor-binding.js";
-import { advanceClockMark, parseClockMark } from "./clock.js";
+import { advanceClockMark, parseClockMark, type ClockMark } from "./clock.js";
 import type { ApprovalRecordScope } from "./record-codec.js";
 import type { ApprovalTransactionProviders } from "./transaction.js";
 
@@ -101,6 +101,11 @@ export class ApprovalOperations {
     const observationId = current.transaction_id === "approval_observation_0" ? "approval_observation_1" : "approval_observation_0";
     return advanceClockMark(current, this.providers.clock.observe(), observationId, this.providers.maximumClockDriftMs);
   }
+  private verifyHistoricalMark(state: VerifiedAuditState, transactionId: string, current: ClockMark, createdAt?: string) {
+    const saved = this.history.readInState(state, transactionId);
+    if (saved === null || (createdAt !== undefined && saved.effective_utc !== createdAt)
+      || saved.boot_id !== current.boot_id || saved.continuous_ms > current.continuous_ms || saved.effective_utc > current.effective_utc) throw Error();
+  }
   health(): ApprovalHealth {
     const counts = { expiry_lag: 0, stale_claim: 0, unknown_attempt: 0, unknown_delivery: 0, retention_overdue: null, needs_review: 0 };
     try {
@@ -125,6 +130,7 @@ export class ApprovalOperations {
         for (const row of attempts) {
           const attempt = this.records.readInState(state, "execution", id.parse(row.attempt_id));
           if (attempt === null) throw Error();
+          this.verifyHistoricalMark(state, attempt.row.clock_transaction_id, mark, attempt.row.claimed_at);
           if (attempt.row.state === "needs_review") counts.needs_review++;
           if (attempt.row.state === "acceptance_unknown") counts.unknown_attempt++;
           if (attempt.row.state === "claimed" && attempt.row.execution_expires_at <= effective
@@ -136,8 +142,19 @@ export class ApprovalOperations {
         for (const row of notifications) {
           const notification = this.records.readInState(state, "notification", id.parse(row.notification_attempt_id));
           if (notification === null) throw Error();
+          this.verifyHistoricalMark(state, notification.row.clock_transaction_id, mark);
           if (notification.row.state === "acceptance_unknown") counts.unknown_delivery++;
           if (notification.row.state === "needs_review") counts.needs_review++;
+        }
+        const presentations = this.db.prepare("SELECT p.update_id FROM main.approval_presentation_updates p JOIN main.approval_notifications n ON n.notification_attempt_id=p.notification_attempt_id JOIN main.approval_requests r ON r.request_id=n.request_id WHERE r.instance_id=? AND r.workspace_id=? ORDER BY p.update_id LIMIT 101")
+          .all(this.scope.instance_id, this.scope.workspace_id) as { update_id: string }[];
+        if (presentations.length > 100 || this.records.readListHeadInState(state, { record_kind: "presentation", membership: "all" }, 1).count !== presentations.length) throw Error();
+        for (const row of presentations) {
+          const presentation = this.records.readInState(state, "presentation", id.parse(row.update_id));
+          if (presentation === null) throw Error();
+          this.verifyHistoricalMark(state, presentation.row.clock_transaction_id, mark);
+          if (presentation.row.state === "acceptance_unknown") counts.unknown_delivery++;
+          if (presentation.row.state === "needs_review") counts.needs_review++;
         }
         // 内部recordの健全性だけではoperator認可やruntimeの安全性を証明できない。
         const degraded = ["runtime_readiness_unverified", "retention_unverified", ...Object.entries(counts).filter(([, count]) => count !== null && count > 0).map(([name]) => name)];
