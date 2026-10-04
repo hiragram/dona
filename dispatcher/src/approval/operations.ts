@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import type { VerifiedAuditState } from "../audit/codec.js";
+import { ApprovalRequestLifecycle } from "./request-lifecycle.js";
 import { z } from "zod";
 import { assertSynchronousResult } from "../audit/synchronous.js";
 import { AuditRepository } from "../audit/repository.js";
@@ -37,6 +39,7 @@ export class ApprovalOperations {
   private readonly audit: AuditRepository;
   private readonly records: ApprovalRecordRepository;
   private readonly history: ApprovalClockHistory;
+  private readonly lifecycle: ApprovalRequestLifecycle;
   constructor(private readonly db: Database.Database, private readonly providers: ApprovalTransactionProviders, scope: ApprovalRecordScope,
     private readonly bindingGuard?: SupervisorBindingGuard) {
     try {
@@ -45,6 +48,7 @@ export class ApprovalOperations {
       this.audit = new AuditRepository(db, providers.auditAnchors, providers.auditKeys);
       this.records = new ApprovalRecordRepository(db, providers.auditAnchors, providers.auditKeys, this.scope);
       this.history = new ApprovalClockHistory(db, this.scope);
+      this.lifecycle = new ApprovalRequestLifecycle(db, providers, this.scope);
     } catch { throw new ApprovalOperationsError(); }
   }
   /** A request list is a hint for an authenticated internal expiry worker. The
@@ -54,9 +58,7 @@ export class ApprovalOperations {
     try {
       assertSynchronousResult(input); const page = pageSchema.parse(input);
       return this.audit.readVerifiedState(state => {
-        const mark = parseClockMark(this.providers.clockMarks.read());
-        const effective = advanceClockMark(mark, this.providers.clock.observe(), "approval_expiry_observation", this.providers.maximumClockDriftMs).effective_utc;
-        if (this.history.readInState(state, mark.transaction_id) === null) throw Error();
+        const mark = this.observation(state), effective = mark.effective_utc;
         // Scan every request in the bounded page before filtering. Filtering on
         // unauthenticated SQL state/expiry could silently hide a due request.
         const total = this.db.prepare("SELECT count(*) FROM main.approval_requests WHERE instance_id=? AND workspace_id=?")
@@ -70,6 +72,7 @@ export class ApprovalOperations {
         for (const row of selected) {
           const request = this.records.readInState(state, "request", id.parse(row.request_id));
           if (request === null || request.row.instance_id !== this.scope.instance_id || request.row.workspace_id !== this.scope.workspace_id) throw Error();
+          this.lifecycle.verifyClock(request, mark, state);
           if (request.row.state === "approved" ? request.row.consume_expires_at !== null && request.row.consume_expires_at <= effective
             : requestStates.slice(0, 4).includes(request.row.state as never) && request.row.expires_at <= effective) due.push(row.request_id);
         }
@@ -91,14 +94,18 @@ export class ApprovalOperations {
     }
     return lines.join("\n") + "\n";
   }
+  private observation(state: VerifiedAuditState) {
+    const current = parseClockMark(this.providers.clockMarks.read());
+    const saved = this.history.readInState(state, current.transaction_id);
+    if (saved === null || !(Object.keys(current) as (keyof typeof current)[]).every(key => current[key] === saved[key])) throw Error();
+    const observationId = current.transaction_id === "approval_observation_0" ? "approval_observation_1" : "approval_observation_0";
+    return advanceClockMark(current, this.providers.clock.observe(), observationId, this.providers.maximumClockDriftMs);
+  }
   health(): ApprovalHealth {
     const counts = { expiry_lag: 0, stale_claim: 0, unknown_attempt: 0, unknown_delivery: 0, retention_overdue: null, needs_review: 0 };
     try {
-      const mark = parseClockMark(this.providers.clockMarks.read());
-      const observation = this.providers.clock.observe();
-      const effective = advanceClockMark(mark, observation, "approval_health_observation", this.providers.maximumClockDriftMs).effective_utc;
       return this.audit.readVerifiedState(state => {
-        if (this.history.readInState(state, mark.transaction_id) === null) throw Error();
+        const mark = this.observation(state), effective = mark.effective_utc;
         if (this.bindingGuard && !this.bindingGuard.matchesScope(this.scope)) throw Error();
         const requestRows = this.db.prepare("SELECT request_id FROM main.approval_requests WHERE instance_id=? AND workspace_id=? ORDER BY request_id LIMIT 101")
           .all(this.scope.instance_id, this.scope.workspace_id) as { request_id: string }[];
@@ -106,6 +113,7 @@ export class ApprovalOperations {
         for (const row of requestRows) {
           const request = this.records.readInState(state, "request", id.parse(row.request_id));
           if (request === null) throw Error();
+          this.lifecycle.verifyClock(request, mark, state);
           if (request.row.state === "needs_review") counts.needs_review++;
           if (requestStates.slice(0, 4).includes(request.row.state as never) && request.row.expires_at <= effective
             || request.row.state === "approved" && request.row.consume_expires_at !== null && request.row.consume_expires_at <= effective)
@@ -117,6 +125,7 @@ export class ApprovalOperations {
         for (const row of attempts) {
           const attempt = this.records.readInState(state, "execution", id.parse(row.attempt_id));
           if (attempt === null) throw Error();
+          if (attempt.row.state === "needs_review") counts.needs_review++;
           if (attempt.row.state === "acceptance_unknown") counts.unknown_attempt++;
           if (attempt.row.state === "claimed" && attempt.row.execution_expires_at <= effective
             || attempt.row.state === "executing" && attempt.row.payload_expires_at <= effective) counts.stale_claim++;

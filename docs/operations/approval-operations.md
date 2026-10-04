@@ -8,7 +8,7 @@ Issue #24の運用機能のうち、内部read-only観測を提供する。公�
 
 `expiryPage({limit, after})`は1〜100件のrequestを走査してから期限でfilterする。`next_after`は期限に達したhandleの最後ではなく、走査した候補の最後を返す。返却handleが空でも`has_more`がtrueなら後続pageを確認する。SQLのstate/期限で候補を先に除外せず、監査rootに結び付いたrecordを再読する。SQL件数と監査付きmanifestが一致しない場合は失敗する。
 
-期限は保護されたeffective UTCへ照合し、clock履歴欠落、boot変更、大きなclock jump、監査不一致では候補を返さない。観測はclock markとaudit anchorを更新しない。内部expiry workerは既存`ApprovalDecisionBroker.expire`で各handleの期限をtransaction内で再検証する。候補一覧だけで状態変更を承認しない。
+current markは全fieldを監査付き履歴へ完全照合し、各requestの作成markとapproval markも既存lifecycleで検証する。観測専用IDはcurrent IDと必ず分離する。期限は保護されたeffective UTCへ照合し、clock履歴欠落、boot変更、大きなclock jump、監査不一致では候補を返さない。観測はclock markとaudit anchorを更新しない。内部expiry workerは既存`ApprovalDecisionBroker.expire`で各handleの期限をtransaction内で再検証する。候補一覧だけで状態変更を承認しない。
 
 ## healthとmetrics
 
